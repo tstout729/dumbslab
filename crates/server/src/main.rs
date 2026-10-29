@@ -344,6 +344,7 @@ fn deliver(app: Arc<App>, effects: Vec<Effect>) -> Vec<tokio::task::JoinHandle<(
 }
 
 /// Whether an address is on the public internet (not loopback, private, link-local, CGNAT, …).
+/// IPv6 is an allowlist of global unicast; forms that embed an IPv4 address are judged by it.
 fn is_public(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
@@ -354,13 +355,26 @@ fn is_public(ip: IpAddr) -> bool {
                 || v4.is_broadcast()
                 || v4.is_unspecified()
                 || v4.is_documentation()
+                || v4.is_multicast()
                 || o[0] == 0
-                || (o[0] == 100 && (o[1] & 0xc0) == 64))
+                || o[0] >= 240
+                || (o[0] == 100 && (o[1] & 0xc0) == 64)
+                || (o[0] == 198 && (o[1] & 0xfe) == 18))
         }
         IpAddr::V6(v6) => {
-            let first = v6.segments()[0];
-            let mapped_private = v6.to_ipv4_mapped().is_some_and(|v4| !is_public(IpAddr::V4(v4)));
-            !(v6.is_loopback() || v6.is_unspecified() || (first & 0xfe00) == 0xfc00 || (first & 0xffc0) == 0xfe80 || mapped_private)
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_public(IpAddr::V4(v4));
+            }
+            let s = v6.segments();
+            if s[0] == 0x2002 {
+                // 6to4 carries an IPv4 address in bits 16-48.
+                let v4 = std::net::Ipv4Addr::new((s[1] >> 8) as u8, s[1] as u8, (s[2] >> 8) as u8, s[2] as u8);
+                return is_public(IpAddr::V4(v4));
+            }
+            let global_unicast = (s[0] & 0xe000) == 0x2000;
+            let teredo = s[0] == 0x2001 && s[1] == 0;
+            let documentation = s[0] == 0x2001 && s[1] == 0x0db8;
+            global_unicast && !teredo && !documentation
         }
     }
 }
@@ -384,6 +398,7 @@ async fn send_webhook(d: &WebhookDelivery, allow_private: bool) -> (Option<u16>,
         }
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
+            .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .resolve_to_addrs(&host, &addrs)
             .build()?;
@@ -418,10 +433,19 @@ mod tests {
             "fc00::1",
             "fe80::1",
             "::ffff:127.0.0.1",
+            "224.0.0.1",
+            "240.0.0.1",
+            "::127.0.0.1",
+            "64:ff9b::a00:1",
+            "2002:7f00:1::",
+            "2001:0:4136:e378::1",
+            "2001:db8::1",
+            "ff02::1",
+            "fec0::1",
         ] {
             assert!(!is_public(ip.parse().unwrap()), "{ip}");
         }
-        for ip in ["1.1.1.1", "93.184.216.34", "2606:4700::1111"] {
+        for ip in ["1.1.1.1", "93.184.216.34", "2606:4700::1111", "2002:5db8:d822::1"] {
             assert!(is_public(ip.parse().unwrap()), "{ip}");
         }
     }

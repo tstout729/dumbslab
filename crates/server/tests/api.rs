@@ -281,6 +281,10 @@ fn drafts_private_topics_and_roles() {
     let feed = h.ok("GET", "/api/v1/activity?limit=200", None, &viewer);
     assert!(feed["items"].as_array().unwrap().iter().all(|a| !a["summary"].as_str().unwrap().contains("Falcon")));
 
+    // Admins keep the full history of deleted topics (S11).
+    let admin_feed = h.ok("GET", "/api/v1/activity?limit=200", None, &admin);
+    assert!(admin_feed["items"].as_array().unwrap().iter().any(|a| a["summary"].as_str().unwrap().contains("Falcon")));
+
     // Breadcrumbs don't reveal a private parent (S5).
     let child = h.ok("POST", "/api/v1/topics", Some(json!({ "name": "Public child", "parent_id": tid })), &admin);
     let crumbs = h.ok("GET", &format!("/api/v1/topics/{}", child["id"].as_str().unwrap()), None, &viewer);

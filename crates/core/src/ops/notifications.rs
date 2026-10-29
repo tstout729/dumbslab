@@ -307,11 +307,14 @@ fn list_activity(ctx: &mut Ctx, input: ListActivityInput) -> ApiResult<ActivityL
         cond.push("a.id > ?".into());
         p.push(after.into());
     }
-    // Hide events about posts and topics the actor can't see (including purged posts).
-    let post_vis = post_visible_sql(&ctx.actor, "vp", &mut p);
-    cond.push(format!("(a.post_id IS NULL OR EXISTS (SELECT 1 FROM posts vp WHERE vp.id = a.post_id AND {post_vis}))"));
-    let topic_vis = topic_visible_sql(&ctx.actor, "vt", &mut p);
-    cond.push(format!("(a.topic_id IS NULL OR EXISTS (SELECT 1 FROM topics vt WHERE vt.id = a.topic_id AND {topic_vis}))"));
+    // Hide events about posts and topics the actor can't see, including ones since deleted.
+    // Admins see everything, including the history of deleted posts and topics.
+    if !ctx.actor.sees_all() {
+        let post_vis = post_visible_sql(&ctx.actor, "vp", &mut p);
+        cond.push(format!("(a.post_id IS NULL OR EXISTS (SELECT 1 FROM posts vp WHERE vp.id = a.post_id AND {post_vis}))"));
+        let topic_vis = topic_visible_sql(&ctx.actor, "vt", &mut p);
+        cond.push(format!("(a.topic_id IS NULL OR EXISTS (SELECT 1 FROM topics vt WHERE vt.id = a.topic_id AND {topic_vis}))"));
+    }
     let order = if input.after_id.is_some() { "ASC" } else { "DESC" };
     p.push((limit + 1).into());
     p.push(offset.into());
