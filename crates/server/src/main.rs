@@ -224,7 +224,7 @@ async fn serve(
             _ => info!("first run: create the admin account at {shown_url}/setup"),
         }
     }
-    let cfg = HostConfig { base_url: base_url.map(|u| u.trim_end_matches('/').to_string()), setup_token, open_setup };
+    let cfg = HostConfig { base_url: base_url.map(|u| u.trim_end_matches('/').to_string()), setup_token, open_setup, ..Default::default() };
     let app = Arc::new(App { store, cfg, allow_private_webhooks });
     let router = Router::new()
         .fallback(handle)

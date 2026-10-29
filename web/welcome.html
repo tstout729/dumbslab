@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>DumbSlab — the free team wiki your AI agents can use too</title>
+<meta name="description" content="A free, open-source team knowledge base. Every workspace includes an MCP server and REST API so AI agents can search, write and edit alongside your team.">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/styles.css">
+<link rel="stylesheet" href="/welcome.css">
+<script src="/theme-init.js"></script>
+<script type="module" src="/welcome.js"></script>
+</head>
+<body class="w-page">
+<header class="w-top">
+  <a class="w-brand" href="/"><img src="/favicon.svg" alt="" width="28" height="28"><span>DumbSlab</span></a>
+  <nav class="w-nav">
+    <a href="#features">Features</a>
+    <a href="#agents">For agents</a>
+    <a href="https://github.com/tstout729/dumbslab">GitHub</a>
+  </nav>
+</header>
+
+<main id="main" class="w-main">
+  <section class="w-hero">
+    <div class="w-pitch">
+      <h1>The free team wiki your AI agents can use too.</h1>
+      <p class="w-lede">Write things down once, find them later, keep them current. Every workspace comes with an MCP server and a REST API, so Claude, ChatGPT and your own agents can search, write and edit alongside your team.</p>
+      <ul class="w-points">
+        <li>Free, with your own address like <strong>acme.<span data-root>dumbslab.com</span></strong></li>
+        <li>Open source: fork it or self-host it</li>
+        <li>No credit card, no trial</li>
+      </ul>
+    </div>
+
+    <div class="w-card">
+      <h2>Create your workspace</h2>
+      <form id="signup" class="w-form" novalidate>
+        <div class="field">
+          <label class="field-label" for="ws-name">Workspace name</label>
+          <input class="input" id="ws-name" name="workspace_name" required maxlength="80" autocomplete="organization" placeholder="Acme Inc.">
+        </div>
+        <div class="field">
+          <label class="field-label" for="ws-address">Address</label>
+          <div class="w-address">
+            <input class="input" id="ws-address" name="address" required maxlength="32" autocomplete="off" spellcheck="false" placeholder="acme" aria-describedby="ws-address-hint">
+            <span class="w-suffix">.<span data-root>dumbslab.com</span></span>
+          </div>
+          <p class="field-hint" id="ws-address-hint">Lowercase letters, numbers and hyphens.</p>
+        </div>
+        <p class="form-error" id="signup-error" role="alert" hidden></p>
+        <button class="btn btn-primary btn-block" type="submit">Create workspace</button>
+        <p class="w-fine">Next you'll set up your admin account. By creating a workspace you agree to the <a href="#rules">rules</a>.</p>
+      </form>
+
+      <form id="goto" class="w-goto" novalidate>
+        <label class="field-label" for="goto-address">Already have a workspace?</label>
+        <div class="w-address">
+          <input class="input" id="goto-address" required maxlength="32" autocomplete="off" spellcheck="false" placeholder="acme">
+          <span class="w-suffix">.<span data-root>dumbslab.com</span></span>
+          <button class="btn" type="submit">Go</button>
+        </div>
+      </form>
+    </div>
+  </section>
+
+  <section id="features" class="w-features">
+    <div><h3>Posts and topics</h3><p>Markdown docs with live preview, organized into nested topics. Private topics for things only some people should see.</p></div>
+    <div><h3>Search everything</h3><p>Full-text search across posts, comments and topics, with highlighted results. Press ⌘K anywhere.</p></div>
+    <div><h3>History you can trust</h3><p>Every save is a version you can compare and restore. Verify docs for a while; stale ones get flagged.</p></div>
+    <div><h3>Discussion in place</h3><p>Comment on a whole doc or a highlighted passage, mention teammates, react, resolve threads.</p></div>
+  </section>
+
+  <section id="agents" class="w-agents">
+    <h2>Built for agents, not bolted on</h2>
+    <p>Everything a person can do in the app, an agent can do through MCP or the API. Each workspace has its own server at <code>https://acme.<span data-root>dumbslab.com</span>/mcp</code>; clients that support OAuth just need the URL.</p>
+    <pre><code>claude mcp add --transport http dumbslab https://acme.<span data-root>dumbslab.com</span>/mcp</code></pre>
+    <p>Agents edit precisely (find and replace, section edits) and never overwrite a teammate's change. Give each agent its own bot account so its work shows up under its own name.</p>
+  </section>
+
+  <section id="rules" class="w-rules">
+    <h2>The rules</h2>
+    <p>Don't use DumbSlab for anything illegal, for spam or malware, or to harass people. Workspaces that do are removed.</p>
+    <p>DumbSlab is a free service offered as is, without uptime or data guarantees. Keep your own copy of anything important: admins can export a workspace any time with the <code>export_workspace</code> operation, or self-host DumbSlab from the source.</p>
+  </section>
+</main>
+
+<footer class="w-foot">
+  <span>DumbSlab is open source under MIT or Apache-2.0. Not affiliated with Slab, Inc.</span>
+  <a href="https://github.com/tstout729/dumbslab">Source on GitHub</a>
+</footer>
+</body>
+</html>

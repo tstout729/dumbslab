@@ -23,6 +23,7 @@ pub mod ops;
 pub mod registry;
 pub mod search;
 pub mod seed;
+pub mod tenancy;
 pub mod util;
 
 pub use db::{Db, Row, SqlValue, migrate};
@@ -41,6 +42,10 @@ pub struct HostConfig {
     pub setup_token: Option<String>,
     /// Allows first-run setup without a token (local development only).
     pub open_setup: bool,
+    /// Multi-tenant hosting: the secret that signs sign-up links (see [`tenancy`]).
+    pub signup_secret: Option<String>,
+    /// Multi-tenant hosting: this workspace's address (its subdomain).
+    pub workspace: Option<String>,
 }
 
 /// A transport-neutral HTTP request.

@@ -1,26 +1,30 @@
-# DumbSlab on Cloudflare Workers + a SQLite-backed Durable Object.
+# DumbSlab on Cloudflare Workers + SQLite-backed Durable Objects.
+#
+# This file deploys the hosted, multi-tenant dumbslab.com: the root domain is the sign-up site and
+# every `name.dumbslab.com` is its own workspace. To run a single private workspace instead, set
+# MULTI_TENANT = "false" and see docs/cloudflare.md.
 #
 #   cd crates/worker
-#   npx wrangler dev --var BASE_URL:http://localhost:8787 --var OPEN_SETUP:true   # local, simulated Durable Object
-#   npx wrangler secret put SETUP_TOKEN           # required before first setup in production
+#   npx wrangler dev --env dev             # local: http://localhost:8787, workspaces at http://acme.localhost:8787
+#   npx wrangler secret put SIGNUP_SECRET  # signs sign-up links (any long random string)
+#   npx wrangler secret put OPERATOR_TOKEN # unlocks the operator API (/api/operator/...)
 #   npx wrangler deploy
-#
-# See docs/cloudflare.md for custom domains and backups.
 
 name = "dumbslab"
 main = "build/index.js"
 compatibility_date = "2026-10-01"
 
-# The project's own deployment. Self-hosters: change these to your domain.
 routes = [
   { pattern = "dumbslab.com", custom_domain = true },
   { pattern = "www.dumbslab.com", custom_domain = true },
+  # Every workspace subdomain. Needs a proxied wildcard DNS record (`*`).
+  { pattern = "*.dumbslab.com/*", zone_name = "dumbslab.com" },
 ]
 
 [build]
 command = "worker-build --release"
 
-# The Worker sees every request (to redirect www) and hands non-API paths to the assets.
+# The Worker sees every request (to route by host) and hands non-API paths to the assets.
 [assets]
 directory = "../../web"
 binding = "ASSETS"
@@ -31,18 +35,56 @@ run_worker_first = true
 name = "WORKSPACE"
 class_name = "Workspace"
 
+[[durable_objects.bindings]]
+name = "DIRECTORY"
+class_name = "Directory"
+
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["Workspace"]
 
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["Directory"]
+
 [vars]
-# Public URL used in links and OAuth metadata. Empty uses the request's origin
-# (local dev: `npx wrangler dev --var BASE_URL:http://localhost:8787 --var OPEN_SETUP:true`).
-BASE_URL = "https://dumbslab.com"
-# Durable Object name holding this deployment's workspace.
+MULTI_TENANT = "true"
+ROOT_DOMAIN = "dumbslab.com"
+# Sign-up limits that keep a free deployment free.
+SIGNUPS_PER_IP_PER_DAY = "3"
+SIGNUPS_PER_DAY = "200"
+MAX_WORKSPACES = "1000"
+# Writes stop (reads, deletes and sign-in keep working) once a workspace's database passes this.
+WORKSPACE_STORAGE_MB = "50"
+# Single-workspace mode only: public URL and Durable Object name.
+BASE_URL = ""
 WORKSPACE_NAME = "main"
-# Only for local development: allow first-run setup without SETUP_TOKEN.
 OPEN_SETUP = "false"
 
 [observability]
 enabled = true
+
+# Local multi-tenant development. Uses a throwaway SIGNUP_SECRET; never deploy this environment.
+[env.dev]
+routes = []
+
+[[env.dev.durable_objects.bindings]]
+name = "WORKSPACE"
+class_name = "Workspace"
+
+[[env.dev.durable_objects.bindings]]
+name = "DIRECTORY"
+class_name = "Directory"
+
+[env.dev.vars]
+MULTI_TENANT = "true"
+ROOT_DOMAIN = "localhost"
+SIGNUP_SECRET = "dev-only-signup-secret"
+OPERATOR_TOKEN = "dev-only-operator-token"
+SIGNUPS_PER_IP_PER_DAY = "50"
+SIGNUPS_PER_DAY = "500"
+MAX_WORKSPACES = "1000"
+WORKSPACE_STORAGE_MB = "50"
+BASE_URL = ""
+WORKSPACE_NAME = "main"
+OPEN_SETUP = "false"

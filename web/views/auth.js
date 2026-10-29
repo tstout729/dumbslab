@@ -26,7 +26,13 @@ function showError(box, err) {
 export function renderSetup(root, authState) {
   document.title = 'Set up DumbSlab';
   const params = new URLSearchParams(location.search);
-  const ws = input({ name: 'workspace_name', required: true, value: 'DumbSlab', autocomplete: 'organization' });
+  // On hosted DumbSlab, an address nobody has signed up for has nothing to set up.
+  if (authState.exists === false && !params.get('token')) {
+    const link = h('a', { class: 'btn btn-primary btn-block', href: authState.signup_url || '/' }, 'Create a workspace');
+    root.replaceChildren(card('There’s no workspace here', `Nobody has created ${location.hostname} yet. You can claim it for free.`, link));
+    return;
+  }
+  const ws = input({ name: 'workspace_name', required: true, value: params.get('name') || 'DumbSlab', autocomplete: 'organization' });
   const name = input({ name: 'name', required: true, autocomplete: 'name' });
   const email = input({ name: 'email', type: 'email', required: true, autocomplete: 'email' });
   const password = input({ name: 'password', type: 'password', required: true, minlength: 8, autocomplete: 'new-password' });
@@ -38,7 +44,8 @@ export function renderSetup(root, authState) {
     field('Your name', name),
     field('Email', email),
     field('Password', password, { hint: 'At least 8 characters.' }),
-    authState.setup_requires_token
+    // A sign-up link carries its token; only self-hosted setups ask for one.
+    authState.setup_requires_token && !params.get('token')
       ? field('Setup token', token, { hint: 'Printed in the server log when it started, or your deployment’s SETUP_TOKEN secret.' })
       : null,
     err,

@@ -1,268 +1,234 @@
 //! DumbSlab on Cloudflare Workers.
 //!
-//! The Worker serves the web app from static assets and forwards API, MCP and OAuth requests to
-//! one SQLite-backed Durable Object that holds the whole workspace. The Durable Object runs the
-//! same core as the native server; every request is one `transactionSync` call, so a failed
-//! operation rolls back exactly like it does on the native SQLite host.
+//! Two hosting modes:
+//! - **Single workspace** (default for self-hosters): every request goes to one Durable Object.
+//! - **Multi-tenant** (`MULTI_TENANT = "true"`, used by dumbslab.com): the root domain serves the
+//!   sign-up site, and each `name.ROOT_DOMAIN` subdomain is its own workspace with its own
+//!   SQLite-backed Durable Object. A `Directory` object tracks addresses and sign-up limits.
+//!
+//! Each workspace object runs the same core as the native server; every request is one
+//! `transactionSync` call, so a failed operation rolls back exactly like it does on SQLite.
 
-use std::cell::{Cell, RefCell};
-use std::rc::Rc;
+mod directory;
+mod sql;
+mod workspace;
 
-use dumbslab_core::db::{Db, Row, SqlValue};
-use dumbslab_core::{ApiError, ApiResult, Effect, HostConfig, Outcome};
-use futures_util::StreamExt;
-use wasm_bindgen::JsCast;
-use wasm_bindgen::prelude::*;
+pub use directory::Directory;
+pub use workspace::Workspace;
+
+use chrono::Utc;
+use dumbslab_core::http::is_core_path;
+use dumbslab_core::tenancy::{self, HostKind};
+use dumbslab_core::util::{secure_eq, sha256_hex};
+use serde::Deserialize;
+use serde_json::{Value, json};
 use worker::*;
 
+use crate::sql::{call_object, error_response, flag, json_response, read_body, var};
+use crate::workspace::WORKSPACE_HEADER;
+
 #[event(fetch)]
-async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
-    // Serve one canonical host: www.example.com → example.com.
+async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     let url = req.url()?;
-    if let Some(apex) = url.host_str().and_then(|h| h.strip_prefix("www.")) {
+    let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
+    // Serve one canonical host: www.example.com → example.com.
+    if let Some(apex) = host.strip_prefix("www.") {
         let mut target = url.clone();
         target.set_host(Some(apex)).map_err(|e| worker::Error::RustError(e.to_string()))?;
         return Response::redirect_with_status(target, 301);
     }
-    let path = req.path();
-    if !dumbslab_core::http::is_core_path(&path) {
-        return env.assets("ASSETS")?.fetch_request(req).await;
+    let path = url.path().to_string();
+    if path.starts_with("/_internal") {
+        return error_response(404, "not_found", "not found");
     }
-    let workspace = env.var("WORKSPACE_NAME").map(|v| v.to_string()).unwrap_or_else(|_| "main".into());
-    let stub = env.durable_object("WORKSPACE")?.id_from_name(&workspace)?.get_stub()?;
-    if matches!(req.method(), Method::Get | Method::Head | Method::Options) {
-        return stub.fetch_with_request(req).await;
+
+    if !flag(&env, "MULTI_TENANT") {
+        if !is_core_path(&path) {
+            return env.assets("ASSETS")?.fetch_request(req).await;
+        }
+        let name = var(&env, "WORKSPACE_NAME").unwrap_or_else(|| "main".into());
+        return forward(&env, &name, req, None).await;
     }
-    // Buffer and bound the body here: if the workspace object answered 413 while this Worker
-    // was still streaming an upload into it, the stream would fail and restart the isolate.
-    let Some(body) = read_body(&mut req).await? else {
-        return Response::error("request body too large", 413);
-    };
+
+    let root = var(&env, "ROOT_DOMAIN").ok_or_else(|| worker::Error::RustError("ROOT_DOMAIN is not set".into()))?;
+    match tenancy::host_kind(&host, &root) {
+        HostKind::Root => root_site(req, &env, &root, &path).await,
+        HostKind::Workspace(slug) if tenancy::validate_slug(&slug).is_ok() => {
+            if !is_core_path(&path) {
+                return env.assets("ASSETS")?.fetch_request(req).await;
+            }
+            forward(&env, &format!("ws:{slug}"), req, Some(&slug)).await
+        }
+        _ => error_response(404, "no_workspace", &format!("There's no workspace at this address. Create one at https://{root}/")),
+    }
+}
+
+/// Sends a request to a workspace object. Bodies are buffered (and bounded) here: if the object
+/// answered while this Worker was still streaming an upload into it, the isolate would restart.
+async fn forward(env: &Env, object: &str, mut req: Request, workspace: Option<&str>) -> Result<Response> {
+    let stub = env.durable_object("WORKSPACE")?.id_from_name(object)?.get_stub()?;
+    let headers = req.headers().clone();
+    // Only this Worker may say which workspace a request is for.
+    match workspace {
+        Some(slug) => headers.set(WORKSPACE_HEADER, slug)?,
+        None => headers.delete(WORKSPACE_HEADER)?,
+    }
     let mut init = RequestInit::new();
     init.with_method(req.method())
-        .with_headers(req.headers().clone())
-        .with_body(Some(js_sys::Uint8Array::from(body.as_slice()).into()))
+        .with_headers(headers)
         // Pass redirects (e.g. the OAuth consent 302 back to the client) through to the browser.
         .with_redirect(RequestRedirect::Manual);
+    if !matches!(req.method(), Method::Get | Method::Head | Method::Options) {
+        let Some(body) = read_body(&mut req).await? else {
+            return error_response(413, "too_large", "request body too large");
+        };
+        init.with_body(Some(js_sys::Uint8Array::from(body.as_slice()).into()));
+    }
     stub.fetch_with_request(Request::new_with_init(req.url()?.as_str(), &init)?).await
 }
 
-/// SQL access through the Durable Object's synchronous SQL API.
-#[derive(Clone)]
-struct DoDb {
-    sql: SqlStorage,
-}
-
-fn to_binding(v: &SqlValue) -> SqlStorageValue {
-    match v {
-        SqlValue::Null => SqlStorageValue::Null,
-        SqlValue::Integer(i) => SqlStorageValue::Integer(*i),
-        SqlValue::Real(f) => SqlStorageValue::Float(*f),
-        SqlValue::Text(s) => SqlStorageValue::String(s.clone()),
-        SqlValue::Blob(b) => SqlStorageValue::Blob(b.clone()),
-    }
-}
-
-fn from_storage(v: SqlStorageValue) -> SqlValue {
-    match v {
-        SqlStorageValue::Null => SqlValue::Null,
-        SqlStorageValue::Boolean(b) => SqlValue::Integer(b as i64),
-        SqlStorageValue::Integer(i) => SqlValue::Integer(i),
-        SqlStorageValue::Float(f) => SqlValue::Real(f),
-        SqlStorageValue::String(s) => SqlValue::Text(s),
-        SqlStorageValue::Blob(b) => SqlValue::Blob(b),
-    }
-}
-
-fn sql_err(e: worker::Error) -> ApiError {
-    let msg = e.to_string();
-    if msg.contains("UNIQUE constraint") || msg.contains("constraint failed") {
-        ApiError::conflict(format!("conflicts with existing data: {msg}"))
-    } else {
-        ApiError::internal(format!("database error: {msg}"))
-    }
-}
-
-impl DoDb {
-    fn run(&self, sql: &str, params: &[SqlValue]) -> ApiResult<SqlCursor> {
-        let bindings: Vec<SqlStorageValue> = params.iter().map(to_binding).collect();
-        self.sql.exec(sql, if bindings.is_empty() { None } else { Some(bindings) }).map_err(sql_err)
-    }
-}
-
-impl Db for DoDb {
-    fn query(&self, sql: &str, params: &[SqlValue]) -> ApiResult<Vec<Row>> {
-        let cursor = self.run(sql, params)?;
-        let columns = std::sync::Arc::new(cursor.column_names());
-        let mut out = vec![];
-        for row in cursor.raw() {
-            let values = row.map_err(sql_err)?.into_iter().map(from_storage).collect();
-            out.push(Row::new(columns.clone(), values));
+/// The root domain: the sign-up site, sign-up API and operator API.
+async fn root_site(req: Request, env: &Env, root: &str, path: &str) -> Result<Response> {
+    let method = req.method();
+    match (method, path) {
+        (Method::Get | Method::Head, "/") => {
+            let mut url = req.url()?;
+            url.set_path("/welcome");
+            env.assets("ASSETS")?.fetch_request(Request::new(url.as_str(), Method::Get)?).await
         }
-        Ok(out)
-    }
-
-    fn execute(&self, sql: &str, params: &[SqlValue]) -> ApiResult<u64> {
-        // Drain the cursor so the statement has fully run before reading changes().
-        for row in self.run(sql, params)?.raw() {
-            row.map_err(sql_err)?;
+        (Method::Get, "/healthz") => json_response(200, &json!({ "ok": true, "version": dumbslab_core::VERSION })),
+        (Method::Get, "/llms.txt") => Response::ok(root_guide(root)),
+        (Method::Post, "/api/signup") => signup(req, env, root).await,
+        (_, p) if p.starts_with("/api/operator/") => operator(req, env, p).await,
+        // Static files the sign-up page uses.
+        (Method::Get | Method::Head, p) if p.rsplit('/').next().is_some_and(|f| f.contains('.')) => {
+            env.assets("ASSETS")?.fetch_request(req).await
         }
-        let changes = self.query("SELECT changes() AS n", &[])?;
-        Ok(changes.first().map(|r| r.i64("n")).unwrap_or(0).max(0) as u64)
-    }
-
-    fn execute_batch(&self, sql: &str) -> ApiResult<()> {
-        for row in self.run(sql, &[])?.raw() {
-            row.map_err(sql_err)?;
+        (_, p) if is_core_path(p) => error_response(
+            404,
+            "no_workspace",
+            &format!(
+                "The API and MCP server live at your workspace's address, e.g. https://acme.{root}/api/v1 and https://acme.{root}/mcp"
+            ),
+        ),
+        _ => {
+            let mut url = req.url()?;
+            url.set_path("/");
+            url.set_query(None);
+            Response::redirect(url)
         }
-        Ok(())
     }
 }
 
-const ROLLBACK: &str = "__dumbslab_rollback__";
+fn root_guide(root: &str) -> String {
+    format!(
+        "# DumbSlab\n\n\
+         > A free, open-source team knowledge base (in the spirit of Slab) built so AI agents can do anything people can.\n\n\
+         - Create a free workspace at https://{root}/ — each workspace gets its own address, e.g. https://acme.{root}.\n\
+         - Every workspace has a REST API (https://acme.{root}/api/v1), an MCP server (https://acme.{root}/mcp, OAuth or bearer token)\n\
+           and its own agent guide at https://acme.{root}/llms.txt.\n\
+         - Self-host it instead: one Rust binary and one SQLite file.\n"
+    )
+}
 
-/// Same cap as the native server.
-const MAX_BODY: usize = 8 * 1024 * 1024;
+#[derive(Deserialize)]
+struct SignupInput {
+    workspace_name: String,
+    address: String,
+}
 
-/// Reads the request body, or `None` when it is larger than [`MAX_BODY`].
-async fn read_body(req: &mut Request) -> Result<Option<Vec<u8>>> {
-    let declared = req.headers().get("content-length")?.and_then(|v| v.parse::<usize>().ok());
-    if declared.is_some_and(|n| n > MAX_BODY) {
-        return Ok(None);
+/// Reserves an address and returns a one-hour sign-up link to the new workspace's setup page.
+async fn signup(mut req: Request, env: &Env, root: &str) -> Result<Response> {
+    // Like the app's own writes, require the client header (a cross-site form can't send it).
+    if req.headers().get("x-dumbslab-client")?.is_none() {
+        return error_response(403, "forbidden", "missing the x-dumbslab-client header");
     }
-    let Ok(mut stream) = req.stream() else {
-        return Ok(Some(vec![])); // no body
+    let Some(secret) = var(env, "SIGNUP_SECRET") else {
+        return error_response(503, "unavailable", "sign-ups aren't configured on this server");
     };
-    let mut body = Vec::new();
-    let mut too_large = false;
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk?;
-        // Past the limit, keep reading but discard: answering before the upload ends breaks the
-        // connection the next request arrives on.
-        too_large |= body.len() + chunk.len() > MAX_BODY;
-        if !too_large {
-            body.extend_from_slice(&chunk);
-        }
+    let Some(body) = read_body(&mut req).await? else {
+        return error_response(413, "too_large", "request body too large");
+    };
+    let input: SignupInput = match serde_json::from_slice(&body) {
+        Ok(i) => i,
+        Err(_) => return error_response(400, "bad_request", "send {\"workspace_name\": \"…\", \"address\": \"…\"}"),
+    };
+    let slug = input.address.trim().to_ascii_lowercase();
+    if let Err(message) = tenancy::validate_slug(&slug) {
+        return error_response(400, "bad_request", &message);
     }
-    Ok((!too_large).then_some(body))
+    let ip = req.headers().get("cf-connecting-ip")?.unwrap_or_else(|| "unknown".into());
+    let ip_hash = sha256_hex(&format!("{secret}:{ip}"));
+    let name = input.workspace_name.trim().to_string();
+    let (status, reply) = call_object(
+        env,
+        "DIRECTORY",
+        "directory",
+        Method::Post,
+        "/reserve",
+        Some(&json!({ "slug": slug, "name": name, "ip_hash": ip_hash })),
+    )
+    .await?;
+    if status != 200 {
+        return json_response(status, &reply);
+    }
+    let expires = reply["reserved_until"].as_i64().unwrap_or_else(|| Utc::now().timestamp() + 3600);
+    let token = tenancy::signup_token(&secret, &slug, expires);
+    let url = req.url()?;
+    let scheme = url.scheme();
+    let port = url.port().map(|p| format!(":{p}")).unwrap_or_default();
+    let setup_url = format!("{scheme}://{slug}.{root}{port}/setup?token={token}&name={}", urlencoding::encode(&name));
+    json_response(200, &json!({ "address": format!("{slug}.{root}"), "setup_url": setup_url }))
 }
 
-/// Runs `f` inside `storage.transactionSync()`. Returning `false` (or panicking) rolls back.
-fn transaction<T: 'static>(storage: &Storage, db: DoDb, f: impl FnOnce(&dyn Db) -> (T, bool) + 'static) -> Result<T> {
-    let raw: &JsValue = storage.as_raw().as_ref();
-    let tx: js_sys::Function = js_sys::Reflect::get(raw, &JsValue::from_str("transactionSync"))?.dyn_into()?;
-    let slot: Rc<RefCell<Option<T>>> = Rc::new(RefCell::new(None));
-    let out = slot.clone();
-    let closure = Closure::once(move || -> std::result::Result<JsValue, JsValue> {
-        let (value, commit) = f(&db);
-        *out.borrow_mut() = Some(value);
-        if commit { Ok(JsValue::UNDEFINED) } else { Err(JsValue::from_str(ROLLBACK)) }
-    });
-    match tx.call1(raw, closure.as_ref().unchecked_ref()) {
-        Ok(_) => {}
-        Err(e) if e.as_string().as_deref() == Some(ROLLBACK) => {}
-        Err(e) => return Err(worker::Error::from(e)),
+/// Operator API for removing abuse: `Authorization: Bearer $OPERATOR_TOKEN`.
+///
+/// - `GET  /api/operator/workspaces`
+/// - `POST /api/operator/workspaces/{address}/disable` (or `enable`, `delete`)
+async fn operator(req: Request, env: &Env, path: &str) -> Result<Response> {
+    let Some(expected) = var(env, "OPERATOR_TOKEN") else {
+        return error_response(404, "not_found", "not found");
+    };
+    let provided = req.headers().get("authorization")?.and_then(|h| h.strip_prefix("Bearer ").map(str::to_string));
+    if !provided.is_some_and(|t| secure_eq(t.trim(), &expected)) {
+        return error_response(401, "unauthorized", "operator token required");
     }
-    slot.borrow_mut().take().ok_or_else(|| worker::Error::RustError("transaction produced no result".into()))
-}
-
-#[durable_object]
-pub struct Workspace {
-    state: State,
-    env: Env,
-    migrated: Cell<bool>,
-}
-
-impl DurableObject for Workspace {
-    fn new(state: State, env: Env) -> Self {
-        Self { state, env, migrated: Cell::new(false) }
+    let rest = path.trim_start_matches("/api/operator/workspaces").trim_matches('/');
+    if req.method() == Method::Get && rest.is_empty() {
+        let (status, body) = call_object(env, "DIRECTORY", "directory", Method::Get, "/list", None).await?;
+        return json_response(status, &body);
     }
-
-    async fn fetch(&self, mut req: Request) -> Result<Response> {
-        let storage = self.state.storage();
-        let db = DoDb { sql: storage.sql() };
-        if !self.migrated.get() {
-            transaction(&storage, db.clone(), |db| match dumbslab_core::migrate(db) {
-                Ok(()) => ((), true),
-                Err(e) => {
-                    console_error!("migration failed: {}", e.message);
-                    ((), false)
-                }
-            })?;
-            self.migrated.set(true);
-        }
-
-        let url = req.url()?;
-        let origin = match url.port() {
-            Some(p) => format!("{}://{}:{p}", url.scheme(), url.host_str().unwrap_or_default()),
-            None => format!("{}://{}", url.scheme(), url.host_str().unwrap_or_default()),
-        };
-        let headers: Vec<(String, String)> = req.headers().entries().map(|(k, v)| (k.to_lowercase(), v)).collect();
-        // Bound the body before anything else runs: one workspace object serves every request.
-        let Some(body) = read_body(&mut req).await? else {
-            return Response::error("request body too large", 413);
-        };
-        let core_req = dumbslab_core::Request {
-            method: req.method().to_string(),
-            path: url.path().to_string(),
-            query: url.query().unwrap_or_default().to_string(),
-            client_ip: headers.iter().find(|(k, _)| k == "cf-connecting-ip").map(|(_, v)| v.clone()),
-            headers,
-            body,
-            origin,
-        };
-        let cfg = HostConfig {
-            base_url: self.env.var("BASE_URL").ok().map(|v| v.to_string()).filter(|s| !s.is_empty()),
-            setup_token: self.env.secret("SETUP_TOKEN").ok().map(|s| s.to_string()).filter(|s| !s.is_empty()),
-            open_setup: self.env.var("OPEN_SETUP").map(|v| v.to_string() == "true").unwrap_or(false),
-        };
-
-        let outcome: Option<Outcome> = transaction(&storage, db.clone(), move |db| match dumbslab_core::handle(db, &cfg, &core_req) {
-            Some(o) => {
-                let commit = o.commit;
-                (Some(o), commit)
-            }
-            None => (None, true),
-        })?;
-        let Some(outcome) = outcome else {
-            return Response::error("not found", 404);
-        };
-
-        for effect in outcome.effects {
-            let Effect::Webhook(d) = effect;
-            let db = db.clone();
-            self.state.wait_until(async move {
-                let headers = Headers::new();
-                for (k, v) in &d.headers {
-                    let _ = headers.set(k, v);
-                }
-                let mut init = RequestInit::new();
-                init.with_method(Method::Post).with_headers(headers).with_body(Some(JsValue::from_str(&d.body)));
-                let result = match Request::new_with_init(&d.url, &init) {
-                    Ok(r) => Fetch::Request(r).send().await,
-                    Err(e) => Err(e),
-                };
-                let (status, error) = match result {
-                    Ok(resp) if (200..300).contains(&resp.status_code()) => (Some(resp.status_code()), None),
-                    Ok(resp) => (Some(resp.status_code()), Some(format!("HTTP {}", resp.status_code()))),
-                    Err(e) => (None, Some(e.to_string())),
-                };
-                let _ = dumbslab_core::record_webhook_result(&db, &d.webhook_id, status, error.as_deref());
-            });
-        }
-
-        let r = outcome.response;
-        // 204/304 responses must not have a body at all, not even an empty one.
-        let mut resp = if r.body.is_empty() { Response::empty()? } else { Response::from_bytes(r.body)? }.with_status(r.status);
-        let h = resp.headers_mut();
-        for (k, v) in &r.headers {
-            // Replace defaults such as `application/octet-stream`; only cookies repeat.
-            if k == "set-cookie" {
-                h.append(k, v)?;
-            } else {
-                h.set(k, v)?;
-            }
-        }
-        Ok(resp)
-    }
+    let (slug, action) = match rest.split_once('/') {
+        Some((s, a)) if req.method() == Method::Post && tenancy::validate_slug(s).is_ok() => (s.to_string(), a.to_string()),
+        _ => return error_response(404, "not_found", "unknown operator route"),
+    };
+    let object = format!("ws:{slug}");
+    let stub = env.durable_object("WORKSPACE")?.id_from_name(&object)?.get_stub()?;
+    // The workspace's answer decides the directory change: 404 means the address was reserved
+    // but never set up.
+    let workspace_call = |internal: &'static str| async move {
+        let mut init = RequestInit::new();
+        init.with_method(Method::Post);
+        let resp = stub.fetch_with_request(Request::new_with_init(&format!("https://internal{internal}"), &init)?).await?;
+        Ok::<u16, worker::Error>(resp.status_code())
+    };
+    let directory: (&str, Value) = match action.as_str() {
+        "disable" => match workspace_call("/_internal/disable").await? {
+            // Disabling a reservation also kills its sign-up link.
+            200 | 404 => ("/status", json!({ "slug": slug, "status": "disabled" })),
+            status => return error_response(status, "failed", "the workspace couldn't be disabled"),
+        },
+        "enable" => match workspace_call("/_internal/enable").await? {
+            200 => ("/status", json!({ "slug": slug, "status": "active" })),
+            404 => ("/status", json!({ "slug": slug, "status": "reserved" })),
+            status => return error_response(status, "failed", "the workspace couldn't be enabled"),
+        },
+        "delete" => match workspace_call("/_internal/delete").await? {
+            200 => ("/remove", json!({ "slug": slug })),
+            status => return error_response(status, "failed", "the workspace couldn't be deleted"),
+        },
+        _ => return error_response(404, "not_found", "use disable, enable or delete"),
+    };
+    let (status, body) = call_object(env, "DIRECTORY", "directory", Method::Post, directory.0, Some(&directory.1)).await?;
+    json_response(status, &body)
 }

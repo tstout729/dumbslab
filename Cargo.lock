@@ -568,10 +568,13 @@ dependencies = [
 name = "dumbslab-worker"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "dumbslab-core",
  "futures-util",
  "js-sys",
+ "serde",
  "serde_json",
+ "urlencoding",
  "wasm-bindgen",
  "worker",
 ]
