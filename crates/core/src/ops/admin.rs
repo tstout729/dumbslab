@@ -167,7 +167,14 @@ fn get_insights(ctx: &mut Ctx, input: InsightsInput) -> ApiResult<Insights> {
         archived: count("archived")?,
         topics: ctx.db.scalar_i64(&format!("SELECT COUNT(*) FROM topics t WHERE {tvis}"), &tp)?,
         people: ctx.db.scalar_i64("SELECT COUNT(*) FROM users WHERE deactivated_at IS NULL", &[])?,
-        comments: ctx.db.scalar_i64("SELECT COUNT(*) FROM comments WHERE deleted_at IS NULL", &[])?,
+        comments: {
+            let mut p = vec![];
+            let vis = post_visible_sql(&ctx.actor, "p", &mut p);
+            ctx.db.scalar_i64(
+                &format!("SELECT COUNT(*) FROM comments c JOIN posts p ON p.id = c.post_id WHERE c.deleted_at IS NULL AND p.deleted_at IS NULL AND {vis}"),
+                &p,
+            )?
+        },
     };
     let most_viewed = visible_posts(ctx, "p.status = 'published' AND p.view_count > 0", vec![], "p.view_count DESC", 5)?;
     let verification_expired = visible_posts(
@@ -184,10 +191,18 @@ fn get_insights(ctx: &mut Ctx, input: InsightsInput) -> ApiResult<Insights> {
         "p.updated_at",
         20,
     )?;
+    let mut p = vec![];
+    let authored_vis = post_visible_sql(&ctx.actor, "ap", &mut p);
+    let edited_vis = post_visible_sql(&ctx.actor, "p", &mut p);
     let rows = ctx.db.query(
-        "SELECT v.editor_id, COUNT(*) AS edits, (SELECT COUNT(*) FROM posts p WHERE p.author_id = v.editor_id AND p.deleted_at IS NULL AND p.status = 'published') AS posts
-         FROM post_versions v WHERE v.editor_id IS NOT NULL GROUP BY v.editor_id ORDER BY edits DESC LIMIT 5",
-        &[],
+        &format!(
+            "SELECT v.editor_id, COUNT(*) AS edits,
+                    (SELECT COUNT(*) FROM posts ap WHERE ap.author_id = v.editor_id AND ap.deleted_at IS NULL AND ap.status = 'published' AND {authored_vis}) AS posts
+             FROM post_versions v JOIN posts p ON p.id = v.post_id
+             WHERE v.editor_id IS NOT NULL AND p.deleted_at IS NULL AND {edited_vis}
+             GROUP BY v.editor_id ORDER BY edits DESC LIMIT 5"
+        ),
+        &p,
     )?;
     let users = user_refs(ctx.db, &rows.iter().map(|r| r.str("editor_id")).collect::<Vec<_>>())?;
     let top_contributors = rows

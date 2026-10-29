@@ -309,10 +309,18 @@ fn set_topics(ctx: &Ctx, post_id: &str, topic_ids: &[String]) -> ApiResult<(Vec<
             wanted.push(t.to_string());
         }
     }
-    let current: Vec<String> =
-        ctx.db.query("SELECT topic_id FROM post_topics WHERE post_id = ?", &params![post_id])?.iter().map(|r| r.str("topic_id")).collect();
-    let added: Vec<String> = wanted.iter().filter(|t| !current.contains(t)).cloned().collect();
-    let removed: Vec<String> = current.iter().filter(|t| !wanted.contains(t)).cloned().collect();
+    // Topics the actor can't see stay attached: they can neither see nor manage them.
+    let mut p = vec![];
+    let vis = topic_visible_sql(&ctx.actor, "t", &mut p);
+    p.push(post_id.into());
+    let current = ctx.db.query(
+        &format!("SELECT pt.topic_id, {vis} AS visible FROM post_topics pt JOIN topics t ON t.id = pt.topic_id WHERE pt.post_id = ?"),
+        &p,
+    )?;
+    let current_ids: Vec<String> = current.iter().map(|r| r.str("topic_id")).collect();
+    let added: Vec<String> = wanted.iter().filter(|t| !current_ids.contains(t)).cloned().collect();
+    let removed: Vec<String> =
+        current.iter().filter(|r| r.bool("visible") && !wanted.contains(&r.str("topic_id"))).map(|r| r.str("topic_id")).collect();
     for t in &removed {
         ctx.db.execute("DELETE FROM post_topics WHERE post_id = ? AND topic_id = ?", &params![post_id, t.clone()])?;
     }
@@ -549,12 +557,7 @@ fn update_post(ctx: &mut Ctx, input: UpdatePostInput) -> ApiResult<Post> {
     if input.topic_ids.is_some() || input.add_topic_ids.is_some() || input.remove_topic_ids.is_some() {
         let mut ids: Vec<String> = match input.topic_ids {
             Some(ids) => ids,
-            None => ctx
-                .db
-                .query("SELECT topic_id FROM post_topics WHERE post_id = ?", &params![id.clone()])?
-                .iter()
-                .map(|r| r.str("topic_id"))
-                .collect(),
+            None => topics_for_posts(ctx, std::slice::from_ref(&id))?.remove(&id).unwrap_or_default().into_iter().map(|t| t.id).collect(),
         };
         ids.extend(input.add_topic_ids.unwrap_or_default());
         let remove = input.remove_topic_ids.unwrap_or_default();
@@ -683,7 +686,13 @@ pub fn apply_edits(original: &str, edits: &[EditOp]) -> Result<String, String> {
                 let count = md.matches(find.as_str()).count();
                 match (count, *all) {
                     (0, _) => return Err(format!("edit {n}: text not found: {find:?}")),
-                    (1, _) | (_, true) => md.replace(find.as_str(), replace),
+                    (1, _) | (_, true) => {
+                        let projected = (md.len() - count * find.len()).saturating_add(count.saturating_mul(replace.len()));
+                        if projected > super::MAX_CONTENT {
+                            return Err(format!("edit {n}: the post would be larger than 2 MB"));
+                        }
+                        md.replace(find.as_str(), replace)
+                    }
                     (c, false) => {
                         return Err(format!("edit {n}: text matches {c} times; include more surrounding text or set `all: true`"));
                     }
@@ -738,6 +747,9 @@ pub fn apply_edits(original: &str, edits: &[EditOp]) -> Result<String, String> {
                 }
             }
         };
+        if md.len() > super::MAX_CONTENT {
+            return Err(format!("edit {n}: the post would be larger than 2 MB"));
+        }
     }
     Ok(md)
 }
@@ -1136,6 +1148,13 @@ mod tests {
         .unwrap();
         assert_eq!(out, "# Doc\n\nintro\n\n## Setup\n\nold steps\n\n## FAQ\n\nQ?\n\n## Usage\n\nuse it\n");
         assert!(apply_edits(md, &[EditOp::DeleteSection { heading: "Nope".into() }]).unwrap_err().contains("Setup"));
+    }
+
+    #[test]
+    fn edits_cannot_blow_up_the_post() {
+        let grow = EditOp::Replace { find: "a".into(), replace: "a".repeat(100), all: true };
+        let err = apply_edits("a", &vec![grow; 5]).unwrap_err();
+        assert!(err.contains("larger than 2 MB"), "{err}");
     }
 
     #[test]

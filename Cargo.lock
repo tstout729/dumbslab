@@ -569,6 +569,7 @@ name = "dumbslab-worker"
 version = "0.1.0"
 dependencies = [
  "dumbslab-core",
+ "futures-util",
  "js-sys",
  "serde_json",
  "wasm-bindgen",

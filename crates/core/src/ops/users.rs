@@ -572,6 +572,15 @@ fn revoke_token(ctx: &mut Ctx, input: TokenIdInput) -> ApiResult<Done> {
         "UPDATE oauth_refresh_tokens SET revoked_at = COALESCE(revoked_at, ?) WHERE access_token_id = ?",
         &params![ctx.now_s(), input.id.clone()],
     )?;
+    if let (true, Some(client)) = (row.str("kind") == "oauth", row.opt_str("client_id")) {
+        // Refreshes rotate token ids, so disconnect the app's whole grant for this person.
+        let p = params![ctx.now_s(), row.str("user_id"), client];
+        ctx.db.execute(
+            "UPDATE api_tokens SET revoked_at = COALESCE(revoked_at, ?) WHERE kind = 'oauth' AND user_id = ? AND client_id = ?",
+            &p,
+        )?;
+        ctx.db.execute("UPDATE oauth_refresh_tokens SET revoked_at = COALESCE(revoked_at, ?) WHERE user_id = ? AND client_id = ?", &p)?;
+    }
     emit(ctx, Event::new("token.revoked", "token", &input.id, format!("revoked API token “{}”", row.str("name"))).admin_only())?;
     Ok(DONE)
 }

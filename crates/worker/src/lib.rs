@@ -10,12 +10,13 @@ use std::rc::Rc;
 
 use dumbslab_core::db::{Db, Row, SqlValue};
 use dumbslab_core::{ApiError, ApiResult, Effect, HostConfig, Outcome};
+use futures_util::StreamExt;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
 use worker::*;
 
 #[event(fetch)]
-async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
+async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
     // Serve one canonical host: www.example.com → example.com.
     let url = req.url()?;
     if let Some(apex) = url.host_str().and_then(|h| h.strip_prefix("www.")) {
@@ -29,7 +30,17 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     }
     let workspace = env.var("WORKSPACE_NAME").map(|v| v.to_string()).unwrap_or_else(|_| "main".into());
     let stub = env.durable_object("WORKSPACE")?.id_from_name(&workspace)?.get_stub()?;
-    stub.fetch_with_request(req).await
+    if matches!(req.method(), Method::Get | Method::Head | Method::Options) {
+        return stub.fetch_with_request(req).await;
+    }
+    // Buffer and bound the body here: if the workspace object answered 413 while this Worker
+    // was still streaming an upload into it, the stream would fail and restart the isolate.
+    let Some(body) = read_body(&mut req).await? else {
+        return Response::error("request body too large", 413);
+    };
+    let mut init = RequestInit::new();
+    init.with_method(req.method()).with_headers(req.headers().clone()).with_body(Some(js_sys::Uint8Array::from(body.as_slice()).into()));
+    stub.fetch_with_request(Request::new_with_init(req.url()?.as_str(), &init)?).await
 }
 
 /// SQL access through the Durable Object's synchronous SQL API.
@@ -106,6 +117,32 @@ impl Db for DoDb {
 
 const ROLLBACK: &str = "__dumbslab_rollback__";
 
+/// Same cap as the native server.
+const MAX_BODY: usize = 8 * 1024 * 1024;
+
+/// Reads the request body, or `None` when it is larger than [`MAX_BODY`].
+async fn read_body(req: &mut Request) -> Result<Option<Vec<u8>>> {
+    let declared = req.headers().get("content-length")?.and_then(|v| v.parse::<usize>().ok());
+    if declared.is_some_and(|n| n > MAX_BODY) {
+        return Ok(None);
+    }
+    let Ok(mut stream) = req.stream() else {
+        return Ok(Some(vec![])); // no body
+    };
+    let mut body = Vec::new();
+    let mut too_large = false;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        // Past the limit, keep reading but discard: answering before the upload ends breaks the
+        // connection the next request arrives on.
+        too_large |= body.len() + chunk.len() > MAX_BODY;
+        if !too_large {
+            body.extend_from_slice(&chunk);
+        }
+    }
+    Ok((!too_large).then_some(body))
+}
+
 /// Runs `f` inside `storage.transactionSync()`. Returning `false` (or panicking) rolls back.
 fn transaction<T: 'static>(storage: &Storage, db: DoDb, f: impl FnOnce(&dyn Db) -> (T, bool) + 'static) -> Result<T> {
     let raw: &JsValue = storage.as_raw().as_ref();
@@ -157,13 +194,17 @@ impl DurableObject for Workspace {
             None => format!("{}://{}", url.scheme(), url.host_str().unwrap_or_default()),
         };
         let headers: Vec<(String, String)> = req.headers().entries().map(|(k, v)| (k.to_lowercase(), v)).collect();
+        // Bound the body before anything else runs: one workspace object serves every request.
+        let Some(body) = read_body(&mut req).await? else {
+            return Response::error("request body too large", 413);
+        };
         let core_req = dumbslab_core::Request {
             method: req.method().to_string(),
             path: url.path().to_string(),
             query: url.query().unwrap_or_default().to_string(),
             client_ip: headers.iter().find(|(k, _)| k == "cf-connecting-ip").map(|(_, v)| v.clone()),
             headers,
-            body: req.bytes().await.unwrap_or_default(),
+            body,
             origin,
         };
         let cfg = HostConfig {

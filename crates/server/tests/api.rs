@@ -257,6 +257,34 @@ fn drafts_private_topics_and_roles() {
     let n = h.ok("GET", "/api/v1/notifications", None, &viewer);
     assert!(n["items"].as_array().unwrap().iter().all(|x| x["post"]["id"] != json!(hid)));
 
+    // Editing a post never drops private topics the editor can't see (B-S3).
+    let shared_post = h.ok(
+        "POST",
+        "/api/v1/posts",
+        Some(json!({ "title": "Cross-listed", "content": "x", "topic_ids": [tid], "status": "published" })),
+        &admin,
+    );
+    let cid = shared_post["id"].as_str().unwrap().to_string();
+    let public_topic = h.ok("POST", "/api/v1/topics", Some(json!({ "name": "Everyone" })), &admin)["id"].as_str().unwrap().to_string();
+    h.ok("PATCH", &format!("/api/v1/posts/{cid}"), Some(json!({ "add_topic_ids": [public_topic] })), &admin);
+    let (_, outsider) = h.user(&admin, "otto@acme.test", "Otto", "member");
+    let other_topic = h.ok("POST", "/api/v1/topics", Some(json!({ "name": "Elsewhere" })), &admin)["id"].as_str().unwrap().to_string();
+    h.ok("PATCH", &format!("/api/v1/posts/{cid}"), Some(json!({ "topic_ids": [public_topic, other_topic] })), &outsider);
+    h.ok("PATCH", &format!("/api/v1/posts/{cid}"), Some(json!({ "add_topic_ids": [other_topic] })), &outsider);
+    let topics_now: Vec<String> = h.ok("GET", &format!("/api/v1/posts/{cid}"), None, &admin)["topics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["id"].as_str().unwrap().to_string())
+        .collect();
+    assert!(topics_now.contains(&tid), "private topic was dropped: {topics_now:?}");
+
+    // Insights totals don't count private comments (B-S5).
+    h.ok("POST", &format!("/api/v1/posts/{hid}/comments"), Some(json!({ "body": "secret thread" })), &admin);
+    let seen_by_admin = h.ok("GET", "/api/v1/insights", None, &admin)["counts"]["comments"].as_i64().unwrap();
+    let seen_by_viewer = h.ok("GET", "/api/v1/insights", None, &viewer)["counts"]["comments"].as_i64().unwrap();
+    assert!(seen_by_viewer < seen_by_admin, "viewer {seen_by_viewer} vs admin {seen_by_admin}");
+
     // Losing access to a post also hides its notifications (S2).
     let shared = h.ok("POST", "/api/v1/posts", Some(json!({ "title": "Roadmap", "content": "hi @vic", "status": "published" })), &member);
     let sid = shared["id"].as_str().unwrap().to_string();
@@ -671,6 +699,44 @@ fn oauth_authorization_code_flow() {
     assert_eq!(r3.body["error"], "invalid_grant", "revoking the grant ends the refresh token");
     h.raw("POST", "/oauth/revoke", format!("token={new_access}").into_bytes(), "application/x-www-form-urlencoded", &Auth::None);
     assert_eq!(h.call("GET", "/api/v1/me", None, &Auth::Bearer(new_access)).status, 401);
+
+    // Revoking the listed grant after the app refreshed again still disconnects it (B-S4).
+    let approve = h.raw(
+        "POST",
+        "/oauth/authorize",
+        format!("{q}&decision=approve&csrf={csrf}").into_bytes(),
+        "application/x-www-form-urlencoded",
+        &cookie,
+    );
+    let code = query_of(approve.header("location").unwrap())["code"].clone();
+    let exchange = format!(
+        "grant_type=authorization_code&code={code}&client_id={client_id}&redirect_uri={}&code_verifier={verifier}",
+        urlencoding::encode("http://localhost:9999/cb")
+    );
+    let fresh = h.raw("POST", "/oauth/token", exchange.into_bytes(), "application/x-www-form-urlencoded", &Auth::None);
+    let listed = h.ok("GET", "/api/v1/tokens", None, &cookie)["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["kind"] == "oauth" && t["revoked"] == false)
+        .expect("fresh grant listed")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let refresh = |rt: &str| {
+        h.raw(
+            "POST",
+            "/oauth/token",
+            format!("grant_type=refresh_token&refresh_token={rt}").into_bytes(),
+            "application/x-www-form-urlencoded",
+            &Auth::None,
+        )
+    };
+    let rotated = refresh(fresh.body["refresh_token"].as_str().unwrap());
+    assert_eq!(rotated.status, 200);
+    h.ok("DELETE", &format!("/api/v1/tokens/{listed}"), None, &cookie);
+    assert_eq!(h.call("GET", "/api/v1/me", None, &Auth::Bearer(rotated.body["access_token"].as_str().unwrap().to_string())).status, 401);
+    assert_eq!(refresh(rotated.body["refresh_token"].as_str().unwrap()).body["error"], "invalid_grant");
 }
 
 #[test]
