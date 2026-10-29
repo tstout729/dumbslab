@@ -1,0 +1,40 @@
+# DumbSlab on Cloudflare Workers + a SQLite-backed Durable Object.
+#
+#   cd crates/worker
+#   npx wrangler dev                              # local, with a simulated Durable Object
+#   npx wrangler secret put SETUP_TOKEN           # required before first setup in production
+#   npx wrangler deploy
+#
+# See docs/cloudflare.md for custom domains and backups.
+
+name = "dumbslab"
+main = "build/index.js"
+compatibility_date = "2026-10-01"
+
+[build]
+command = "worker-build --release"
+
+[assets]
+directory = "../../web"
+binding = "ASSETS"
+not_found_handling = "single-page-application"
+run_worker_first = ["/api/*", "/mcp", "/oauth/*", "/.well-known/*", "/llms.txt", "/healthz"]
+
+[[durable_objects.bindings]]
+name = "WORKSPACE"
+class_name = "Workspace"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Workspace"]
+
+[vars]
+# Public URL used in links and OAuth metadata. Leave empty to use the request's origin.
+BASE_URL = ""
+# Durable Object name holding this deployment's workspace.
+WORKSPACE_NAME = "main"
+# Only for local development: allow first-run setup without SETUP_TOKEN.
+OPEN_SETUP = "false"
+
+[observability]
+enabled = true
