@@ -77,12 +77,17 @@ function composer({ placeholder = 'Add a comment', submitLabel = 'Comment', onSu
   const send = () => {
     const text = ta.value.trim();
     if (!text) return;
+    ta.readOnly = true;
     busy(submit, async () => {
       await onSubmit(text);
       ta.value = '';
       grow();
       submit.disabled = true;
-    }).catch(toastError);
+    })
+      .catch(toastError)
+      .finally(() => {
+        ta.readOnly = false;
+      });
   };
   ta.addEventListener('input', () => {
     submit.disabled = !ta.value.trim();

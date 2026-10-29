@@ -121,7 +121,10 @@ export function safeNext(next) {
   try {
     const u = new URL(next, location.origin);
     if (u.origin !== location.origin) return null;
-    return u.pathname + u.search + u.hash;
+    const out = u.pathname + u.search + u.hash;
+    // `/.//evil.example` normalizes to `//evil.example`, which browsers treat as another host.
+    if (out.startsWith('//') || out.startsWith('/\\')) return null;
+    return out;
   } catch {
     return null;
   }

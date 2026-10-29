@@ -92,6 +92,9 @@ async function signOut() {
   } catch (e) {
     toastError(e);
   }
+  try {
+    for (const key of Object.keys(localStorage)) if (key.startsWith('ds-recovery:')) localStorage.removeItem(key);
+  } catch { /* storage unavailable */ }
   location.href = '/login';
 }
 

@@ -6,7 +6,7 @@ import {
   h, icon, button, busy, toast, toastError, modal, confirmDialog, openPopover, closeLayers, debounce,
   checkbox, select, emptyState, relTime, modKey, topicIcon,
 } from '/ui.js';
-import { state, navigate, topicById, flatTopicTree, canEdit } from '/state.js';
+import { state, navigate, topicById, flatTopicTree, canEdit, myId } from '/state.js';
 import { openTopicForm } from '/views/topic.js';
 
 export async function renderNew(ctx) {
@@ -287,7 +287,7 @@ function mountEditor(ctx, { post, initial, templates, startTemplate }) {
   let baseVersion = post ? post.version : null;
   let status = initial.status;
   let templateId = null;
-  let recoveryKey = `ds-recovery:${postId || 'new'}`;
+  let recoveryKey = `ds-recovery:${myId()}:${postId || 'new'}`;
   let saved = { title: initial.title, content: initial.content, topic_ids: [...initial.topic_ids].sort(), is_template: !!initial.is_template };
   let dirty = false;
   let saving = false;
@@ -523,13 +523,20 @@ function mountEditor(ctx, { post, initial, templates, startTemplate }) {
       slug = result.slug;
       baseVersion = result.version;
       status = result.status;
-      recoveryKey = `ds-recovery:${postId}`;
+      recoveryKey = `ds-recovery:${myId()}:${postId}`;
       saved = { ...snap, title: snap.title.trim() };
-      titleEl.value = saved.title;
-      dirty = false;
+      const editedDuringSave = !same(snapshot(), snap);
+      if (!editedDuringSave) titleEl.value = saved.title;
+      dirty = !same(snapshot(), saved);
       saving = false;
       writeRecovery.cancel();
+      if (dirty) persistRecovery();
       updateChrome();
+      if (editedDuringSave) {
+        if (wasNew) ctx.replaceUrl(`/p/${postId}/edit`);
+        toast('Saved. You have newer changes that aren’t saved yet.');
+        return;
+      }
       if (publish || view) {
         ctx.clearLeaveGuard();
         toast(publish ? 'Published' : 'Saved');
