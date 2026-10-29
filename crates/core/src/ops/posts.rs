@@ -221,16 +221,18 @@ fn list_posts(ctx: &mut Ctx, input: ListPostsInput) -> ApiResult<PostList> {
 #[serde(deny_unknown_fields)]
 pub struct GetPostInput {
     pub id: String,
-    /// `markdown` (default), `html`, or `both`. HTML is the rendered, sanitized body.
+    /// `markdown` (default), `html`, or `both`. HTML is the rendered, sanitized body. In the web app,
+    /// fetching HTML counts as a view.
     pub format: Option<String>,
 }
 
 fn get_post(ctx: &mut Ctx, input: GetPostInput) -> ApiResult<Post> {
     let row = load_post(ctx, &input.id, true)?;
-    if ctx.actor.via == Via::Web && row.opt_str("deleted_at").is_none() {
+    let with_html = matches!(input.format.as_deref(), Some("html" | "both"));
+    // A person reading the rendered post counts as a view; the editor and agents fetching Markdown don't.
+    if with_html && ctx.actor.via == Via::Web && row.opt_str("deleted_at").is_none() {
         record_view(ctx, &row.str("id"))?;
     }
-    let with_html = matches!(input.format.as_deref(), Some("html" | "both"));
     full_post(ctx, &row, with_html)
 }
 
