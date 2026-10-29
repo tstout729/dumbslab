@@ -75,6 +75,8 @@ function composer({ placeholder = 'Add a comment', submitLabel = 'Comment', onSu
   const submit = button(submitLabel, { variant: 'primary', size: 'sm' });
   submit.disabled = !initial.trim();
   const send = () => {
+    // A second Cmd/Ctrl+Enter while sending must not unlock the box early.
+    if (ta.readOnly) return;
     const text = ta.value.trim();
     if (!text) return;
     ta.readOnly = true;
