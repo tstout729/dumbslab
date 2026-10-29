@@ -2,7 +2,9 @@
 
 An open-source team knowledge base in the spirit of [Slab](https://slab.com), written in Rust and built so AI agents can do everything people can.
 
-- **One binary, one SQLite file.** Or deploy to Cloudflare, where the whole workspace lives in a SQLite-backed Durable Object.
+**Try it free at [dumbslab.com](https://dumbslab.com).** Pick an address, and your workspace lives at `name.dumbslab.com`. Or self-host it from this repository.
+
+- **One binary, one SQLite file.** Or deploy to Cloudflare, where each workspace is its own SQLite-backed Durable Object. It runs either as a hosted service anyone can sign up for, or as one private workspace.
 - **Every feature is an operation.** Each one is exposed four ways from a single definition: the REST API, a call-any-operation endpoint, MCP tools, and the CLI. The web app uses the same public API, so nothing is UI-only.
 - **Agents are first-class.** There's a built-in MCP server with OAuth, precise edits that never clobber a teammate's change, bot accounts with their own identity, an activity feed every agent change shows up in, and signed webhooks.
 
@@ -47,7 +49,7 @@ docker run -p 8080:8080 -v dumbslab:/data dumbslab
 
 ### Cloudflare
 
-See [docs/cloudflare.md](docs/cloudflare.md). In short: `cd crates/worker && npx wrangler secret put SETUP_TOKEN && npx wrangler deploy`.
+See [docs/cloudflare.md](docs/cloudflare.md). It covers both the hosted multi-tenant mode that runs dumbslab.com and a single private workspace.
 
 ## For agents
 
@@ -93,7 +95,7 @@ Give each agent its own bot account (Settings → People → Add bot) and token.
 ```
 crates/core    storage-agnostic core: schema, permissions, operations, REST routing, MCP, OAuth, search
 crates/server  `dumbslab` binary: axum + SQLite (one transaction per request), embedded web app, CLI, stdio MCP
-crates/worker  Cloudflare Worker + SQLite-backed Durable Object running the same core (compiled to wasm)
+crates/worker  Cloudflare Worker: a Durable Object per workspace running the same core (wasm), plus the sign-up Directory
 web/           the web app: plain HTML/CSS/JS modules, no build step
 ```
 
@@ -104,7 +106,7 @@ The core talks to SQLite through a small synchronous `Db` trait. The native serv
 ```sh
 cargo test -p dumbslab-core -p dumbslab        # unit + end-to-end tests
 cargo run -p dumbslab -- serve --open-setup    # debug builds read web/ from disk, so edits need only a reload
-cd crates/worker && npx wrangler dev --var BASE_URL:http://localhost:8787 --var OPEN_SETUP:true   # the Cloudflare build, locally
+cd crates/worker && npx wrangler dev --env dev   # the hosted Cloudflare build, locally (workspaces at name.localhost:8787)
 ```
 
 See [AGENTS.md](AGENTS.md) for conventions, which apply to people too.

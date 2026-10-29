@@ -41,7 +41,7 @@ impl H {
         let store = Store::open(&dir.path().join("t.db")).unwrap();
         H {
             store,
-            cfg: HostConfig { base_url: Some("https://kb.test".into()), setup_token: Some("SETUP".into()), open_setup: false },
+            cfg: HostConfig { base_url: Some("https://kb.test".into()), setup_token: Some("SETUP".into()), ..Default::default() },
             _dir: dir,
         }
     }
@@ -791,4 +791,79 @@ fn rest_routing_and_docs() {
     assert!(spec["paths"]["/api/v1/posts/{id}"]["patch"]["requestBody"].is_object());
     let llms = h.call("GET", "/llms.txt", None, &Auth::None);
     assert!(llms.text().contains("https://kb.test/mcp"));
+}
+
+#[test]
+fn signed_signup_links_set_up_hosted_workspaces() {
+    use dumbslab_core::tenancy::signup_token;
+    let mut h = H::new();
+    h.cfg = HostConfig {
+        base_url: Some("https://acme.kb.test".into()),
+        signup_secret: Some("sekret".into()),
+        workspace: Some("acme".into()),
+        ..Default::default()
+    };
+    let now = chrono::Utc::now().timestamp();
+    let setup = |token: &str| {
+        h.call(
+            "POST",
+            "/api/v1/auth/setup",
+            Some(json!({ "setup_token": token, "workspace_name": "Acme", "name": "Ada", "email": "ada@acme.test", "password": "password123" })),
+            &Auth::None,
+        )
+    };
+    assert_eq!(setup(&signup_token("sekret", "other", now + 3600)).status, 403, "link for another workspace");
+    assert_eq!(setup(&signup_token("sekret", "acme", now - 1)).status, 403, "expired link");
+    assert_eq!(setup(&signup_token("wrong", "acme", now + 3600)).status, 403, "wrong secret");
+    assert_eq!(setup("").status, 403);
+    let ok = setup(&signup_token("sekret", "acme", now + 3600));
+    assert_eq!(ok.status, 200, "{}", ok.body);
+    assert_eq!(setup(&signup_token("sekret", "acme", now + 3600)).status, 409, "only once");
+}
+
+#[test]
+fn directory_reserves_addresses_within_limits() {
+    use chrono::{Duration, Utc};
+    use dumbslab_core::tenancy::{self, Limits};
+    let h = H::new();
+    let limits = Limits { per_ip_per_day: 2, per_day: 4, max_workspaces: 5 };
+    let t0 = Utc::now();
+    let t1 = t0 + Duration::days(2);
+    let run = |f: &dyn Fn(&dyn dumbslab_core::Db) -> dumbslab_core::ApiResult<()>| {
+        h.store
+            .with_tx(|db| {
+                let r = f(db);
+                let ok = r.is_ok();
+                (r, ok)
+            })
+            .unwrap()
+    };
+    let reserve = |slug: &'static str, ip: &'static str, at| run(&move |db| tenancy::reserve(db, slug, "Name", ip, at, limits).map(|_| ()));
+    let status = |r: dumbslab_core::ApiResult<()>| r.err().map(|e| e.status);
+    run(&|db| tenancy::directory_migrate(db)).unwrap();
+
+    // Taken while reserved, and once active.
+    assert_eq!(status(reserve("acme", "ip1", t0)), None);
+    assert_eq!(status(reserve("acme", "ip2", t0)), Some(409));
+    run(&|db| tenancy::activate(db, "acme", t0)).unwrap();
+    assert_eq!(status(reserve("acme", "ip2", t0 + Duration::hours(3))), Some(409));
+    // Per-IP, then per-day limits.
+    assert_eq!(status(reserve("beta", "ip1", t0)), None);
+    assert_eq!(status(reserve("gamma", "ip1", t0)), Some(429));
+    assert_eq!(status(reserve("delta", "ip9", t0)), None);
+    assert_eq!(status(reserve("eps", "ip10", t0)), None);
+    run(&|db| tenancy::activate(db, "delta", t0)).unwrap();
+    run(&|db| tenancy::activate(db, "eps", t0)).unwrap();
+    assert_eq!(status(reserve("zeta", "ip11", t0)), Some(429));
+    // Two days later: beta's abandoned reservation is free again, then the total cap applies.
+    assert_eq!(status(reserve("beta", "ip3", t1)), None);
+    assert_eq!(status(reserve("eta", "ip4", t1)), None);
+    assert_eq!(status(reserve("theta", "ip5", t1)), Some(503));
+    // Operator actions and reserved names.
+    run(&|db| tenancy::set_status(db, "acme", "disabled")).unwrap();
+    run(&|db| tenancy::remove(db, "eps")).unwrap();
+    let entries = h.store.with_tx(|db| (tenancy::list(db), true)).unwrap().unwrap();
+    assert!(entries.iter().any(|e| e.slug == "acme" && e.status == "disabled"));
+    assert!(!entries.iter().any(|e| e.slug == "eps"));
+    assert_eq!(status(reserve("www", "ip8", t1)), Some(400));
 }

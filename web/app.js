@@ -326,9 +326,10 @@ async function boot() {
   });
   await render();
   refreshUnread();
+  // Every 5 minutes while the tab is visible: cheap for hosted workspaces, fresh enough for people.
   setInterval(() => {
     if (document.visibilityState === 'visible') refreshUnread();
-  }, 60_000);
+  }, 300_000);
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'visible') refreshUnread();
   });

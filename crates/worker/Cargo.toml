@@ -11,7 +11,10 @@ crate-type = ["cdylib"]
 
 [dependencies]
 dumbslab-core.workspace = true
+chrono.workspace = true
+serde.workspace = true
 serde_json.workspace = true
+urlencoding.workspace = true
 worker = "0.8.7"
 futures-util = "0.3"
 wasm-bindgen = "0.2"

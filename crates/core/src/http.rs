@@ -257,12 +257,15 @@ fn setup(db: &dyn Db, cfg: &HostConfig, req: &Request) -> Outcome {
         if user_count(db)? > 0 {
             return Err(ApiError::conflict("this workspace is already set up; sign in instead"));
         }
-        let token_ok = match &cfg.setup_token {
-            Some(expected) => input.setup_token.as_deref().is_some_and(|t| secure_eq(t.trim(), expected)),
-            None => cfg.open_setup,
-        };
-        if !token_ok {
-            return Err(ApiError::forbidden(if cfg.setup_token.is_some() {
+        let token = input.setup_token.as_deref().map(str::trim);
+        let signed_link = matches!((&cfg.signup_secret, &cfg.workspace, token),
+            (Some(secret), Some(ws), Some(t)) if crate::tenancy::verify_signup_token(secret, ws, t, Utc::now().timestamp()));
+        let static_token = matches!((&cfg.setup_token, token), (Some(expected), Some(t)) if secure_eq(t, expected));
+        let open = cfg.open_setup && cfg.setup_token.is_none() && cfg.signup_secret.is_none();
+        if !(signed_link || static_token || open) {
+            return Err(ApiError::forbidden(if cfg.signup_secret.is_some() {
+                "this sign-up link is invalid or has expired; start again from the sign-up page"
+            } else if cfg.setup_token.is_some() {
                 "the setup token is missing or wrong; find it in the server log or your deployment's SETUP_TOKEN secret"
             } else {
                 "setup is locked: start the server with a setup token"
