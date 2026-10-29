@@ -1,7 +1,7 @@
 # DumbSlab on Cloudflare Workers + a SQLite-backed Durable Object.
 #
 #   cd crates/worker
-#   npx wrangler dev                              # local, with a simulated Durable Object
+#   npx wrangler dev --var BASE_URL:http://localhost:8787 --var OPEN_SETUP:true   # local, simulated Durable Object
 #   npx wrangler secret put SETUP_TOKEN           # required before first setup in production
 #   npx wrangler deploy
 #
@@ -11,14 +11,21 @@ name = "dumbslab"
 main = "build/index.js"
 compatibility_date = "2026-10-01"
 
+# The project's own deployment. Self-hosters: change these to your domain.
+routes = [
+  { pattern = "dumbslab.com", custom_domain = true },
+  { pattern = "www.dumbslab.com", custom_domain = true },
+]
+
 [build]
 command = "worker-build --release"
 
+# The Worker sees every request (to redirect www) and hands non-API paths to the assets.
 [assets]
 directory = "../../web"
 binding = "ASSETS"
 not_found_handling = "single-page-application"
-run_worker_first = ["/api/*", "/mcp", "/oauth/*", "/.well-known/*", "/llms.txt", "/healthz"]
+run_worker_first = true
 
 [[durable_objects.bindings]]
 name = "WORKSPACE"
@@ -29,8 +36,9 @@ tag = "v1"
 new_sqlite_classes = ["Workspace"]
 
 [vars]
-# Public URL used in links and OAuth metadata. Leave empty to use the request's origin.
-BASE_URL = ""
+# Public URL used in links and OAuth metadata. Empty uses the request's origin
+# (local dev: `npx wrangler dev --var BASE_URL:http://localhost:8787 --var OPEN_SETUP:true`).
+BASE_URL = "https://dumbslab.com"
 # Durable Object name holding this deployment's workspace.
 WORKSPACE_NAME = "main"
 # Only for local development: allow first-run setup without SETUP_TOKEN.

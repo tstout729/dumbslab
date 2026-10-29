@@ -27,7 +27,7 @@ Then open `https://<your-worker>/setup?token=<SETUP_TOKEN>` and create the admin
 
 ## Custom domain
 
-Add the domain to the Worker in `wrangler.toml`, and set `BASE_URL` so links and OAuth metadata use it:
+The checked-in `wrangler.toml` deploys the project's own instance at dumbslab.com. Point the routes and `BASE_URL` at your domain instead (requests to `www.` redirect to the bare domain):
 
 ```toml
 routes = [{ pattern = "wiki.example.com", custom_domain = true }]
@@ -49,8 +49,10 @@ BASE_URL = "https://wiki.example.com"
 
 ```sh
 cd crates/worker
-npx wrangler dev --var OPEN_SETUP:true
+npx wrangler dev --var BASE_URL:http://localhost:8787 --var OPEN_SETUP:true
 ```
+
+The `BASE_URL` override makes links and OAuth metadata point at your local server instead of the production domain.
 
 ## Backups
 

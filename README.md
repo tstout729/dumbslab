@@ -104,7 +104,7 @@ The core talks to SQLite through a small synchronous `Db` trait. The native serv
 ```sh
 cargo test -p dumbslab-core -p dumbslab        # unit + end-to-end tests
 cargo run -p dumbslab -- serve --open-setup    # debug builds read web/ from disk, so edits need only a reload
-cd crates/worker && npx wrangler dev --var OPEN_SETUP:true   # the Cloudflare build, locally
+cd crates/worker && npx wrangler dev --var BASE_URL:http://localhost:8787 --var OPEN_SETUP:true   # the Cloudflare build, locally
 ```
 
 See [AGENTS.md](AGENTS.md) for conventions, which apply to people too.

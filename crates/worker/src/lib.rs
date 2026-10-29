@@ -16,6 +16,13 @@ use worker::*;
 
 #[event(fetch)]
 async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
+    // Serve one canonical host: www.example.com → example.com.
+    let url = req.url()?;
+    if let Some(apex) = url.host_str().and_then(|h| h.strip_prefix("www.")) {
+        let mut target = url.clone();
+        target.set_host(Some(apex)).map_err(|e| worker::Error::RustError(e.to_string()))?;
+        return Response::redirect_with_status(target, 301);
+    }
     let path = req.path();
     if !dumbslab_core::http::is_core_path(&path) {
         return env.assets("ASSETS")?.fetch_request(req).await;
@@ -204,7 +211,12 @@ impl DurableObject for Workspace {
         let mut resp = if r.body.is_empty() { Response::empty()? } else { Response::from_bytes(r.body)? }.with_status(r.status);
         let h = resp.headers_mut();
         for (k, v) in &r.headers {
-            h.append(k, v)?;
+            // Replace defaults such as `application/octet-stream`; only cookies repeat.
+            if k == "set-cookie" {
+                h.append(k, v)?;
+            } else {
+                h.set(k, v)?;
+            }
         }
         Ok(resp)
     }
