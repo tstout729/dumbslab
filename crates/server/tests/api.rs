@@ -776,7 +776,19 @@ fn oauth_authorization_code_flow() {
     assert_eq!(h.call("GET", "/api/v1/me", None, &Auth::Bearer(rotated.body["access_token"].as_str().unwrap().to_string())).status, 401);
     assert_eq!(refresh(rotated.body["refresh_token"].as_str().unwrap()).body["error"], "invalid_grant");
     // At the cap, the oldest never-used client makes room instead of locking everyone out;
-    // clients that connected are never evicted.
+    // clients that connected, or whose consent page someone opened, are never evicted.
+    let pending = h.call(
+        "POST",
+        "/oauth/register",
+        Some(json!({ "client_name": "Pending", "redirect_uris": ["http://localhost:9995/cb"] })),
+        &Auth::None,
+    );
+    let pending_id = pending.body["client_id"].as_str().unwrap().to_string();
+    let pending_q = format!(
+        "response_type=code&client_id={pending_id}&redirect_uri={}&code_challenge={challenge}&code_challenge_method=S256&state=p",
+        urlencoding::encode("http://localhost:9995/cb")
+    );
+    assert_eq!(h.call("GET", &format!("/oauth/authorize?{pending_q}"), None, &cookie).status, 200);
     h.store
         .with_tx(|db| {
             let mut r = Ok(0);
@@ -792,6 +804,7 @@ fn oauth_authorization_code_flow() {
         .unwrap();
     assert_eq!(h.call("POST", "/oauth/register", Some(json!({ "redirect_uris": ["http://localhost:9996/cb"] })), &Auth::None).status, 201);
     assert_eq!(h.call("GET", &format!("/oauth/authorize?{q}"), None, &cookie).status, 200, "the connected client survived");
+    assert_eq!(h.call("GET", &format!("/oauth/authorize?{pending_q}"), None, &cookie).status, 200, "the client awaiting consent survived");
 }
 
 #[test]

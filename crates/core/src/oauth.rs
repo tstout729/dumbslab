@@ -144,7 +144,8 @@ fn register(db: &dyn Db, req: &Request) -> Outcome {
     // Registration is anonymous, so keep the table small: drop day-old clients that were never
     // used, and at the cap make room by evicting the oldest never-used one (so a flood of
     // registrations can't lock real clients out).
-    const UNUSED: &str = "client_id NOT IN (SELECT client_id FROM api_tokens WHERE client_id IS NOT NULL)
+    const UNUSED: &str = "seen_at IS NULL
+           AND client_id NOT IN (SELECT client_id FROM api_tokens WHERE client_id IS NOT NULL)
            AND client_id NOT IN (SELECT client_id FROM oauth_codes)
            AND client_id NOT IN (SELECT client_id FROM oauth_refresh_tokens)";
     let day_ago = ts(Utc::now() - Duration::days(1));
@@ -279,6 +280,8 @@ fn authorize_page(db: &dyn Db, cfg: &HostConfig, req: &Request) -> Outcome {
         let next = format!("/oauth/authorize?{}", req.query);
         return done(Response::redirect(&format!("/login?next={}", urlencoding::encode(&next))));
     };
+    // A person is connecting this client: keep it safe from pruning and eviction.
+    let _ = db.execute("UPDATE oauth_clients SET seen_at = ? WHERE client_id = ?", &params![ts(Utc::now()), ar.client_id.clone()]);
     let scopes = effective_scopes(&actor, ar.scopes);
     let workspace = crate::ops::admin::setting(db, "workspace_name").ok().flatten().unwrap_or_else(|| "DumbSlab".into());
     let csrf = auth::form_csrf(actor.session_hash.as_deref().unwrap_or_default());
