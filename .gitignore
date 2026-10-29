@@ -1,0 +1,10 @@
+/target
+/crates/worker/build
+.wrangler/
+node_modules/
+*.db
+*.db-shm
+*.db-wal
+.DS_Store
+.env
+.dev.vars
