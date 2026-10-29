@@ -199,6 +199,12 @@ fn setup_login_and_csrf() {
     }
     let throttled = h.call("POST", "/api/v1/auth/login", Some(json!({ "email": "ghost@acme.test", "password": "nopenope" })), &Auth::None);
     assert_eq!(throttled.status, 429);
+    // Oversized login input is refused up front, and throttle keys are fixed-size hashes.
+    let huge = format!("{}@acme.test", "a".repeat(300));
+    assert_eq!(h.call("POST", "/api/v1/auth/login", Some(json!({ "email": huge, "password": "nopenope" })), &Auth::None).status, 400);
+    let longest_key =
+        h.store.with_tx(|db| (db.scalar_i64("SELECT COALESCE(MAX(length(key)), 0) FROM login_attempts", &[]), true)).unwrap().unwrap();
+    assert!(longest_key <= 70, "throttle keys stay small: {longest_key}");
     // Failed-login bookkeeping is forgotten once its window closes (anyone can fail with any email).
     h.store.with_tx(|db| (db.execute("UPDATE login_attempts SET window_start = '2000-01-01T00:00:00.000Z'", &[]), true)).unwrap().unwrap();
     h.call("POST", "/api/v1/auth/login", Some(json!({ "email": "someone-else@acme.test", "password": "nopenope" })), &Auth::None);
@@ -607,7 +613,7 @@ fn oauth_authorization_code_flow() {
         .with_tx(|db| (db.scalar_i64("SELECT COUNT(*) FROM oauth_clients WHERE client_id = ?", &[stale_id.clone().into()]), true))
         .unwrap()
         .unwrap();
-    assert_eq!(left, 0, "never-used week-old client pruned");
+    assert_eq!(left, 0, "never-used old client pruned");
 
     let (verifier, challenge) = pkce_pair();
     let q = format!(
@@ -769,6 +775,23 @@ fn oauth_authorization_code_flow() {
     h.ok("DELETE", &format!("/api/v1/tokens/{listed}"), None, &cookie);
     assert_eq!(h.call("GET", "/api/v1/me", None, &Auth::Bearer(rotated.body["access_token"].as_str().unwrap().to_string())).status, 401);
     assert_eq!(refresh(rotated.body["refresh_token"].as_str().unwrap()).body["error"], "invalid_grant");
+    // At the cap, the oldest never-used client makes room instead of locking everyone out;
+    // clients that connected are never evicted.
+    h.store
+        .with_tx(|db| {
+            let mut r = Ok(0);
+            for i in 0..dumbslab_core::oauth::MAX_CLIENTS {
+                r = db.execute(
+                    "INSERT INTO oauth_clients (client_id, client_name, redirect_uris, created_at) VALUES (?, 'flood', '[]', ?)",
+                    &[format!("flood{i}").into(), chrono::Utc::now().to_rfc3339().into()],
+                );
+            }
+            (r, true)
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(h.call("POST", "/oauth/register", Some(json!({ "redirect_uris": ["http://localhost:9996/cb"] })), &Auth::None).status, 201);
+    assert_eq!(h.call("GET", &format!("/oauth/authorize?{q}"), None, &cookie).status, 200, "the connected client survived");
 }
 
 #[test]

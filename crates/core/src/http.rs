@@ -325,7 +325,11 @@ fn login(db: &dyn Db, req: &Request) -> Outcome {
         Ok(i) => i,
         Err(e) => return failed(&e),
     };
-    let key = format!("login:{}", input.email.trim().to_lowercase());
+    // Logins are anonymous: refuse oversized input before any work, and keep throttle keys fixed-size.
+    if input.email.len() > 254 || input.password.len() > 256 {
+        return failed(&ApiError::bad_request("email or password is too long"));
+    }
+    let key = format!("login:{}", crate::util::sha256_hex(&input.email.trim().to_lowercase()));
     let run = || -> ApiResult<Outcome> {
         auth::check_throttle(db, &key, now)?;
         let row = db.one("SELECT id, password_hash FROM users WHERE email = ? AND deactivated_at IS NULL", &params![input.email.trim()])?;

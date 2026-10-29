@@ -141,18 +141,22 @@ fn register(db: &dyn Db, req: &Request) -> Outcome {
     if let Some(bad) = uris.iter().find(|u| !valid_redirect_uri(u)) {
         return oauth_error(400, "invalid_redirect_uri", &format!("redirect URI not allowed: {bad}"));
     }
-    // Registration is anonymous, so keep the table small: drop week-old clients that were never
-    // used, and cap the rest.
-    let week_ago = ts(Utc::now() - Duration::days(7));
-    let _ = db.execute(
-        "DELETE FROM oauth_clients WHERE created_at < ?
-           AND client_id NOT IN (SELECT client_id FROM api_tokens WHERE client_id IS NOT NULL)
+    // Registration is anonymous, so keep the table small: drop day-old clients that were never
+    // used, and at the cap make room by evicting the oldest never-used one (so a flood of
+    // registrations can't lock real clients out).
+    const UNUSED: &str = "client_id NOT IN (SELECT client_id FROM api_tokens WHERE client_id IS NOT NULL)
            AND client_id NOT IN (SELECT client_id FROM oauth_codes)
-           AND client_id NOT IN (SELECT client_id FROM oauth_refresh_tokens)",
-        &params![week_ago],
-    );
-    let count = db.scalar_i64("SELECT COUNT(*) FROM oauth_clients", &[]).unwrap_or(0);
-    if count >= MAX_CLIENTS {
+           AND client_id NOT IN (SELECT client_id FROM oauth_refresh_tokens)";
+    let day_ago = ts(Utc::now() - Duration::days(1));
+    let _ = db.execute(&format!("DELETE FROM oauth_clients WHERE created_at < ? AND {UNUSED}"), &params![day_ago]);
+    let excess = db.scalar_i64("SELECT COUNT(*) FROM oauth_clients", &[]).unwrap_or(0) - MAX_CLIENTS + 1;
+    if excess > 0 {
+        let _ = db.execute(
+            &format!("DELETE FROM oauth_clients WHERE client_id IN (SELECT client_id FROM oauth_clients WHERE {UNUSED} ORDER BY created_at LIMIT ?)"),
+            &params![excess],
+        );
+    }
+    if db.scalar_i64("SELECT COUNT(*) FROM oauth_clients", &[]).unwrap_or(0) >= MAX_CLIENTS {
         return oauth_error(400, "invalid_client_metadata", "too many registered clients; try again later");
     }
     let name: String = body["client_name"].as_str().unwrap_or("MCP client").chars().take(100).collect();
