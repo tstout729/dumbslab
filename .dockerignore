@@ -1,0 +1,6 @@
+target
+crates/worker/build
+.wrangler
+.git
+*.db
+*.db-*

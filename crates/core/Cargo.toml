@@ -1,0 +1,28 @@
+[package]
+name = "dumbslab-core"
+description = "DumbSlab's storage-agnostic core: schema, permissions, operations, REST, MCP and OAuth."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ammonia.workspace = true
+argon2.workspace = true
+base64.workspace = true
+chrono.workspace = true
+hex.workspace = true
+hmac.workspace = true
+pulldown-cmark.workspace = true
+rand.workspace = true
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+similar.workspace = true
+thiserror.workspace = true
+urlencoding.workspace = true
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { workspace = true, features = ["wasm_js"] }
+chrono = { workspace = true, features = ["wasmbind"] }
