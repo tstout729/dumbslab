@@ -173,7 +173,20 @@ fn ancestors(ctx: &Ctx, topic: &Row) -> ApiResult<Vec<TopicRef>> {
         if guard > 50 {
             break;
         }
-        let Some(r) = ctx.db.one("SELECT id, name, slug, icon, color, parent_id FROM topics WHERE id = ?", &params![pid])? else { break };
+        let mut p = vec![];
+        let vis = topic_visible_sql(&ctx.actor, "t", &mut p);
+        p.push(pid.into());
+        let Some(r) = ctx.db.one(
+            &format!("SELECT t.id, t.name, t.slug, t.icon, t.color, t.parent_id, {vis} AS visible FROM topics t WHERE t.id = ?"),
+            &p,
+        )?
+        else {
+            break;
+        };
+        next = r.opt_str("parent_id");
+        if !r.bool("visible") {
+            continue;
+        }
         out.push(TopicRef {
             url: topic_url(ctx, &r.str("id"), &r.str("slug")),
             id: r.str("id"),
@@ -181,7 +194,6 @@ fn ancestors(ctx: &Ctx, topic: &Row) -> ApiResult<Vec<TopicRef>> {
             icon: r.str("icon"),
             color: r.str("color"),
         });
-        next = r.opt_str("parent_id");
     }
     out.reverse();
     Ok(out)

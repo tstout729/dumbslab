@@ -825,7 +825,7 @@ fn delete_post(ctx: &mut Ctx, input: DeletePostInput) -> ApiResult<DeleteResult>
         }
         ctx.db.execute("DELETE FROM post_links WHERE source_id = ?", &p)?;
         ctx.db.execute("DELETE FROM posts WHERE id = ?", &p)?;
-        emit(ctx, Event::new("post.purged", "post", &id, format!("permanently deleted “{title}”")))?;
+        emit(ctx, Event::new("post.purged", "post", &id, format!("permanently deleted “{title}”")).admin_only())?;
     } else if post.opt_str("deleted_at").is_none() {
         ctx.db.execute(
             "UPDATE posts SET deleted_at = ?, deleted_by = ? WHERE id = ?",

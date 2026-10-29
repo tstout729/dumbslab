@@ -443,7 +443,12 @@ fn list_tokens(ctx: &mut Ctx, input: ListTokensInput) -> ApiResult<TokenList> {
     }
     if !input.include_revoked.unwrap_or(false) {
         cond.push("revoked_at IS NULL");
-        cond.push("(expires_at IS NULL OR expires_at > ?)");
+        // A connected app's access token expires hourly but its grant lives on while the refresh token does.
+        cond.push(
+            "(expires_at IS NULL OR expires_at > ? OR id IN (SELECT access_token_id FROM oauth_refresh_tokens
+               WHERE access_token_id IS NOT NULL AND revoked_at IS NULL AND expires_at > ?))",
+        );
+        p.push(ctx.now_s().into());
         p.push(ctx.now_s().into());
     }
     let where_ = if cond.is_empty() { "1=1".to_string() } else { cond.join(" AND ") };
@@ -525,7 +530,19 @@ fn create_token(ctx: &mut Ctx, input: CreateTokenInput) -> ApiResult<CreatedToke
     if (requested.write && !ctx.actor.scopes.write) || (requested.admin && !ctx.actor.scopes.admin) {
         return Err(ApiError::forbidden("you can't create a token with more scopes than the credential you're using"));
     }
-    let expires = input.expires_in_days.filter(|d| *d > 0).map(|d| ts(ctx.now + Duration::days(d as i64)));
+    let mut expires = input.expires_in_days.filter(|d| *d > 0).map(|d| ts(ctx.now + Duration::days(d as i64)));
+    if let Some(tid) = &ctx.actor.token_id {
+        let caller = ctx.db.one("SELECT kind, expires_at FROM api_tokens WHERE id = ?", &params![tid.clone()])?;
+        if caller.as_ref().is_some_and(|c| c.str("kind") == "oauth") {
+            return Err(ApiError::forbidden("connected apps can't create API tokens; create one in Settings → API tokens"));
+        }
+        if let Some(limit) = caller.and_then(|c| c.opt_str("expires_at")) {
+            expires = Some(match expires {
+                Some(e) if e < limit => e,
+                _ => limit,
+            });
+        }
+    }
     let (id, token) = mint_token(ctx, &owner.str("id"), &name, requested, "personal", None, expires)?;
     emit(
         ctx,

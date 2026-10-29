@@ -74,20 +74,27 @@ pub struct NotificationList {
 fn list_notifications(ctx: &mut Ctx, input: ListNotificationsInput) -> ApiResult<NotificationList> {
     let (limit, offset) = page(input.limit, &input.cursor)?;
     let unread = if input.unread_only.unwrap_or(false) { "AND n.read_at IS NULL" } else { "" };
+    // Notifications about posts the person can no longer see (or that are gone) are hidden.
+    let (visible, vis_params) = visible_notification_sql(ctx);
+    let mut p = params![ctx.actor.user_id.clone()];
+    p.extend(vis_params.clone());
+    p.push((limit + 1).into());
+    p.push(offset.into());
     let mut rows = ctx.db.query(
         &format!(
             "SELECT n.*, p.title AS post_title, p.slug AS post_slug FROM notifications n
              LEFT JOIN posts p ON p.id = n.post_id AND p.deleted_at IS NULL
-             WHERE n.user_id = ? {unread} ORDER BY n.created_at DESC, n.id LIMIT ? OFFSET ?"
+             WHERE n.user_id = ? AND {visible} {unread} ORDER BY n.created_at DESC, n.id LIMIT ? OFFSET ?"
         ),
-        &params![ctx.actor.user_id.clone(), limit + 1, offset],
+        &p,
     )?;
     let next_cursor = next_cursor(rows.len(), limit, offset);
     rows.truncate(limit as usize);
     let users = user_refs(ctx.db, &rows.iter().filter_map(|r| r.opt_str("actor_id")).collect::<Vec<_>>())?;
-    let unread_count = ctx
-        .db
-        .scalar_i64("SELECT COUNT(*) FROM notifications WHERE user_id = ? AND read_at IS NULL", &params![ctx.actor.user_id.clone()])?;
+    let mut p = params![ctx.actor.user_id.clone()];
+    p.extend(vis_params);
+    let unread_count =
+        ctx.db.scalar_i64(&format!("SELECT COUNT(*) FROM notifications n WHERE n.user_id = ? AND {visible} AND n.read_at IS NULL"), &p)?;
     Ok(NotificationList {
         items: rows
             .iter()
@@ -110,6 +117,13 @@ fn list_notifications(ctx: &mut Ctx, input: ListNotificationsInput) -> ApiResult
         unread_count,
         next_cursor,
     })
+}
+
+/// SQL (on notifications alias `n`) that hides notices about posts the actor can't see now.
+fn visible_notification_sql(ctx: &Ctx) -> (String, Vec<SqlValue>) {
+    let mut p = vec![];
+    let vis = post_visible_sql(&ctx.actor, "vn", &mut p);
+    (format!("(n.post_id IS NULL OR EXISTS (SELECT 1 FROM posts vn WHERE vn.id = n.post_id AND vn.deleted_at IS NULL AND {vis}))"), p)
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -297,7 +311,7 @@ fn list_activity(ctx: &mut Ctx, input: ListActivityInput) -> ApiResult<ActivityL
     let post_vis = post_visible_sql(&ctx.actor, "vp", &mut p);
     cond.push(format!("(a.post_id IS NULL OR EXISTS (SELECT 1 FROM posts vp WHERE vp.id = a.post_id AND {post_vis}))"));
     let topic_vis = topic_visible_sql(&ctx.actor, "vt", &mut p);
-    cond.push(format!("(a.topic_id IS NULL OR NOT EXISTS (SELECT 1 FROM topics vt0 WHERE vt0.id = a.topic_id) OR EXISTS (SELECT 1 FROM topics vt WHERE vt.id = a.topic_id AND {topic_vis}))"));
+    cond.push(format!("(a.topic_id IS NULL OR EXISTS (SELECT 1 FROM topics vt WHERE vt.id = a.topic_id AND {topic_vis}))"));
     let order = if input.after_id.is_some() { "ASC" } else { "DESC" };
     p.push((limit + 1).into());
     p.push(offset.into());

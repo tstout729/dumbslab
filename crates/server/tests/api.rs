@@ -48,14 +48,12 @@ impl H {
 
     fn raw(&self, method: &str, path_q: &str, body: Vec<u8>, content_type: &str, auth: &Auth) -> Res {
         let (path, query) = path_q.split_once('?').unwrap_or((path_q, ""));
-        let mut headers = vec![("content-type".to_string(), content_type.to_string())];
+        let mut headers =
+            vec![("content-type".to_string(), content_type.to_string()), ("x-dumbslab-client".to_string(), "web".to_string())];
         match auth {
             Auth::None => {}
             Auth::Bearer(t) => headers.push(("authorization".into(), format!("Bearer {t}"))),
-            Auth::Cookie(c) => {
-                headers.push(("cookie".into(), format!("dumbslab_session={c}")));
-                headers.push(("x-dumbslab-client".into(), "web".into()));
-            }
+            Auth::Cookie(c) => headers.push(("cookie".into(), format!("dumbslab_session={c}"))),
         }
         let req = Request {
             method: method.into(),
@@ -177,6 +175,18 @@ fn setup_login_and_csrf() {
     let out = h.store.with_tx(|db| (dumbslab_core::handle(db, &h.cfg, &req).unwrap(), true)).unwrap();
     assert_eq!(out.response.status, 403);
 
+    // A cross-site form can't log the victim into another account (login CSRF).
+    let forged_login = Request {
+        method: "POST".into(),
+        path: "/api/v1/auth/login".into(),
+        headers: vec![("content-type".into(), "text/plain".into())],
+        body: br#"{"email":"ada@acme.test","password":"correct horse"}"#.to_vec(),
+        origin: "https://kb.test".into(),
+        ..Default::default()
+    };
+    let out = h.store.with_tx(|db| (dumbslab_core::handle(db, &h.cfg, &forged_login).unwrap(), true)).unwrap();
+    assert_eq!(out.response.status, 403);
+
     // Login: wrong password, then right one; throttled after repeated failures.
     let wrong = h.call("POST", "/api/v1/auth/login", Some(json!({ "email": "ada@acme.test", "password": "wrong password" })), &Auth::None);
     assert_eq!(wrong.status, 401);
@@ -246,6 +256,35 @@ fn drafts_private_topics_and_roles() {
     h.ok("POST", &format!("/api/v1/posts/{hid}/edit"), Some(json!({ "edits": [{ "type": "append", "content": "cc @vic" }] })), &member);
     let n = h.ok("GET", "/api/v1/notifications", None, &viewer);
     assert!(n["items"].as_array().unwrap().iter().all(|x| x["post"]["id"] != json!(hid)));
+
+    // Losing access to a post also hides its notifications (S2).
+    let shared = h.ok("POST", "/api/v1/posts", Some(json!({ "title": "Roadmap", "content": "hi @vic", "status": "published" })), &member);
+    let sid = shared["id"].as_str().unwrap().to_string();
+    let has_notice = |h: &H| {
+        h.ok("GET", "/api/v1/notifications", None, &viewer)["items"].as_array().unwrap().iter().any(|x| x["post"]["id"] == json!(sid))
+    };
+    assert!(has_notice(&h));
+    h.ok("PATCH", &format!("/api/v1/posts/{sid}"), Some(json!({ "topic_ids": [tid], "title": "Roadmap (confidential)" })), &member);
+    assert!(!has_notice(&h));
+    assert_eq!(h.ok("GET", "/api/v1/notifications?unread_only=true", None, &viewer)["unread_count"], 0);
+
+    // Purging a private post doesn't announce its title to everyone (S1).
+    h.ok("DELETE", &format!("/api/v1/posts/{sid}?permanent=true"), None, &admin);
+    let feed = h.ok("GET", "/api/v1/activity?limit=200", None, &viewer);
+    assert!(feed["items"].as_array().unwrap().iter().all(|a| !a["summary"].as_str().unwrap().contains("Roadmap")));
+
+    // Deleting a private topic doesn't reveal its earlier events (S3).
+    let secret = h.ok("POST", "/api/v1/topics", Some(json!({ "name": "Project Falcon", "visibility": "private" })), &admin);
+    let fid = secret["id"].as_str().unwrap();
+    h.ok("PATCH", &format!("/api/v1/topics/{fid}"), Some(json!({ "description": "acquisition" })), &admin);
+    h.ok("DELETE", &format!("/api/v1/topics/{fid}"), None, &admin);
+    let feed = h.ok("GET", "/api/v1/activity?limit=200", None, &viewer);
+    assert!(feed["items"].as_array().unwrap().iter().all(|a| !a["summary"].as_str().unwrap().contains("Falcon")));
+
+    // Breadcrumbs don't reveal a private parent (S5).
+    let child = h.ok("POST", "/api/v1/topics", Some(json!({ "name": "Public child", "parent_id": tid })), &admin);
+    let crumbs = h.ok("GET", &format!("/api/v1/topics/{}", child["id"].as_str().unwrap()), None, &viewer);
+    assert!(crumbs["breadcrumbs"].as_array().unwrap().is_empty());
 
     // Scopes and admin-only operations.
     let ro =
@@ -382,6 +421,11 @@ fn search_ranks_titles_and_supports_prefixes() {
     // No AND match falls back to any word.
     let broad = h.ok("GET", "/api/v1/search?q=pods%20zzzqqq", None, &admin);
     assert_eq!(broad["broadened"], true);
+    let page1 = h.ok("GET", "/api/v1/search?q=kubernetes%20zzzqqq&limit=1&types=post", None, &admin);
+    assert_eq!(page1["broadened"], true);
+    let cursor = page1["next_cursor"].as_str().unwrap();
+    let page2 = h.ok("GET", &format!("/api/v1/search?q=kubernetes%20zzzqqq&limit=1&types=post&cursor={cursor}"), None, &admin);
+    assert_eq!(page2["items"].as_array().unwrap().len(), 1, "second page of broadened results");
     // Types filter and odd input.
     let topics_only = h.ok("GET", "/api/v1/search?q=getting&types=topic", None, &admin);
     assert!(topics_only["items"].as_array().unwrap().iter().all(|x| x["kind"] == "topic"));
@@ -422,6 +466,24 @@ fn mcp_tools_and_rollback() {
     assert_eq!(before, after);
     let drafts = h.ok("GET", "/api/v1/posts?status=draft", None, &admin);
     assert!(drafts["items"].as_array().unwrap().iter().all(|p| p["title"] != "Orphan"));
+
+    h.ok("POST", "/api/v1/webhooks", Some(json!({ "url": "https://hooks.test/in" })), &admin);
+    let partial = h.mcp(
+        &admin,
+        "",
+        json!({ "jsonrpc": "2.0", "id": 41, "method": "tools/call", "params": { "name": "import_documents", "arguments": {
+        "documents": [{ "title": "Good", "content": "ok" }, { "title": "  ", "content": "bad" }] } } }),
+    );
+    assert_eq!(partial.body["result"]["isError"], true);
+    assert!(partial.effects.is_empty(), "rolled-back call must not send webhooks");
+    let none_scope =
+        h.ok("POST", "/api/v1/tokens", Some(json!({ "name": "none", "scopes": [] })), &admin)["token"].as_str().unwrap().to_string();
+    let res = h.mcp(
+        &Auth::Bearer(none_scope),
+        "",
+        json!({ "jsonrpc": "2.0", "id": 42, "method": "resources/read", "params": { "uri": format!("dumbslab://posts/{pid}") } }),
+    );
+    assert!(res.body["error"].is_object(), "{}", res.body);
 
     let unknown = h.mcp(&admin, "", json!({ "jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": { "name": "nope" } }));
     assert_eq!(unknown.body["error"]["code"], -32602);
@@ -562,6 +624,10 @@ fn oauth_authorization_code_flow() {
     );
     assert_eq!(me.body["result"]["structuredContent"]["scopes"], json!(["read", "write"]));
 
+    // Connected apps can't mint long-lived personal tokens.
+    let minted = h.call("POST", "/api/v1/tokens", Some(json!({ "name": "persist" })), &Auth::Bearer(access.clone()));
+    assert_eq!(minted.status, 403);
+
     // Refresh rotates: the old access and refresh tokens stop working.
     let r2 = h.raw(
         "POST",
@@ -582,9 +648,23 @@ fn oauth_authorization_code_flow() {
     assert_eq!(again.body["error"], "invalid_grant");
     let new_access = r2.body["access_token"].as_str().unwrap().to_string();
     assert_eq!(h.call("GET", "/api/v1/me", None, &Auth::Bearer(new_access.clone())).status, 200);
-    // Connected apps show up as tokens the person can revoke.
+    // Connected apps stay listed (and revocable) after the hourly access token expires (S7).
+    h.store
+        .with_tx(|db| (db.execute("UPDATE api_tokens SET expires_at = '2000-01-01T00:00:00.000Z' WHERE kind = 'oauth'", &[]), true))
+        .unwrap()
+        .unwrap();
     let tokens = h.ok("GET", "/api/v1/tokens", None, &cookie);
-    assert!(tokens["items"].as_array().unwrap().iter().any(|t| t["kind"] == "oauth"));
+    let grant =
+        tokens["items"].as_array().unwrap().iter().find(|t| t["kind"] == "oauth" && t["revoked"] == false).expect("grant listed").clone();
+    h.ok("DELETE", &format!("/api/v1/tokens/{}", grant["id"].as_str().unwrap()), None, &cookie);
+    let r3 = h.raw(
+        "POST",
+        "/oauth/token",
+        format!("grant_type=refresh_token&refresh_token={}", r2.body["refresh_token"].as_str().unwrap()).into_bytes(),
+        "application/x-www-form-urlencoded",
+        &Auth::None,
+    );
+    assert_eq!(r3.body["error"], "invalid_grant", "revoking the grant ends the refresh token");
     h.raw("POST", "/oauth/revoke", format!("token={new_access}").into_bytes(), "application/x-www-form-urlencoded", &Auth::None);
     assert_eq!(h.call("GET", "/api/v1/me", None, &Auth::Bearer(new_access)).status, 401);
 }

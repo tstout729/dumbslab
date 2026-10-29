@@ -107,7 +107,8 @@ fn post(db: &dyn Db, cfg: &HostConfig, req: &Request) -> Outcome {
     let toolset = Toolset::parse(query_param(req, "toolset"));
     let mut ctx = new_ctx(db, cfg, req, actor);
     let (reply, ok) = handle_message(&mut ctx, toolset, &message);
-    let effects = std::mem::take(&mut ctx.effects);
+    // Rolled-back calls must not announce writes that never happened.
+    let effects = if ok { std::mem::take(&mut ctx.effects) } else { vec![] };
     match reply {
         Some(body) => Outcome { response: Response::json(200, &body), commit: ok, effects },
         None => Outcome { response: Response::empty(202), commit: ok, effects },
@@ -150,6 +151,7 @@ pub fn handle_message(ctx: &mut Ctx, toolset: Toolset, msg: &Value) -> (Option<V
         "ping" | "logging/setLevel" => Ok(json!({})),
         "tools/list" => Ok(json!({ "tools": tools(&ctx.actor, toolset) })),
         "tools/call" => return call_tool(ctx, toolset, id, &params),
+        "resources/list" | "resources/read" if !ctx.actor.scopes.read => Err((-32603, "this credential lacks the read scope".to_string())),
         "resources/list" => list_resources(ctx),
         "resources/templates/list" => Ok(json!({ "resourceTemplates": [
             { "uriTemplate": "dumbslab://posts/{id}", "name": "post", "title": "A post as Markdown", "mimeType": "text/markdown" },
@@ -382,7 +384,8 @@ pub fn handle_stdio(
     let req = Request { origin: cfg.base_url.clone().unwrap_or_else(|| "http://localhost:8080".into()), ..Default::default() };
     let mut ctx = new_ctx(db, cfg, &req, actor);
     let (reply, ok) = handle_message(&mut ctx, toolset, &msg);
-    (reply, ok, std::mem::take(&mut ctx.effects))
+    let effects = if ok { std::mem::take(&mut ctx.effects) } else { vec![] };
+    (reply, ok, effects)
 }
 
 /// Used by tests and the CLI to confirm a token resolves.

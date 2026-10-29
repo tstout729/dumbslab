@@ -1,6 +1,6 @@
 //! `dumbslab`: the self-hosted server and CLI. One binary, one SQLite file.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,7 +15,7 @@ use dumbslab_core::auth::{Actor, Role, Scopes, Via};
 use dumbslab_core::db::DbExt;
 use dumbslab_core::mcp::Toolset;
 use dumbslab_core::registry::registry;
-use dumbslab_core::{Effect, HostConfig, Outcome, Request, params};
+use dumbslab_core::{Effect, HostConfig, Outcome, Request, WebhookDelivery, params};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tracing::{info, warn};
 
@@ -28,6 +28,9 @@ struct Cli {
     /// Path to the SQLite database file.
     #[arg(long, global = true, env = "DUMBSLAB_DB", default_value = "dumbslab.db")]
     db: PathBuf,
+    /// Allow webhooks to loopback, private and link-local addresses (off by default to prevent SSRF).
+    #[arg(long, global = true, env = "DUMBSLAB_ALLOW_PRIVATE_WEBHOOKS")]
+    allow_private_webhooks: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -77,7 +80,7 @@ enum Command {
 pub struct App {
     pub store: Store,
     pub cfg: HostConfig,
-    pub http: reqwest::Client,
+    pub allow_private_webhooks: bool,
 }
 
 #[tokio::main]
@@ -98,9 +101,11 @@ async fn main() -> anyhow::Result<()> {
             println!("{}", serde_json::to_string_pretty(&dumbslab_core::openapi::spec(&base_url))?);
             Ok(())
         }
-        Command::Serve { bind, base_url, setup_token, open_setup } => serve(cli.db, bind, base_url, setup_token, open_setup).await,
-        Command::Mcp { user, toolset } => stdio_mcp(cli.db, user, Toolset::parse(Some(&toolset))).await,
-        Command::Call { operation, input, user } => call(cli.db, operation, input, user),
+        Command::Serve { bind, base_url, setup_token, open_setup } => {
+            serve(cli.db, cli.allow_private_webhooks, bind, base_url, setup_token, open_setup).await
+        }
+        Command::Mcp { user, toolset } => stdio_mcp(cli.db, cli.allow_private_webhooks, user, Toolset::parse(Some(&toolset))).await,
+        Command::Call { operation, input, user } => call(cli.db, cli.allow_private_webhooks, operation, input, user).await,
     }
 }
 
@@ -135,31 +140,40 @@ fn local_actor(store: &Store, user: Option<&str>, via: Via) -> anyhow::Result<Ac
     })
 }
 
-fn call(db: PathBuf, operation: String, input: Option<String>, user: Option<String>) -> anyhow::Result<()> {
-    let store = open(&db)?;
-    let actor = local_actor(&store, user.as_deref(), Via::Cli)?;
+async fn call(
+    db: PathBuf,
+    allow_private_webhooks: bool,
+    operation: String,
+    input: Option<String>,
+    user: Option<String>,
+) -> anyhow::Result<()> {
+    let app = Arc::new(App { store: open(&db)?, cfg: HostConfig::default(), allow_private_webhooks });
+    let actor = local_actor(&app.store, user.as_deref(), Via::Cli)?;
     let op = registry().get(&operation).ok_or_else(|| anyhow!("unknown operation `{operation}`; run `dumbslab ops`"))?;
     let input: serde_json::Value = serde_json::from_str(input.as_deref().unwrap_or("{}")).context("input must be JSON")?;
-    let cfg = HostConfig::default();
-    let result = store.with_tx(|db| {
+    let result = app.store.with_tx(|db| {
         let req = Request { origin: "http://localhost:8080".into(), ..Default::default() };
-        let mut ctx = dumbslab_core::http::new_ctx(db, &cfg, &req, actor);
+        let mut ctx = dumbslab_core::http::new_ctx(db, &app.cfg, &req, actor);
         match op.call(&mut ctx, input) {
-            Ok(v) => (Ok(v), true),
+            Ok(v) => (Ok((v, ctx.effects)), true),
             Err(e) => (Err(e), false),
         }
     })?;
     match result {
-        Ok(v) => {
+        Ok((v, effects)) => {
             println!("{}", serde_json::to_string_pretty(&v)?);
+            for handle in deliver(app, effects) {
+                let _ = handle.await;
+            }
             Ok(())
         }
         Err(e) => Err(anyhow!("{} ({})", e.message, e.code)),
     }
 }
 
-async fn stdio_mcp(db: PathBuf, user: Option<String>, toolset: Toolset) -> anyhow::Result<()> {
-    let app = Arc::new(App { store: open(&db)?, cfg: HostConfig::default(), http: reqwest::Client::new() });
+async fn stdio_mcp(db: PathBuf, allow_private_webhooks: bool, user: Option<String>, toolset: Toolset) -> anyhow::Result<()> {
+    let app = Arc::new(App { store: open(&db)?, cfg: HostConfig::default(), allow_private_webhooks });
+    let mut pending = vec![];
     let actor = local_actor(&app.store, user.as_deref(), Via::Mcp)?;
     info!(user = %actor.email, "serving MCP over stdio");
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
@@ -176,17 +190,22 @@ async fn stdio_mcp(db: PathBuf, user: Option<String>, toolset: Toolset) -> anyho
             })
         })
         .await??;
-        deliver(app.clone(), effects);
+        pending.extend(deliver(app.clone(), effects));
+        pending.retain(|h: &tokio::task::JoinHandle<()>| !h.is_finished());
         if let Some(reply) = reply {
             stdout.write_all(format!("{reply}\n").as_bytes()).await?;
             stdout.flush().await?;
         }
+    }
+    for handle in pending {
+        let _ = handle.await;
     }
     Ok(())
 }
 
 async fn serve(
     db: PathBuf,
+    allow_private_webhooks: bool,
     bind: SocketAddr,
     base_url: Option<String>,
     setup_token: Option<String>,
@@ -206,8 +225,7 @@ async fn serve(
         }
     }
     let cfg = HostConfig { base_url: base_url.map(|u| u.trim_end_matches('/').to_string()), setup_token, open_setup };
-    let http = reqwest::Client::builder().timeout(Duration::from_secs(10)).build()?;
-    let app = Arc::new(App { store, cfg, http });
+    let app = Arc::new(App { store, cfg, allow_private_webhooks });
     let router = Router::new()
         .fallback(handle)
         .with_state(app)
@@ -297,35 +315,114 @@ fn respond(app: Arc<App>, outcome: Outcome) -> axum::response::Response {
 }
 
 /// Delivers webhooks in the background with a few retries, then records the outcome.
-fn deliver(app: Arc<App>, effects: Vec<Effect>) {
-    for effect in effects {
-        let Effect::Webhook(d) = effect;
-        let app = app.clone();
-        tokio::spawn(async move {
-            let mut last: (Option<u16>, Option<String>) = (None, None);
-            for (attempt, delay) in [0u64, 2, 10].into_iter().enumerate() {
-                if delay > 0 {
-                    tokio::time::sleep(Duration::from_secs(delay)).await;
+fn deliver(app: Arc<App>, effects: Vec<Effect>) -> Vec<tokio::task::JoinHandle<()>> {
+    effects
+        .into_iter()
+        .map(|effect| {
+            let Effect::Webhook(d) = effect;
+            let app = app.clone();
+            tokio::spawn(async move {
+                let mut last: (Option<u16>, Option<String>) = (None, None);
+                for (attempt, delay) in [0u64, 2, 10].into_iter().enumerate() {
+                    if delay > 0 {
+                        tokio::time::sleep(Duration::from_secs(delay)).await;
+                    }
+                    last = send_webhook(&d, app.allow_private_webhooks).await;
+                    if last.1.is_none() {
+                        break;
+                    }
+                    warn!(url = %d.url, attempt = attempt + 1, error = ?last.1, "webhook delivery failed");
                 }
-                let mut req = app.http.post(&d.url).body(d.body.clone());
-                for (k, v) in &d.headers {
-                    req = req.header(k, v);
-                }
-                last = match req.send().await {
-                    Ok(r) if r.status().is_success() => (Some(r.status().as_u16()), None),
-                    Ok(r) => (Some(r.status().as_u16()), Some(format!("HTTP {}", r.status()))),
-                    Err(e) => (None, Some(e.to_string())),
-                };
-                if last.1.is_none() {
-                    break;
-                }
-                warn!(url = %d.url, attempt = attempt + 1, error = ?last.1, "webhook delivery failed");
-            }
-            let id = d.webhook_id.clone();
-            let _ = tokio::task::spawn_blocking(move || {
-                app.store.with_tx(|db| (dumbslab_core::record_webhook_result(db, &id, last.0, last.1.as_deref()), true))
+                let id = d.webhook_id.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    app.store.with_tx(|db| (dumbslab_core::record_webhook_result(db, &id, last.0, last.1.as_deref()), true))
+                })
+                .await;
             })
-            .await;
-        });
+        })
+        .collect()
+}
+
+/// Whether an address is on the public internet (not loopback, private, link-local, CGNAT, …).
+fn is_public(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            !(v4.is_private()
+                || v4.is_loopback()
+                || v4.is_link_local()
+                || v4.is_broadcast()
+                || v4.is_unspecified()
+                || v4.is_documentation()
+                || o[0] == 0
+                || (o[0] == 100 && (o[1] & 0xc0) == 64))
+        }
+        IpAddr::V6(v6) => {
+            let first = v6.segments()[0];
+            let mapped_private = v6.to_ipv4_mapped().is_some_and(|v4| !is_public(IpAddr::V4(v4)));
+            !(v6.is_loopback() || v6.is_unspecified() || (first & 0xfe00) == 0xfc00 || (first & 0xffc0) == 0xfe80 || mapped_private)
+        }
+    }
+}
+
+/// Sends one delivery. Resolves the host once, refuses private targets (unless allowed), pins the
+/// connection to the checked addresses, and never follows redirects.
+async fn send_webhook(d: &WebhookDelivery, allow_private: bool) -> (Option<u16>, Option<String>) {
+    let attempt = async {
+        let url = reqwest::Url::parse(&d.url)?;
+        let port = url.port_or_known_default().unwrap_or(443);
+        let host = url.host_str().unwrap_or_default().trim_start_matches('[').trim_end_matches(']').to_string();
+        let addrs: Vec<SocketAddr> = match host.parse::<IpAddr>() {
+            Ok(ip) => vec![SocketAddr::new(ip, port)],
+            Err(_) => tokio::net::lookup_host((host.as_str(), port)).await?.collect(),
+        };
+        if addrs.is_empty() {
+            anyhow::bail!("webhook host did not resolve");
+        }
+        if !allow_private && addrs.iter().any(|a| !is_public(a.ip())) {
+            anyhow::bail!("webhook URL points to a private address (start the server with --allow-private-webhooks to permit this)");
+        }
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .redirect(reqwest::redirect::Policy::none())
+            .resolve_to_addrs(&host, &addrs)
+            .build()?;
+        let mut req = client.post(url).body(d.body.clone());
+        for (k, v) in &d.headers {
+            req = req.header(k, v);
+        }
+        Ok::<_, anyhow::Error>(req.send().await?.status())
+    };
+    match attempt.await {
+        Ok(status) if status.is_success() => (Some(status.as_u16()), None),
+        Ok(status) => (Some(status.as_u16()), Some(format!("HTTP {status}"))),
+        Err(e) => (None, Some(e.to_string())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_public;
+
+    #[test]
+    fn private_addresses_are_refused() {
+        for ip in [
+            "127.0.0.1",
+            "10.1.2.3",
+            "192.168.1.1",
+            "172.16.0.1",
+            "169.254.169.254",
+            "100.100.1.1",
+            "0.0.0.0",
+            "::1",
+            "fc00::1",
+            "fe80::1",
+            "::ffff:127.0.0.1",
+        ] {
+            assert!(!is_public(ip.parse().unwrap()), "{ip}");
+        }
+        for ip in ["1.1.1.1", "93.184.216.34", "2606:4700::1111"] {
+            assert!(is_public(ip.parse().unwrap()), "{ip}");
+        }
     }
 }

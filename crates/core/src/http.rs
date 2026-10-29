@@ -71,6 +71,10 @@ pub fn unauthorized(cfg: &HostConfig, req: &Request, message: &str) -> Outcome {
 
 fn api(db: &dyn Db, cfg: &HostConfig, req: &Request, rest: &str) -> Outcome {
     let now = Utc::now();
+    let session_change = matches!((req.method.as_str(), rest), ("POST", "/auth/setup" | "/auth/login" | "/auth/logout"));
+    if session_change && req.header(CSRF_HEADER).is_none() {
+        return failed(&ApiError::forbidden(format!("missing the {CSRF_HEADER} header")));
+    }
     match (req.method.as_str(), rest) {
         ("GET", "/auth/state") => return auth_state(db, cfg, req),
         ("POST", "/auth/setup") => return setup(db, cfg, req),

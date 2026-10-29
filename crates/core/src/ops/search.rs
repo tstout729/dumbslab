@@ -136,15 +136,16 @@ fn search(ctx: &mut Ctx, input: SearchInput) -> ApiResult<SearchResults> {
     let Some(all_words) = fts_query(&input.q, false) else {
         return Ok(SearchResults { items: vec![], next_cursor: None, broadened: false });
     };
-    let mut rows = run(ctx, &input, &all_words, limit, offset)?;
+    let mut match_q = all_words.clone();
     let mut broadened = false;
-    if rows.is_empty()
-        && offset == 0
-        && let Some(any_word) = fts_query(&input.q, true).filter(|q| *q != all_words)
+    if let Some(any_word) = fts_query(&input.q, true).filter(|q| *q != all_words)
+        && run(ctx, &input, &all_words, 0, 0)?.is_empty()
     {
-        rows = run(ctx, &input, &any_word, limit, offset)?;
-        broadened = !rows.is_empty();
+        match_q = any_word;
+        broadened = true;
     }
+    let mut rows = run(ctx, &input, &match_q, limit, offset)?;
+    broadened &= !rows.is_empty() || offset > 0;
     let next_cursor = next_cursor(rows.len(), limit, offset);
     rows.truncate(limit as usize);
 

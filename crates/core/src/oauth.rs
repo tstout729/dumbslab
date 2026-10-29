@@ -360,8 +360,13 @@ fn issue_tokens(db: &dyn Db, cfg: &HostConfig, req: &Request, user_id: &str, cli
         "INSERT INTO oauth_refresh_tokens (token_hash, client_id, user_id, scopes, access_token_id, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
         &params![sha256_hex(&refresh), client_id, user_id, scopes.to_str(), token_id, ctx.now_s(), ts(ctx.now + Duration::days(REFRESH_TOKEN_DAYS))],
     )?;
-    // Housekeeping: drop long-expired connected-app tokens.
-    db.execute("DELETE FROM api_tokens WHERE kind = 'oauth' AND expires_at < ?", &params![ts(ctx.now - Duration::days(7))])?;
+    // Housekeeping: drop long-expired connected-app tokens whose grant has also ended.
+    db.execute(
+        "DELETE FROM api_tokens WHERE kind = 'oauth' AND expires_at < ?
+           AND id NOT IN (SELECT access_token_id FROM oauth_refresh_tokens
+                          WHERE access_token_id IS NOT NULL AND revoked_at IS NULL AND expires_at > ?)",
+        &params![ts(ctx.now - Duration::days(7)), ctx.now_s()],
+    )?;
     Ok(json!({
         "access_token": access,
         "token_type": "Bearer",
