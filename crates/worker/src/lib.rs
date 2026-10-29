@@ -204,24 +204,29 @@ async fn operator(req: Request, env: &Env, path: &str) -> Result<Response> {
     };
     let object = format!("ws:{slug}");
     let stub = env.durable_object("WORKSPACE")?.id_from_name(&object)?.get_stub()?;
+    // The workspace's answer decides the directory change: 404 means the address was reserved
+    // but never set up.
     let workspace_call = |internal: &'static str| async move {
         let mut init = RequestInit::new();
         init.with_method(Method::Post);
-        stub.fetch_with_request(Request::new_with_init(&format!("https://internal{internal}"), &init)?).await
+        let resp = stub.fetch_with_request(Request::new_with_init(&format!("https://internal{internal}"), &init)?).await?;
+        Ok::<u16, worker::Error>(resp.status_code())
     };
     let directory: (&str, Value) = match action.as_str() {
-        "disable" => {
-            workspace_call("/_internal/disable").await?;
-            ("/status", json!({ "slug": slug, "status": "disabled" }))
-        }
-        "enable" => {
-            workspace_call("/_internal/enable").await?;
-            ("/status", json!({ "slug": slug, "status": "active" }))
-        }
-        "delete" => {
-            workspace_call("/_internal/delete").await?;
-            ("/remove", json!({ "slug": slug }))
-        }
+        "disable" => match workspace_call("/_internal/disable").await? {
+            // Disabling a reservation also kills its sign-up link.
+            200 | 404 => ("/status", json!({ "slug": slug, "status": "disabled" })),
+            status => return error_response(status, "failed", "the workspace couldn't be disabled"),
+        },
+        "enable" => match workspace_call("/_internal/enable").await? {
+            200 => ("/status", json!({ "slug": slug, "status": "active" })),
+            404 => ("/status", json!({ "slug": slug, "status": "reserved" })),
+            status => return error_response(status, "failed", "the workspace couldn't be enabled"),
+        },
+        "delete" => match workspace_call("/_internal/delete").await? {
+            200 => ("/remove", json!({ "slug": slug })),
+            status => return error_response(status, "failed", "the workspace couldn't be deleted"),
+        },
         _ => return error_response(404, "not_found", "use disable, enable or delete"),
     };
     let (status, body) = call_object(env, "DIRECTORY", "directory", Method::Post, directory.0, Some(&directory.1)).await?;

@@ -170,7 +170,8 @@ pub fn reserve(db: &dyn Db, slug: &str, name: &str, ip_hash: &str, now: DateTime
     if live >= limits.max_workspaces {
         return Err(ApiError::new(503, "full", "DumbSlab has reached its workspace limit for now; you can self-host it for free"));
     }
-    let until = now + Duration::minutes(RESERVATION_MINUTES);
+    // Whole seconds, so a sign-up link's expiry names exactly this reservation.
+    let until = DateTime::from_timestamp(now.timestamp() + RESERVATION_MINUTES * 60, 0).unwrap_or(now);
     db.execute(
         "INSERT INTO workspaces (slug, name, status, ip_hash, created_at, reserved_until) VALUES (?, ?, 'reserved', ?, ?, ?)
          ON CONFLICT(slug) DO UPDATE SET name = excluded.name, status = 'reserved', ip_hash = excluded.ip_hash,
@@ -178,6 +179,16 @@ pub fn reserve(db: &dyn Db, slug: &str, name: &str, ip_hash: &str, now: DateTime
         &params![slug, name, ip_hash, now_s, ts(until)],
     )?;
     Ok(until)
+}
+
+/// Whether a sign-up link (by its expiry) matches the address's current, live reservation.
+/// Deleted, disabled, activated and re-reserved addresses all fail, so old links die with them.
+pub fn reservation_matches(db: &dyn Db, slug: &str, expires_unix: i64, now: DateTime<Utc>) -> ApiResult<bool> {
+    let Some(row) = db.one("SELECT status, reserved_until FROM workspaces WHERE slug = ?", &params![slug])? else {
+        return Ok(false);
+    };
+    let until = crate::util::parse_ts(&row.str("reserved_until"));
+    Ok(row.str("status") == "reserved" && until.is_some_and(|u| u.timestamp() == expires_unix && u > now))
 }
 
 /// Marks a reserved address as an active workspace (called after its first admin is created).
@@ -190,8 +201,8 @@ pub fn activate(db: &dyn Db, slug: &str, now: DateTime<Utc>) -> ApiResult<()> {
 }
 
 pub fn set_status(db: &dyn Db, slug: &str, status: &str) -> ApiResult<()> {
-    if !matches!(status, "active" | "disabled") {
-        return Err(ApiError::bad_request("status must be active or disabled"));
+    if !matches!(status, "reserved" | "active" | "disabled") {
+        return Err(ApiError::bad_request("status must be reserved, active or disabled"));
     }
     let n = db.execute("UPDATE workspaces SET status = ? WHERE slug = ?", &params![status, slug])?;
     if n == 0 {

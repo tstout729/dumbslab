@@ -2,6 +2,7 @@
 
 use base64::Engine;
 use dumbslab::store::Store;
+use dumbslab_core::db::DbExt;
 use dumbslab_core::{Effect, HostConfig, Request};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -198,6 +199,11 @@ fn setup_login_and_csrf() {
     }
     let throttled = h.call("POST", "/api/v1/auth/login", Some(json!({ "email": "ghost@acme.test", "password": "nopenope" })), &Auth::None);
     assert_eq!(throttled.status, 429);
+    // Failed-login bookkeeping is forgotten once its window closes (anyone can fail with any email).
+    h.store.with_tx(|db| (db.execute("UPDATE login_attempts SET window_start = '2000-01-01T00:00:00.000Z'", &[]), true)).unwrap().unwrap();
+    h.call("POST", "/api/v1/auth/login", Some(json!({ "email": "someone-else@acme.test", "password": "nopenope" })), &Auth::None);
+    let kept = h.store.with_tx(|db| (db.scalar_i64("SELECT COUNT(*) FROM login_attempts", &[]), true)).unwrap().unwrap();
+    assert_eq!(kept, 1, "only the current window's record remains");
 
     // Logout ends the session.
     let session = session_from(&right);
@@ -576,6 +582,32 @@ fn oauth_authorization_code_flow() {
     let client_id = reg.body["client_id"].as_str().unwrap().to_string();
     let bad_reg = h.call("POST", "/oauth/register", Some(json!({ "redirect_uris": ["http://evil.test/cb"] })), &Auth::None);
     assert_eq!(bad_reg.status, 400);
+    // Registration is anonymous, so it is bounded: few, short redirect URIs, and stale clients pruned.
+    let many: Vec<String> = (0..6).map(|i| format!("http://localhost:{}/cb", 9000 + i)).collect();
+    assert_eq!(h.call("POST", "/oauth/register", Some(json!({ "redirect_uris": many })), &Auth::None).status, 400);
+    let long = format!("http://localhost:9000/{}", "a".repeat(600));
+    assert_eq!(h.call("POST", "/oauth/register", Some(json!({ "redirect_uris": [long] })), &Auth::None).status, 400);
+    let stale = h.call("POST", "/oauth/register", Some(json!({ "redirect_uris": ["http://localhost:9998/cb"] })), &Auth::None);
+    let stale_id = stale.body["client_id"].as_str().unwrap().to_string();
+    h.store
+        .with_tx(|db| {
+            (
+                db.execute(
+                    "UPDATE oauth_clients SET created_at = '2000-01-01T00:00:00.000Z' WHERE client_id = ?",
+                    &[stale_id.clone().into()],
+                ),
+                true,
+            )
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(h.call("POST", "/oauth/register", Some(json!({ "redirect_uris": ["http://localhost:9997/cb"] })), &Auth::None).status, 201);
+    let left = h
+        .store
+        .with_tx(|db| (db.scalar_i64("SELECT COUNT(*) FROM oauth_clients WHERE client_id = ?", &[stale_id.clone().into()]), true))
+        .unwrap()
+        .unwrap();
+    assert_eq!(left, 0, "never-used week-old client pruned");
 
     let (verifier, challenge) = pkce_pair();
     let q = format!(
@@ -842,10 +874,18 @@ fn directory_reserves_addresses_within_limits() {
     let status = |r: dumbslab_core::ApiResult<()>| r.err().map(|e| e.status);
     run(&|db| tenancy::directory_migrate(db)).unwrap();
 
-    // Taken while reserved, and once active.
+    // Taken while reserved, and once active. A sign-up link names exactly one live reservation.
     assert_eq!(status(reserve("acme", "ip1", t0)), None);
+    let matches = |slug: &'static str, expires: i64, at| {
+        h.store.with_tx(|db| (tenancy::reservation_matches(db, slug, expires, at), true)).unwrap().unwrap()
+    };
+    let expires = t0.timestamp() + tenancy::RESERVATION_MINUTES * 60;
+    assert!(matches("acme", expires, t0));
+    assert!(!matches("acme", expires + 1, t0), "another reservation's link");
+    assert!(!matches("acme", expires, t0 + Duration::minutes(61)), "expired");
     assert_eq!(status(reserve("acme", "ip2", t0)), Some(409));
     run(&|db| tenancy::activate(db, "acme", t0)).unwrap();
+    assert!(!matches("acme", expires, t0), "used links stop working");
     assert_eq!(status(reserve("acme", "ip2", t0 + Duration::hours(3))), Some(409));
     // Per-IP, then per-day limits.
     assert_eq!(status(reserve("beta", "ip1", t0)), None);
@@ -862,6 +902,13 @@ fn directory_reserves_addresses_within_limits() {
     // Operator actions and reserved names.
     run(&|db| tenancy::set_status(db, "acme", "disabled")).unwrap();
     run(&|db| tenancy::remove(db, "eps")).unwrap();
+    // Disabled or deleted reservations reject their links.
+    let eta_expires = t1.timestamp() + tenancy::RESERVATION_MINUTES * 60;
+    assert!(matches("eta", eta_expires, t1));
+    run(&|db| tenancy::set_status(db, "eta", "disabled")).unwrap();
+    assert!(!matches("eta", eta_expires, t1));
+    run(&|db| tenancy::remove(db, "eta")).unwrap();
+    assert!(!matches("eta", eta_expires, t1));
     let entries = h.store.with_tx(|db| (tenancy::list(db), true)).unwrap().unwrap();
     assert!(entries.iter().any(|e| e.slug == "acme" && e.status == "disabled"));
     assert!(!entries.iter().any(|e| e.slug == "eps"));

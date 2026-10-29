@@ -8,12 +8,12 @@ use std::cell::Cell;
 
 use chrono::Utc;
 use dumbslab_core::db::{Db, DbExt};
-use dumbslab_core::{Effect, HostConfig, Outcome};
+use dumbslab_core::{ApiError, ApiResult, Effect, HostConfig, Outcome};
 use serde_json::{Value, json};
 use wasm_bindgen::prelude::*;
 use worker::*;
 
-use crate::sql::{DoDb, call_object, error_response, flag, json_response, read_body, transaction, var, var_i64};
+use crate::sql::{DoDb, api_error_response, call_object, error_response, flag, json_response, read_body, transaction, var, var_i64};
 
 /// The header the front Worker uses to tell a workspace object its address.
 pub const WORKSPACE_HEADER: &str = "x-dumbslab-workspace";
@@ -115,13 +115,6 @@ impl Workspace {
     }
 }
 
-/// Writes that a full workspace refuses. Reads, deletes, sign-in and OAuth keep working.
-fn grows_storage(method: &Method, path: &str) -> bool {
-    !matches!(method, Method::Get | Method::Head | Method::Options | Method::Delete)
-        && !path.starts_with("/api/v1/auth/")
-        && !path.starts_with("/oauth/")
-}
-
 impl DurableObject for Workspace {
     fn new(state: State, env: Env) -> Self {
         Self { state, env, migrated: Cell::new(false) }
@@ -145,33 +138,53 @@ impl DurableObject for Workspace {
         };
 
         let signup_secret = var(&self.env, "SIGNUP_SECRET");
+        // Set when this request creates the workspace: schema and first admin commit together.
+        let mut creating = false;
         if let Some(slug) = &workspace {
             if !self.initialized()? {
                 // Only a valid sign-up link may create the workspace's storage.
-                let token = serde_json::from_slice::<Value>(&body).ok().and_then(|v| v["setup_token"].as_str().map(str::to_string));
-                let valid = method == Method::Post
+                let token =
+                    serde_json::from_slice::<Value>(&body).ok().and_then(|v| v["setup_token"].as_str().map(|t| t.trim().to_string()));
+                let signed = method == Method::Post
                     && path == "/api/v1/auth/setup"
                     && matches!((&signup_secret, &token), (Some(secret), Some(t))
-                        if dumbslab_core::tenancy::verify_signup_token(secret, slug, t.trim(), Utc::now().timestamp()));
-                if !valid {
+                        if dumbslab_core::tenancy::verify_signup_token(secret, slug, t, Utc::now().timestamp()));
+                if !signed {
                     return self.unclaimed(&method, &path, &url, &origin, slug);
                 }
-            }
-            self.migrate()?;
-            if self.disabled()? {
-                return error_response(403, "disabled", "This workspace has been disabled for breaking the acceptable use policy.");
-            }
-            let quota = var_i64(&self.env, "WORKSPACE_STORAGE_MB", 50).max(1) as usize * 1024 * 1024;
-            if grows_storage(&method, &path) && self.db().sql.database_size() > quota {
-                return error_response(
-                    507,
-                    "storage_full",
-                    "This workspace has reached its storage limit. Delete old posts, or export it and self-host DumbSlab for unlimited space.",
-                );
+                // The link must also name the address's live reservation, so links for deleted,
+                // disabled or already-used addresses stop working.
+                let expires = token.as_deref().and_then(|t| t.split_once('.')).and_then(|(e, _)| e.parse::<i64>().ok()).unwrap_or(0);
+                let (status, reply) = call_object(
+                    &self.env,
+                    "DIRECTORY",
+                    "directory",
+                    Method::Post,
+                    "/check",
+                    Some(&json!({ "slug": slug, "expires": expires })),
+                )
+                .await?;
+                if status != 200 || reply["ok"] != json!(true) {
+                    return error_response(403, "forbidden", "This sign-up link is no longer valid. Start again from the sign-up page.");
+                }
+                creating = true;
+            } else {
+                self.migrate()?;
+                if self.disabled()? {
+                    return error_response(403, "disabled", "This workspace has been disabled for breaking the acceptable use policy.");
+                }
             }
         } else {
             self.migrate()?;
         }
+
+        // Writes may not grow a full workspace. Reads and sign-in always work, and deletes free space.
+        let exempt = matches!(method, Method::Get | Method::Head | Method::Options)
+            || matches!(
+                path.as_str(),
+                "/api/v1/auth/login" | "/api/v1/auth/logout" | "/api/v1/auth/setup" | "/oauth/token" | "/oauth/revoke" | "/oauth/authorize"
+            );
+        let quota = (workspace.is_some() && !exempt).then(|| var_i64(&self.env, "WORKSPACE_STORAGE_MB", 50).max(1) as usize * 1024 * 1024);
 
         let headers: Vec<(String, String)> = req.headers().entries().map(|(k, v)| (k.to_lowercase(), v)).collect();
         let core_req = dumbslab_core::Request {
@@ -193,16 +206,40 @@ impl DurableObject for Workspace {
         };
 
         let storage = self.state.storage();
-        let outcome: Option<Outcome> = transaction(&storage, self.db(), move |db| match dumbslab_core::handle(db, &cfg, &core_req) {
-            Some(o) => {
-                let commit = o.commit;
-                (Some(o), commit)
+        let sql = self.db().sql;
+        let result: ApiResult<Option<Outcome>> = transaction(&storage, self.db(), move |db| {
+            if creating && let Err(e) = dumbslab_core::migrate(db) {
+                return (Err(e), false);
             }
-            None => (None, true),
+            let before = sql.database_size();
+            match dumbslab_core::handle(db, &cfg, &core_req) {
+                None => (Ok(None), true),
+                Some(o) => {
+                    // A failed setup leaves no schema behind.
+                    let commit = o.commit && (!creating || o.response.status == 200);
+                    if let Some(limit) = quota {
+                        let after = sql.database_size();
+                        if commit && after > before && after > limit {
+                            let full = ApiError::new(
+                                507,
+                                "storage_full",
+                                "This workspace has reached its storage limit. Delete old posts, or export it and self-host DumbSlab for unlimited space.",
+                            );
+                            return (Err(full), false);
+                        }
+                    }
+                    (Ok(Some(o)), commit)
+                }
+            }
         })?;
-        let Some(outcome) = outcome else {
-            return error_response(404, "not_found", "not found");
+        let outcome = match result {
+            Ok(Some(o)) => o,
+            Ok(None) => return error_response(404, "not_found", "not found"),
+            Err(e) => return api_error_response(&e),
         };
+        if creating && outcome.response.status == 200 {
+            self.migrated.set(true);
+        }
 
         // A new workspace's first admin exists: mark its address active in the directory.
         if let Some(slug) = workspace.filter(|_| path == "/api/v1/auth/setup" && outcome.response.status == 200) {

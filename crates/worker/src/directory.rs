@@ -27,6 +27,12 @@ struct ReserveInput {
 }
 
 #[derive(Deserialize)]
+struct CheckInput {
+    slug: String,
+    expires: i64,
+}
+
+#[derive(Deserialize)]
 struct SlugInput {
     slug: String,
     status: Option<String>,
@@ -86,6 +92,13 @@ impl DurableObject for Directory {
                     let input = input?;
                     let until = tenancy::reserve(db, &input.slug, &input.name, &input.ip_hash, Utc::now(), limits)?;
                     Ok(json!({ "reserved_until": until.timestamp() }))
+                })?
+            }
+            (Method::Post, "/check") => {
+                let input: ApiResult<CheckInput> = parse(&body);
+                self.run(move |db| {
+                    let input = input?;
+                    tenancy::reservation_matches(db, &input.slug, input.expires, Utc::now()).map(|ok| json!({ "ok": ok }))
                 })?
             }
             (Method::Post, "/activate") => {

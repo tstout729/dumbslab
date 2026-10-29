@@ -322,6 +322,8 @@ pub fn check_throttle(db: &dyn Db, key: &str, now: DateTime<Utc>) -> ApiResult<(
 
 pub fn record_failure(db: &dyn Db, key: &str, now: DateTime<Utc>) -> ApiResult<()> {
     let window_floor = ts(now - Duration::minutes(WINDOW_MINUTES));
+    // Anyone can fail a login with any email, so forget windows that have closed.
+    db.execute("DELETE FROM login_attempts WHERE window_start < ?", &params![window_floor.clone()])?;
     db.execute(
         "INSERT INTO login_attempts (key, failures, window_start) VALUES (?, 1, ?)
          ON CONFLICT(key) DO UPDATE SET
