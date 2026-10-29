@@ -23,6 +23,8 @@ const REFRESH_TOKEN_DAYS: i64 = 60;
 const CODE_MINUTES: i64 = 10;
 /// Registered (dynamic) clients kept per workspace.
 pub const MAX_CLIENTS: i64 = 1000;
+/// How long opening a client's consent page protects it from eviction.
+pub const CONSENT_PROTECTION_MINUTES: i64 = 15;
 
 pub fn handle(db: &dyn Db, cfg: &HostConfig, req: &Request) -> Outcome {
     let base = base_url(cfg, req);
@@ -143,18 +145,22 @@ fn register(db: &dyn Db, req: &Request) -> Outcome {
     }
     // Registration is anonymous, so keep the table small: drop day-old clients that were never
     // used, and at the cap make room by evicting the oldest never-used one (so a flood of
-    // registrations can't lock real clients out).
-    const UNUSED: &str = "seen_at IS NULL
+    // registrations can't lock real clients out). A client whose consent page someone opened
+    // is safe for a short while so they can click Allow; the protection expires, so opening
+    // consent pages (which a hostile site can trigger) can't pin slots for good.
+    const UNUSED: &str = "(seen_at IS NULL OR seen_at < ?)
            AND client_id NOT IN (SELECT client_id FROM api_tokens WHERE client_id IS NOT NULL)
            AND client_id NOT IN (SELECT client_id FROM oauth_codes)
            AND client_id NOT IN (SELECT client_id FROM oauth_refresh_tokens)";
-    let day_ago = ts(Utc::now() - Duration::days(1));
-    let _ = db.execute(&format!("DELETE FROM oauth_clients WHERE created_at < ? AND {UNUSED}"), &params![day_ago]);
+    let now = Utc::now();
+    let pending_cutoff = ts(now - Duration::minutes(CONSENT_PROTECTION_MINUTES));
+    let day_ago = ts(now - Duration::days(1));
+    let _ = db.execute(&format!("DELETE FROM oauth_clients WHERE created_at < ? AND {UNUSED}"), &params![day_ago, pending_cutoff.clone()]);
     let excess = db.scalar_i64("SELECT COUNT(*) FROM oauth_clients", &[]).unwrap_or(0) - MAX_CLIENTS + 1;
     if excess > 0 {
         let _ = db.execute(
             &format!("DELETE FROM oauth_clients WHERE client_id IN (SELECT client_id FROM oauth_clients WHERE {UNUSED} ORDER BY created_at LIMIT ?)"),
-            &params![excess],
+            &params![pending_cutoff, excess],
         );
     }
     if db.scalar_i64("SELECT COUNT(*) FROM oauth_clients", &[]).unwrap_or(0) >= MAX_CLIENTS {
@@ -162,7 +168,6 @@ fn register(db: &dyn Db, req: &Request) -> Outcome {
     }
     let name: String = body["client_name"].as_str().unwrap_or("MCP client").chars().take(100).collect();
     let client_id = format!("dsc_{}", new_id());
-    let now = Utc::now();
     if let Err(e) = db.execute(
         "INSERT INTO oauth_clients (client_id, client_name, redirect_uris, created_at) VALUES (?, ?, ?, ?)",
         &params![client_id.clone(), name.clone(), serde_json::to_string(&uris).unwrap_or_default(), ts(now)],

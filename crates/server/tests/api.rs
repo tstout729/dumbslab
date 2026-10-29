@@ -805,6 +805,38 @@ fn oauth_authorization_code_flow() {
     assert_eq!(h.call("POST", "/oauth/register", Some(json!({ "redirect_uris": ["http://localhost:9996/cb"] })), &Auth::None).status, 201);
     assert_eq!(h.call("GET", &format!("/oauth/authorize?{q}"), None, &cookie).status, 200, "the connected client survived");
     assert_eq!(h.call("GET", &format!("/oauth/authorize?{pending_q}"), None, &cookie).status, 200, "the client awaiting consent survived");
+    // The protection expires: an abandoned consent page doesn't pin its client for good.
+    h.store
+        .with_tx(|db| {
+            (
+                db.execute(
+                    "UPDATE oauth_clients SET seen_at = '2000-01-01T00:00:00.000Z' WHERE client_id = ?",
+                    &[pending_id.clone().into()],
+                ),
+                true,
+            )
+        })
+        .unwrap()
+        .unwrap();
+    h.store
+        .with_tx(|db| {
+            (
+                db.execute(
+                    "UPDATE oauth_clients SET created_at = '1999-01-01T00:00:00.000Z' WHERE client_id = ?",
+                    &[pending_id.clone().into()],
+                ),
+                true,
+            )
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(h.call("POST", "/oauth/register", Some(json!({ "redirect_uris": ["http://localhost:9994/cb"] })), &Auth::None).status, 201);
+    let pending_left = h
+        .store
+        .with_tx(|db| (db.scalar_i64("SELECT COUNT(*) FROM oauth_clients WHERE client_id = ?", &[pending_id.clone().into()]), true))
+        .unwrap()
+        .unwrap();
+    assert_eq!(pending_left, 0, "an abandoned client is evicted once its protection expired");
 }
 
 #[test]
