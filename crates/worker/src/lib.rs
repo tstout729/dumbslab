@@ -39,7 +39,11 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
         return Response::error("request body too large", 413);
     };
     let mut init = RequestInit::new();
-    init.with_method(req.method()).with_headers(req.headers().clone()).with_body(Some(js_sys::Uint8Array::from(body.as_slice()).into()));
+    init.with_method(req.method())
+        .with_headers(req.headers().clone())
+        .with_body(Some(js_sys::Uint8Array::from(body.as_slice()).into()))
+        // Pass redirects (e.g. the OAuth consent 302 back to the client) through to the browser.
+        .with_redirect(RequestRedirect::Manual);
     stub.fetch_with_request(Request::new_with_init(req.url()?.as_str(), &init)?).await
 }
 
