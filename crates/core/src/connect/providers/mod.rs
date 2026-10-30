@@ -2,12 +2,16 @@
 
 use super::Connector;
 
+pub mod asana;
+pub mod box_com;
 pub mod clickup;
 pub mod confluence;
+pub mod dropbox;
 pub mod freshdesk;
 pub mod github;
 pub mod gitlab;
 pub mod google_drive;
+pub mod guru;
 pub mod jira;
 pub mod linear;
 pub mod monday;
@@ -26,6 +30,10 @@ pub static ALL: &[&dyn Connector] = &[
     &jira::Jira,
     &confluence::Confluence,
     &zendesk::Zendesk,
+    &asana::Asana,
+    &box_com::BoxCom,
+    &dropbox::Dropbox,
+    &guru::Guru,
     &gitlab::GitLab,
     &linear::Linear,
     &freshdesk::Freshdesk,
