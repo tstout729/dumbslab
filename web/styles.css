@@ -531,6 +531,11 @@ a.chip:hover { background: var(--bg-hover); color: var(--ink); text-decoration: 
 .auth-form { display: flex; flex-direction: column; gap: 16px; margin-top: 24px; }
 .auth-form .btn { height: 38px; margin-top: 4px; }
 .auth-foot { margin-top: 20px; font-size: 12.5px; color: var(--ink-3); text-align: center; }
+.auth-sso { display: flex; flex-direction: column; gap: 12px; margin-top: 24px; }
+.auth-sso > .btn { height: 38px; }
+.auth-sso > .auth-form { margin-top: 4px; }
+.auth-or { display: flex; align-items: center; gap: 10px; font-size: 12.5px; color: var(--ink-3); }
+.auth-or::before, .auth-or::after { content: ""; flex: 1; border-top: 1px solid var(--line); }
 
 /* ---------------------------------------------------------------------------
    Toasts */

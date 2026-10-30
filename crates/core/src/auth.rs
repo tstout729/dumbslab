@@ -200,7 +200,8 @@ pub fn dummy_verify(password: &str) {
     let _ = verify_password(password, hash);
 }
 
-fn cookie_value<'a>(req: &'a Request, name: &str) -> Option<&'a str> {
+/// A cookie's value from the request.
+pub fn cookie_value<'a>(req: &'a Request, name: &str) -> Option<&'a str> {
     let header = req.header("cookie")?;
     header.split(';').map(str::trim).find_map(|kv| {
         let (k, v) = kv.split_once('=')?;

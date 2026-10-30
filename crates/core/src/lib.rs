@@ -27,6 +27,7 @@ pub mod plan;
 pub mod registry;
 pub mod search;
 pub mod seed;
+pub mod sso;
 pub mod telemetry;
 pub mod tenancy;
 pub mod util;
