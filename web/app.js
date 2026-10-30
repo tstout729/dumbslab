@@ -48,7 +48,7 @@ const ROUTES = [
 });
 
 /** Paths the server handles itself; links to them do a full page load. */
-const SERVER_PATH = /^\/(api\/|oauth\/|mcp($|\/)|llms\.txt$|healthz$|\.well-known\/)/;
+const SERVER_PATH = /^\/(api\/|oauth\/|sso\/|connect\/|mcp($|\/)|llms\.txt$|healthz$|\.well-known\/)/;
 
 let main = null;
 let navToken = 0;
