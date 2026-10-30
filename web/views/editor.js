@@ -370,7 +370,8 @@ function mountEditor(ctx, { post, initial, templates, startTemplate }) {
   const wordCount = h('span', { class: 'muted small' });
 
   // --- Uploads ---------------------------------------------------------------------------
-  const fileInput = h('input', { type: 'file', multiple: true, hidden: true, tabindex: '-1' });
+  // Recordings mask inputs but still read a file picker's value (`C:\fakepath\<name>`): block it.
+  const fileInput = h('input', { type: 'file', multiple: true, hidden: true, tabindex: '-1', class: BLOCK_RECORDING });
   const placeholderTag = Date.now().toString(36);
   let placeholderSeq = 0;
 
