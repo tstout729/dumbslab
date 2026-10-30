@@ -23,6 +23,8 @@ enum Auth {
 struct Res {
     status: u16,
     body: Value,
+    /// The raw response body (for files).
+    bytes: Vec<u8>,
     headers: Vec<(String, String)>,
     effects: Vec<Effect>,
 }
@@ -84,7 +86,7 @@ impl H {
         } else {
             Value::String(String::from_utf8_lossy(&out.response.body).into_owned())
         };
-        Res { status: out.response.status, body, headers: out.response.headers, effects: out.effects }
+        Res { status: out.response.status, body, bytes: out.response.body, headers: out.response.headers, effects: out.effects }
     }
 
     fn call(&self, method: &str, path: &str, body: Option<Value>, auth: &Auth) -> Res {
@@ -1306,9 +1308,10 @@ fn deleted_comments_leave_no_body_behind() {
         .unwrap()
         .unwrap();
     h.ok("DELETE", &format!("/api/v1/posts/{pid}?permanent=true"), None, &admin);
-    let last = dumbslab_core::db::MIGRATIONS.len() as i64;
+    // Run the scrub (0004) again, and the migrations after it.
+    let before_scrub = dumbslab_core::db::MIGRATIONS.iter().position(|m| m.contains("UPDATE activity SET data = '{}'")).unwrap();
     h.store
-        .with_tx(|db| (db.execute("UPDATE meta SET value = ? WHERE key = 'schema_version'", &[(last - 1).to_string().into()]), true))
+        .with_tx(|db| (db.execute("UPDATE meta SET value = ? WHERE key = 'schema_version'", &[before_scrub.to_string().into()]), true))
         .unwrap()
         .unwrap();
     let _reopened = Store::open(&h._dir.path().join("t.db")).unwrap();
@@ -1556,4 +1559,240 @@ fn rich_content_embeds_callouts_and_bare_links() {
     // The preview operation renders the same way.
     let preview = h.ok("POST", "/api/v1/render", Some(json!({ "markdown": "https://vimeo.com/925549059/56f7392e1c" })), &viewer);
     assert!(preview["html"].as_str().unwrap().contains("https://player.vimeo.com/video/925549059?h=56f7392e1c"));
+}
+
+// Uploaded images and files.
+
+const PNG: &[u8] = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR not really an image";
+
+fn b64(bytes: &[u8]) -> String {
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+fn upload(h: &H, auth: &Auth, name: &str, content_type: Option<&str>, bytes: &[u8], post_id: Option<&str>) -> Res {
+    let mut body = json!({ "name": name, "data_base64": b64(bytes) });
+    if let Some(t) = content_type {
+        body["content_type"] = json!(t);
+    }
+    if let Some(p) = post_id {
+        body["post_id"] = json!(p);
+    }
+    h.call("POST", "/api/v1/files", Some(body), auth)
+}
+
+/// Fetches a file's bytes the way a browser (cookie) or an agent (token) does.
+fn fetch(h: &H, path: &str, auth: &Auth) -> Res {
+    h.call("GET", path, None, auth)
+}
+
+#[test]
+fn files_upload_serve_and_stay_safe() {
+    let h = H::new();
+    let (cookie, admin) = h.setup();
+    let (_, member) = h.user(&admin, "mia@acme.test", "Mia Member", "member");
+    let (_, viewer) = h.user(&admin, "vic@acme.test", "Vic Viewer", "viewer");
+
+    // An image is detected from its bytes and gets Markdown that shows it.
+    let shot = upload(&h, &member, "Screenshot 2026-10-30 at 9.41.12 AM.png", Some("image/png"), PNG, None);
+    assert_eq!(shot.status, 200, "{}", shot.body);
+    let f = &shot.body;
+    let id = f["id"].as_str().unwrap();
+    let path = f["path"].as_str().unwrap().to_string();
+    let sha: String = Sha256::digest(PNG).iter().map(|b| format!("{b:02x}")).collect();
+    assert_eq!(f["content_type"], "image/png");
+    assert_eq!(f["is_image"], true);
+    assert_eq!(f["size"], PNG.len());
+    assert_eq!(f["sha256"], sha);
+    assert_eq!(path, format!("/files/{id}/Screenshot%202026-10-30%20at%209.41.12%20AM.png"));
+    assert_eq!(f["url"], format!("https://kb.test{path}"));
+    assert_eq!(f["markdown"], format!("![Screenshot 2026-10-30 at 9.41.12 AM.png]({path})"));
+    let rendered = h.ok("POST", "/api/v1/render", Some(json!({ "markdown": f["markdown"] })), &member);
+    assert!(rendered["html"].as_str().unwrap().contains(&format!("<img src=\"{path}\"")), "{rendered}");
+
+    // It's private to its uploader until a post uses it; then everyone who can see the post can.
+    assert_eq!(fetch(&h, &path, &viewer).status, 404);
+    h.ok("POST", "/api/v1/posts", Some(json!({ "title": "Screenshot", "content": f["markdown"], "status": "published" })), &member);
+
+    // Agents without a way to fetch the URL get the bytes through the API.
+    let dl = h.ok("GET", &format!("/api/v1/files/{id}/content"), None, &viewer);
+    assert_eq!(dl["data_base64"], b64(PNG));
+    assert_eq!(dl["file"]["id"], id);
+
+    // Members, viewers and browser sessions can open it, inline, with protective headers.
+    assert!(dumbslab_core::http::is_core_path(&path));
+    for who in [&member, &viewer, &cookie] {
+        let got = fetch(&h, &path, who);
+        assert_eq!(got.status, 200);
+        assert_eq!(got.bytes, PNG);
+    }
+    let got = fetch(&h, &path, &viewer);
+    assert_eq!(got.header("content-type"), Some("image/png"));
+    assert_eq!(got.header("x-content-type-options"), Some("nosniff"));
+    assert_eq!(got.header("content-security-policy"), Some("default-src 'none'; sandbox"));
+    assert!(got.header("content-disposition").unwrap().starts_with("inline; filename=\"Screenshot"), "{:?}", got.headers);
+    assert_eq!(got.header("cache-control"), Some("private, max-age=31536000, immutable"));
+    // The name in the URL is only for people; a known version revalidates with 304.
+    assert_eq!(fetch(&h, &format!("/files/{id}/renamed.png"), &viewer).bytes, PNG);
+    let Auth::Bearer(token) = &viewer else { unreachable!() };
+    let revalidate = Request {
+        method: "GET".into(),
+        path: path.clone(),
+        headers: vec![
+            ("authorization".into(), format!("Bearer {token}")),
+            ("if-none-match".into(), got.header("etag").unwrap().to_string()),
+        ],
+        origin: "https://kb.test".into(),
+        ..Default::default()
+    };
+    let r = h.send(&revalidate);
+    assert_eq!(r.status, 304);
+    assert!(r.bytes.is_empty());
+
+    // Signed-out people get nothing, unknown files are 404, and files can't be written here.
+    let anon = fetch(&h, &path, &Auth::None);
+    assert_eq!(anon.status, 401);
+    assert_eq!(anon.header("cache-control"), Some("no-store"));
+    assert_eq!(fetch(&h, "/files/nope000000/x.png", &member).status, 404);
+    assert_eq!(h.call("POST", &path, Some(json!({})), &member).status, 405);
+
+    // A claim never makes a file render: spoofed images, SVG and HTML download as plain bytes.
+    for (name, claim, bytes) in [
+        ("fake.png", "image/png", &b"MZ\x90\0 not a png"[..]),
+        ("logo.svg", "image/svg+xml", &b"<svg xmlns=\"http://www.w3.org/2000/svg\" onload=\"alert(1)\"/>"[..]),
+        ("page.html", "text/html", &b"<script>alert(1)</script>"[..]),
+    ] {
+        let r = upload(&h, &member, name, Some(claim), bytes, None);
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert_eq!(r.body["content_type"], "application/octet-stream", "{name}");
+        assert_eq!(r.body["is_image"], false);
+        assert!(r.body["markdown"].as_str().unwrap().starts_with(&format!("[{name}](/files/")), "{}", r.body["markdown"]);
+        let got = fetch(&h, r.body["path"].as_str().unwrap(), &member);
+        assert_eq!(got.header("content-type"), Some("application/octet-stream"));
+        assert!(got.header("content-disposition").unwrap().starts_with("attachment;"));
+    }
+    // A PDF is detected but downloads; a CSV keeps the type it claims.
+    let pdf = upload(&h, &member, "plan.pdf", None, b"%PDF-1.7\n%stuff", None);
+    assert_eq!(pdf.body["content_type"], "application/pdf");
+    let got = fetch(&h, pdf.body["path"].as_str().unwrap(), &member);
+    assert!(got.header("content-disposition").unwrap().starts_with("attachment;"));
+    assert_eq!(upload(&h, &member, "data.csv", Some("text/csv"), b"a,b\n1,2\n", None).body["content_type"], "text/csv");
+
+    // Big files are stored in chunks of at most 1 MB and come back intact.
+    let mut big = PNG.to_vec();
+    big.extend((0..2_500_000u32).map(|i| (i % 251) as u8));
+    let r = upload(&h, &member, "big.png", None, &big, None);
+    assert_eq!(r.status, 200, "{}", r.body);
+    let big_id = r.body["id"].as_str().unwrap();
+    assert_eq!(count(&h, &format!("SELECT COUNT(*) FROM file_chunks WHERE file_id = '{big_id}'")), 3);
+    assert!(count(&h, "SELECT MAX(length(data)) FROM file_chunks") <= 1024 * 1024);
+    assert_eq!(fetch(&h, r.body["path"].as_str().unwrap(), &member).bytes, big);
+
+    // Too large, empty or not base64: refused before anything is stored.
+    let stored = count(&h, "SELECT COUNT(*) FROM files");
+    let r = upload(&h, &member, "huge.bin", None, &vec![0u8; 10 * 1024 * 1024 + 1], None);
+    assert_eq!(r.status, 413);
+    assert_eq!(r.body["error"]["code"], "too_large");
+    assert_eq!(upload(&h, &member, "empty.txt", None, b"", None).status, 400);
+    assert_eq!(h.call("POST", "/api/v1/files", Some(json!({ "name": "x", "data_base64": "%%%" })), &member).status, 400);
+    assert_eq!(count(&h, "SELECT COUNT(*) FROM files"), stored);
+
+    // The operations endpoint and MCP run the same operation.
+    let gif = json!({ "name": "a.gif", "data_base64": b64(b"GIF89a\x01\0\x01\0") });
+    assert_eq!(h.ok("POST", "/api/v1/operations/upload_file", Some(gif), &member)["content_type"], "image/gif");
+    let args = json!({ "name": "b.txt", "content_type": "text/plain", "data_base64": b64(b"hello") });
+    let r = h.mcp(
+        &member,
+        "",
+        json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": { "name": "upload_file", "arguments": args } }),
+    );
+    assert_eq!(r.body["result"]["structuredContent"]["content_type"], "text/plain", "{}", r.body);
+}
+
+#[test]
+fn file_access_follows_posts() {
+    let h = H::new();
+    let (_, admin) = h.setup();
+    let (mia_id, mia) = h.user(&admin, "mia@acme.test", "Mia Member", "member");
+    let (_, otto) = h.user(&admin, "otto@acme.test", "Otto Outsider", "member");
+    let (_, vic) = h.user(&admin, "vic@acme.test", "Vic Viewer", "viewer");
+
+    // Viewers and read-only tokens can't upload, just as they can't write posts.
+    assert_eq!(upload(&h, &vic, "x.png", None, PNG, None).status, 403);
+    let ro = h.ok("POST", "/api/v1/tokens", Some(json!({ "name": "ro", "scopes": ["read"] })), &mia)["token"].as_str().unwrap().to_string();
+    assert_eq!(upload(&h, &Auth::Bearer(ro), "x.png", None, PNG, None).status, 403);
+
+    // A file for a private post opens only for people who can see the post.
+    let topic = h.ok("POST", "/api/v1/topics", Some(json!({ "name": "Leadership", "visibility": "private" })), &admin)["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    h.ok("POST", &format!("/api/v1/topics/{topic}/members"), Some(json!({ "user": "mia@acme.test" })), &admin);
+    let post =
+        h.ok("POST", "/api/v1/posts", Some(json!({ "title": "Org chart", "topic_ids": [topic], "status": "published" })), &mia)["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+    let chart = upload(&h, &mia, "secret-org-chart.png", None, PNG, Some(&post));
+    assert_eq!(chart.status, 200, "{}", chart.body);
+    assert_eq!(chart.body["post_id"], post.as_str());
+    let chart_id = chart.body["id"].as_str().unwrap().to_string();
+    let chart_path = chart.body["path"].as_str().unwrap().to_string();
+    assert_eq!(fetch(&h, &chart_path, &mia).status, 200);
+    assert_eq!(fetch(&h, &chart_path, &admin).status, 200);
+    assert_eq!(fetch(&h, &chart_path, &otto).status, 404);
+    assert_eq!(fetch(&h, &chart_path, &vic).status, 404);
+    assert_eq!(h.call("GET", &format!("/api/v1/files/{chart_id}"), None, &otto).status, 404);
+    assert_eq!(h.call("GET", &format!("/api/v1/files?post_id={post}"), None, &otto).status, 404);
+    assert!(!ids(&h.ok("GET", "/api/v1/files", None, &otto)).contains(&chart_id));
+    assert_eq!(ids(&h.ok("GET", &format!("/api/v1/files?post_id={post}"), None, &mia)), vec![chart_id.clone()]);
+    // Nobody can add a file to a post they can't see.
+    assert_eq!(upload(&h, &otto, "x.png", None, PNG, Some(&post)).status, 404);
+
+    // A file uploaded before its post exists is private to its uploader, even to someone who has
+    // its id, until the uploader saves a post that uses it. Then it follows that post.
+    let early = upload(&h, &mia, "salary-bands.png", None, PNG, None);
+    let early_id = early.body["id"].as_str().unwrap().to_string();
+    let early_path = early.body["path"].as_str().unwrap().to_string();
+    assert_eq!(fetch(&h, &early_path, &otto).status, 404);
+    assert_eq!(h.call("GET", &format!("/api/v1/files/{early_id}"), None, &otto).status, 404);
+    assert_eq!(h.call("GET", &format!("/api/v1/files/{early_id}/content"), None, &otto).status, 404);
+    assert_eq!(fetch(&h, &early_path, &mia).status, 200);
+    assert!(!ids(&h.ok("GET", "/api/v1/files", None, &otto)).contains(&early_id));
+    let feed = h.ok("GET", "/api/v1/activity?event=file.&limit=200", None, &otto);
+    let summaries: Vec<&str> = feed["items"].as_array().unwrap().iter().map(|a| a["summary"].as_str().unwrap()).collect();
+    assert!(summaries.iter().all(|s| !s.contains("salary") && !s.contains("org-chart")), "{summaries:?}");
+    assert!(feed["items"].as_array().unwrap().iter().all(|a| a["target_id"] != early_id.as_str()), "an unattached file's id stays private");
+    let content = format!("See {}", early.body["markdown"].as_str().unwrap());
+    let bands = h.ok(
+        "POST",
+        "/api/v1/posts",
+        Some(json!({ "title": "Bands", "content": content, "topic_ids": [topic], "status": "published" })),
+        &mia,
+    );
+    assert_eq!(h.ok("GET", &format!("/api/v1/files/{early_id}"), None, &mia)["post_id"], bands["id"]);
+    assert_eq!(fetch(&h, &early_path, &otto).status, 404);
+    // Someone else's upload doesn't move into your post.
+    let otto_file = upload(&h, &otto, "otto.png", None, PNG, None);
+    let otto_id = otto_file.body["id"].as_str().unwrap().to_string();
+    let edit = json!({ "edits": [{ "type": "append", "content": otto_file.body["markdown"] }] });
+    h.ok("POST", &format!("/api/v1/posts/{post}/edit"), Some(edit), &mia);
+    assert!(h.ok("GET", &format!("/api/v1/files/{otto_id}"), None, &otto)["post_id"].is_null());
+
+    // Listing by uploader, with paging.
+    let page = h.ok("GET", "/api/v1/files?uploaded_by=me&limit=1", None, &mia);
+    assert_eq!(page["items"].as_array().unwrap().len(), 1);
+    assert!(page["next_cursor"].is_string());
+    assert_eq!(h.ok("GET", &format!("/api/v1/files?uploaded_by={mia_id}"), None, &admin)["items"].as_array().unwrap().len(), 2);
+
+    // Only the uploader or an admin deletes a file, and deleting frees its storage.
+    assert_eq!(h.call("DELETE", &format!("/api/v1/files/{otto_id}"), None, &mia).status, 404);
+    h.ok("DELETE", &format!("/api/v1/files/{otto_id}"), None, &otto);
+    assert_eq!(count(&h, &format!("SELECT COUNT(*) FROM file_chunks WHERE file_id = '{otto_id}'")), 0);
+    assert_eq!(fetch(&h, otto_file.body["path"].as_str().unwrap(), &otto).status, 404);
+    h.ok("DELETE", &format!("/api/v1/files/{chart_id}"), None, &admin);
+
+    // Erasing a post erases its files.
+    h.ok("DELETE", &format!("/api/v1/posts/{}?permanent=true", bands["id"].as_str().unwrap()), None, &admin);
+    assert_eq!(count(&h, &format!("SELECT COUNT(*) FROM files WHERE id = '{early_id}'")), 0);
+    assert_eq!(count(&h, &format!("SELECT COUNT(*) FROM file_chunks WHERE file_id = '{early_id}'")), 0);
 }

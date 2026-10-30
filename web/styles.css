@@ -1141,3 +1141,6 @@ a.stat:hover { background: var(--bg-hover); text-decoration: none; }
   .sidebar, .topbar, .post-actions, .comments, .post-reactions, .toc, .toc-inline, .banner { display: none !important; }
   .page { padding: 0; }
 }
+
+/* Uploads: show where a dragged file will land in the editor. */
+.pane-write.is-dropping { outline: 2px dashed var(--accent); outline-offset: -4px; }

@@ -178,6 +178,7 @@ pub const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0002_oauth_client_seen.sql"),
     include_str!("migrations/0003_token_resource.sql"),
     include_str!("migrations/0004_activity_without_comment_bodies.sql"),
+    include_str!("migrations/0005_files.sql"),
 ];
 
 /// Brings the schema up to date. Safe to call on every start.

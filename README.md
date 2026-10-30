@@ -14,6 +14,7 @@ An open-source team knowledge base in the spirit of [Slab](https://slab.com), wr
 | --- | --- |
 | Posts | Markdown posts with live preview, drafts, publish/archive, templates, duplicate, trash and restore |
 | Rich content | Embeds (paste a YouTube, Vimeo, Loom, Google Docs/Sheets/Slides/Forms/Drive, Figma, Airtable or Miro link on its own line), callouts (`> [!NOTE]`, `[!TIP]`, `[!IMPORTANT]`, `[!WARNING]`, `[!CAUTION]`), tables, checklists, toggles (`<details>`), linked URLs |
+| Images and files | Paste, drop or upload screenshots and files into a post (10 MB each). Images show inline; other files download |
 | History | Every save is a version; diff any two versions and restore any of them |
 | Topics | Nested topics, private topics with members, pinned posts, follow topics |
 | Verification | Mark posts verified for N days; expired and stale docs surface in Insights |
@@ -74,6 +75,7 @@ claude mcp add --transport http dumbslab https://your-host/mcp --header "Authori
 - OpenAPI 3.1: `/api/v1/openapi.json`. Agent guide: `/llms.txt`.
 - Any operation by name: `POST /api/v1/operations/{name}` with the input as JSON.
 - Precise edits: `POST /api/v1/posts/{id}/edit` with find/replace, append/prepend, and section edits addressed by heading text. Pass `base_version` to get a 409 instead of overwriting someone else's change.
+- Images and files: `POST /api/v1/files` (`upload_file`) with `name`, the bytes as `data_base64` (up to 10 MB) and an optional `post_id`. It returns `markdown` to put in a post: `![name](/files/<id>/<name>)` shows an image, `[name](/files/<id>/<name>)` links a download. Fetch the bytes from `/files/<id>/<name>` with your token.
 - Polling: `GET /api/v1/activity?after_id=N`. Push: admins add webhooks signed with `x-dumbslab-signature: sha256=HMAC(secret, timestamp + "." + body)`.
 
 **CLI.**
@@ -91,6 +93,7 @@ Give each agent its own bot account (Settings → People → Add bot) and token.
 - **Roles.** Admins manage everything. Members write and organize. Viewers read, comment and react.
 - **Drafts** are visible only to their author and admins. So is the **trash**: a trashed post disappears for everyone else until it's restored.
 - **Private topics.** A post whose topics are all private is visible only to members of those topics. It is hidden from lists, search, activity and notifications for everyone else. Removing its last private topic is refused, because a post without topics is visible to everyone; to share it, add an org-wide topic.
+- **Files** are stored in the workspace database and open only for signed-in people. A file that belongs to a post (uploaded for it, or referenced when its uploader saves the post) opens only for people who can see that post. PNG, JPEG, GIF, WebP and AVIF images, recognized by their bytes, show inline; everything else, including SVG and HTML, downloads.
 - **Tokens** carry `read`, `write` and/or `admin` scopes. A token never exceeds its owner's role, and an MCP connection from a read-only token lists only read-only tools. Tokens can't change passwords, and a connected app can't create tokens or revoke other credentials unless it was granted `admin`.
 
 ## Architecture

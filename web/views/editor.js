@@ -193,7 +193,40 @@ const ACTIONS = [
   { id: 'embed', icon: 'video', label: 'Embed a video, doc or design', run: embed },
   { id: 'table', icon: 'table', label: 'Table', run: (ta) => insertBlock(ta, '| Column | Column |\n| --- | --- |\n| Cell | Cell |', 2, 6) },
   { id: 'hr', icon: 'minus', label: 'Divider', run: (ta) => insertBlock(ta, '---') },
+  'sep',
+  // Runs the editor's file picker (see mountEditor).
+  { id: 'upload', icon: 'paperclip', label: 'Upload an image or file' },
 ];
+
+// ---------------------------------------------------------------------------
+// Uploads: pasted, dropped or picked files become Markdown that shows them.
+
+const MAX_UPLOAD = 10 * 1024 * 1024;
+
+function readAsBase64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const url = String(reader.result);
+      resolve(url.slice(url.indexOf(',') + 1));
+    };
+    reader.onerror = () => reject(reader.error || new Error('Couldn’t read the file.'));
+    reader.readAsDataURL(file);
+  });
+}
+
+/** Files to upload from a paste. Rich text (Word, Sheets, web pages) also carries a picture of itself; paste its text instead. */
+function pastedFiles(data) {
+  if (!data || !data.files || !data.files.length) return [];
+  const types = [...data.types];
+  if (types.includes('text/html') && types.includes('text/plain') && data.getData('text/plain').trim()) return [];
+  return [...data.files];
+}
+
+function uploadError(name, err) {
+  const reason = err.status === 413 ? 'it’s larger than 10 MB.' : err.message;
+  return `Couldn’t upload “${name}”: ${reason}`;
+}
 
 /** Continues lists and quotes when pressing Enter; an empty item ends the list. */
 function continueList(ev, ta) {
@@ -312,6 +345,7 @@ function mountEditor(ctx, { post, initial, templates, startTemplate }) {
   let saved = { title: initial.title, content: initial.content, topic_ids: [...initial.topic_ids].sort(), is_template: !!initial.is_template };
   let dirty = false;
   let saving = false;
+  let uploads = 0;
 
   ctx.setTitle(post ? `Editing ${post.title}` : 'New post');
 
@@ -334,6 +368,69 @@ function mountEditor(ctx, { post, initial, templates, startTemplate }) {
   const statusBadge = h('span', { class: 'badge' });
   const wordCount = h('span', { class: 'muted small' });
 
+  // --- Uploads ---------------------------------------------------------------------------
+  const fileInput = h('input', { type: 'file', multiple: true, hidden: true, tabindex: '-1' });
+  const placeholderTag = Date.now().toString(36);
+  let placeholderSeq = 0;
+
+  /** Swaps an upload's placeholder for its Markdown (or removes it), leaving the caret where it was. */
+  function replacePlaceholder(placeholder, text) {
+    const at = ta.value.indexOf(placeholder);
+    if (at < 0) return; // deleted while uploading
+    const end = at + placeholder.length;
+    if (document.activeElement !== ta) {
+      ta.setRangeText(text, at, end, 'preserve');
+      ta.dispatchEvent(new Event('input', { bubbles: true }));
+      return;
+    }
+    const move = (pos) => (pos >= end ? pos + text.length - placeholder.length : pos > at ? at + text.length : pos);
+    const { selectionStart: s, selectionEnd: e } = ta;
+    replaceRange(ta, at, end, text, move(s), move(e));
+  }
+
+  async function uploadFiles(files) {
+    const ready = [];
+    for (const f of files) {
+      if (f.size > MAX_UPLOAD) toast(`“${f.name}” is larger than 10 MB, the most you can upload.`, { type: 'error' });
+      else if (!f.size) toast(`“${f.name}” is empty or a folder, so it wasn’t uploaded.`, { type: 'error' });
+      else ready.push(f);
+    }
+    if (!ready.length) return;
+    const placeholders = ready.map((f) => `![Uploading ${f.name.replace(/[[\]\\\n]/g, '')}…](#uploading-${placeholderTag}-${++placeholderSeq})`);
+    const { selectionStart: s, selectionEnd: e } = ta;
+    const lead = s > 0 && !/\s/.test(ta.value[s - 1]) ? ' ' : '';
+    const text = lead + placeholders.join('\n');
+    replaceRange(ta, s, e, text, s + text.length);
+    uploads += ready.length;
+    updateChrome();
+    // One at a time: the server runs requests in turn anyway.
+    for (const [i, f] of ready.entries()) {
+      try {
+        const data = await readAsBase64(f);
+        const r = await api.post('/files', {
+          name: f.name || 'pasted file',
+          content_type: f.type || undefined,
+          data_base64: data,
+          post_id: postId || undefined,
+        });
+        replacePlaceholder(placeholders[i], r.markdown);
+      } catch (err) {
+        replacePlaceholder(placeholders[i], '');
+        toast(uploadError(f.name, err), { type: 'error' });
+      } finally {
+        uploads -= 1;
+        updateChrome();
+      }
+    }
+  }
+
+  fileInput.addEventListener('change', () => {
+    const files = [...fileInput.files];
+    fileInput.value = '';
+    ta.focus();
+    uploadFiles(files);
+  });
+
   const toolbar = h('div', { class: 'toolbar', role: 'toolbar', 'aria-label': 'Formatting', 'aria-controls': 'editor-text' });
   ta.id = 'editor-text';
   for (const a of ACTIONS) {
@@ -343,7 +440,7 @@ function mountEditor(ctx, { post, initial, templates, startTemplate }) {
     }
     const b = h('button', { type: 'button', class: 'tool', title: a.keys ? `${a.label} (${a.keys})` : a.label, 'aria-label': a.label, tabindex: '-1' }, icon(a.icon, { size: 16 }));
     b.addEventListener('mousedown', (e) => e.preventDefault());
-    b.addEventListener('click', () => a.run(ta));
+    b.addEventListener('click', () => (a.run ? a.run(ta) : fileInput.click()));
     toolbar.appendChild(b);
   }
   const tools = [...toolbar.querySelectorAll('.tool')];
@@ -367,7 +464,32 @@ function mountEditor(ctx, { post, initial, templates, startTemplate }) {
   const previewTitle = h('h1', { class: 'post-title preview-title' });
   const previewBody = h('div', { class: 'prose post-body' });
   const previewPane = h('div', { class: 'pane pane-preview', id: 'pane-preview', role: 'tabpanel', 'aria-label': 'Preview' }, previewTitle, previewBody);
-  const writePane = h('div', { class: 'pane pane-write', id: 'pane-write', role: 'tabpanel', 'aria-label': 'Write' }, toolbar, ta);
+  const writePane = h('div', { class: 'pane pane-write', id: 'pane-write', role: 'tabpanel', 'aria-label': 'Write' }, toolbar, ta, fileInput);
+
+  // Paste or drop files into the text to upload them.
+  ta.addEventListener('paste', (e) => {
+    const files = pastedFiles(e.clipboardData);
+    if (!files.length) return;
+    e.preventDefault();
+    uploadFiles(files);
+  });
+  const draggingFiles = (e) => !!e.dataTransfer && [...e.dataTransfer.types].includes('Files');
+  writePane.addEventListener('dragover', (e) => {
+    if (!draggingFiles(e)) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'copy';
+    writePane.classList.add('is-dropping');
+  });
+  writePane.addEventListener('dragleave', (e) => {
+    if (!writePane.contains(e.relatedTarget)) writePane.classList.remove('is-dropping');
+  });
+  writePane.addEventListener('drop', (e) => {
+    writePane.classList.remove('is-dropping');
+    if (!draggingFiles(e)) return;
+    e.preventDefault();
+    ta.focus();
+    uploadFiles([...e.dataTransfer.files]);
+  });
 
   const tabWrite = h('button', { type: 'button', class: 'tab', role: 'tab', 'aria-selected': 'true', 'aria-controls': 'pane-write' }, 'Write');
   const tabPreview = h('button', { type: 'button', class: 'tab', role: 'tab', 'aria-selected': 'false', 'aria-controls': 'pane-preview' }, 'Preview');
@@ -437,7 +559,7 @@ function mountEditor(ctx, { post, initial, templates, startTemplate }) {
     const labels = { draft: 'Draft', published: 'Published', archived: 'Archived' };
     statusBadge.className = `badge badge-${status}`;
     statusBadge.textContent = postId ? labels[status] || status : 'New draft';
-    saveState.textContent = saving ? 'Saving…' : dirty ? 'Unsaved changes' : postId ? 'All changes saved' : '';
+    saveState.textContent = saving ? 'Saving…' : uploads ? 'Uploading…' : dirty ? 'Unsaved changes' : postId ? 'All changes saved' : '';
     saveState.classList.toggle('is-dirty', dirty);
     document.body.dataset.dirty = dirty ? '1' : '';
     actionsBox.replaceChildren(...actionButtons());

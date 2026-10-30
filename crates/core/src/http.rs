@@ -15,6 +15,21 @@ use crate::{HostConfig, Outcome, Request, Response, params};
 
 pub const API_PREFIX: &str = "/api/v1";
 
+/// The largest request body a host accepts.
+pub const MAX_BODY: usize = 8 * 1024 * 1024;
+/// Uploads carry a base64 file: the largest (`files::MAX_FILE_SIZE`, 10 MB) is about 13.3 MB
+/// encoded, and line breaks and the rest of the JSON need a little more.
+pub const MAX_UPLOAD_BODY: usize = 15 * 1024 * 1024;
+
+/// The largest request body a host should read for `path`, before it knows who's asking. Only
+/// the routes that can run `upload_file` get room for a file.
+pub fn body_limit(path: &str) -> usize {
+    match path.trim_end_matches('/') {
+        "/api/v1/files" | "/api/v1/operations/upload_file" | "/mcp" => MAX_UPLOAD_BODY,
+        _ => MAX_BODY,
+    }
+}
+
 /// Whether the core handles this path (everything else is the web app's static files).
 pub fn is_core_path(path: &str) -> bool {
     path == "/healthz"
@@ -24,6 +39,7 @@ pub fn is_core_path(path: &str) -> bool {
         || path.starts_with("/.well-known/oauth")
         || path == API_PREFIX
         || path.starts_with("/api/")
+        || path.starts_with("/files/")
 }
 
 /// Handles a request. `None` means the path isn't ours (the host serves static files).
@@ -37,6 +53,8 @@ pub fn handle(db: &dyn Db, cfg: &HostConfig, req: &Request) -> Option<Outcome> {
         crate::mcp::handle_http(db, cfg, req)
     } else if path.starts_with("/oauth/") || path.starts_with("/.well-known/oauth") {
         crate::oauth::handle(db, cfg, req)
+    } else if path.starts_with("/files/") {
+        crate::ops::files::serve(db, cfg, req)
     } else {
         let rest = path.strip_prefix(API_PREFIX)?;
         let r = api(db, cfg, req, rest);

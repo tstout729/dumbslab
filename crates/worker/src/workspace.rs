@@ -394,7 +394,7 @@ impl DurableObject for Workspace {
                             let full = ApiError::new(
                                 507,
                                 "storage_full",
-                                "This workspace has reached its storage limit. Delete old posts, or export it and self-host DumbSlab for unlimited space.",
+                                "This workspace has reached its storage limit. Delete old posts or uploaded files, or export it and self-host DumbSlab for unlimited space.",
                             );
                             return (Err(full), false);
                         }

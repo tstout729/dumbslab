@@ -9,6 +9,7 @@ use crate::registry::Op;
 
 pub mod admin;
 pub mod comments;
+pub mod files;
 pub mod meta;
 pub mod notifications;
 pub mod posts;
@@ -22,6 +23,7 @@ pub fn all() -> Vec<Op> {
     ops.extend(posts::ops());
     ops.extend(topics::ops());
     ops.extend(comments::ops());
+    ops.extend(files::ops());
     ops.extend(search::ops());
     ops.extend(notifications::ops());
     ops.extend(admin::ops());

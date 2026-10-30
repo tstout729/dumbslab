@@ -18,7 +18,9 @@ const INSTRUCTIONS: &str = "DumbSlab is a team knowledge base. Posts are Markdow
 Start with `search` or `list_topics`, read with `get_post`, and write with `create_post` (drafts by default; pass status \"published\" to share). \
 For changes to an existing post prefer `edit_post` (find/replace or section edits) and pass `base_version` from `get_post` so you never overwrite someone else's edit. \
 Link posts with /p/<id> URLs and mention people with @handle. \
-Put a YouTube, Vimeo, Loom, Google Docs/Sheets/Slides/Forms/Drive, Figma, Airtable or Miro link on a line of its own to embed it, and write callouts as `> [!NOTE]` (or TIP, IMPORTANT, WARNING, CAUTION). Every change is recorded in history (`list_post_versions`, `diff_post_versions`) and can be restored.";
+Put a YouTube, Vimeo, Loom, Google Docs/Sheets/Slides/Forms/Drive, Figma, Airtable or Miro link on a line of its own to embed it, and write callouts as `> [!NOTE]` (or TIP, IMPORTANT, WARNING, CAUTION). \
+To add an image or file, send it to `upload_file` as base64 (`data_base64`, up to 10 MB) and put the `markdown` it returns in the post: `![name](/files/<id>/<name>)` shows an image, `[name](/files/<id>/<name>)` links a download. \
+Every change is recorded in history (`list_post_versions`, `diff_post_versions`) and can be restored.";
 
 /// Which tools to expose. `core` keeps the list short; `call_operation` reaches everything else.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
