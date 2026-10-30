@@ -4572,27 +4572,30 @@ mod slack {
         h.user(&admin, "mo@acme.test", "Mo", "member");
         let post = h.ok("POST", "/api/v1/posts", Some(json!({ "title": "Shared", "status": "published" })), &admin);
         let form = "application/x-www-form-urlencoded";
-        let one_step = |job: &mut Job, replies: Vec<HttpReply>| {
+        // A host's step: the step and its own check in one transaction, rolled back on failure,
+        // and the notice to send then (the native server has no check of its own).
+        let one_step = |job: &mut Job, replies: Vec<HttpReply>, refuse: Option<dumbslab_core::ApiError>| {
             h.store
                 .with_tx(|db| {
-                    let step = connect::step(db, &h.cfg, job, replies, chrono::Utc::now());
+                    let (step, notice) = connect::guarded_step(db, &h.cfg, job, replies, chrono::Utc::now(), |_| refuse);
                     let ok = step.is_ok();
-                    (step, ok)
+                    ((step, notice), ok)
                 })
                 .unwrap()
         };
         let r = h.send(&signed_at("/slack/commands", &command_body("UMO", "new Rollback me"), form, now(), SECRET));
         let mut job = later_of(&r).unwrap();
-        let Ok(Step::Fetch(calls)) = one_step(&mut job, vec![]) else { panic!("asks who's asking") };
+        let (Ok(Step::Fetch(calls)), None) = one_step(&mut job, vec![], None) else { panic!("asks who's asking") };
 
         // Creating the post fails part-way (a database error): the step rolls back...
         db_run(&h, |db| db.execute_batch("DROP TABLE post_versions"));
         let posts = count(&h, "SELECT COUNT(*) FROM posts");
-        let failed = one_step(&mut job, calls.iter().map(slack_api).collect()).expect_err("the step fails");
+        let (step, notice) = one_step(&mut job, calls.iter().map(slack_api).collect(), None);
+        let failed = step.expect_err("the step fails");
         assert_eq!(failed.status, 500, "{failed:?}");
         assert_eq!(count(&h, "SELECT COUNT(*) FROM posts"), posts, "nothing was kept");
         // ...and the person hears so at the response_url, with nothing about why inside.
-        let notice = job.failure_notice(&failed).expect("a notice");
+        let notice = notice.expect("a notice");
         assert_eq!((notice.method, notice.url.as_str()), ("POST", REPLY_TO));
         assert!(!notice.headers.iter().any(|(k, _)| k == "authorization"));
         let body: Value = serde_json::from_str(notice.body.as_deref().unwrap()).unwrap();
@@ -4614,10 +4617,12 @@ mod slack {
             text_of(&serde_json::from_str::<Value>(search.failure_notice(&failed).unwrap().body.as_deref().unwrap()).unwrap())
                 .contains("Couldn't search DumbSlab")
         );
-        let Ok(Step::Fetch(calls)) = one_step(&mut search, vec![]) else { panic!() };
-        let Ok(Step::Fetch(answer)) = one_step(&mut search, calls.iter().map(slack_api).collect()) else { panic!() };
+        let (Ok(Step::Fetch(calls)), _) = one_step(&mut search, vec![], None) else { panic!() };
+        let (Ok(Step::Fetch(answer)), _) = one_step(&mut search, calls.iter().map(slack_api).collect(), None) else { panic!() };
         assert_eq!(answer[0].url, REPLY_TO);
-        assert!(search.failure_notice(&failed).is_none(), "answered already");
+        // The host sent that answer before the next step, so a failure there sends nothing more.
+        let (step, notice) = one_step(&mut search, vec![HttpReply { status: 200, body: "ok".into() }], Some(failed.clone()));
+        assert!(step.is_err() && notice.is_none(), "answered already");
         let r = h.send(&signed_at(
             "/slack/events",
             &event(&[post["url"].as_str().unwrap()], "UMO", "composer"),
@@ -4626,6 +4631,59 @@ mod slack {
             SECRET,
         ));
         assert!(later_of(&r).unwrap().failure_notice(&failed).is_none());
+    }
+
+    /// The Worker checks a step's storage after the step ran. A `/dumbslab new` step that made the
+    /// draft and prepared its answer, then grew a full workspace, is rolled back whole: no draft,
+    /// and the answer never goes. So the notice is decided from the job as it was before the step,
+    /// and the person hears exactly once.
+    #[test]
+    fn slack_drafts_refused_after_the_step_still_get_one_answer() {
+        use dumbslab_core::plan;
+        let (mut h, admin) = hosted(None);
+        h.cfg.connectors.key = Some("connector-key".into());
+        let r = h.call("PATCH", "/api/v1/slack", Some(json!({ "bot_token": TOKEN, "signing_secret": SECRET })), &admin);
+        assert!(matches!(drive(&h, job_of(&r).unwrap()).0, Finish::Fill(_)));
+        h.user(&admin, "mo@acme.test", "Mo", "member");
+        let full = plan::storage_full(&plans(None), plan::Plan::Free, false);
+
+        // The host's loop, with the Worker's storage guard refusing the second step.
+        let r =
+            h.send(&signed_at("/slack/commands", &command_body("UMO", "new Too big"), "application/x-www-form-urlencoded", now(), SECRET));
+        let mut job = later_of(&r).unwrap();
+        let (mut replies, mut sent, mut notices) = (vec![], vec![], vec![]);
+        for refuse in [None, Some(full.clone())] {
+            let (step, notice) = h
+                .store
+                .with_tx(|db| {
+                    let (step, notice) = connect::guarded_step(db, &h.cfg, &mut job, replies.clone(), chrono::Utc::now(), |_| refuse);
+                    let ok = step.is_ok();
+                    ((step, notice), ok)
+                })
+                .unwrap();
+            notices.extend(notice);
+            match step {
+                Ok(Step::Fetch(calls)) => {
+                    replies = calls.iter().map(slack_api).collect();
+                    sent.extend(calls);
+                }
+                Err(e) => {
+                    assert_eq!(e.code, "storage_full");
+                    break;
+                }
+                Ok(other) => panic!("{other:?}"),
+            }
+        }
+        // The core step had made the draft and prepared its answer before the guard refused it:
+        // asked afterwards, the job would say it had answered already.
+        assert!(job.failure_notice(&full).is_none());
+        // But the rollback kept nothing, the prepared answer never went, and one notice did.
+        assert_eq!(count(&h, "SELECT COUNT(*) FROM posts WHERE title = 'Too big'"), 0, "no draft remains");
+        assert!(sent.iter().all(|c| c.url != REPLY_TO), "{sent:?}");
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert_eq!((notices[0].method, notices[0].url.as_str()), ("POST", REPLY_TO));
+        let text = text_of(&serde_json::from_str::<Value>(notices[0].body.as_deref().unwrap()).unwrap());
+        assert!(text.contains("Couldn't create the draft. This workspace has reached its 50 MB storage limit"), "{text}");
     }
 
     /// Hosts record each job step's writes as soon as its transaction ends (the Worker's

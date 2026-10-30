@@ -616,7 +616,8 @@ async fn drive_job(state: &State, mut job: Job, cfg: &HostConfig) -> Result<(Fin
     let mut replies = vec![];
     let mut written = 0;
     for _ in 0..connect::MAX_STEPS {
-        // Who to tell if this step can't even run (the job goes with it).
+        // Who to tell if this step can't even run (the job goes with it). Like any failure
+        // notice, it's decided from the job as it is before the step.
         let unran = job.failure_notice(&ApiError::internal("the step didn't run"));
         let storage = state.storage();
         let step_cfg = cfg.clone();
@@ -625,17 +626,14 @@ async fn drive_job(state: &State, mut job: Job, cfg: &HostConfig) -> Result<(Fin
         let ran = transaction(&storage, db.clone(), move |db| {
             let before = sql.database_size() as u64;
             let mut job = job;
-            let mut step = connect::step(db, &step_cfg, &mut job, replies, Utc::now());
-            if let Some(e) = step_cfg
-                .hosting
-                .as_ref()
-                .filter(|_| step.is_ok() && !signs_in)
-                .and_then(|h| storage_refusal(db, h, before, sql.database_size() as u64))
-            {
-                step = Err(e);
-            }
+            // A step that grew a full workspace's storage is refused and rolled back, except a
+            // sign-in's. The notice comes from the job as it was before the step, which had
+            // perhaps prepared an answer the rollback undoes.
+            let hosting = step_cfg.hosting.clone().filter(|_| !signs_in);
+            let guard = |db: &dyn Db| hosting.as_ref().and_then(|h| storage_refusal(db, h, before, sql.database_size() as u64));
+            let (step, notice) = connect::guarded_step(db, &step_cfg, &mut job, replies, Utc::now(), guard);
             let ok = step.is_ok();
-            ((step, job), ok)
+            ((step, notice, job), ok)
         });
         // Nothing awaits between the step's transaction and this, so no other request sees the
         // allowance without this step's rows.
@@ -647,7 +645,7 @@ async fn drive_job(state: &State, mut job: Job, cfg: &HostConfig) -> Result<(Fin
         {
             console_error!("recording usage failed: {}", e.message);
         }
-        let (step, next) = match ran {
+        let (step, notice, next) = match ran {
             Ok(v) => v,
             Err(e) => {
                 notify_failure(unran).await;
@@ -659,7 +657,7 @@ async fn drive_job(state: &State, mut job: Job, cfg: &HostConfig) -> Result<(Fin
             Err(e) => {
                 // The step rolled back (a full workspace, a failed operation); whoever is waiting
                 // elsewhere (a Slack command) hears so.
-                notify_failure(job.failure_notice(&e)).await;
+                notify_failure(notice).await;
                 return Ok((Finish::Fail(e), vec![], written));
             }
             Ok(Step::Done(done)) => return Ok((done, job.take_effects(), written)),

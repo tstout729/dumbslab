@@ -536,18 +536,20 @@ fn take_job(effects: &mut Vec<Effect>) -> Option<connect::Job> {
 async fn run_job(app: &Arc<App>, mut job: connect::Job) -> connect::Finish {
     let mut replies = vec![];
     for _ in 0..connect::MAX_STEPS {
-        // Who to tell if this step can't even run (the job goes with it).
+        // Who to tell if this step can't even run (the job goes with it). Like any failure
+        // notice, it's decided from the job as it is before the step.
         let unran = job.failure_notice(&dumbslab_core::ApiError::internal("the step didn't run"));
         let app2 = app.clone();
         let ran = tokio::task::spawn_blocking(move || {
             app2.store.with_tx(|db| {
-                let step = connect::step(db, &app2.cfg, &mut job, replies, chrono::Utc::now());
+                // This server has no check of its own after a step (no plan, no storage limit).
+                let (step, notice) = connect::guarded_step(db, &app2.cfg, &mut job, replies, chrono::Utc::now(), |_| None);
                 let ok = step.is_ok();
-                ((step, job), ok)
+                ((step, notice, job), ok)
             })
         })
         .await;
-        let (step, next) = match ran {
+        let (step, notice, next) = match ran {
             Ok(Ok(v)) => v,
             Ok(Err(e)) => {
                 warn!("connected-apps job failed: {e:#}");
@@ -564,7 +566,7 @@ async fn run_job(app: &Arc<App>, mut job: connect::Job) -> connect::Finish {
         match step {
             Err(e) => {
                 // The step rolled back; whoever is waiting elsewhere (a Slack command) hears so.
-                notify_failure(app, job.failure_notice(&e)).await;
+                notify_failure(app, notice).await;
                 return connect::Finish::Fail(e);
             }
             Ok(connect::Step::Done(finish)) => {
