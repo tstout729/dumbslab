@@ -1862,6 +1862,86 @@ fn file_access_follows_posts() {
 // ---------------------------------------------------------------------------
 // Plans for hosted workspaces.
 
+#[test]
+fn imports_skip_what_exists_and_stay_quiet() {
+    let h = H::new();
+    let (_, admin) = h.setup();
+    let (_, member) = h.user(&admin, "mia@acme.test", "Mia Member", "member");
+    let (_, other) = h.user(&admin, "otto@acme.test", "Otto Other", "member");
+    let (_, viewer) = h.user(&admin, "vic@acme.test", "Vic Viewer", "viewer");
+    let docs = h.ok("POST", "/api/v1/topics", Some(json!({ "name": "Docs" })), &admin)["id"].as_str().unwrap().to_string();
+    h.ok("POST", "/api/v1/follows", Some(json!({ "target_type": "topic", "target_id": docs })), &viewer);
+
+    // Viewers can't import.
+    let one = json!({ "documents": [{ "title": "x", "content": "y" }] });
+    assert_eq!(h.call("POST", "/api/v1/import", Some(one), &viewer).status, 403);
+
+    // An image uploaded before the import joins the post that uses it.
+    let png = b"\x89PNG\r\n\x1a\nimported";
+    let file = upload(&h, &member, "diagram.png", None, png, None).body;
+    let batch = json!({ "skip_existing": true, "documents": [
+        { "title": "Home", "content": format!("Welcome @vic\n\n{}", file["markdown"].as_str().unwrap()), "topic": "Docs" },
+        { "title": "Runbook", "content": "Steps", "topic": "Docs/Ops" },
+        { "title": "Loose page", "content": "No topic" },
+    ] });
+    let first = h.ok("POST", "/api/v1/import", Some(batch.clone()), &member);
+    assert_eq!(first["created"].as_array().unwrap().len(), 3);
+    assert_eq!(first["topics_created"], 1);
+    let first_ids: Vec<&str> = first["results"].as_array().unwrap().iter().map(|r| r["id"].as_str().unwrap()).collect();
+    assert!(first["results"].as_array().unwrap().iter().all(|r| r["skipped"] == false));
+    assert_eq!(first["results"][1]["title"], "Runbook");
+    let home = first_ids[0];
+    let fid = file["id"].as_str().unwrap();
+    assert_eq!(h.ok("GET", &format!("/api/v1/files/{fid}"), None, &member)["post_id"], home);
+
+    // Imported pages don't notify topic followers or the people their text mentions.
+    let n = h.ok("GET", "/api/v1/notifications", None, &viewer);
+    assert!(n["items"].as_array().unwrap().iter().all(|x| !first_ids.contains(&x["post"]["id"].as_str().unwrap_or_default())), "{n}");
+    // The activity feed still records each new post.
+    let feed = h.ok("GET", &format!("/api/v1/activity?post_id={home}"), None, &viewer);
+    assert_eq!(feed["items"][0]["event"], "post.created");
+
+    // Running the same import again creates nothing and reports the posts it matched, in order.
+    let again = h.ok("POST", "/api/v1/import", Some(batch.clone()), &member);
+    assert!(again["created"].as_array().unwrap().is_empty(), "{again}");
+    assert_eq!(again["skipped"].as_array().unwrap().len(), 3);
+    assert_eq!(again["topics_created"], 0);
+    let again_ids: Vec<&str> = again["results"].as_array().unwrap().iter().map(|r| r["id"].as_str().unwrap()).collect();
+    assert_eq!(again_ids, first_ids);
+    assert!(again["results"].as_array().unwrap().iter().all(|r| r["skipped"] == true));
+
+    // The match is exact title in the same topic: other topics, other titles and trashed posts don't count.
+    h.ok("DELETE", &format!("/api/v1/posts/{}", first_ids[2]), None, &member);
+    let mixed = h.ok(
+        "POST",
+        "/api/v1/import",
+        Some(json!({ "skip_existing": true, "documents": [
+            { "title": "Runbook", "content": "Elsewhere", "topic": "Docs" },
+            { "title": "runbook", "content": "Case differs", "topic": "Docs/Ops" },
+            { "title": "Loose page", "content": "Back from the trash" },
+            { "title": "New page", "content": "a", "topic": "Docs" },
+            { "title": "New page", "content": "b", "topic": "Docs" },
+        ] })),
+        &member,
+    );
+    let skipped: Vec<bool> = mixed["results"].as_array().unwrap().iter().map(|r| r["skipped"].as_bool().unwrap()).collect();
+    assert_eq!(skipped, [false, false, false, false, true], "{mixed}");
+    assert_eq!(mixed["results"][4]["id"], mixed["results"][3]["id"]);
+
+    // Someone else's draft stays invisible, so it is neither matched nor revealed.
+    let draft =
+        json!({ "skip_existing": true, "documents": [{ "title": "Plans", "content": "draft", "topic": "Docs", "status": "draft" }] });
+    let mine = h.ok("POST", "/api/v1/import", Some(draft.clone()), &member);
+    let theirs = h.ok("POST", "/api/v1/import", Some(draft), &other);
+    assert_eq!(theirs["results"][0]["skipped"], false);
+    assert_ne!(theirs["results"][0]["id"], mine["results"][0]["id"]);
+
+    // Without `skip_existing`, an import still creates every document, as before.
+    let dup =
+        h.ok("POST", "/api/v1/import", Some(json!({ "documents": [{ "title": "Home", "content": "again", "topic": "Docs" }] })), &member);
+    assert_ne!(dup["created"][0]["id"], home);
+}
+
 fn plans(price: Option<&str>) -> dumbslab_core::plan::Plans {
     use dumbslab_core::plan::{Allowance, Plans};
     Plans {

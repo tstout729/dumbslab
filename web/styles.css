@@ -1182,3 +1182,25 @@ a.stat:hover { background: var(--bg-hover); text-decoration: none; }
 
 /* Uploads: show where a dragged file will land in the editor. */
 .pane-write.is-dropping { outline: 2px dashed var(--accent); outline-offset: -4px; }
+
+/* Settings › Import */
+.import-file:focus-visible + .btn { box-shadow: var(--focus-ring); }
+.import-sources { list-style: none; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.import-source { display: flex; flex-direction: column; gap: 6px; padding: 14px 16px; border: 1px solid var(--line); border-radius: var(--r-md); background: var(--bg-sunk); }
+.import-source strong { font-size: 14px; }
+.import-source p { line-height: 1.5; color: var(--ink-2); }
+.import-source .muted { color: var(--ink-3); }
+.import-stats { list-style: none; display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
+.import-stats li { display: flex; flex-direction: column; gap: 2px; padding: 10px 12px; border: 1px solid var(--line); border-radius: var(--r-md); }
+.import-stat-value { font-size: 18px; font-weight: 650; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.import-stat-label { font-size: 12.5px; color: var(--ink-3); }
+.import-tree { list-style: none; display: flex; flex-direction: column; gap: 4px; font-size: 14px; }
+.import-tree summary, .import-details summary { cursor: pointer; padding: 4px 0; }
+.import-tree summary .icon { vertical-align: -2px; color: var(--ink-3); }
+.import-list { margin: 4px 0 6px; padding-left: 22px; display: flex; flex-direction: column; gap: 3px; font-size: 13.5px; color: var(--ink-2); overflow-wrap: anywhere; }
+.import-list code { font-size: 12.5px; }
+.import-details summary { font-size: 14px; font-weight: 600; }
+@media (max-width: 640px) {
+  .import-sources { grid-template-columns: minmax(0, 1fr); }
+  .import-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}

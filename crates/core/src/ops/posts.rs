@@ -476,6 +476,12 @@ pub struct CreatePostInput {
 }
 
 pub fn create_post(ctx: &mut Ctx, input: CreatePostInput) -> ApiResult<Post> {
+    insert_post(ctx, input, true)
+}
+
+/// Creates a post. `notify: false` skips the notifications a first publish sends (topic
+/// followers and `@mentions`), for imports, whose text was written elsewhere.
+pub fn insert_post(ctx: &mut Ctx, input: CreatePostInput, notify: bool) -> ApiResult<Post> {
     ctx.actor.require_role(Role::Member)?;
     let title = required(&input.title, "title", 300)?;
     let mut content = input.content.unwrap_or_default();
@@ -522,7 +528,7 @@ pub fn create_post(ctx: &mut Ctx, input: CreatePostInput) -> ApiResult<Post> {
     search::index_post(ctx.db, &id)?;
     let uid = ctx.actor.user_id.clone();
     notify::follow(ctx, &uid, "post", &id)?;
-    if status == "published" {
+    if status == "published" && notify {
         on_first_publish(ctx, &id, &title, &content)?;
     }
     emit(ctx, Event::new("post.created", "post", &id, format!("created “{title}”")).post(&id).data(json!({ "status": status })))?;
