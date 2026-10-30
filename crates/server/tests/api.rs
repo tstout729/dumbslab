@@ -4357,6 +4357,58 @@ mod slack {
         assert!(later_of(&r).unwrap().failure_notice(&failed).is_none());
     }
 
+    /// Hosts record each job step's writes as soon as its transaction ends (the Worker's
+    /// `drive_job`), so a step that runs while other jobs wait on Slack is metered against them.
+    /// Here two overlapping commands each start a draft on a hosted workspace with room for one
+    /// more change: the first uses it up while the second waits on users.info, and the second is
+    /// refused at its next step, with the reason posted to its response_url.
+    #[test]
+    fn slack_job_steps_are_metered_as_they_go() {
+        use dumbslab_core::plan;
+        let (mut h, admin) = hosted(None);
+        h.cfg.connectors.key = Some("connector-key".into());
+        let r = h.call("PATCH", "/api/v1/slack", Some(json!({ "bot_token": TOKEN, "signing_secret": SECRET })), &admin);
+        assert!(matches!(drive(&h, job_of(&r).unwrap()).0, Finish::Fill(_)));
+        h.user(&admin, "mo@acme.test", "Mo", "member");
+        let form = "application/x-www-form-urlencoded";
+        let one_step = |job: &mut Job, replies: Vec<HttpReply>| -> Vec<HttpCall> {
+            let step = h
+                .store
+                .with_tx(|db| {
+                    let step = connect::step(db, &h.cfg, job, replies, chrono::Utc::now());
+                    let ok = step.is_ok();
+                    (step, ok)
+                })
+                .unwrap();
+            match step.unwrap() {
+                Step::Fetch(calls) => calls,
+                other => panic!("{other:?}"),
+            }
+        };
+        // What the host does once a step's transaction ends: count its rows right away.
+        let meter = |rows: u64| db_run(&h, |db| plan::record_writes(db, chrono::Utc::now(), rows));
+        let limit = plans(None).free.writes_per_day;
+
+        let first = h.send(&signed_at("/slack/commands", &command_body("UMO", "new First"), form, now(), SECRET));
+        let second = h.send(&signed_at("/slack/commands", &command_body("UMO", "new Second"), form, now(), SECRET));
+        let (mut a, mut b) = (later_of(&first).unwrap(), later_of(&second).unwrap());
+        // Both wait on users.info. One change's worth of the allowance is left.
+        let (asks_a, asks_b) = (one_step(&mut a, vec![]), one_step(&mut b, vec![]));
+        let used = db_run(&h, |db| plan::writes_24h(db, chrono::Utc::now()));
+        meter(limit - 1 - used);
+
+        // The first creates its draft, and its rows are counted as soon as its step ends, before
+        // it waits on the response_url.
+        let answer_a = one_step(&mut a, asks_a.iter().map(slack_api).collect());
+        assert!(text_of(&posted_answer(&answer_a)).contains("Started a draft"));
+        meter(20);
+        // So the second, which was waiting meanwhile, is refused, and hears why.
+        let answer_b = posted_answer(&one_step(&mut b, asks_b.iter().map(slack_api).collect()));
+        assert!(text_of(&answer_b).contains("changes are paused"), "{answer_b}");
+        let titles = db_run(&h, |db| db.query("SELECT title FROM posts WHERE title IN ('First', 'Second')", &[]));
+        assert_eq!(titles.iter().map(|r| r.str("title")).collect::<Vec<_>>(), vec!["First"]);
+    }
+
     #[test]
     fn slack_secrets_are_never_returned() {
         let (h, admin) = connected();

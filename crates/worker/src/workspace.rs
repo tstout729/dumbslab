@@ -298,40 +298,32 @@ impl Workspace {
         }
     }
 
-    /// Runs a connected-apps, sign-in or Slack job (see `dumbslab_core::connect::step`), sends the
-    /// webhooks its operations left, and counts its writes against the plan like the request's own.
+    /// Runs a connected-apps, sign-in or Slack job (see `dumbslab_core::connect::step`) and sends
+    /// the webhooks its operations left. Its writes count against the plan step by step (see
+    /// [`drive_job`]).
     async fn run_job(&self, job: Job, cfg: &HostConfig) -> Result<Finish> {
         let (finish, effects, written) = drive_job(&self.state, job, cfg).await?;
         send_webhooks(&self.state, effects);
         if let Some(h) = cfg.hosting.as_ref().filter(|_| written > 0) {
-            if let Err(e) = plan::record_writes(&self.db(), Utc::now(), written) {
-                console_error!("recording usage failed: {}", e.message);
-            }
             self.report_usage(&h.home, false);
         }
         Ok(finish)
     }
 
     /// Runs a job once the response has gone (Slack's commands and events: Slack wants an answer
-    /// within three seconds). Its steps are storage-checked and its writes metered like any job's;
-    /// the directory hears about them with this workspace's next report.
+    /// within three seconds). Its steps are storage-checked and metered like any job's (see
+    /// [`drive_job`]); the directory hears about them with this workspace's next report.
     fn run_job_later(&self, job: Job, cfg: HostConfig) {
         // The object's state outlives this request; the job holds its own handle to it.
         let raw: &JsValue = self.state.as_raw().as_ref();
         let state = State::from(raw.clone().unchecked_into::<worker::worker_sys::DurableObjectState>());
         self.state.wait_until(async move {
             match drive_job(&state, job, &cfg).await {
-                Ok((finish, effects, written)) => {
+                Ok((finish, effects, _)) => {
                     if let Finish::Fail(e) = finish {
                         console_warn!("a background job failed: {} ({})", e.message, e.code);
                     }
                     send_webhooks(&state, effects);
-                    if cfg.hosting.is_some()
-                        && written > 0
-                        && let Err(e) = plan::record_writes(&DoDb::new(state.storage().sql()), Utc::now(), written)
-                    {
-                        console_error!("recording usage failed: {}", e.message);
-                    }
                 }
                 Err(e) => console_error!("a background job failed: {e}"),
             }
@@ -614,8 +606,11 @@ impl DurableObject for Workspace {
 
 /// Runs a job's steps, each in its own transaction, sending the requests it asks for in between.
 /// A step that grows a full workspace's storage fails, except a sign-in's (like password
-/// sign-ins). Returns how it finished, the effects its operations left for the host (see
-/// `Job::take_effects`), and the rows its steps wrote.
+/// sign-ins). On hosted workspaces each step's rows count against the plan as soon as its
+/// transaction ends, rolled back or not, like a request's: while the job waits on another app,
+/// other requests and jobs on this object check the allowance against them. Returns how it
+/// finished, the effects its operations left for the host (see `Job::take_effects`), and the rows
+/// its steps wrote.
 async fn drive_job(state: &State, mut job: Job, cfg: &HostConfig) -> Result<(Finish, Vec<Effect>, u64)> {
     let signs_in = job.is_sign_in();
     let mut replies = vec![];
@@ -624,14 +619,14 @@ async fn drive_job(state: &State, mut job: Job, cfg: &HostConfig) -> Result<(Fin
         // Who to tell if this step can't even run (the job goes with it).
         let unran = job.failure_notice(&ApiError::internal("the step didn't run"));
         let storage = state.storage();
-        let cfg = cfg.clone();
+        let step_cfg = cfg.clone();
         let db = DoDb::new(storage.sql());
         let sql = db.sql.clone();
         let ran = transaction(&storage, db.clone(), move |db| {
             let before = sql.database_size() as u64;
             let mut job = job;
-            let mut step = connect::step(db, &cfg, &mut job, replies, Utc::now());
-            if let Some(e) = cfg
+            let mut step = connect::step(db, &step_cfg, &mut job, replies, Utc::now());
+            if let Some(e) = step_cfg
                 .hosting
                 .as_ref()
                 .filter(|_| step.is_ok() && !signs_in)
@@ -642,7 +637,16 @@ async fn drive_job(state: &State, mut job: Job, cfg: &HostConfig) -> Result<(Fin
             let ok = step.is_ok();
             ((step, job), ok)
         });
-        written += db.rows_written();
+        // Nothing awaits between the step's transaction and this, so no other request sees the
+        // allowance without this step's rows.
+        let rows = db.rows_written();
+        written += rows;
+        if cfg.hosting.is_some()
+            && rows > 0
+            && let Err(e) = plan::record_writes(&DoDb::new(state.storage().sql()), Utc::now(), rows)
+        {
+            console_error!("recording usage failed: {}", e.message);
+        }
         let (step, next) = match ran {
             Ok(v) => v,
             Err(e) => {
