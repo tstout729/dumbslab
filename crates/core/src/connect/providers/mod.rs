@@ -3,22 +3,28 @@
 use super::Connector;
 
 pub mod confluence;
+pub mod freshdesk;
 pub mod github;
 pub mod gitlab;
 pub mod google_drive;
 pub mod jira;
 pub mod linear;
 pub mod shortcut;
+pub mod slack;
 pub mod todoist;
+pub mod zendesk;
 
 /// Every app this build can connect to, in the order Settings shows them.
 pub static ALL: &[&dyn Connector] = &[
     &github::GitHub,
     &google_drive::GoogleDrive,
+    &slack::Slack,
     &jira::Jira,
     &confluence::Confluence,
+    &zendesk::Zendesk,
     &gitlab::GitLab,
     &linear::Linear,
+    &freshdesk::Freshdesk,
     &shortcut::Shortcut,
     &todoist::Todoist,
 ];
