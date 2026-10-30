@@ -334,10 +334,23 @@ const MAX_WORKSPACE_FAILURES: i64 = 200;
 pub fn password_keys(email: &str, client_ip: Option<&str>) -> Vec<(String, i64)> {
     let mut keys = vec![(format!("login:{}", sha256_hex(&email.trim().to_lowercase())), MAX_FAILURES)];
     if let Some(ip) = client_ip {
-        keys.push((format!("ip:{}", sha256_hex(ip)), MAX_CLIENT_FAILURES));
+        keys.push((format!("ip:{}", sha256_hex(&client_network(ip))), MAX_CLIENT_FAILURES));
     }
     keys.push(("workspace".into(), MAX_WORKSPACE_FAILURES));
     keys
+}
+
+/// The network a client address belongs to for sign-in limits. One IPv6 subscriber usually holds a
+/// whole /64, so its addresses count together; IPv4 addresses count one by one.
+fn client_network(ip: &str) -> String {
+    match ip.trim().parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V6(v6)) if v6.to_ipv4_mapped().is_none() => {
+            let s = v6.segments();
+            format!("{:x}:{:x}:{:x}:{:x}::/64", s[0], s[1], s[2], s[3])
+        }
+        Ok(addr) => addr.to_canonical().to_string(),
+        Err(_) => ip.trim().to_string(),
+    }
 }
 
 /// Rejects a password check, before any hashing, when one of its keys failed too often recently.
@@ -390,6 +403,15 @@ mod tests {
         let s = Scopes::parse("read").unwrap();
         assert!(s.read && !s.write && !s.admin);
         assert!(Scopes::parse("root").is_err());
+    }
+
+    #[test]
+    fn ipv6_clients_count_per_network() {
+        let key = |ip: &str| password_keys("a@b.c", Some(ip))[1].0.clone();
+        assert_eq!(key("2001:db8:1:2::1"), key("2001:db8:1:2:ffff::9"));
+        assert_ne!(key("2001:db8:1:2::1"), key("2001:db8:1:3::1"));
+        assert_eq!(key("::ffff:203.0.113.7"), key("203.0.113.7"));
+        assert_ne!(key("203.0.113.7"), key("203.0.113.8"));
     }
 
     #[test]
