@@ -7,6 +7,10 @@
 export const MAX_ZIP_BYTES = 1024 * 1024 * 1024;
 /** More entries than this is almost certainly not a wiki export. */
 export const MAX_ENTRIES = 200_000;
+/** The largest central directory read: 200,000 entries with long names take about 40 MB. */
+export const MAX_DIRECTORY_BYTES = 64 * 1024 * 1024;
+/** One directory record at its largest: 46 bytes plus a name, extra field and comment of up to 65,535 bytes each. */
+const MAX_RECORD_BYTES = 46 + 3 * 65535;
 /** The most one entry is ever inflated to, whatever the caller allows. */
 export const MAX_ENTRY_BYTES = 64 * 1024 * 1024;
 
@@ -83,6 +87,9 @@ export async function openZip(blob) {
   }
   if (count > MAX_ENTRIES) throw new ZipError(`This zip has ${count.toLocaleString('en-US')} files; the importer reads at most ${MAX_ENTRIES.toLocaleString('en-US')}.`);
   if (cdOffset + cdSize > blob.size) throw new ZipError('This zip is incomplete. Download the export again.');
+  // The directory is read whole, so its size is checked first: it can't be larger than its
+  // entries could ever need, or than any real export's.
+  if (cdSize > Math.min(count * MAX_RECORD_BYTES, MAX_DIRECTORY_BYTES)) throw new ZipError('This zip’s directory is damaged (it is larger than its files could need).');
   const cd = await bytesAt(blob, cdOffset, cdOffset + cdSize);
   const dv = view(cd);
   const entries = [];

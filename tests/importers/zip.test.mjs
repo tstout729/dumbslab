@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { makeZip } from './helpers.mjs';
-import { openZip, readEntry, ZipError, MAX_ZIP_BYTES, MAX_ENTRY_BYTES } from '../../web/importers/zip.js';
+import { openZip, readEntry, ZipError, MAX_ZIP_BYTES, MAX_ENTRY_BYTES, MAX_DIRECTORY_BYTES } from '../../web/importers/zip.js';
 import { zipSource, cleanPath, isJunk } from '../../web/importers/source.js';
 
 test('reads stored and deflated entries with UTF-8 names', async () => {
@@ -72,4 +72,44 @@ test('crafted sizes are refused before anything large is read', async () => {
   // The honest version reads.
   const honest = await makeZip({ 'a.bin': big });
   assert.equal((await readEntry(honest, (await openZip(honest)).entries[0])).length, big.length);
+});
+
+/** A Blob that records how much is read from it, beyond the end-record search at its tail. */
+function watched(blob) {
+  const reads = [];
+  return {
+    size: blob.size,
+    reads,
+    slice(a, b) {
+      reads.push(b - a);
+      return blob.slice(a, b);
+    },
+  };
+}
+
+/** An end-of-central-directory record claiming `count` entries in `cdSize` bytes at `cdOffset`. */
+function endRecord(count, cdSize, cdOffset) {
+  const end = new DataView(new ArrayBuffer(22));
+  end.setUint32(0, 0x06054b50, true);
+  end.setUint16(8, count, true);
+  end.setUint16(10, count, true);
+  end.setUint32(12, cdSize, true);
+  end.setUint32(16, cdOffset, true);
+  return new Uint8Array(end.buffer);
+}
+
+test('a directory larger than its entries could need is refused before it is read', async () => {
+  // One entry, and a 2 MB "directory" (the file really is that big, so only the size check stops it).
+  const padding = new Uint8Array(2 * 1024 * 1024);
+  const one = watched(new Blob([padding, endRecord(1, padding.length, 0)]));
+  await assert.rejects(openZip(one), /directory is damaged/);
+  assert.ok(Math.max(...one.reads) <= 65557 + 22, `read ${Math.max(...one.reads)} bytes`);
+  // Many entries can't claim more than the absolute cap either; nothing past the tail is read.
+  const huge = MAX_DIRECTORY_BYTES + 1;
+  const fake = { size: huge + 22, reads: [], slice(a, b) { this.reads.push(b - a); return new Blob([new Uint8Array(b - a - 22), endRecord(60000, huge, 0)]); } };
+  await assert.rejects(openZip(fake), /directory is damaged/);
+  assert.equal(fake.reads.length, 1);
+  // A real directory is well inside both.
+  const ok = await makeZip({ 'a.txt': 'x', 'b.txt': 'y' });
+  assert.equal((await openZip(watched(ok))).entries.length, 2);
 });
