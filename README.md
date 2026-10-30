@@ -13,7 +13,7 @@ An open-source team knowledge base, written in Rust and built so AI agents can d
 | Area | What you get |
 | --- | --- |
 | Posts | Markdown posts with live preview, drafts, publish/archive, templates, duplicate, trash and restore |
-| Rich content | Embeds (paste a YouTube, Vimeo, Loom, Google Docs/Sheets/Slides/Forms/Drive, Figma, Airtable or Miro link on its own line), callouts (`> [!NOTE]`, `[!TIP]`, `[!IMPORTANT]`, `[!WARNING]`, `[!CAUTION]`), tables, checklists, toggles (`<details>`), linked URLs |
+| Rich content | Embeds (paste a link on its own line: YouTube, Vimeo, Loom, Wistia, Google Docs/Sheets/Slides/Forms/Drive, Word/Excel/PowerPoint embed links from OneDrive or SharePoint, Figma, Canva, Miro, Lucid, Draw.io, Gliffy, Airtable, Smartsheet, monday.com, Mode, Typeform, Jotform, CodePen, JSFiddle, iorad, Ludus, SlideShare, Dropbox images and videos; X posts show as a link card), callouts (`> [!NOTE]`, `[!TIP]`, `[!IMPORTANT]`, `[!WARNING]`, `[!CAUTION]`), tables, checklists, toggles (`<details>`), linked URLs |
 | Images and files | Paste, drop or upload screenshots and files into a post (10 MB each). Images show inline; other files download |
 | History | Every save is a version; diff any two versions and restore any of them |
 | Topics | Nested topics, private topics with members, pinned posts, follow topics |
@@ -23,6 +23,7 @@ An open-source team knowledge base, written in Rust and built so AI agents can d
 | People | Admin, member and viewer roles, bot accounts, deactivation |
 | Notifications | Mentions, replies, comments and updates on followed posts, new posts in followed topics |
 | Admin | Workspace settings, API tokens with scopes, signed webhooks, JSON export, bulk Markdown import |
+| Connected apps | Everyone connects their own GitHub, Google Drive, Slack, Jira, Confluence, Zendesk, Asana, Box, Dropbox, Guru and more, to search them from DumbSlab and preview links to them in posts. See [docs/connected-apps.md](docs/connected-apps.md) |
 
 ## Quick start
 
@@ -40,6 +41,7 @@ Options (flags or environment variables):
 | `--bind` | `DUMBSLAB_BIND` | `127.0.0.1:8080` |
 | `--base-url` | `DUMBSLAB_BASE_URL` | the request's origin |
 | `--setup-token` | `DUMBSLAB_SETUP_TOKEN` | generated and logged |
+| | `DUMBSLAB_CONNECTOR_KEY` | unset: [connected apps](docs/connected-apps.md) are off |
 | `--open-setup` | | off (local development only: setup without a token) |
 | `--quill-host` | `DUMBSLAB_QUILL_HOST` | off: record sessions in this [Quill](https://github.com/164investments/quill) or other PostHog-compatible server |
 | `--quill-token` | `DUMBSLAB_QUILL_TOKEN` | off: that project's public `phc_` token |
@@ -123,6 +125,12 @@ cd crates/worker && npx wrangler dev --env dev   # the hosted Cloudflare build, 
 ```
 
 See [AGENTS.md](AGENTS.md) for conventions, which apply to people too.
+
+## Support
+
+[Report a bug](https://github.com/tstout729/dumbslab/issues/new?template=bug_report.yml) with steps to reproduce it and what you expected to happen. Public issues are visible to everyone; leave out passwords, tokens, workspace content and other private details.
+
+For account, billing or other private support, email [simplycoo+dumbslab@mail.grokbot.com](mailto:simplycoo+dumbslab@mail.grokbot.com).
 
 ## License
 

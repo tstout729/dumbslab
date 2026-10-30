@@ -74,6 +74,8 @@ PRO_WRITES_PER_DAY = "200000"
 # (50 million rows written a month, 5 GB stored); sign-ups and free writes pause past them.
 FREE_TOTAL_WRITES_PER_DAY = "1000000"
 FREE_TOTAL_STORAGE_MB = "4096"
+# Connected apps (docs/connected-apps.md): the CONNECTOR_KEY secret turns them on; `<APP>_CLIENT_ID`
+# here and the `<APP>_CLIENT_SECRET` secret let people sign in to that app, e.g. GITHUB_CLIENT_ID.
 STRIPE_PRICE_ID = ""
 # Optional: the customer portal settings scripts/stripe-setup.sh made (bpc_…).
 STRIPE_PORTAL_CONFIG = ""

@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Billing and private support
+    url: mailto:simplycoo+dumbslab@mail.grokbot.com
+    about: Email for billing, account access and other private support requests.
+  - name: Report a security vulnerability privately
+    url: https://github.com/tstout729/dumbslab/security/policy
+    about: Follow the private reporting instructions; do not open a public issue.

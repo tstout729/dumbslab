@@ -1575,6 +1575,54 @@ fn rich_content_embeds_callouts_and_bare_links() {
     assert!(preview["html"].as_str().unwrap().contains("https://player.vimeo.com/video/925549059?h=56f7392e1c"));
 }
 
+#[test]
+fn embeds_code_office_forms_files_and_posts() {
+    let h = H::new();
+    let (_, admin) = h.setup();
+    let (_, viewer) = h.user(&admin, "vic@acme.test", "Vic", "viewer");
+    let share = "https://1drv.ms/w/c/501d3fb1eb052268/EXyzEXyzEXyzEXyzEXyzEXyzEXyzEXyz?e=AbC123";
+    let content = format!(
+        "https://codepen.io/chriscoyier/pen/gfdDu\n\n\
+         https://1drv.ms/x/c/501d3fb1eb052268/IQTl3fqe7dWBR4yXmtb3biJLAcQq4RHDzlDdwrPC2xXOtUw?em=2\n\n\
+         https://acme.typeform.com/to/u6nXL7\n\n\
+         https://www.dropbox.com/s/abc123def456ghi/floor-plan.png?dl=0\n\n\
+         https://www.dropbox.com/s/abc123def456ghi/walkthrough.mp4?dl=0\n\n\
+         https://x.com/jack/status/20\n\n\
+         {share}"
+    );
+    let post = h.ok("POST", "/api/v1/posts", Some(json!({ "title": "Embeds", "content": content, "status": "published" })), &admin);
+    let got = h.ok("GET", &format!("/api/v1/posts/{}?format=html", post["id"].as_str().unwrap()), None, &viewer);
+    let html = got["html"].as_str().unwrap();
+
+    // Each frame's whole opening tag, found by its src.
+    let frame = |src: &str| -> String {
+        let start = html.find(&format!("<iframe src=\"{src}\"")).unwrap_or_else(|| panic!("no frame for {src}: {html}"));
+        html[start..start + html[start..].find('>').unwrap() + 1].to_string()
+    };
+    let code = frame("https://codepen.io/chriscoyier/embed/gfdDu?default-tab=result");
+    assert!(code.ends_with(" sandbox=\"allow-scripts allow-same-origin\">"), "{code}");
+    assert!(!code.contains("allow=") && !code.contains("allowfullscreen"), "{code}");
+    let excel = frame("https://1drv.ms/x/c/501d3fb1eb052268/IQTl3fqe7dWBR4yXmtb3biJLAcQq4RHDzlDdwrPC2xXOtUw?em=2");
+    assert!(excel.contains("title=\"Excel: ") && excel.contains("allow-forms allow-presentation\">"), "{excel}");
+    let form = frame("https://form.typeform.com/to/u6nXL7");
+    assert!(form.ends_with(" sandbox=\"allow-scripts allow-same-origin allow-popups allow-forms\">"), "{form}");
+    assert_eq!(html.matches("<iframe ").count(), 3, "{html}");
+
+    // Files show from Dropbox's content host; the X post is a card with no frame.
+    assert!(html.contains("<img src=\"https://dl.dropboxusercontent.com/s/abc123def456ghi/floor-plan.png\""), "{html}");
+    assert!(html.contains("<video src=\"https://dl.dropboxusercontent.com/s/abc123def456ghi/walkthrough.mp4\" controls"), "{html}");
+    assert!(
+        html.contains(
+            "<figure class=\"embed embed-card\"><a href=\"https://x.com/jack/status/20\" target=\"_blank\" rel=\"noopener noreferrer\">\
+             <span class=\"embed-card-title\">@jack</span><span class=\"embed-card-meta\">Post on X</span></a></figure>"
+        ),
+        "{html}"
+    );
+    // A OneDrive share link can't be framed, so it stays a plain link.
+    assert!(html.contains(&format!("<a href=\"{share}\"")), "{html}");
+    assert!(!html.contains("<iframe src=\"https://1drv.ms/w/"), "{html}");
+}
+
 // Uploaded images and files.
 
 const PNG: &[u8] = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR not really an image";
@@ -2182,4 +2230,469 @@ fn telemetry_settings_reach_the_web_app_only_when_configured() {
     h.cfg.telemetry = Telemetry::new(None, None, Some(dsn)).0;
     let telemetry = h.ok("GET", "/api/v1/auth/state", None, &cookie)["telemetry"].clone();
     assert_eq!((telemetry["quill"].clone(), telemetry["sentry"]["dsn"].clone()), (Value::Null, json!(dsn)));
+}
+
+// ---------------------------------------------------------------------------
+// Connected apps. The tests play the host: they run each job's steps with canned answers.
+
+mod connected {
+    use super::*;
+    use dumbslab_core::connect::{self, Finish, HttpCall, HttpReply, Job, OAuthApp, Step};
+
+    fn with_key(h: &mut H) {
+        h.cfg.connectors.key = Some("connector-key".into());
+    }
+
+    fn job_of(r: &Res) -> Job {
+        r.effects
+            .iter()
+            .find_map(|e| match e {
+                Effect::Connect(j) => Some(j.clone()),
+                _ => None,
+            })
+            .expect("a connected-apps job")
+    }
+
+    /// Runs a job, answering each step's requests with `answer`. Returns how it finished and every
+    /// request it made.
+    fn drive(h: &H, mut job: Job, answer: &dyn Fn(&HttpCall) -> HttpReply) -> (Finish, Vec<HttpCall>) {
+        let mut replies = vec![];
+        let mut sent = vec![];
+        for _ in 0..connect::MAX_STEPS {
+            let (step, next) = h
+                .store
+                .with_tx(|db| {
+                    let step = connect::step(db, &h.cfg, &mut job, replies.clone(), chrono::Utc::now());
+                    let ok = step.is_ok();
+                    ((step, job.clone()), ok)
+                })
+                .unwrap();
+            job = next;
+            match step.unwrap() {
+                Step::Done(f) => return (f, sent),
+                Step::Fetch(calls) => {
+                    replies = calls.iter().map(answer).collect();
+                    sent.extend(calls);
+                }
+            }
+        }
+        panic!("job didn't finish");
+    }
+
+    fn filled(r: &Res, finish: Finish) -> Value {
+        match finish {
+            Finish::Fill(v) => connect::fill(r.body.clone(), Ok(v)).expect("a placeholder to fill"),
+            other => panic!("expected a result, got {other:?}"),
+        }
+    }
+
+    /// Runs one step of a job.
+    fn step(h: &H, job: &mut Job, replies: Vec<HttpReply>) -> Step {
+        h.store
+            .with_tx(|db| {
+                let step = connect::step(db, &h.cfg, job, replies, chrono::Utc::now());
+                let ok = step.is_ok();
+                (step, ok)
+            })
+            .unwrap()
+            .unwrap()
+    }
+
+    fn fetches(step: Step) -> Vec<HttpCall> {
+        match step {
+            Step::Fetch(calls) => calls,
+            other => panic!("expected requests, got {other:?}"),
+        }
+    }
+
+    fn result(step: Step) -> Value {
+        match step {
+            Step::Done(Finish::Fill(v)) => v,
+            other => panic!("expected a result, got {other:?}"),
+        }
+    }
+
+    fn ok(body: Value) -> HttpReply {
+        HttpReply { status: 200, body: body.to_string() }
+    }
+
+    /// GitHub, answering as the account `ada` in org `acme`.
+    fn github(call: &HttpCall) -> HttpReply {
+        let url = call.url.as_str();
+        if url.ends_with("/user") {
+            ok(json!({ "login": "ada" }))
+        } else if url.contains("/user/orgs") {
+            ok(json!([{ "login": "acme" }]))
+        } else if url.contains("/search/issues") {
+            ok(
+                json!({ "items": [{ "title": "Deploy fails", "html_url": "https://github.com/acme/api/issues/7", "number": 7, "state": "open",
+                "repository_url": "https://api.github.com/repos/acme/api", "user": { "login": "bo" } }] }),
+            )
+        } else if url.contains("/search/repositories") {
+            ok(json!({ "items": [] }))
+        } else if url.contains("/repos/acme/api/issues/7") {
+            ok(
+                json!({ "title": "Deploy fails", "html_url": "https://github.com/acme/api/issues/7", "state": "open", "user": { "login": "bo" } }),
+            )
+        } else if url.contains("login/oauth/access_token") {
+            ok(json!({ "access_token": "gho_from_oauth", "token_type": "bearer" }))
+        } else {
+            HttpReply { status: 404, body: "{}".into() }
+        }
+    }
+
+    fn connect_github(h: &H, auth: &Auth) {
+        let r = h.call("POST", "/api/v1/connections", Some(json!({ "app": "github", "fields": { "token": "ghp_secret_token" } })), auth);
+        assert_eq!(r.status, 200, "{}", r.body);
+        let (finish, sent) = drive(h, job_of(&r), &github);
+        assert!(sent.iter().all(|c| c.headers.contains(&("authorization".into(), "Bearer ghp_secret_token".into()))));
+        let v = filled(&r, finish);
+        assert_eq!(v["connection"]["account"], "@ada", "{v}");
+    }
+
+    #[test]
+    fn people_connect_and_search_their_own_apps() {
+        let mut h = H::new();
+        let (admin, admin_token) = h.setup();
+        let (_, mo) = h.user(&admin, "mo@acme.test", "Mo", "member");
+
+        // Without a connector key, nothing can be connected.
+        let list = h.ok("GET", "/api/v1/connections", None, &admin);
+        assert_eq!(list["enabled"], false);
+        assert_eq!(h.call("POST", "/api/v1/connections", Some(json!({ "app": "github", "fields": { "token": "t" } })), &admin).status, 503);
+
+        with_key(&mut h);
+        let list = h.ok("GET", "/api/v1/connections", None, &admin);
+        let gh = list["apps"].as_array().unwrap().iter().find(|a| a["id"] == "github").unwrap().clone();
+        assert_eq!((gh["sign_in"].as_bool(), gh["search"].as_bool(), gh["preview"].as_bool()), (Some(false), Some(true), Some(true)));
+        assert!(gh["connected"].is_null());
+        let bad = |fields: Value| h.call("POST", "/api/v1/connections", Some(json!({ "app": "github", "fields": fields })), &admin).status;
+        assert_eq!(bad(json!({})), 400, "a token is required");
+        assert_eq!(bad(json!({ "token": "t", "password": "x" })), 400, "unknown fields are refused");
+        assert_eq!(h.call("POST", "/api/v1/connections", Some(json!({ "app": "nope" })), &admin).status, 400);
+        assert_eq!(
+            h.call("POST", "/api/v1/connections", Some(json!({ "app": "google-drive", "fields": { "token": "t" } })), &admin).status,
+            400
+        );
+
+        // A bad token is refused and nothing is saved.
+        let r = h.call("POST", "/api/v1/connections", Some(json!({ "app": "github", "fields": { "token": "wrong" } })), &admin);
+        let (finish, _) = drive(&h, job_of(&r), &|_| HttpReply { status: 401, body: "{}".into() });
+        assert!(matches!(finish, Finish::Fail(ref e) if e.message.contains("rejected")), "{finish:?}");
+        assert_eq!(count(&h, "SELECT COUNT(*) FROM connections"), 0);
+
+        connect_github(&h, &admin);
+        // The token is encrypted at rest and never comes back.
+        let secret: String =
+            h.store.with_tx(|db| (db.one("SELECT secret FROM connections", &[]).unwrap().unwrap().str("secret"), true)).unwrap();
+        assert!(!secret.contains("ghp_secret_token"));
+        let list = h.ok("GET", "/api/v1/connections", None, &admin);
+        assert!(!list.to_string().contains("ghp_secret_token"));
+        let gh = list["apps"].as_array().unwrap().iter().find(|a| a["id"] == "github").unwrap().clone();
+        assert_eq!(gh["connected"]["account"], "@ada");
+
+        // Search uses the person's own token and scope; results fill the answer over REST and MCP.
+        let r = h.call("GET", "/api/v1/search/connected?q=deploy", None, &admin);
+        assert_eq!(r.status, 200, "{}", r.body);
+        let (finish, sent) = drive(&h, job_of(&r), &github);
+        assert!(sent[0].url.contains("q=deploy%20user%3Aada%20org%3Aacme"), "{:?}", sent[0].url);
+        let v = filled(&r, finish);
+        assert_eq!(v["items"][0]["title"], "Deploy fails");
+        assert_eq!(v["apps"][0]["ok"], true);
+        let via_mcp = h.mcp(&admin_token, "", json!({ "jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": { "name": "search_connected", "arguments": { "q": "deploy" } } }));
+        let (finish, _) = drive(&h, job_of(&via_mcp), &github);
+        let v = filled(&via_mcp, finish);
+        assert_eq!(v["result"]["structuredContent"]["items"][0]["kind"], "issue");
+
+        // Someone else has no connections, so nothing is searched for them.
+        let r = h.call("GET", "/api/v1/search/connected?q=deploy", None, &mo);
+        assert!(r.effects.is_empty());
+        assert_eq!(r.body["items"], json!([]));
+
+        // Previews: a connected app's link is read with the viewer's account.
+        let r = h.call("GET", "/api/v1/connections/preview?url=https%3A%2F%2Fgithub.com%2Facme%2Fapi%2Fissues%2F7", None, &admin);
+        let (finish, _) = drive(&h, job_of(&r), &github);
+        let v = filled(&r, finish);
+        assert_eq!((v["app"].as_str(), v["preview"]["reference"].as_str()), (Some("github"), Some("acme/api #7")));
+        // Not connected: the app is named so the UI can suggest connecting it, and nothing is fetched.
+        let r = h.call("GET", "/api/v1/connections/preview?url=https%3A%2F%2Fgithub.com%2Facme%2Fapi%2Fissues%2F7", None, &mo);
+        assert!(r.effects.is_empty());
+        assert_eq!((r.body["app"].as_str(), r.body["connected"].as_bool()), (Some("github"), Some(false)));
+        // Apps on a customer's own address too.
+        for (url, app) in [("https://acme.atlassian.net/browse/OPS-12", "jira"), ("https://acme.monday.com/boards/1/pulses/2", "monday")] {
+            let r = h.call("GET", &format!("/api/v1/connections/preview?url={}", urlencoding::encode(url)), None, &mo);
+            assert_eq!((r.body["app"].as_str(), r.body["connected"].as_bool()), (Some(app), Some(false)), "{url}");
+        }
+        let r = h.call("GET", "/api/v1/connections/preview?url=https%3A%2F%2Fexample.com%2Fx", None, &admin);
+        assert!(r.effects.is_empty() && r.body["app"].is_null());
+
+        // Disconnecting forgets the credentials.
+        h.ok("DELETE", "/api/v1/connections/github", None, &admin);
+        assert_eq!(count(&h, "SELECT COUNT(*) FROM connections"), 0);
+        assert_eq!(h.call("DELETE", "/api/v1/connections/github", None, &admin).status, 404);
+    }
+
+    #[test]
+    fn signing_in_with_an_app() {
+        let mut h = H::new();
+        let (admin, _) = h.setup();
+        let (_, mo) = h.user(&admin, "mo@acme.test", "Mo", "member");
+        with_key(&mut h);
+        assert_eq!(h.call("POST", "/api/v1/connections", Some(json!({ "app": "github" })), &admin).status, 400, "no OAuth app yet");
+        h.cfg.connectors.apps.insert("github".into(), OAuthApp { client_id: "cid".into(), client_secret: "csecret".into() });
+        assert_eq!(h.ok("GET", "/api/v1/connections", None, &admin)["apps"][0]["sign_in"], true);
+
+        let start = |auth: &Auth| {
+            let url =
+                h.ok("POST", "/api/v1/connections", Some(json!({ "app": "github" })), auth)["authorize_url"].as_str().unwrap().to_string();
+            assert!(url.starts_with("https://github.com/login/oauth/authorize?"), "{url}");
+            let q = query_of(&url);
+            assert_eq!((q["client_id"].as_str(), q["redirect_uri"].as_str()), ("cid", "https://kb.test/connect/callback"));
+            assert_eq!(q["scope"], "repo read:org");
+            q["state"].clone()
+        };
+        let callback = |state: &str, auth: &Auth| {
+            h.call("GET", &format!("/connect/callback?code=the-code&state={}", urlencoding::encode(state)), None, auth)
+        };
+        let location = |r: &Res| r.header("location").unwrap_or_default().to_string();
+
+        // The person who started must be the one coming back.
+        let state = start(&admin);
+        let r = callback(&state, &mo);
+        assert!(r.effects.is_empty() && location(&r).contains("connect_error="), "{}", location(&r));
+        assert!(location(&callback(&state, &admin)).contains("no%20longer%20valid"), "a state works once");
+
+        // Success: the code is exchanged with the client secret, the account read, and the person sent to Settings.
+        let state = start(&admin);
+        let r = callback(&state, &admin);
+        let (finish, sent) = drive(&h, job_of(&r), &github);
+        let exchange = &sent[0];
+        assert_eq!(exchange.url, "https://github.com/login/oauth/access_token");
+        let body = exchange.body.clone().unwrap();
+        assert!(
+            body.contains("code=the-code")
+                && body.contains("client_secret=csecret")
+                && body.contains("redirect_uri=https%3A%2F%2Fkb.test%2Fconnect%2Fcallback"),
+            "{body}"
+        );
+        assert!(sent[1].headers.contains(&("authorization".into(), "Bearer gho_from_oauth".into())));
+        assert!(matches!(&finish, Finish::Redirect(u) if u == "https://kb.test/settings/connections?connected=github"), "{finish:?}");
+        assert_eq!(h.ok("GET", "/api/v1/connections", None, &admin)["apps"][0]["connected"]["account"], "@ada");
+
+        // The app saying no lands back in Settings with its reason.
+        let state = start(&admin);
+        let r = h.call(
+            "GET",
+            &format!("/connect/callback?error=access_denied&error_description=The+user+said+no&state={}", urlencoding::encode(&state)),
+            None,
+            &admin,
+        );
+        assert!(r.effects.is_empty() && location(&r).contains("said%20no"), "{}", location(&r));
+
+        // Hosted workspaces name themselves in the state, so the root domain can forward the person.
+        let mut hosted = h;
+        hosted.cfg.workspace = Some("acme".into());
+        let url = hosted.ok("POST", "/api/v1/connections", Some(json!({ "app": "github" })), &admin)["authorize_url"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(query_of(&url)["state"].starts_with("acme."));
+    }
+
+    #[test]
+    fn a_late_refresh_never_lands_on_a_replaced_connection() {
+        let mut h = H::new();
+        let (admin, _) = h.setup();
+        with_key(&mut h);
+        h.cfg.connectors.apps.insert("gitlab".into(), OAuthApp { client_id: "gl".into(), client_secret: "glsecret".into() });
+        let user_id = h.ok("GET", "/api/v1/me", None, &admin)["user"]["id"].as_str().unwrap().to_string();
+        // A gitlab.com connection whose token has expired.
+        let cred = connect::Credential { token: "com-old".into(), refresh_token: Some("com-refresh".into()), ..Default::default() };
+        let sealed = connect::seal("connector-key", &user_id, "gitlab", &cred).unwrap();
+        let past = dumbslab_core::util::ts(chrono::Utc::now() - chrono::Duration::hours(1));
+        h.store
+            .with_tx(|db| {
+                (db.execute(
+                    "INSERT INTO connections (user_id, provider, account, settings, secret, expires_at, created_at, updated_at) VALUES (?, 'gitlab', '@ada', ?, ?, ?, ?, ?)",
+                    &dumbslab_core::params![user_id.clone(), json!({ "host": "gitlab.com", "username": "ada" }).to_string(), sealed, past.clone(), past.clone(), past.clone()],
+                ), true)
+            })
+            .unwrap()
+            .unwrap();
+        let preview =
+            |url: &str| job_of(&h.call("GET", &format!("/api/v1/connections/preview?url={}", urlencoding::encode(url)), None, &admin));
+
+        // A preview starts refreshing the gitlab.com token...
+        let mut late = preview("https://gitlab.com/acme/api/-/issues/3");
+        assert!(fetches(step(&h, &mut late, vec![]))[0].url.starts_with("https://gitlab.com/oauth/token"));
+        // ...while the person connects their own GitLab server instead.
+        let fields = json!({ "app": "gitlab", "fields": { "token": "self-token", "base_url": "https://gitlab.example.com" } });
+        let r = h.call("POST", "/api/v1/connections", Some(fields), &admin);
+        let (finish, _) = drive(&h, job_of(&r), &|_: &HttpCall| ok(json!({ "username": "ada" })));
+        assert!(filled(&r, finish)["connection"]["account"].as_str().unwrap().contains("gitlab.example.com"));
+
+        // The gitlab.com tokens arrive late: they're dropped, not saved over the new connection.
+        let tokens = ok(json!({ "access_token": "com-new", "refresh_token": "com-refresh-2", "expires_in": 7200 }));
+        let v = result(step(&h, &mut late, vec![tokens]));
+        assert!(v["error"].as_str().unwrap().contains("connected again"), "{v}");
+        let secret = h.store.with_tx(|db| (db.one("SELECT secret FROM connections", &[]).unwrap().unwrap().str("secret"), true)).unwrap();
+        assert_eq!(connect::open("connector-key", &user_id, "gitlab", &secret).unwrap().token, "self-token");
+        // So the new server only ever gets its own token.
+        let (_, sent) = drive(&h, preview("https://gitlab.example.com/acme/api/-/issues/3"), &|_: &HttpCall| ok(json!({ "title": "x" })));
+        assert!(sent[0].url.starts_with("https://gitlab.example.com/"));
+        assert!(sent[0].headers.contains(&("authorization".into(), "Bearer self-token".into())), "{sent:?}");
+    }
+
+    #[test]
+    fn previews_follow_the_connection_as_it_is_now() {
+        let mut h = H::new();
+        let (admin, _) = h.setup();
+        with_key(&mut h);
+        h.cfg.connectors.apps.insert("gitlab".into(), OAuthApp { client_id: "gl".into(), client_secret: "glsecret".into() });
+        let user_id = h.ok("GET", "/api/v1/me", None, &admin)["user"]["id"].as_str().unwrap().to_string();
+        let gitlab_com = |expires: chrono::DateTime<chrono::Utc>| {
+            let cred = connect::Credential { token: "com-old".into(), refresh_token: Some("com-refresh".into()), ..Default::default() };
+            let sealed = connect::seal("connector-key", &user_id, "gitlab", &cred).unwrap();
+            let (expires, now) = (dumbslab_core::util::ts(expires), dumbslab_core::util::ts(chrono::Utc::now()));
+            let settings = json!({ "host": "gitlab.com", "username": "ada" }).to_string();
+            h.store
+                .with_tx(|db| {
+                    db.execute("DELETE FROM connections", &[]).unwrap();
+                    (db.execute(
+                        "INSERT INTO connections (user_id, provider, account, settings, secret, expires_at, created_at, updated_at) VALUES (?, 'gitlab', '@ada', ?, ?, ?, ?, ?)",
+                        &dumbslab_core::params![user_id.clone(), settings, sealed, expires, now.clone(), now],
+                    ), true)
+                })
+                .unwrap()
+                .unwrap();
+        };
+        let own_server = || {
+            let fields = json!({ "app": "gitlab", "fields": { "token": "self-token", "base_url": "https://gitlab.example.com" } });
+            drive(&h, job_of(&h.call("POST", "/api/v1/connections", Some(fields), &admin)), &|_: &HttpCall| {
+                ok(json!({ "username": "ada" }))
+            });
+        };
+        let link = format!("/api/v1/connections/preview?url={}", urlencoding::encode("https://gitlab.com/acme/api/-/issues/3"));
+        let preview = || job_of(&h.call("GET", &link, None, &admin));
+        let error = |step: Step| result(step)["error"].as_str().unwrap_or_default().to_string();
+        let (past, later) = (chrono::Utc::now() - chrono::Duration::hours(1), chrono::Utc::now() + chrono::Duration::hours(1));
+
+        // The refresh is refused because the person connected their own server meanwhile: the
+        // gitlab.com link isn't on that server, so nothing is fetched from it.
+        gitlab_com(past);
+        let mut job = preview();
+        fetches(step(&h, &mut job, vec![]));
+        own_server();
+        let refused = HttpReply { status: 400, body: json!({ "error": "invalid_grant" }).to_string() };
+        assert!(error(step(&h, &mut job, vec![refused])).contains("connected again"));
+        // The same when the change comes before the preview starts.
+        gitlab_com(later);
+        let mut job = preview();
+        own_server();
+        assert!(error(step(&h, &mut job, vec![])).contains("connected again"));
+        // A disconnected app's token isn't used at all.
+        gitlab_com(later);
+        let mut job = preview();
+        h.ok("DELETE", "/api/v1/connections/gitlab", None, &admin);
+        assert!(error(step(&h, &mut job, vec![])).contains("isn't connected any more"));
+    }
+
+    #[test]
+    fn expired_tokens_are_refreshed_first() {
+        let mut h = H::new();
+        let (admin, _) = h.setup();
+        with_key(&mut h);
+        h.cfg.connectors.apps.insert("google-drive".into(), OAuthApp { client_id: "gid".into(), client_secret: "gsecret".into() });
+        h.cfg.connectors.apps.insert("linear".into(), OAuthApp { client_id: "lid".into(), client_secret: "lsecret".into() });
+        let user_id = h.ok("GET", "/api/v1/me", None, &admin)["user"]["id"].as_str().unwrap().to_string();
+        // A Drive connection whose access token expired an hour ago.
+        let cred = connect::Credential { token: "old".into(), refresh_token: Some("refresh-1".into()), ..Default::default() };
+        let sealed = connect::seal("connector-key", &user_id, "google-drive", &cred).unwrap();
+        let past = dumbslab_core::util::ts(chrono::Utc::now() - chrono::Duration::hours(1));
+        // And an expired Linear one: Linear only previews links, so searching leaves it alone.
+        let linear = connect::seal("connector-key", &user_id, "linear", &cred).unwrap();
+        h.store
+            .with_tx(|db| {
+                let insert = "INSERT INTO connections (user_id, provider, account, settings, secret, expires_at, created_at, updated_at) VALUES (?, ?, 'ada@acme.test', '{}', ?, ?, ?, ?)";
+                for (app, sealed) in [("google-drive", &sealed), ("linear", &linear)] {
+                    db.execute(insert, &dumbslab_core::params![user_id.clone(), app, sealed.clone(), past.clone(), past.clone(), past.clone()]).unwrap();
+                }
+                ((), true)
+            })
+            .unwrap();
+        let r = h.call("GET", "/api/v1/search/connected?q=budget", None, &admin);
+        let (finish, sent) = drive(&h, job_of(&r), &|c: &HttpCall| {
+            if c.url.contains("oauth2.googleapis.com/token") {
+                ok(json!({ "access_token": "new", "expires_in": 3600 }))
+            } else {
+                ok(
+                    json!({ "files": [{ "name": "Budget", "mimeType": "application/vnd.google-apps.spreadsheet", "webViewLink": "https://docs.google.com/x" }] }),
+                )
+            }
+        });
+        assert!(
+            sent[0].body.as_deref().unwrap().contains("grant_type=refresh_token")
+                && sent[0].body.as_deref().unwrap().contains("refresh_token=refresh-1")
+        );
+        assert!(sent[1].headers.contains(&("authorization".into(), "Bearer new".into())), "searches with the new token");
+        assert!(!sent.iter().any(|c| c.url.contains("linear")), "{sent:?}");
+        let v = filled(&r, finish);
+        assert_eq!((v["items"][0]["kind"].as_str(), v["apps"].as_array().unwrap().len()), (Some("spreadsheet"), 1), "{v}");
+        // The new token was saved, encrypted.
+        let (secret, expires): (String, String) = h
+            .store
+            .with_tx(|db| {
+                let row = db.one("SELECT secret, expires_at FROM connections WHERE provider = 'google-drive'", &[]).unwrap().unwrap();
+                ((row.str("secret"), row.str("expires_at")), true)
+            })
+            .unwrap();
+        assert_eq!(connect::open("connector-key", &user_id, "google-drive", &secret).unwrap().token, "new");
+        assert!(expires > dumbslab_core::util::ts(chrono::Utc::now()));
+
+        // Two searches at once. Refresh tokens that work only once (Box, Atlassian) mean only the
+        // first may refresh; the second keeps using the current token, still good for a while.
+        let set = |token: &str, refresh: &str, expires: String| {
+            let cred = connect::Credential { token: token.into(), refresh_token: Some(refresh.into()), ..Default::default() };
+            let sealed = connect::seal("connector-key", &user_id, "google-drive", &cred).unwrap();
+            h.store
+                .with_tx(|db| {
+                    (
+                        db.execute(
+                            "UPDATE connections SET secret = ?, expires_at = ? WHERE provider = 'google-drive'",
+                            &dumbslab_core::params![sealed, expires],
+                        ),
+                        true,
+                    )
+                })
+                .unwrap()
+                .unwrap();
+        };
+        let search = || job_of(&h.call("GET", "/api/v1/search/connected?q=budget", None, &admin));
+        let bearer = |calls: &[HttpCall]| {
+            calls.iter().find_map(|c| c.headers.iter().find(|(k, _)| k == "authorization").map(|(_, v)| v.clone())).unwrap_or_default()
+        };
+        set("new", "refresh-2", dumbslab_core::util::ts(chrono::Utc::now() + chrono::Duration::minutes(2)));
+        let (mut first, mut second) = (search(), search());
+        let refreshing = fetches(step(&h, &mut first, vec![]));
+        assert!(refreshing[0].body.as_deref().unwrap().contains("refresh_token=refresh-2"));
+        assert_eq!(bearer(&fetches(step(&h, &mut second, vec![]))), "Bearer new", "the second searches with the current token");
+        let tokens = ok(json!({ "access_token": "newer", "refresh_token": "refresh-3", "expires_in": 3600 }));
+        assert_eq!(bearer(&fetches(step(&h, &mut first, vec![tokens]))), "Bearer newer");
+
+        // Once the token has expired, the second asks to try again, not to reconnect.
+        set("newer", "refresh-3", past.clone());
+        let (mut first, mut second) = (search(), search());
+        fetches(step(&h, &mut first, vec![]));
+        let v = result(step(&h, &mut second, vec![]));
+        assert!(v["apps"][0]["error"].as_str().unwrap().contains("Try again in a moment"), "{v}");
+        // The refresh times out: not a reason to reconnect either, and the next search refreshes.
+        let v = result(step(&h, &mut first, vec![HttpReply::default()]));
+        assert!(v["apps"][0]["error"].as_str().unwrap().contains("didn't answer in time"), "{v}");
+        let mut third = search();
+        assert!(fetches(step(&h, &mut third, vec![]))[0].url.contains("oauth2.googleapis.com/token"), "the first let go");
+
+        // A refused refresh token does mean reconnecting.
+        let v = result(step(&h, &mut third, vec![HttpReply { status: 400, body: json!({ "error": "invalid_grant" }).to_string() }]));
+        assert!(v["apps"][0]["error"].as_str().unwrap().contains("connect it again"), "{v}");
+    }
 }

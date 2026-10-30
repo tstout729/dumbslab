@@ -12,6 +12,8 @@ description = "An open-source team knowledge base, built for people and AI agent
 
 [workspace.dependencies]
 dumbslab-core = { path = "crates/core" }
+# Only the cipher: nonces come from `rand`, so no second `getrandom` is pulled into the wasm build.
+aes-gcm = { version = "0.10.3", default-features = false, features = ["aes", "alloc"] }
 ammonia = "4.2.4"
 anyhow = "1.0.104"
 argon2 = "0.6.0"

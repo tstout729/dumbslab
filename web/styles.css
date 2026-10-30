@@ -401,6 +401,9 @@ a.chip:hover { background: var(--bg-hover); color: var(--ink); text-decoration: 
 .main-col { flex: 1; min-width: 0; display: flex; flex-direction: column; }
 .main { flex: 1; outline: none; }
 .main:focus-visible { box-shadow: none; }
+.app-footer { padding: 16px 24px; border-top: 1px solid var(--line); font-size: 13px; color: var(--ink-3); }
+.app-footer nav { display: flex; flex-wrap: wrap; gap: 12px 24px; }
+.app-footer a { color: var(--ink-2); }
 .topbar { display: none; }
 .backdrop { position: fixed; inset: 0; background: rgb(10 10 25 / 38%); z-index: 25; }
 
@@ -783,7 +786,7 @@ mark { background: var(--mark-bg); color: inherit; border-radius: 3px; padding: 
 .prose .md-callout-important .md-callout-title::before { content: "❗"; }
 .prose .md-callout-warning .md-callout-title::before { content: "⚠️"; }
 .prose .md-callout-caution .md-callout-title::before { content: "🛑"; }
-/* Embeds: a YouTube, Vimeo, Loom, Google, Figma, Airtable or Miro link on its own line. */
+/* Embeds: a provider link on its own line (see crates/core/src/embed.rs) shows as a frame, an image or video file, or a link card. */
 .prose figure.embed { margin: 1.4em 0; border: 1px solid var(--line); border-radius: 12px; overflow: hidden; background: var(--bg-sunk); }
 .prose .embed-frame { position: relative; width: 100%; }
 .prose .embed-video .embed-frame { aspect-ratio: 16 / 9; }
@@ -792,6 +795,14 @@ mark { background: var(--mark-bg); color: inherit; border-radius: 3px; padding: 
 .prose .embed figcaption { display: flex; align-items: center; gap: .6em; min-width: 0; padding: .5em .85em; border-top: 1px solid var(--line); font-size: .8em; line-height: 1.4; color: var(--ink-3); }
 .prose .embed-provider { flex: none; font-weight: 600; color: var(--ink-2); }
 .prose .embed figcaption a { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.prose .embed-file { display: flex; justify-content: center; }
+.prose .embed-file img { display: block; max-height: min(80vh, 900px); border-radius: 0; }
+.prose .embed-file video { display: block; width: 100%; max-height: min(72vh, 600px); background: #000; }
+.prose figure.embed-card { max-width: 34em; }
+.prose .embed-card a { display: flex; flex-direction: column; gap: .15em; padding: .75em 1em; color: inherit; text-decoration: none; }
+.prose .embed-card a:hover { background: var(--bg-hover); }
+.prose .embed-card-title { font-weight: 600; color: var(--ink); }
+.prose .embed-card-meta { font-size: .85em; color: var(--ink-3); }
 .prose code { font-size: .86em; padding: .15em .38em; border-radius: 5px; background: var(--bg-sunk); border: 1px solid var(--line); }
 .prose pre { padding: 14px 18px; border-radius: 10px; background: var(--bg-sunk); border: 1px solid var(--line); overflow-x: auto; font-size: 13.5px; line-height: 1.6; tab-size: 4; }
 .prose pre code { padding: 0; border: 0; background: none; font-size: inherit; }
@@ -1066,6 +1077,23 @@ a.stat:hover { background: var(--bg-hover); text-decoration: none; }
 .usage-high .usage-fill { background: var(--amber); }
 .usage-full .usage-fill { background: var(--red); }
 .plan-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.connected-results { margin-top: 28px; display: flex; flex-direction: column; gap: 14px; }
+.connected-title { font-size: 15px; font-weight: 650; }
+.connected-group { display: flex; flex-direction: column; gap: 8px; }
+.connected-app { font-size: 13px; font-weight: 650; color: var(--ink-2); text-transform: uppercase; letter-spacing: .04em; }
+.connected-hint { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.app-list { display: flex; flex-direction: column; gap: 12px; }
+.app-card { border: 1px solid var(--line); border-radius: var(--r-md); padding: 14px 16px; display: flex; flex-direction: column; gap: 10px; }
+.app-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; }
+.app-name { font-weight: 650; }
+.app-body { display: flex; flex-direction: column; gap: 10px; }
+.token-form { max-width: 460px; }
+.link-preview { padding: 12px 14px; display: flex; flex-direction: column; gap: 6px; max-width: 360px; font-size: 13.5px; }
+.link-preview-title { font-weight: 650; font-size: 14.5px; line-height: 1.35; }
+.link-preview-facts { display: grid; grid-template-columns: auto 1fr; gap: 2px 10px; margin: 2px 0; }
+.link-preview-facts dt { color: var(--ink-3); }
+.link-preview-facts dd { margin: 0; }
+.link-preview-desc { color: var(--ink-2); line-height: 1.45; display: -webkit-box; -webkit-line-clamp: 4; -webkit-box-orient: vertical; overflow: hidden; }
 .plan-list { margin: 0; padding-left: 18px; display: flex; flex-direction: column; gap: 4px; font-size: 14px; color: var(--ink-2); }
 
 .snippet { display: flex; flex-direction: column; gap: 6px; }

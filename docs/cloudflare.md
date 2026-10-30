@@ -112,6 +112,10 @@ How it works:
 
 To try it locally, create a Stripe sandbox, run `scripts/stripe-setup.sh local` against it, and put its `STRIPE_SECRET_KEY`, `STRIPE_PRICE_ID` and the secret `stripe listen --forward-to http://localhost:8787/api/stripe/webhook` prints in `crates/worker/.dev.vars`.
 
+### Connected apps
+
+Set the `CONNECTOR_KEY` secret to let people connect GitHub, Google Drive, Jira and other apps; register OAuth apps to let them sign in instead of pasting tokens. The redirect URL is `https://<root domain>/connect/callback` for every workspace. See [connected-apps.md](connected-apps.md).
+
 ### Operator API
 
 Manage workspaces with `Authorization: Bearer $OPERATOR_TOKEN` on the root domain:
@@ -166,7 +170,7 @@ What is recorded, and what never leaves the browser:
 - **Page addresses.** Captured URLs lose post and topic slugs (they're titles), file names, the search text, the hash, and every query parameter the app doesn't read, so sign-up tokens, OAuth codes and other secrets in a URL never leave. Another site's URL keeps only its origin. Pageview titles are dropped.
 - **Errors** go to Sentry with the same URL rules, tagged `runtime=browser` and the workspace's address. No session replay, tracing, release-health sessions, console or click breadcrumbs. API errors aren't reported from the browser: the person sees them, and the server's own failures are reported by the Worker.
 
-Server-side failures are reported by the Worker itself, to the same `SENTRY_DSN`. Because `SENTRY_DSN` is in `[vars]`, don't also add it as a secret: a variable and a secret can't share a name. A panic in the Worker (Rust compiled to wasm) aborts the request before any code can report it; a [Tail Worker](https://developers.cloudflare.com/workers/observability/logs/tail-workers/) that forwards `exception` outcomes to Sentry would cover those.
+Server-side failures are reported by the Worker itself, to the same `SENTRY_DSN` (see "Optional Sentry error reporting" below). Because `SENTRY_DSN` is in `[vars]`, don't also add it as a secret: a variable and a secret can't share a name. A panic in the Worker (Rust compiled to wasm) aborts the request before any code can report it; a [Tail Worker](https://developers.cloudflare.com/workers/observability/logs/tail-workers/) that forwards `exception` outcomes to Sentry would cover those.
 
 ## Local development
 
@@ -181,3 +185,25 @@ The `dev` environment runs hosted mode on `localhost` with throwaway secrets: op
 
 - Admins can export a workspace as JSON with the `export_workspace` operation: `GET /api/v1/export`.
 - Durable Objects support point-in-time recovery for 30 days. See Cloudflare's [PITR API](https://developers.cloudflare.com/durable-objects/api/sqlite-storage-api/#pitr-point-in-time-recovery-api).
+
+## Optional Sentry error reporting
+
+`SENTRY_DSN`, the `[vars]` value the web app's error reports use (see "Session
+recordings and error reports" above), also makes the Worker report failed Worker
+requests and HTTP 5xx responses, including failures returned by workspace and
+directory Durable Objects. Leave it empty to disable reporting. Use an HTTPS DSN
+with a public key and numeric project ID; malformed values disable reporting. The
+hosted Sentry project is `164-investments-llc/dumbslab`.
+
+The Worker sends minimal Sentry envelopes directly, without a browser or native
+SDK. Events contain a random event ID, fixed failure category, app version and
+logger name. They include no raw error text, stack traces, URLs, request bodies,
+headers, workspace names, user identifiers or breadcrumbs. Categories distinguish
+runtime failures from HTTP 5xx responses; they deliberately do not identify the
+underlying exception. Panics/traps and errors swallowed by the application are
+not captured. Successful requests and HTTP 4xx responses are not reported.
+
+Delivery uses `wait_until` and is best effort, with no retries; delivery failures
+never replace an application's response and are not logged. Redirects are not
+followed. This integration does not configure Sentry, enable reporting for the
+native server, or alter deployment settings.

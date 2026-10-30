@@ -1,0 +1,35 @@
+name: Bug report
+description: Report something that is broken in DumbSlab.
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Issues are public. Remove passwords, tokens, workspace content and personal details.
+        For security issues, use the private reporting routes in SECURITY.md instead.
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: Describe the smallest example that shows the problem.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: Include sanitized errors or screenshots if useful.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Hosted or self-hosted, version or commit (if known), browser and operating system.
+    validations:
+      required: true

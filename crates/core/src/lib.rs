@@ -2,14 +2,15 @@
 //!
 //! A host (the native server or the Cloudflare Worker) turns an incoming HTTP request into a
 //! [`Request`], opens a database transaction, calls [`handle`], commits or rolls back according
-//! to [`Outcome::commit`], and then performs the returned [`Effect`]s (webhook deliveries and,
-//! for hosted workspaces, address moves and Stripe calls).
+//! to [`Outcome::commit`], and then performs the returned [`Effect`]s (webhook deliveries,
+//! requests to connected apps and, for hosted workspaces, address moves and Stripe calls).
 //!
 //! Every capability is an operation in [`registry`]. Each one is exposed the same way over REST
 //! (`/api/v1/...`), the generic operations endpoint (`/api/v1/operations/{name}`), MCP (`/mcp`)
 //! and the CLI, so agents can do anything a person can do in the web app.
 
 pub mod auth;
+pub mod connect;
 pub mod db;
 pub mod embed;
 pub mod error;
@@ -53,6 +54,8 @@ pub struct HostConfig {
     /// Multi-tenant hosting: the plans on offer and what the host measured (see [`plan`]).
     /// Self-hosted servers leave it unset and have no limits.
     pub hosting: Option<Hosting>,
+    /// Connected apps (see [`connect`]): the key that encrypts credentials, and OAuth apps.
+    pub connectors: connect::Connectors,
     /// The web app's session recordings and error reports. Off unless the host configures them.
     pub telemetry: telemetry::Telemetry,
 }
@@ -157,6 +160,8 @@ pub enum Effect {
     /// Hosted workspaces only: ask Stripe for a Checkout or customer portal page, and answer the
     /// request with its URL.
     Stripe(plan::StripeCall),
+    /// Requests to connected apps: run the job with [`connect::step`] and answer with its result.
+    Connect(connect::Job),
 }
 
 #[derive(Clone, Debug)]
