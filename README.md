@@ -26,6 +26,7 @@ An open-source team knowledge base, written in Rust and built so AI agents can d
 | Notifications | Mentions, replies, comments and updates on followed posts, new posts in followed topics |
 | Import | Confluence spaces (HTML export), Guru collections, GitHub wikis and folders of Markdown files, with their topics, links between pages, images and attachments. Converted in the browser with a preview first; running an import again skips what's already there. Agents can import through MCP too. See [docs/import.md](docs/import.md) |
 | Admin | Workspace settings, API tokens with scopes, signed webhooks, JSON export |
+| Slack | `/dumbslab search` and `/dumbslab new` from Slack as yourself, previews of links to posts everyone can see, and messages in chosen channels when posts are published or updated. See [docs/slack.md](docs/slack.md) |
 | Connected apps | Everyone connects their own GitHub, Google Drive, Slack, Jira, Confluence, Zendesk, Asana, Box, Dropbox, Guru and more, to search them from DumbSlab and preview links to them in posts. See [docs/connected-apps.md](docs/connected-apps.md) |
 | Single sign-on | Sign in with Google Workspace, Microsoft Entra ID, Okta, OneLogin, Slack or any OpenID Connect provider, set up per workspace on every plan. Optional auto-provisioning, and an option to require it for everyone but admins. See [docs/sso.md](docs/sso.md) |
 
@@ -45,7 +46,7 @@ Options (flags or environment variables):
 | `--bind` | `DUMBSLAB_BIND` | `127.0.0.1:8080` |
 | `--base-url` | `DUMBSLAB_BASE_URL` | the request's origin |
 | `--setup-token` | `DUMBSLAB_SETUP_TOKEN` | generated and logged |
-| | `DUMBSLAB_CONNECTOR_KEY` | unset: [connected apps](docs/connected-apps.md), [single sign-on](docs/sso.md), people sync and docs sync are off |
+| | `DUMBSLAB_CONNECTOR_KEY` | unset: [connected apps](docs/connected-apps.md), [single sign-on](docs/sso.md), [Slack](docs/slack.md), people sync and docs sync are off |
 | `--open-setup` | | off (local development only: setup without a token) |
 | `--quill-host` | `DUMBSLAB_QUILL_HOST` | off: record sessions in this [Quill](https://github.com/164investments/quill) or other PostHog-compatible server |
 | `--quill-token` | `DUMBSLAB_QUILL_TOKEN` | off: that project's public `phc_` token |

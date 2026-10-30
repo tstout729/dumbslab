@@ -26,6 +26,7 @@ pub const MAX_UPLOAD_BODY: usize = 15 * 1024 * 1024;
 pub fn body_limit(path: &str) -> usize {
     match path.trim_end_matches('/') {
         "/api/v1/files" | "/api/v1/operations/upload_file" | "/mcp" => MAX_UPLOAD_BODY,
+        p if p.starts_with("/slack/") => crate::slack::MAX_BODY,
         _ => MAX_BODY,
     }
 }
@@ -46,6 +47,7 @@ pub fn is_core_path(path: &str) -> bool {
         || path.starts_with("/files/")
         || path.starts_with("/connect/")
         || path.starts_with("/sso/")
+        || path.starts_with("/slack/")
         || path.starts_with("/hooks/")
 }
 
@@ -74,6 +76,9 @@ pub fn handle(db: &dyn Db, cfg: &HostConfig, req: &Request) -> Option<Outcome> {
         crate::sso::callback(db, cfg, req)
     } else if path.starts_with("/sso/") {
         failed(&ApiError::not_found("route"))
+    } else if path.starts_with("/slack/") {
+        // Slack's own requests: no session or token, only Slack's signature.
+        crate::slack::handle(db, cfg, req)
     } else if path.starts_with("/hooks/") {
         no_store(crate::sync::hook(db, cfg, req))
     } else {

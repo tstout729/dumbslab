@@ -16,6 +16,7 @@ pub mod notifications;
 pub mod plan;
 pub mod posts;
 pub mod search;
+pub mod slack;
 pub mod sso;
 pub mod sync;
 pub mod topics;
@@ -33,6 +34,7 @@ pub fn all() -> Vec<Op> {
     ops.extend(sync::ops());
     ops.extend(notifications::ops());
     ops.extend(admin::ops());
+    ops.extend(slack::ops());
     ops.extend(sso::ops());
     ops.extend(plan::ops());
     ops.extend(meta::ops());
