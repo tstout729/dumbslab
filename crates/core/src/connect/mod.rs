@@ -572,6 +572,9 @@ pub struct Connection {
     pub cred: Credential,
     pub expires_at: Option<DateTime<Utc>>,
     pub connected_at: String,
+    /// The refresh lease this request holds, from [`renewal`]: what proves the stored connection
+    /// is still the one it's refreshing.
+    lease: Option<String>,
 }
 
 fn key_of(cfg: &HostConfig) -> ApiResult<&str> {
@@ -595,6 +598,7 @@ fn read_row(cfg: &HostConfig, user_id: &str, r: &crate::db::Row) -> ApiResult<Op
         cred,
         expires_at: r.opt_str("expires_at").and_then(|s| parse_ts(&s)),
         connected_at: r.str("created_at"),
+        lease: None,
     }))
 }
 
@@ -613,26 +617,29 @@ pub fn connections(db: &dyn Db, cfg: &HostConfig, user_id: &str) -> ApiResult<Ve
     Ok(out)
 }
 
-/// Saves the connection a [`ConnectJob`] made.
+/// Saves the connection a [`ConnectJob`] made. It replaces any earlier one, and with it any
+/// refresh of that one still under way.
 fn save(db: &dyn Db, cfg: &HostConfig, j: &ConnectJob, account: &Account, now: DateTime<Utc>) -> ApiResult<()> {
     let secret = seal(key_of(cfg)?, &j.user_id, j.provider, &j.cred)?;
     db.execute(
         "INSERT INTO connections (user_id, provider, account, settings, secret, expires_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(user_id, provider) DO UPDATE SET account = excluded.account, settings = excluded.settings, secret = excluded.secret,
-           expires_at = excluded.expires_at, updated_at = excluded.updated_at",
+           expires_at = excluded.expires_at, refreshing_until = NULL, updated_at = excluded.updated_at",
         &params![j.user_id.clone(), j.provider, account.label.clone(), account.settings.to_string(), secret, j.expires_at.map(ts), ts(now), ts(now)],
     )?;
     Ok(())
 }
 
-/// Saves a refreshed token, keeping everything else.
-fn save_token(db: &dyn Db, cfg: &HostConfig, user_id: &str, conn: &Connection, now: DateTime<Utc>) -> ApiResult<()> {
+/// Saves a refreshed token, keeping everything else, and lets go of the lease. `false` when the
+/// connection was replaced (or the lease ran out and another request took it) meanwhile: the
+/// token belongs to an account that isn't stored any more.
+fn save_token(db: &dyn Db, cfg: &HostConfig, user_id: &str, conn: &Connection, now: DateTime<Utc>) -> ApiResult<bool> {
     let secret = seal(key_of(cfg)?, user_id, conn.provider, &conn.cred)?;
-    db.execute(
-        "UPDATE connections SET secret = ?, expires_at = ?, refreshing_until = NULL, updated_at = ? WHERE user_id = ? AND provider = ?",
-        &params![secret, conn.expires_at.map(ts), ts(now), user_id, conn.provider],
+    let saved = db.execute(
+        "UPDATE connections SET secret = ?, expires_at = ?, refreshing_until = NULL, updated_at = ? WHERE user_id = ? AND provider = ? AND refreshing_until = ?",
+        &params![secret, conn.expires_at.map(ts), ts(now), user_id, conn.provider, conn.lease.clone()],
     )?;
-    Ok(())
+    Ok(saved > 0)
 }
 
 pub fn remove(db: &dyn Db, user_id: &str, provider: &str) -> ApiResult<bool> {
@@ -1040,13 +1047,18 @@ const REFRESH_LEASE_SECS: i64 = 30;
 /// each time (Box, Atlassian, monday) refuse the old one once it's used, so two requests refreshing
 /// together would leave one asking the person to reconnect. Refreshing starts
 /// [`REFRESH_MARGIN_SECS`] before the token expires, so the others can keep using it meanwhile.
-fn renewal(db: &dyn Db, user_id: &str, conn: &Connection, now: DateTime<Utc>) -> ApiResult<Renewal> {
+fn renewal(db: &dyn Db, user_id: &str, conn: &mut Connection, now: DateTime<Utc>) -> ApiResult<Renewal> {
+    // When it runs out, then a random id: each lease is this request's alone.
+    let lease = format!("{} {}", ts(now + Duration::seconds(REFRESH_LEASE_SECS)), crate::util::new_id());
     let claimed = db.execute(
         "UPDATE connections SET refreshing_until = ? WHERE user_id = ? AND provider = ? AND (refreshing_until IS NULL OR refreshing_until <= ?)",
-        &params![ts(now + Duration::seconds(REFRESH_LEASE_SECS)), user_id, conn.provider, ts(now)],
+        &params![lease.clone(), user_id, conn.provider, ts(now)],
     )? > 0;
     Ok(match claimed {
-        true => Renewal::Refresh,
+        true => {
+            conn.lease = Some(lease);
+            Renewal::Refresh
+        }
         false if conn.expires_at.is_some_and(|e| e > now) => Renewal::UseCurrent,
         false => Renewal::Wait,
     })
@@ -1068,7 +1080,10 @@ fn apply_refresh(
 ) -> ApiResult<Result<(), String>> {
     let p = providers::get(conn.provider).expect("known provider");
     let Ok(tokens) = p.read_token(reply) else {
-        db.execute("UPDATE connections SET refreshing_until = NULL WHERE user_id = ? AND provider = ?", &params![user_id, conn.provider])?;
+        db.execute(
+            "UPDATE connections SET refreshing_until = NULL WHERE user_id = ? AND provider = ? AND refreshing_until = ?",
+            &params![user_id, conn.provider, conn.lease.clone()],
+        )?;
         if reply.status == 0 || reply.status == 429 || reply.status >= 500 {
             return Ok(Err(http_error(p.info().name, reply)));
         }
@@ -1087,7 +1102,9 @@ fn apply_refresh(
     }
     conn.cred.fields.extend(tokens.fields.clone());
     conn.expires_at = expiry(now, &tokens);
-    save_token(db, cfg, user_id, conn, now)?;
+    if !save_token(db, cfg, user_id, conn, now)? {
+        return Ok(Err(format!("{} was connected again while this was loading. Try again.", p.info().name)));
+    }
     Ok(Ok(()))
 }
 
@@ -1135,7 +1152,7 @@ fn preview_step(db: &dyn Db, cfg: &HostConfig, j: &mut PreviewJob, replies: Vec<
                 j.conn = saved;
             }
             if needs_refresh(cfg, &j.conn, now) {
-                match renewal(db, &j.user_id, &j.conn, now)? {
+                match renewal(db, &j.user_id, &mut j.conn, now)? {
                     Renewal::Refresh => {
                         j.phase = PreviewPhase::Refreshing;
                         return Ok(Step::Fetch(vec![refresh_call(cfg, &j.conn)]));
@@ -1176,7 +1193,7 @@ fn search_step(db: &dyn Db, cfg: &HostConfig, j: &mut SearchJob, replies: Vec<Ht
     match std::mem::replace(&mut j.phase, SearchPhase::Start) {
         SearchPhase::Start => {
             let (mut fresh, mut stale, mut failed) = (vec![], vec![], vec![]);
-            for c in connections(db, cfg, &j.user_id)? {
+            for mut c in connections(db, cfg, &j.user_id)? {
                 let searches = providers::get(c.provider).is_some_and(|p| p.info().search);
                 if !searches || !(j.only.is_empty() || j.only.iter().any(|o| o == c.provider)) {
                     continue;
@@ -1185,7 +1202,7 @@ fn search_step(db: &dyn Db, cfg: &HostConfig, j: &mut SearchJob, replies: Vec<Ht
                     fresh.push(c);
                     continue;
                 }
-                match renewal(db, &j.user_id, &c, now)? {
+                match renewal(db, &j.user_id, &mut c, now)? {
                     Renewal::Refresh => stale.push(c),
                     Renewal::UseCurrent => fresh.push(c),
                     Renewal::Wait => {

@@ -2429,6 +2429,50 @@ mod connected {
     }
 
     #[test]
+    fn a_late_refresh_never_lands_on_a_replaced_connection() {
+        let mut h = H::new();
+        let (admin, _) = h.setup();
+        with_key(&mut h);
+        h.cfg.connectors.apps.insert("gitlab".into(), OAuthApp { client_id: "gl".into(), client_secret: "glsecret".into() });
+        let user_id = h.ok("GET", "/api/v1/me", None, &admin)["user"]["id"].as_str().unwrap().to_string();
+        // A gitlab.com connection whose token has expired.
+        let cred = connect::Credential { token: "com-old".into(), refresh_token: Some("com-refresh".into()), ..Default::default() };
+        let sealed = connect::seal("connector-key", &user_id, "gitlab", &cred).unwrap();
+        let past = dumbslab_core::util::ts(chrono::Utc::now() - chrono::Duration::hours(1));
+        h.store
+            .with_tx(|db| {
+                (db.execute(
+                    "INSERT INTO connections (user_id, provider, account, settings, secret, expires_at, created_at, updated_at) VALUES (?, 'gitlab', '@ada', ?, ?, ?, ?, ?)",
+                    &dumbslab_core::params![user_id.clone(), json!({ "host": "gitlab.com", "username": "ada" }).to_string(), sealed, past.clone(), past.clone(), past.clone()],
+                ), true)
+            })
+            .unwrap()
+            .unwrap();
+        let preview =
+            |url: &str| job_of(&h.call("GET", &format!("/api/v1/connections/preview?url={}", urlencoding::encode(url)), None, &admin));
+
+        // A preview starts refreshing the gitlab.com token...
+        let mut late = preview("https://gitlab.com/acme/api/-/issues/3");
+        assert!(fetches(step(&h, &mut late, vec![]))[0].url.starts_with("https://gitlab.com/oauth/token"));
+        // ...while the person connects their own GitLab server instead.
+        let fields = json!({ "app": "gitlab", "fields": { "token": "self-token", "base_url": "https://gitlab.example.com" } });
+        let r = h.call("POST", "/api/v1/connections", Some(fields), &admin);
+        let (finish, _) = drive(&h, job_of(&r), &|_: &HttpCall| ok(json!({ "username": "ada" })));
+        assert!(filled(&r, finish)["connection"]["account"].as_str().unwrap().contains("gitlab.example.com"));
+
+        // The gitlab.com tokens arrive late: they're dropped, not saved over the new connection.
+        let tokens = ok(json!({ "access_token": "com-new", "refresh_token": "com-refresh-2", "expires_in": 7200 }));
+        let v = result(step(&h, &mut late, vec![tokens]));
+        assert!(v["error"].as_str().unwrap().contains("connected again"), "{v}");
+        let secret = h.store.with_tx(|db| (db.one("SELECT secret FROM connections", &[]).unwrap().unwrap().str("secret"), true)).unwrap();
+        assert_eq!(connect::open("connector-key", &user_id, "gitlab", &secret).unwrap().token, "self-token");
+        // So the new server only ever gets its own token.
+        let (_, sent) = drive(&h, preview("https://gitlab.example.com/acme/api/-/issues/3"), &|_: &HttpCall| ok(json!({ "title": "x" })));
+        assert!(sent[0].url.starts_with("https://gitlab.example.com/"));
+        assert!(sent[0].headers.contains(&("authorization".into(), "Bearer self-token".into())), "{sent:?}");
+    }
+
+    #[test]
     fn expired_tokens_are_refreshed_first() {
         let mut h = H::new();
         let (admin, _) = h.setup();
