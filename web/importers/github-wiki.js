@@ -23,8 +23,9 @@ export function wikiRepo(gitConfig) {
   return m ? { owner: m[1], repo: m[2] } : null;
 }
 
-export async function convertGithubWiki(source, { onProgress } = {}) {
-  const b = new PlanBuilder('github-wiki', source);
+export async function convertGithubWiki(source, opts = {}) {
+  const { onProgress } = opts;
+  const b = new PlanBuilder('github-wiki', source, opts);
   const repo = source.gitConfig ? wikiRepo(await source.gitConfig().catch(() => '')) : null;
   const repoName = repo ? repo.repo : (source.root || stripExt(source.name || '')).replace(/\.wiki$/i, '');
   b.rootTopic = repoName ? `${repoName} wiki` : 'Wiki';
@@ -131,6 +132,10 @@ export async function convertGithubWiki(source, { onProgress } = {}) {
   let done = 0;
   for (const path of ordered) {
     if (onProgress) onProgress(++done, ordered.length);
+    if (b.full) {
+      b.skip(path, b.fullReason);
+      continue;
+    }
     if (source.size(path) > MAX_SOURCE_BYTES) {
       b.skip(path, `The file is ${formatSize(source.size(path))}; pages can be at most ${formatSize(MAX_SOURCE_BYTES)}.`);
       continue;

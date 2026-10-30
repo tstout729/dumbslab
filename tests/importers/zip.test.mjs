@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { makeZip } from './helpers.mjs';
-import { openZip, readEntry, ZipError, MAX_ZIP_BYTES } from '../../web/importers/zip.js';
+import { openZip, readEntry, ZipError, MAX_ZIP_BYTES, MAX_ENTRY_BYTES } from '../../web/importers/zip.js';
 import { zipSource, cleanPath, isJunk } from '../../web/importers/source.js';
 
 test('reads stored and deflated entries with UTF-8 names', async () => {
@@ -49,4 +49,27 @@ test('a cloned wiki keeps its .git/config for the repository name', async () => 
   const src = await zipSource(zip);
   assert.deepEqual(src.paths, ['Home.md']);
   assert.match(await src.gitConfig(), /o\/w\.wiki\.git/);
+});
+
+test('crafted sizes are refused before anything large is read', async () => {
+  const big = new Uint8Array(2 * 1024 * 1024).fill(7);
+  // A stored entry that claims 1 byte but spans 2 MB of data.
+  const liar = await makeZip({ 'a.bin': big }, { lie: { 'a.bin': { size: 1 } } });
+  const [a] = (await openZip(liar)).entries;
+  await assert.rejects(readEntry(liar, a), /sizes don’t agree/);
+  // A deflated entry that claims far more compressed bytes than its size could need.
+  const inflated = await makeZip({ 'b.txt': 'short text' }, { lie: { 'b.txt': { compressedSize: 5_000_000 } } });
+  const [b] = (await openZip(inflated)).entries;
+  await assert.rejects(readEntry(inflated, b), /sizes don’t agree/);
+  // Sizes that agree but run past the end of the file.
+  const cut = await makeZip({ 'c.bin': new Uint8Array(10) }, { lie: { 'c.bin': { size: 4000, compressedSize: 4000 } } });
+  const [c] = (await openZip(cut)).entries;
+  await assert.rejects(readEntry(cut, c), /past the end/);
+  // An entry that says it is enormous is refused whatever the caller allows.
+  const huge = await makeZip({ 'd.bin': new Uint8Array(4) }, { lie: { 'd.bin': { size: MAX_ENTRY_BYTES + 1, compressedSize: MAX_ENTRY_BYTES + 1 } } });
+  const [d] = (await openZip(huge)).entries;
+  await assert.rejects(readEntry(huge, d, { maxBytes: Infinity }), /more than the 64 MB allowed/);
+  // The honest version reads.
+  const honest = await makeZip({ 'a.bin': big });
+  assert.equal((await readEntry(honest, (await openZip(honest)).entries[0])).length, big.length);
 });

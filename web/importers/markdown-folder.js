@@ -13,8 +13,9 @@ const INDEX_NAMES = new Set(['readme', 'index', '_index']);
 
 const isIndex = (p) => INDEX_NAMES.has(stripExt(basename(p)).toLowerCase());
 
-export async function convertMarkdownFolder(source, { onProgress } = {}) {
-  const b = new PlanBuilder('markdown', source);
+export async function convertMarkdownFolder(source, opts = {}) {
+  const { onProgress } = opts;
+  const b = new PlanBuilder('markdown', source, opts);
   b.rootTopic = source.root || stripExt(source.name || '').replace(/[-_]+/g, ' ').trim();
   const pages = source.paths.filter((p) => MARKDOWN_EXT.has(extname(p)));
   for (const p of source.paths) {
@@ -49,6 +50,10 @@ export async function convertMarkdownFolder(source, { onProgress } = {}) {
   let done = 0;
   for (const path of pages) {
     if (onProgress) onProgress(++done, pages.length);
+    if (b.full) {
+      b.skip(path, b.fullReason);
+      continue;
+    }
     if (source.size(path) > MAX_SOURCE_BYTES) {
       b.skip(path, `The file is ${formatSize(source.size(path))}; pages can be at most ${formatSize(MAX_SOURCE_BYTES)}.`);
       continue;

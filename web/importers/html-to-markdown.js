@@ -6,7 +6,12 @@
 // It reads nodes through nodeType, localName, childNodes, nodeValue and getAttribute only, so
 // tests can run it on a small parsed tree without a browser.
 
-const BREAK = '';
+const BREAK = '\uE000';
+// Budgets that keep the output close to the input's size whatever the HTML says: spans can't
+// stretch a table past these, and structures nested deeper than this are flattened.
+const MAX_TABLE_COLUMNS = 64;
+const MAX_TABLE_CELLS = 50_000;
+const MAX_DEPTH = 12;
 
 const SKIP = new Set([
   'script', 'style', 'noscript', 'template', 'head', 'title', 'meta', 'link', 'base', 'svg', 'math', 'canvas', 'button',
@@ -252,9 +257,9 @@ class Converter {
       case 'li': return this.list({ childNodes: [el], nodeType: 1, localName: 'ul', getAttribute: () => null }, st);
       case 'pre': return this.pre(el, st);
       case 'blockquote': {
-        const inner = this.blocks(el, st);
+        const inner = this.blocks(el, down(st));
         if (!inner.length) return [];
-        return st.cell ? inner : [quote(inner.join('\n\n'))];
+        return st.cell || deep(st) ? inner : [quote(inner.join('\n\n'))];
       }
       case 'table': return this.table(el, st);
       case 'hr': return st.cell ? [] : ['---'];
@@ -342,6 +347,11 @@ class Converter {
   }
 
   list(el, st) {
+    // Lists nested past the limit read as text, so indentation can't multiply the size.
+    if (deep(st)) {
+      const text = escapeText(textOf(el));
+      return text ? [text] : [];
+    }
     const ordered = tag(el) === 'ol';
     let n = Number.parseInt(attr(el, 'start'), 10);
     if (!Number.isFinite(n) || n < 0) n = 1;
@@ -372,7 +382,7 @@ class Converter {
     if (box && check === null) check = box.getAttribute('checked') !== null;
     const prefix = marker + (check === null ? '' : check ? '[x] ' : '[ ] ');
     const pad = ' '.repeat(marker.length);
-    const blocks = this.blocks(li, st);
+    const blocks = this.blocks(li, down(st));
     let text = '';
     blocks.forEach((b, i) => {
       if (i > 0) text += isListBlock(b) && !isListBlock(blocks[i - 1]) ? '\n' : '\n\n';
@@ -409,17 +419,19 @@ class Converter {
     const titleEl = find(el, (x) => x !== el && (hasClass(x, 'title') || hasClass(x, 'panelHeader') || hasClass(x, 'ghq-card-content__callout-title')));
     const bodyEl = find(el, (x) => hasClass(x, 'confluence-information-macro-body') || hasClass(x, 'panelContent')) || el;
     const title = titleEl ? textOf(titleEl) : '';
-    const body = this.blocks(bodyEl === el && titleEl ? withoutNode(el, titleEl) : bodyEl, st);
+    const body = this.blocks(bodyEl === el && titleEl ? withoutNode(el, titleEl) : bodyEl, down(st));
     const parts = [title ? `**${escapeText(title)}**` : '', ...body].filter(Boolean);
     if (!parts.length) return [];
     if (st.cell) return [parts.join('<br>')];
+    if (deep(st)) return parts;
     return [`> [!${kind}]\n` + quote(parts.join('\n\n'))];
   }
 
   panel(el, st) {
     const header = find(el, (x) => hasClass(x, 'panelHeader'));
     const content = find(el, (x) => hasClass(x, 'panelContent')) || (header ? withoutNode(el, header) : el);
-    const parts = [header ? `**${escapeText(textOf(header))}**` : '', ...this.blocks(content, st)].filter(Boolean);
+    const parts = [header ? `**${escapeText(textOf(header))}**` : '', ...this.blocks(content, down(st))].filter(Boolean);
+    if (deep(st)) return parts;
     return parts.length ? [quote(parts.join('\n\n'))] : [];
   }
 
@@ -427,18 +439,19 @@ class Converter {
     const control = find(el, (x) => hasClass(x, 'expand-control-text'));
     const content = find(el, (x) => hasClass(x, 'expand-content'));
     const summary = control ? textOf(control) : 'Details';
-    const body = content ? this.blocks(content, st) : [];
+    const body = content ? this.blocks(content, down(st)) : [];
     return this.toggle(summary, body, st);
   }
 
   details(el, st) {
     const sum = kids(el).find((x) => tag(x) === 'summary');
     const summary = sum ? textOf(sum) : 'Details';
-    return this.toggle(summary, this.blocks(sum ? withoutNode(el, sum) : el, st), st);
+    return this.toggle(summary, this.blocks(sum ? withoutNode(el, sum) : el, down(st)), st);
   }
 
   toggle(summary, body, st) {
     if (st.cell) return [[escapeText(summary), ...body].join('<br>')];
+    if (deep(st)) return [`**${escapeText(summary)}**`, ...body];
     const s = escapeHtml(summary || 'Details');
     return [`<details>\n<summary>${s}</summary>\n\n${body.join('\n\n')}\n\n</details>`];
   }
@@ -454,42 +467,68 @@ class Converter {
     };
     collect(el);
     if (!rows.length) return [];
-    const cellSt = { ...st, cell: true };
+    if (deep(st)) {
+      const text = escapeText(textOf(el));
+      return text ? [text] : [];
+    }
+    const cellSt = { ...down(st), cell: true };
+    const written = rows.map((tr) => kids(tr).filter((td) => tag(td) === 'td' || tag(td) === 'th').map((td) => ({
+      text: this.blocks(td, cellSt).join('<br>').replace(/\n+/g, ' ').replace(/(?<!\\)\|/g, '\\|').trim(),
+      colspan: Math.min(50, Math.max(1, Number.parseInt(attr(td, 'colspan'), 10) || 1)),
+      rowspan: Math.min(500, Math.max(1, Number.parseInt(attr(td, 'rowspan'), 10) || 1)),
+    })));
+    if (written.every((r) => r.every((c) => !c.text))) return [];
+    // Spans may add empty cells, but not many more than the table spells out.
+    const allowed = Math.min(MAX_TABLE_CELLS, Math.max(2000, 4 * written.reduce((n, r) => n + r.length, 0)));
+    // Lay the cells out with their spans, unless that would make a table too large to keep as one:
+    // spans could otherwise turn a few kilobytes of HTML into megabytes of empty cells.
     const grid = [];
     const spans = [];
-    for (const tr of rows) {
+    let cells = 0;
+    let fits = true;
+    for (const r of written) {
       const row = [];
       let col = 0;
       const next = () => {
-        while (spans[col] && spans[col].left > 0) {
+        while (spans[col] && spans[col].left > 0 && col < MAX_TABLE_COLUMNS) {
           row.push('');
           spans[col].left--;
           col++;
         }
       };
-      for (const td of kids(tr)) {
-        if (tag(td) !== 'td' && tag(td) !== 'th') continue;
+      for (const c of r) {
         next();
-        const text = this.blocks(td, cellSt).join('<br>').replace(/\n+/g, ' ').replace(/(?<!\\)\|/g, '\\|').trim();
-        const colspan = Math.min(50, Math.max(1, Number.parseInt(attr(td, 'colspan'), 10) || 1));
-        const rowspan = Math.min(500, Math.max(1, Number.parseInt(attr(td, 'rowspan'), 10) || 1));
-        for (let k = 0; k < colspan; k++) {
-          row.push(k === 0 ? text : '');
-          spans[col] = { left: rowspan - 1 };
+        for (let k = 0; k < c.colspan && fits; k++) {
+          row.push(k === 0 ? c.text : '');
+          spans[col] = { left: c.rowspan - 1 };
           col++;
+          fits = col <= MAX_TABLE_COLUMNS;
         }
+        if (!fits) break;
       }
-      next();
+      if (fits) next();
+      cells += row.length;
+      if (!fits || cells > allowed) {
+        fits = false;
+        break;
+      }
       grid.push(row);
     }
-    const width = Math.max(...grid.map((r) => r.length));
-    if (!width || grid.every((r) => r.every((c) => !c))) return [];
+    const width = fits ? Math.max(...grid.map((r) => r.length)) : 0;
+    if (!fits || width * grid.length > allowed) {
+      // Too big for a Markdown table: one line per row with just the cells it has.
+      const lines = written.map((r) => r.map((c) => c.text).filter(Boolean).join(' · ')).filter(Boolean);
+      return st.cell ? [lines.join('<br>')] : [lines.map((l) => `- ${l}`).join('\n')];
+    }
     if (st.cell) return [grid.map((r) => r.filter(Boolean).join(' · ')).filter(Boolean).join('<br>')];
     const line = (r) => '| ' + Array.from({ length: width }, (_, i) => r[i] || '').join(' | ') + ' |';
     const out = [line(grid[0]), '|' + ' --- |'.repeat(width), ...grid.slice(1).map(line)];
     return [out.join('\n')];
   }
 }
+
+const deep = (st) => (st.depth || 0) >= MAX_DEPTH;
+const down = (st) => ({ ...st, depth: (st.depth || 0) + 1 });
 
 /** A shallow stand-in for `el` without one of its children. */
 function withoutNode(el, drop) {

@@ -141,9 +141,11 @@ function previewView(c) {
   // The tree below names the top topic; keep it in step without re-rendering (a click on Import
   // right after typing must still land).
   const top = h('strong', null, c.rootTopic.trim() || 'the top level');
+  const privacy = h('span', null, privacyNote(c.rootTopic));
   topic.addEventListener('input', () => {
     c.rootTopic = topic.value;
     top.textContent = topic.value.trim() || 'the top level';
+    privacy.textContent = privacyNote(topic.value);
   });
   const status = select([
     { value: 'published', label: 'Published', selected: c.status === 'published' },
@@ -175,6 +177,7 @@ function previewView(c) {
         field('Format', formatSel, { hint: 'Detected from the files in the zip.' }),
         field('Status', status)),
       field('Put everything under the topic', topic, { hint: 'Created if it doesn’t exist. Leave empty to put the top-level topics at the top.' }),
+      h('p', { class: 'callout', role: 'note' }, icon('lock'), privacy),
       lists,
       h('ul', { class: 'import-stats' },
         stat('Pages', s.documents.toLocaleString('en-US')),
@@ -193,6 +196,16 @@ function previewView(c) {
         h('ul', { class: 'import-list' }, plan.skipped.slice(0, 500).map((x) => h('li', null, h('code', null, x.path), h('span', { class: 'muted' }, ` ${x.reason}`))),
           plan.skipped.length > 500 ? h('li', { class: 'muted' }, `…and ${(plan.skipped.length - 500).toLocaleString('en-US')} more`) : null)) : null),
   ];
+}
+
+/** Who will see the import, given the top topic's name. */
+function privacyNote(name) {
+  const wanted = String(name || '').trim().toLowerCase();
+  const existing = wanted ? state.topics.find((t) => !t.parent_id && t.name.toLowerCase() === wanted) : null;
+  if (existing && existing.visibility === 'private') {
+    return `“${existing.name}” is private: the imported pages, and the topics the import creates inside it, are visible only to its members.`;
+  }
+  return 'Topics the import creates are visible to everyone in the workspace. To keep the import private, create a private topic first and put everything under it: topics created inside a private topic are private too, with the same members.';
 }
 
 const stat = (label, value) => h('li', null, h('span', { class: 'import-stat-value' }, value), h('span', { class: 'import-stat-label' }, label));
@@ -220,7 +233,7 @@ async function run() {
   const c = current;
   c.step = 'running';
   c.controller = new AbortController();
-  c.progress = { phase: 'import', docsDone: 0, docsTotal: c.plan.documents.length, filesDone: 0, filesTotal: c.plan.attachments.length, linksDone: 0, linksTotal: 0, failed: 0 };
+  c.progress = { phase: 'import', docsDone: 0, docsTotal: c.plan.documents.length, finishDone: 0, finishTotal: 0, failed: 0 };
   window.addEventListener('beforeunload', warnLeaving);
   repaint();
   try {
@@ -262,10 +275,12 @@ function progressBar(done, total, label) {
 }
 
 function progressText(p) {
-  if (p.phase === 'upload') return `Uploading images and files: ${p.filesDone.toLocaleString('en-US')} of ${p.filesTotal.toLocaleString('en-US')}${p.current ? ` (${p.current})` : ''}`;
-  if (p.phase === 'link') return `Linking pages to each other: ${p.linksDone.toLocaleString('en-US')} of ${p.linksTotal.toLocaleString('en-US')}`;
+  if (p.phase === 'finish') return `Adding images, files and links: page ${p.finishDone.toLocaleString('en-US')} of ${p.finishTotal.toLocaleString('en-US')}${p.current ? ` (${p.current})` : ''}`;
   return `Importing pages: ${p.docsDone.toLocaleString('en-US')} of ${p.docsTotal.toLocaleString('en-US')}${p.current ? ` (${p.current}…)` : ''}`;
 }
+
+const progressDone = (p) => p.docsDone + p.finishDone;
+const progressTotal = (p) => p.docsTotal + p.finishTotal;
 
 function runningView(c) {
   const p = c.progress;
@@ -276,7 +291,7 @@ function runningView(c) {
   });
   return panel('Importing', 'Keep this tab open until it finishes. You can use DumbSlab in the meantime.',
     h('p', { class: 'small', id: 'import-status', 'aria-live': 'polite' }, progressText(p)),
-    progressBar(p.docsDone + p.filesDone + p.linksDone, p.docsTotal + p.filesTotal + p.linksTotal, 'Import progress'),
+    progressBar(progressDone(p), progressTotal(p), 'Import progress'),
     h('p', { class: 'muted small', id: 'import-failed' }, p.failed ? `${plural(p.failed, 'page')} failed so far; you’ll see why at the end.` : ''),
     h('div', null, cancel));
 }
@@ -287,8 +302,8 @@ function updateProgress(c) {
   const p = c.progress;
   status.textContent = progressText(p);
   const bar = status.nextElementSibling;
-  const total = p.docsTotal + p.filesTotal + p.linksTotal;
-  const done = p.docsDone + p.filesDone + p.linksDone;
+  const total = progressTotal(p);
+  const done = progressDone(p);
   bar.setAttribute('aria-valuemax', String(total));
   bar.setAttribute('aria-valuenow', String(done));
   bar.firstChild.style.width = `${(total ? Math.min(100, (done / total) * 100) : 0).toFixed(1)}%`;
@@ -322,8 +337,8 @@ function doneView(c) {
       c.topic ? h('p', null, h('a', { href: `/t/${encodeURIComponent(c.topic.id)}`, class: 'btn btn-primary' }, icon('folder'), h('span', null, `Open ${c.topic.name}`))) : null,
       list('Pages that failed', r.failed, (x) => h('li', null, h('strong', null, x.title), h('span', { class: 'muted' }, ` ${x.reason}`))),
       list('Not imported because the import stopped', r.notImported, (x) => h('li', null, x.title)),
-      list('Files that failed to upload', r.files.failed, (x) => h('li', null, h('code', null, x.name), h('span', { class: 'muted' }, ` ${x.reason}`))),
-      list('Pages whose links couldn’t be updated', r.linkFailed, (x) => h('li', null, h('a', { href: x.url }, x.title), h('span', { class: 'muted' }, ` ${x.reason}`))),
+      list('Files that failed to upload (running the import again adds them)', r.files.failed, (x) => h('li', null, h('code', null, x.name), h('span', { class: 'muted' }, ` on ${x.page}: ${x.reason}`))),
+      list('Pages whose images, files or links couldn’t be added', r.linkFailed, (x) => h('li', null, h('a', { href: x.url }, x.title), h('span', { class: 'muted' }, ` ${x.reason}`))),
       list('Imported pages', r.created, (x) => h('li', null, h('a', { href: x.url }, x.title))),
       h('div', { class: 'plan-actions' }, unfinished || r.stopped ? again : null, another)),
   ];

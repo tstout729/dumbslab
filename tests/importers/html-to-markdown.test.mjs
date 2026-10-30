@@ -51,3 +51,20 @@ test('tables keep their shape', () => {
 test('frames become links on their own line, which posts embed', () => {
   assert.equal(md('<p>Watch:<iframe src="https://www.youtube.com/embed/abc"></iframe></p>'), 'Watch:\n\n<https://www.youtube.com/embed/abc>');
 });
+
+test('spans and nesting can’t blow a page up', () => {
+  // 100 cells spanning 50 columns each, then 500 rows: padding every row would be megabytes.
+  const probe = '<table><tr>' + '<td colspan="50">a</td>'.repeat(100) + '</tr>' + '<tr><td>b</td></tr>'.repeat(500) + '</table>';
+  const out = md(probe);
+  assert.ok(probe.length > 10_000 && out.length < probe.length, `${probe.length} → ${out.length}`);
+  assert.ok(out.startsWith('- a · a · a') && out.endsWith('- b'), out.slice(0, 40));
+  const tall = '<table><tr><td rowspan="500" colspan="50">a</td><td>x</td></tr>' + '<tr><td>b</td></tr>'.repeat(900) + '</table>';
+  assert.ok(md(tall).length < tall.length);
+  // Ordinary spans still make a table.
+  assert.equal(md('<table><tr><th colspan="2">Both</th></tr><tr><td>x</td><td>y</td></tr></table>'), '| Both |  |\n| --- | --- |\n| x | y |');
+  // Nesting past twelve levels reads as text instead of multiplying indentation and quote marks.
+  const lists = md('<ul><li>x'.repeat(800) + '</li></ul>'.repeat(800));
+  assert.ok(lists.length < 3000, String(lists.length));
+  const quotes = md('<blockquote><p>q</p>'.repeat(600) + '</blockquote>'.repeat(600));
+  assert.ok(quotes.length < 40_000, String(quotes.length));
+});

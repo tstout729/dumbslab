@@ -1,9 +1,15 @@
-// Runs an import plan against the API: uploads the attachments a batch needs, imports the batch
-// with import_documents, then points links that were waiting for later pages at them. Running a
-// plan again is safe: pages already there are matched (skip_existing) and files already uploaded
-// are reused by checksum.
+// Runs an import plan against the API in two steps.
+//
+// 1. Pages: batches go to import_documents with skip_existing. Links to pages that don't exist
+//    yet and images and files that aren't uploaded yet are placeholders (see plan.js).
+// 2. Finishing: each page with placeholders gets its files, uploaded to that page (so exactly its
+//    readers can open them), and links to the pages that now exist, in one save.
+//
+// Running a plan again is safe. Pages already there are matched, not duplicated, and their
+// remaining placeholders are finished, so a file that failed to upload the first time is
+// uploaded then. A file already uploaded to a page is reused by checksum and name.
 
-import { fillTokens, pendingLink, byteLength, MAX_FILE_BYTES } from './plan.js';
+import { fillTokens, pendingLink, pendingFile, byteLength, MAX_FILE_BYTES } from './plan.js';
 import { topicSegment } from './paths.js';
 
 /** Pages per import_documents call: small enough to retry and show progress, large enough to be quick. */
@@ -26,6 +32,12 @@ function stops(e) {
     || (status === 503 && e.code === 'free_capacity') || (e && e.name === 'AbortError');
 }
 
+/** No answer, or a server error: the request may or may not have taken effect. */
+const ambiguous = (e) => {
+  const s = e && typeof e.status === 'number' ? e.status : 0;
+  return s === 0 || (s >= 500 && s !== 507 && !(s === 503 && e.code === 'free_capacity'));
+};
+
 /**
  * opts: { api: { get, post, patch }, source, rootTopic, status, sha256(bytes), base64(bytes),
  * onProgress(progress), signal, sleep(ms) }. Resolves to a report; never throws for a failed page.
@@ -40,18 +52,14 @@ export async function runImport(plan, opts) {
     files: { uploaded: 0, reused: 0, failed: [] },
     linked: 0, linkFailed: [],
   };
-  const progress = { phase: 'import', docsDone: 0, docsTotal: plan.documents.length, filesDone: 0, filesTotal: plan.attachments.length, linksDone: 0, linksTotal: 0, failed: 0 };
+  const progress = { phase: 'import', docsDone: 0, docsTotal: plan.documents.length, finishDone: 0, finishTotal: 0, failed: 0 };
   const tell = () => opts.onProgress && opts.onProgress({ ...progress });
 
   const checkAbort = () => {
-    if (signal && signal.aborted) {
-      const e = new Error('Cancelled');
-      e.name = 'AbortError';
-      throw e;
-    }
+    if (signal && signal.aborted) throw new StopImport(null, 'Cancelled.');
   };
 
-  /** One API call with retries for network trouble, server errors and the request limit. */
+  /** One API call, retried after network trouble, server errors and the request limit. */
   async function call(fn) {
     for (let attempt = 0; ; attempt++) {
       checkAbort();
@@ -59,12 +67,11 @@ export async function runImport(plan, opts) {
         return await fn();
       } catch (e) {
         if (e && e.name === 'AbortError') throw new StopImport(e, 'Cancelled.');
-        const s = e && typeof e.status === 'number' ? e.status : 0;
-        if (s === 429 && e.code === 'rate_limited' && attempt < 5) {
+        if (e && e.status === 429 && e.code === 'rate_limited' && attempt < 5) {
           await sleep(30_000);
           continue;
         }
-        if ((s === 0 || (s >= 500 && s !== 507 && !(s === 503 && e.code === 'free_capacity'))) && attempt < 3) {
+        if (ambiguous(e) && attempt < 3) {
           await sleep([2000, 5000, 15000][attempt]);
           continue;
         }
@@ -75,51 +82,22 @@ export async function runImport(plan, opts) {
   }
 
   const docs = new Map();
-  const files = new Map();
-  const waiting = new Set();
-  let mine = null;
-
-  async function myFiles() {
-    if (mine) return mine;
-    mine = new Map();
-    let cursor;
-    for (let pages = 0; pages < 100; pages++) {
-      const r = await call(() => api.get('/files', { uploaded_by: 'me', limit: 200, cursor }));
-      for (const f of r.items || []) mine.set(`${f.sha256}\u0000${f.name}`, f.path);
-      cursor = r.next_cursor;
-      if (!cursor) break;
-    }
-    return mine;
-  }
-
-  async function upload(att) {
-    const bytes = await source.bytes(att.path, { maxBytes: MAX_FILE_BYTES });
-    const sum = await sha256(bytes);
-    const known = (await myFiles()).get(`${sum}\u0000${att.name}`);
-    if (known) {
-      report.files.reused++;
-      return known;
-    }
-    const body = { name: att.name, data_base64: base64(bytes) };
-    if (att.type) body.content_type = att.type;
-    const r = await call(() => api.post('/files', body));
-    mine.set(`${sum}\u0000${att.name}`, r.path);
-    report.files.uploaded++;
-    return r.path;
-  }
-
+  const attachments = new Map(plan.attachments.map((a) => [a.n, a]));
   const topicOf = (d) => [root, ...d.topic].map(topicSegment).filter(Boolean).join('/') || undefined;
+  const pageRefs = (d) => [...new Set([...d.markdown.matchAll(/dsimport:page:(\d+)/g)].map((m) => Number(m[1])))];
+  const fileRefs = (d) => [...new Set([...d.markdown.matchAll(/dsimport:file:(\d+)/g)].map((m) => Number(m[1])))].filter((n) => attachments.has(n));
+
+  // ---------------------------------------------------------------------------
+  // 1. Pages
 
   function content(d) {
     return fillTokens(d.markdown, {
       page: (n) => {
         if (docs.has(n)) return `/p/${docs.get(n).id}`;
         const target = plan.byNumber.get(n);
-        if (!target) return null;
-        waiting.add(d.n);
-        return pendingLink(target);
+        return target ? pendingLink(target) : null;
       },
-      file: (n) => files.get(n) || null,
+      file: (n) => (attachments.has(n) ? pendingFile(attachments.get(n)) : null),
     });
   }
 
@@ -132,7 +110,7 @@ export async function runImport(plan, opts) {
   let cur = [];
   let size = 0;
   for (const d of plan.documents) {
-    // As JSON (newlines and quotes double), plus room for the links and file paths filled in.
+    // As JSON (newlines and quotes double), plus room for links and placeholders filled in.
     const bytes = byteLength(JSON.stringify(d.markdown)) + byteLength(d.title) + 300 + (d.markdown.match(/dsimport:/g) || []).length * 300;
     if (cur.length && (cur.length >= (opts.batchSize || BATCH_DOCS) || size + bytes > BATCH_BYTES)) {
       batches.push(cur);
@@ -144,32 +122,10 @@ export async function runImport(plan, opts) {
   }
   if (cur.length) batches.push(cur);
 
-  const attachmentsByNumber = new Map(plan.attachments.map((a) => [a.n, a]));
   let bi = 0;
   try {
     for (; bi < batches.length; bi++) {
       const batch = batches[bi];
-      // Files this batch shows, uploaded first so its Markdown can point at them.
-      for (const d of batch) {
-        for (const m of d.markdown.matchAll(/dsimport:file:(\d+)/g)) {
-          const n = Number(m[1]);
-          if (files.has(n) || !attachmentsByNumber.has(n)) continue;
-          const att = attachmentsByNumber.get(n);
-          progress.phase = 'upload';
-          progress.current = att.name;
-          tell();
-          try {
-            files.set(n, await upload(att));
-          } catch (e) {
-            if (e instanceof StopImport) throw e;
-            files.set(n, null);
-            report.files.failed.push({ name: att.name, path: att.path, reason: e.message || String(e) });
-          }
-          progress.filesDone++;
-          tell();
-        }
-      }
-      progress.phase = 'import';
       progress.current = batch[0].title;
       tell();
       const payload = batch.map((d) => ({ d, doc: { title: d.title, content: content(d), topic: topicOf(d), status } }));
@@ -197,48 +153,6 @@ export async function runImport(plan, opts) {
       progress.docsDone += batch.length;
       tell();
     }
-
-    // Links that waited for pages imported later, and pages a previous run left waiting.
-    const toLink = plan.documents.filter((d) => docs.has(d.n) && (waiting.has(d.n) || (!docs.get(d.n).created && /dsimport:page:/.test(d.markdown))));
-    progress.phase = 'link';
-    progress.linksTotal = toLink.length;
-    tell();
-    for (const d of toLink) {
-      const t = docs.get(d.n);
-      const targets = [...new Set([...d.markdown.matchAll(/dsimport:page:(\d+)/g)].map((m) => Number(m[1])))]
-        .filter((n) => docs.has(n) && plan.byNumber.has(n));
-      const fix = (text) => targets.reduce((s, n) => s.split(pendingLink(plan.byNumber.get(n))).join(`/p/${docs.get(n).id}`), text);
-      progress.current = d.title;
-      try {
-        let done = false;
-        if (t.created && t.sent !== undefined) {
-          const next = fix(t.sent);
-          if (next === t.sent) done = true;
-          else {
-            try {
-              await call(() => api.patch(`/posts/${encodeURIComponent(t.id)}`, { content: next, base_version: 1, note: 'Linked imported pages' }));
-              report.linked++;
-              done = true;
-            } catch (e) {
-              if (e instanceof StopImport || e.status !== 409) throw e;
-            }
-          }
-        }
-        if (!done) {
-          const post = await call(() => api.get(`/posts/${encodeURIComponent(t.id)}`));
-          const next = fix(post.content);
-          if (next !== post.content) {
-            await call(() => api.patch(`/posts/${encodeURIComponent(t.id)}`, { content: next, base_version: post.version, note: 'Linked imported pages' }));
-            report.linked++;
-          }
-        }
-      } catch (e) {
-        if (e instanceof StopImport) throw e;
-        report.linkFailed.push({ title: d.title, url: t.url, reason: e.message || String(e) });
-      }
-      progress.linksDone++;
-      tell();
-    }
   } catch (e) {
     if (!(e instanceof StopImport)) throw e;
     report.stopped = e.message;
@@ -247,6 +161,137 @@ export async function runImport(plan, opts) {
         if (!docs.has(d.n) && !report.notImported.some((x) => x.path === d.path)) report.notImported.push({ title: d.title, path: d.path });
       }
     }
+  }
+
+  // ---------------------------------------------------------------------------
+  // 2. Finishing: files and links. This runs even after a stop, for the pages that are in, so a
+  // stop leaves as little as possible for the next run; it stops itself at the next refusal.
+
+  /** Files already uploaded to a post, by checksum and name. */
+  const onPost = new Map();
+  async function attachedTo(postId, { fresh = false } = {}) {
+    if (onPost.has(postId) && !fresh) return onPost.get(postId);
+    const found = new Map();
+    let cursor;
+    for (let page = 0; page < 50; page++) {
+      const r = await call(() => api.get('/files', { post_id: postId, limit: 200, cursor }));
+      for (const f of r.items || []) found.set(`${f.sha256}\u0000${f.name}`, f.path);
+      cursor = r.next_cursor;
+      if (!cursor) break;
+    }
+    onPost.set(postId, found);
+    return found;
+  }
+
+  /** Uploads a file to a post, or finds it already there. Never stores the same file twice. */
+  async function uploadTo(postId, att) {
+    const bytes = await source.bytes(att.path, { maxBytes: MAX_FILE_BYTES });
+    const key = `${await sha256(bytes)}\u0000${att.name}`;
+    const known = (await attachedTo(postId)).get(key);
+    if (known) {
+      report.files.reused++;
+      return known;
+    }
+    const body = { name: att.name, data_base64: base64(bytes), post_id: postId };
+    if (att.type) body.content_type = att.type;
+    for (let attempt = 0; ; attempt++) {
+      checkAbort();
+      try {
+        const r = await api.post('/files', body);
+        onPost.get(postId).set(key, r.path);
+        report.files.uploaded++;
+        return r.path;
+      } catch (e) {
+        if (e && e.name === 'AbortError') throw new StopImport(e, 'Cancelled.');
+        if (e && e.status === 429 && e.code === 'rate_limited' && attempt < 5) {
+          await sleep(30_000);
+          continue;
+        }
+        if (!ambiguous(e) || attempt >= 3) {
+          if (stops(e)) throw new StopImport(e);
+          throw e;
+        }
+        // The upload may have landed even though the answer didn't: look before sending it again.
+        await sleep([2000, 5000, 15000][attempt]);
+        const landed = (await attachedTo(postId, { fresh: true })).get(key);
+        if (landed) {
+          report.files.uploaded++;
+          return landed;
+        }
+      }
+    }
+  }
+
+  const toFinish = plan.documents.filter((d) => {
+    const t = docs.get(d.n);
+    if (!t) return false;
+    const hasRefs = pageRefs(d).length || fileRefs(d).length;
+    return t.created ? /#import-file-|\/search\?q=[^)\s"]*&import=/.test(t.sent) : hasRefs;
+  });
+  progress.phase = 'finish';
+  progress.finishTotal = toFinish.length;
+  progress.current = '';
+  tell();
+  try {
+    for (const d of toFinish) {
+      checkAbort();
+      const t = docs.get(d.n);
+      progress.current = d.title;
+      tell();
+      try {
+        let text;
+        let version;
+        if (t.created && t.sent !== undefined) {
+          text = t.sent;
+          version = 1;
+        } else {
+          const post = await call(() => api.get(`/posts/${encodeURIComponent(t.id)}`));
+          text = post.content;
+          version = post.version;
+        }
+        // What each placeholder becomes. Files are uploaded only for placeholders still there.
+        const swaps = new Map();
+        for (const n of pageRefs(d)) {
+          const target = plan.byNumber.get(n);
+          if (target && docs.has(n)) swaps.set(pendingLink(target), `/p/${docs.get(n).id}`);
+        }
+        for (const n of fileRefs(d)) {
+          const att = attachments.get(n);
+          const placeholder = pendingFile(att);
+          if (!text.includes(placeholder)) continue;
+          try {
+            swaps.set(placeholder, await uploadTo(t.id, att));
+          } catch (e) {
+            if (e instanceof StopImport) throw e;
+            report.files.failed.push({ name: att.name, path: att.path, page: d.title, reason: e.message || String(e) });
+          }
+        }
+        const apply = (s) => [...swaps].reduce((acc, [from, to]) => acc.split(from).join(to), s);
+        let next = apply(text);
+        if (next !== text) {
+          try {
+            await call(() => api.patch(`/posts/${encodeURIComponent(t.id)}`, { content: next, base_version: version, note: 'Added imported files and links' }));
+          } catch (e) {
+            if (e instanceof StopImport || e.status !== 409) throw e;
+            // Someone edited the page meanwhile: apply the same changes to their version.
+            const post = await call(() => api.get(`/posts/${encodeURIComponent(t.id)}`));
+            next = apply(post.content);
+            if (next !== post.content) {
+              await call(() => api.patch(`/posts/${encodeURIComponent(t.id)}`, { content: next, base_version: post.version, note: 'Added imported files and links' }));
+            }
+          }
+          report.linked++;
+        }
+      } catch (e) {
+        if (e instanceof StopImport) throw e;
+        report.linkFailed.push({ title: d.title, url: t.url, reason: e.message || String(e) });
+      }
+      progress.finishDone++;
+      tell();
+    }
+  } catch (e) {
+    if (!(e instanceof StopImport)) throw e;
+    report.stopped = report.stopped || e.message;
   }
   progress.phase = 'done';
   progress.current = '';

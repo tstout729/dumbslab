@@ -29,9 +29,10 @@ async function deflate(bytes) {
 
 /**
  * A zip Blob of `files` ({ path: string | Uint8Array }). Text is deflated and binary stored,
- * so both methods get read. `utf8Flag: false` leaves the UTF-8 name flag off.
+ * so both methods get read. `utf8Flag: false` leaves the UTF-8 name flag off. `lie` writes
+ * other sizes into an entry's headers ({ path: { size, compressedSize } }), as a crafted zip would.
  */
-export async function makeZip(files, { utf8Flag = true, comment = '' } = {}) {
+export async function makeZip(files, { utf8Flag = true, comment = '', lie = {} } = {}) {
   const enc = new TextEncoder();
   const locals = [];
   const central = [];
@@ -42,6 +43,7 @@ export async function makeZip(files, { utf8Flag = true, comment = '' } = {}) {
     const deflated = typeof value === 'string' && data.length > 0;
     const body = deflated ? await deflate(data) : data;
     const crc = crc32(data);
+    const sizes = { size: data.length, compressedSize: body.length, ...(lie[path] || {}) };
     const flags = utf8Flag ? 0x800 : 0;
     const local = new DataView(new ArrayBuffer(30));
     local.setUint32(0, 0x04034b50, true);
@@ -49,8 +51,8 @@ export async function makeZip(files, { utf8Flag = true, comment = '' } = {}) {
     local.setUint16(6, flags, true);
     local.setUint16(8, deflated ? 8 : 0, true);
     local.setUint32(14, crc, true);
-    local.setUint32(18, body.length, true);
-    local.setUint32(22, data.length, true);
+    local.setUint32(18, sizes.compressedSize, true);
+    local.setUint32(22, sizes.size, true);
     local.setUint16(26, name.length, true);
     locals.push(new Uint8Array(local.buffer), name, body);
     const cd = new DataView(new ArrayBuffer(46));
@@ -60,8 +62,8 @@ export async function makeZip(files, { utf8Flag = true, comment = '' } = {}) {
     cd.setUint16(8, flags, true);
     cd.setUint16(10, deflated ? 8 : 0, true);
     cd.setUint32(16, crc, true);
-    cd.setUint32(20, body.length, true);
-    cd.setUint32(24, data.length, true);
+    cd.setUint32(20, sizes.compressedSize, true);
+    cd.setUint32(24, sizes.size, true);
     cd.setUint16(28, name.length, true);
     cd.setUint32(42, offset, true);
     central.push(new Uint8Array(cd.buffer), name);

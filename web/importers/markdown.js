@@ -2,7 +2,7 @@
 // titles, and rewriting link and image targets outside code. Raw HTML that would run (scripts,
 // styles, event handlers, javascript: URLs) is removed; the server sanitizes the rest.
 
-const MASK = '';
+const MASK = '\uE001';
 
 /** Splits YAML front matter off the top. Returns { data, body }; data holds simple `key: value` pairs. */
 export function splitFrontMatter(md) {

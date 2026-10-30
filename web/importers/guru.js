@@ -22,8 +22,9 @@ const get = (obj, key) => {
   return k === undefined ? undefined : obj[k];
 };
 
-export async function convertGuru(source, { parseHtml, onProgress } = {}) {
-  const b = new PlanBuilder('guru', source);
+export async function convertGuru(source, opts = {}) {
+  const { parseHtml, onProgress } = opts;
+  const b = new PlanBuilder('guru', source, opts);
   const readYaml = async (p) => {
     try {
       return parseYaml(await source.text(p, { maxBytes: 1024 * 1024 })) || {};
@@ -133,6 +134,10 @@ export async function convertGuru(source, { parseHtml, onProgress } = {}) {
   for (const id of order) {
     if (onProgress) onProgress(++done, order.length);
     const card = cards.get(id);
+    if (b.full && card.content) {
+      b.skip(card.content, b.fullReason);
+      continue;
+    }
     if (!card.content) {
       if (card.meta) b.skip(card.meta, 'A card without its content file (.html or .md).');
       continue;

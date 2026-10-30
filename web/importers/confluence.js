@@ -26,8 +26,9 @@ export function confluenceBase(paths) {
   return nested ? dirname(nested) : null;
 }
 
-export async function convertConfluence(source, { parseHtml, onProgress, attachmentLists = true } = {}) {
-  const b = new PlanBuilder('confluence', source);
+export async function convertConfluence(source, opts = {}) {
+  const { parseHtml, onProgress, attachmentLists = true } = opts;
+  const b = new PlanBuilder('confluence', source, opts);
   const base = confluenceBase(source.paths) ?? '';
   const inBase = (p) => (base ? p.startsWith(base + '/') && !p.slice(base.length + 1).includes('/') : !p.includes('/'));
   const indexPath = base ? `${base}/index.html` : 'index.html';
@@ -105,6 +106,10 @@ export async function convertConfluence(source, { parseHtml, onProgress, attachm
   const all = [...order, ...unplaced];
   for (const path of all) {
     if (onProgress) onProgress(++done, all.length);
+    if (b.full) {
+      b.skip(path, b.fullReason);
+      continue;
+    }
     if (source.size(path) > MAX_SOURCE_BYTES) {
       b.skip(path, `The page is ${formatSize(source.size(path))}; pages can be at most ${formatSize(MAX_SOURCE_BYTES)}.`);
       continue;

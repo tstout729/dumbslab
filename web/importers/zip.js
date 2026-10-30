@@ -7,6 +7,8 @@
 export const MAX_ZIP_BYTES = 1024 * 1024 * 1024;
 /** More entries than this is almost certainly not a wiki export. */
 export const MAX_ENTRIES = 200_000;
+/** The most one entry is ever inflated to, whatever the caller allows. */
+export const MAX_ENTRY_BYTES = 64 * 1024 * 1024;
 
 export class ZipError extends Error {
   constructor(message) {
@@ -118,23 +120,26 @@ export async function openZip(blob) {
 }
 
 /**
- * Reads one entry's bytes. Refuses entries larger than `maxBytes`, encrypted ones and
- * compression methods other than stored and deflate, and checks the CRC.
+ * Reads one entry's bytes. Refuses entries larger than `maxBytes` (and MAX_ENTRY_BYTES),
+ * encrypted ones and compression methods other than stored and deflate, sizes the zip can't
+ * back up, and data whose checksum doesn't match. Nothing is read before the sizes check out.
  */
-export async function readEntry(blob, entry, { maxBytes = Infinity } = {}) {
+export async function readEntry(blob, entry, { maxBytes = MAX_ENTRY_BYTES } = {}) {
+  const limit = Math.min(maxBytes, MAX_ENTRY_BYTES);
   if (entry.encrypted) throw new ZipError(`“${entry.name}” is encrypted.`);
   if (entry.method !== 0 && entry.method !== 8) throw new ZipError(`“${entry.name}” uses a compression method browsers can’t read (${entry.method}).`);
-  if (entry.size > maxBytes) throw new ZipError(`“${entry.name}” is ${formatSize(entry.size)}, more than the ${formatSize(maxBytes)} allowed.`);
+  if (entry.size > limit) throw new ZipError(`“${entry.name}” is ${formatSize(entry.size)}, more than the ${formatSize(limit)} allowed.`);
+  // A stored entry is exactly its bytes. Deflate can grow data that doesn't compress, but even a
+  // poor encoder stays within an eighth (stored blocks add 5 bytes per 64 KB).
+  const maxCompressed = entry.method === 0 ? entry.size : entry.size + Math.ceil(entry.size / 8) + 1024;
+  if (entry.compressedSize > maxCompressed) throw new ZipError(`“${entry.name}” is damaged (its sizes don’t agree).`);
+  if (entry.offset + 30 > blob.size) throw new ZipError(`“${entry.name}” is damaged (it starts past the end of the zip).`);
   const head = view(await bytesAt(blob, entry.offset, entry.offset + 30));
-  if (head.byteLength < 30 || head.getUint32(0, true) !== LOCAL) throw new ZipError(`“${entry.name}” is damaged.`);
+  if (head.getUint32(0, true) !== LOCAL) throw new ZipError(`“${entry.name}” is damaged.`);
   const start = entry.offset + 30 + head.getUint16(26, true) + head.getUint16(28, true);
+  if (start + entry.compressedSize > blob.size) throw new ZipError(`“${entry.name}” is damaged (it runs past the end of the zip).`);
   const raw = blob.slice(start, start + entry.compressedSize);
-  let out;
-  if (entry.method === 0) {
-    out = new Uint8Array(await raw.arrayBuffer());
-  } else {
-    out = await inflate(raw, entry);
-  }
+  const out = entry.method === 0 ? new Uint8Array(await raw.arrayBuffer()) : await inflate(raw, entry);
   if (out.length !== entry.size) throw new ZipError(`“${entry.name}” is damaged (its size doesn’t match).`);
   if (crc32(out) !== entry.crc) throw new ZipError(`“${entry.name}” is damaged (its checksum doesn’t match).`);
   return out;

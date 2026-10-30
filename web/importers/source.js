@@ -2,7 +2,7 @@
 //   { name, root, paths, has(path), size(path), text(path), bytes(path) }
 // zipSource reads a zip lazily; memorySource wraps files already in memory (tests, agents).
 
-import { openZip, readEntry, ZipError } from './zip.js';
+import { openZip, readEntry, ZipError, MAX_ENTRY_BYTES } from './zip.js';
 
 /** Files no export means to include: OS metadata and version-control internals. */
 export function isJunk(path) {
@@ -73,7 +73,7 @@ export function memorySource(map, name = 'export', { gitConfig = null } = {}) {
   }
   const { root, strip } = stripRoot([...raw.keys()]);
   const files = new Map([...raw].map(([p, v]) => [strip(p), v]));
-  const get = (p, { maxBytes = Infinity } = {}) => {
+  const get = (p, { maxBytes = MAX_ENTRY_BYTES } = {}) => {
     const v = files.get(p);
     if (!v) throw new ZipError(`“${p}” isn’t in the export.`);
     if (v.length > maxBytes) throw new ZipError(`“${p}” is too large.`);

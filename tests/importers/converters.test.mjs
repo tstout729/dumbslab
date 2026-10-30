@@ -4,7 +4,8 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { fixtureZip } from './helpers.mjs';
 import { parseHtml } from './mini-dom.mjs';
-import { zipSource } from '../../web/importers/source.js';
+import { zipSource, memorySource } from '../../web/importers/source.js';
+import { PlanBuilder, MAX_PLAN_BYTES } from '../../web/importers/plan.js';
 import { detectFormat, convert } from '../../web/importers/index.js';
 
 async function load(name, opts = {}) {
@@ -132,4 +133,36 @@ test('large attachments are skipped and listed', async () => {
   assert.equal(plan.attachments.length, 0);
   assert.match(plan.skipped.find((s) => s.path === 'img/diagram.png').reason, /10 MB/);
   assert.ok(plan.documents.find((d) => d.title === 'Install').markdown.includes('*Diagram*'));
+});
+
+test('same-titled pages get numbered, even at the 300-character limit', () => {
+  const b = new PlanBuilder('markdown', memorySource({}));
+  const long = 'x'.repeat(301);
+  for (const key of ['a.md', 'b.md', 'c.md']) b.add({ key, title: long, topic: ['T'], markdown: 'body' });
+  b.add({ key: 'd.md', title: 'Short', topic: ['T'], markdown: '' });
+  b.add({ key: 'e.md', title: 'Short', topic: ['Other'], markdown: '' });
+  const titles = b.finish().documents.map((d) => d.title);
+  assert.equal(new Set(titles.slice(0, 3)).size, 3);
+  assert.ok(titles.every((t) => t.length <= 300), titles.map((t) => t.length).join());
+  assert.ok(titles[0].endsWith('…') && titles[1].endsWith('… (2)') && titles[2].endsWith('… (3)'), titles.join('\n'));
+  assert.deepEqual(titles.slice(3), ['Short', 'Short']);
+});
+
+test('oversized pages and exports past the budget are skipped as they are converted', async () => {
+  const b = new PlanBuilder('markdown', memorySource({}), { maxPlanBytes: 1000 });
+  assert.equal(b.add({ key: 'huge.md', title: 'Huge', markdown: 'x'.repeat(2_000_000) }), null);
+  assert.ok(b.add({ key: 'a.md', title: 'A', markdown: 'y'.repeat(600) }));
+  assert.equal(b.add({ key: 'b.md', title: 'B', markdown: 'z'.repeat(600) }), null);
+  assert.equal(b.add({ key: 'c.md', title: 'C', markdown: 'small' }), null, 'nothing more once the budget is spent');
+  const plan = b.finish();
+  assert.deepEqual(plan.documents.map((d) => d.title), ['A']);
+  assert.match(plan.skipped.find((x) => x.path === 'huge.md').reason, /2 MB/);
+  assert.deepEqual(plan.skipped.filter((x) => /already holds/.test(x.reason)).map((x) => x.path), ['b.md', 'c.md']);
+  assert.equal(plan.notes.length, 1);
+  assert.equal(MAX_PLAN_BYTES, 100 * 1024 * 1024);
+
+  // Converters stop parsing once the budget is spent.
+  const { plan: part } = await load('markdown', { convert: { maxPlanBytes: 200 } });
+  assert.ok(part.documents.length >= 1 && part.documents.length < 5, String(part.documents.length));
+  assert.ok(part.skipped.some((x) => /already holds/.test(x.reason)));
 });

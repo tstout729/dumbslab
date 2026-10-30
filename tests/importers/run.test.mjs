@@ -14,7 +14,7 @@ const sha256 = async (b) => createHash('sha256').update(b).digest('hex');
 const base64 = (b) => Buffer.from(b).toString('base64');
 const fail = (status, code, message) => Object.assign(new Error(message), { status, code });
 
-function fakeServer({ rejectContent, rejectFile, importCalls = Infinity, flaky = 0 } = {}) {
+function fakeServer({ rejectContent, rejectFile, loseUploadAnswer, importCalls = Infinity, flaky = 0 } = {}) {
   const posts = [];
   const files = [];
   let seq = 0;
@@ -26,9 +26,10 @@ function fakeServer({ rejectContent, rejectFile, importCalls = Infinity, flaky =
     async get(path, query) {
       api.calls.push(['GET', path]);
       if (path === '/files') {
+        const mine = query.post_id ? files.filter((f) => f.post_id === query.post_id) : files;
         const start = Number(query.cursor || 0);
-        const items = files.slice(start, start + 2);
-        return { items, next_cursor: start + 2 < files.length ? String(start + 2) : null };
+        const items = mine.slice(start, start + 2);
+        return { items, next_cursor: start + 2 < mine.length ? String(start + 2) : null };
       }
       const post = posts.find((p) => path === `/posts/${p.id}`);
       if (!post) throw fail(404, 'not_found', 'post not found');
@@ -42,10 +43,15 @@ function fakeServer({ rejectContent, rejectFile, importCalls = Infinity, flaky =
       }
       if (path === '/files') {
         if (rejectFile && body.name === rejectFile) throw fail(400, 'bad_request', 'the file is empty');
+        if (body.post_id && !posts.some((p) => p.id === body.post_id)) throw fail(404, 'not_found', 'post not found');
         const bytes = Buffer.from(body.data_base64, 'base64');
         const id = `f${String(++seq).padStart(9, '0')}`;
-        const f = { id, name: body.name, sha256: await sha256(bytes), path: `/files/${id}/${encodeURIComponent(body.name)}` };
+        const f = { id, name: body.name, sha256: await sha256(bytes), path: `/files/${id}/${encodeURIComponent(body.name)}`, post_id: body.post_id || null };
         files.push(f);
+        if (loseUploadAnswer === body.name) {
+          loseUploadAnswer = null;
+          throw fail(0, 'network', 'Could not reach the server.');
+        }
         return f;
       }
       if (path === '/import') {
@@ -78,7 +84,7 @@ function fakeServer({ rejectContent, rejectFile, importCalls = Infinity, flaky =
       return post;
     },
   };
-  return { api, posts, files, refill: () => { importCalls = Infinity; } };
+  return { api, posts, files, refill: () => { importCalls = Infinity; }, rejectNone: () => { rejectFile = null; } };
 }
 
 async function plan(name) {
@@ -109,7 +115,11 @@ test('imports everything, uploads files once and links pages to each other', asy
   const again = await run(p, server, { batchSize: 2 });
   assert.equal(again.created.length, 0);
   assert.equal(again.existing.length, 7);
-  assert.deepEqual([again.files.uploaded, again.files.reused], [0, 3]);
+  assert.deepEqual([again.files.uploaded, again.files.reused], [0, 0]);
+  assert.equal(server.files.length, 3);
+  // Each file belongs to the page that shows it.
+  const laptop = byTitle('Laptop setup');
+  assert.deepEqual(server.files.filter((f) => f.post_id === laptop.id).map((f) => f.name).sort(), ['checklist.pdf', 'dock.png']);
   assert.equal(JSON.stringify(server.posts), before);
 });
 
@@ -141,14 +151,47 @@ test('an import that runs out of writes stops, then finishes when run again', as
   assert.ok(!/dsimport:|\/search\?q=/.test(all), all);
 });
 
-test('a file that fails to upload leaves its link text, and the page still imports', async () => {
+test('a file that fails to upload is added by the next run', async () => {
   const p = await plan('confluence');
-  const server = fakeServer({ rejectFile: 'checklist.pdf', flaky: 1 });
+  const server = fakeServer({ rejectFile: 'dock.png', flaky: 1 });
+  const first = await run(p, server);
+  assert.equal(first.created.length, 7);
+  assert.deepEqual(first.files.failed.map((f) => [f.name, f.page]), [['dock.png', 'Laptop setup']]);
+  const laptop = () => server.posts.find((x) => x.title === 'Laptop setup');
+  assert.match(laptop().content, /!\[Dock diagram\]\(#import-file-[0-9a-f]{8}\)/);
+  assert.match(laptop().content, /\[checklist\.pdf\]\(\/files\/f\d+\/checklist\.pdf\)/);
+
+  // The page is already there, so it isn't imported again, but its missing image is added.
+  server.rejectNone();
+  const second = await run(p, server);
+  assert.deepEqual([second.created.length, second.existing.length], [0, 7]);
+  assert.deepEqual([second.files.uploaded, second.files.failed.length], [1, 0]);
+  assert.match(laptop().content, /!\[Dock diagram\]\(\/files\/f\d+\/dock\.png\)/);
+  assert.ok(!/#import-file-/.test(server.posts.map((x) => x.content).join('\n')));
+  assert.deepEqual(server.files.filter((f) => f.post_id === laptop().id).map((f) => f.name).sort(), ['checklist.pdf', 'dock.png']);
+});
+
+test('a file someone already uploaded to another page is not borrowed', async () => {
+  const p = await plan('confluence');
+  const server = fakeServer();
+  // The same image, by the same person, on an unrelated (say private) page.
+  const dock = (await p.source.bytes('attachments/1003/2001.png'));
+  server.files.push({ id: 'fprivate01', name: 'dock.png', sha256: await sha256(dock), path: '/files/fprivate01/dock.png', post_id: 'pprivate01' });
+  await run(p, server);
+  const laptop = server.posts.find((x) => x.title === 'Laptop setup');
+  assert.ok(!laptop.content.includes('fprivate01'), laptop.content);
+  const shown = /\/files\/(f\d+)\/dock\.png/.exec(laptop.content)[1];
+  assert.equal(server.files.find((f) => f.id === shown).post_id, laptop.id);
+});
+
+test('an upload whose answer is lost is not stored twice', async () => {
+  const p = await plan('confluence');
+  const server = fakeServer({ loseUploadAnswer: 'dock.png' });
   const report = await run(p, server);
-  assert.equal(report.created.length, 7);
-  assert.deepEqual(report.files.failed.map((f) => f.name), ['checklist.pdf']);
-  const laptop = server.posts.find((x) => x.title === 'Laptop setup').content;
-  assert.ok(laptop.startsWith('Install the tools, then check the checklist.pdf.'), laptop);
+  assert.equal(report.files.uploaded, 3);
+  assert.equal(server.files.filter((f) => f.name === 'dock.png').length, 1);
+  const laptop = server.posts.find((x) => x.title === 'Laptop setup');
+  assert.match(laptop.content, /!\[Dock diagram\]\(\/files\/f\d+\/dock\.png\)/);
 });
 
 test('drafts, a different top topic and every format run cleanly', async () => {
