@@ -9,13 +9,16 @@
 //   app's own harmless parameters (never search text, tokens or OAuth codes); hashes go. Another
 //   site's URL keeps only its origin. Pageview titles are dropped.
 // - Recordings mask all text, every input and words in attributes, and template links' and images'
-//   URLs. No canvas, console or network capture. While an excluded page (setup, sign-in) is on
+//   URLs. People's own rendered content (post and comment bodies, previews, search snippets, the
+//   editor) is recorded as an empty box: the views mark it `ph-no-capture`. No canvas, console or
+//   network capture. While an excluded page (setup, sign-in) is on
 //   screen nothing is recorded, and anything recorded during that time is dropped before sending.
 // - posthog-js never calls /flags (feature flags are off), so no request carries person
 //   properties it hasn't passed through `before_send`.
-// - Sentry gets errors only: no replay, tracing, sessions, console or click breadcrumbs. Exception
-//   and breadcrumb text is replaced with "[redacted]"; error types, function names and line
-//   numbers stay. API errors are left out; the server reports its own failures.
+// - Sentry gets errors only: no replay, tracing, sessions, console or click breadcrumbs, and no IP
+//   address. Exception and breadcrumb text is replaced with "[redacted]"; error types, function
+//   names and line numbers stay. Breadcrumbs from excluded pages are dropped. API errors are left
+//   out; the server reports its own failures.
 
 import { ApiError } from '/api.js';
 
@@ -37,8 +40,18 @@ const API_WORDS = new Set([
   'operations', 'password', 'pins', 'plan', 'posts', 'preview', 'reactions', 'read', 'recent', 'render', 'restore', 'search',
   'settings', 'setup', 'state', 'tokens', 'topics', 'upgrade', 'users', 'verify', 'versions', 'webhooks',
 ]);
-/** The app's own scripts and images, which name only code (Sentry's stack frames point at them). */
-const STATIC_FILE = /^\/(?:[\w-]+\/)*[\w.-]+\.(?:js|mjs|css|svg|png|ico|webmanifest)$/;
+/**
+ * The app's own files, which name only code (Sentry's stack frames point at them). Any other
+ * file name is someone's (`/files/…`, an image a post links) and becomes `/:other`. Add new
+ * files under web/ here, or their frames read `/:other`.
+ */
+const APP_FILES = new Set([
+  '/app.js', '/api.js', '/state.js', '/ui.js', '/telemetry.js', '/theme-init.js', '/styles.css', '/favicon.svg',
+  '/apple-touch-icon.png', '/og.png', '/index.html', '/welcome.html', '/welcome.js', '/welcome.css',
+  '/vendor/posthog/array.no-external.js', '/vendor/posthog/posthog-recorder.js', '/vendor/sentry/bundle.min.js',
+  ...['activity', 'auth', 'common', 'connected', 'editor', 'history', 'home', 'insights', 'lists', 'notifications', 'people', 'post',
+    'search', 'settings', 'shell', 'topic'].map((v) => `/views/${v}.js`),
+]);
 
 /** Attributes that carry people's words. `maskTextSelector` masks text nodes only. */
 const TEXT_ATTRIBUTES = new Set([
@@ -91,7 +104,7 @@ export function templatePath(pathname) {
     case 'api':
       return '/' + s.slice(1).map((seg, i) => (i === 0 || API_WORDS.has(seg) ? seg : ':id')).join('/');
     default:
-      if (STATIC_FILE.test(path)) return path;
+      if (APP_FILES.has(path)) return path;
   }
   return '/:other';
 }
@@ -200,9 +213,26 @@ function scrubFrames(stacktrace) {
 
 const CRUMB_DATA = new Set(['method', 'status_code', 'url', 'from', 'to', 'request_body_size', 'response_body_size']);
 
-/** Sentry's `beforeBreadcrumb`: no text, templated URLs. */
+const pathOf = (v) => {
+  try {
+    return new URL(v, location.origin).pathname;
+  } catch {
+    return '';
+  }
+};
+
+/** Whether a breadcrumb happened on, or moved to or from, an excluded page. */
+function excludedCrumb(crumb) {
+  const at = typeof crumb.timestamp === 'number' ? crumb.timestamp * 1000 : Date.now();
+  if (excludedAt(at)) return true;
+  const data = crumb.data || {};
+  return ['from', 'to'].some((k) => typeof data[k] === 'string' && PRIVATE_PATH.test(pathOf(data[k])));
+}
+
+/** Sentry's `beforeBreadcrumb`: nothing from excluded pages, no text, templated URLs. */
 export function prepareCrumb(crumb) {
   if (!crumb) return crumb;
+  if (PRIVATE_PATH.test(location.pathname) || excludedCrumb(crumb)) return null;
   if (crumb.message) crumb.message = REDACTED;
   if (crumb.data) {
     const data = {};
@@ -237,8 +267,11 @@ export function prepareError(event, hint) {
   if (event.tags) scrubUrls(event.tags);
   if (event.contexts) scrubUrls(event.contexts);
   delete event.extra;
+  // The user id only: never an IP address, and Sentry must not infer one.
   event.user = event.user && event.user.id ? { id: event.user.id } : undefined;
-  event.breadcrumbs = (event.breadcrumbs || []).map(prepareCrumb);
+  if (event.sdk) event.sdk.settings = { ...event.sdk.settings, infer_ip: 'never' };
+  // Breadcrumbs from an excluded page could be kept from before; drop them by time as well.
+  event.breadcrumbs = (event.breadcrumbs || []).filter((c) => c && !excludedCrumb(c)).map(prepareCrumb).filter(Boolean);
   return event;
 }
 
@@ -261,9 +294,18 @@ async function startSentry(config, user, workspace) {
     dsn: config.sentry.dsn,
     release: config.release || undefined,
     environment: /(^|\.)localhost$/.test(location.hostname) ? 'development' : 'production',
-    sendDefaultPii: false,
+    // Sentry 11 reads this, not sendDefaultPii: no IP addresses, cookies, headers or bodies.
+    dataCollection: {
+      userInfo: false,
+      cookies: false,
+      httpHeaders: false,
+      httpBodies: [],
+      urlQueryParams: false,
+      stackFrameVariables: false,
+      frameContextLines: 0,
+    },
     integrations: (defaults) => [
-      ...defaults.filter((i) => i.name !== 'Breadcrumbs' && i.name !== 'BrowserSession'),
+      ...defaults.filter((i) => !['Breadcrumbs', 'BrowserSession', 'Console', 'ConsoleLogs'].includes(i.name)),
       S.breadcrumbsIntegration({ console: false, dom: false, sentry: false }),
     ],
     beforeSend: prepareError,
