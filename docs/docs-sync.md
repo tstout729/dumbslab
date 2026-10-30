@@ -4,9 +4,15 @@ Docs sync keeps the Markdown files in a repository folder as posts in a topic. W
 
 - **Each file is a published post.** Files ending in `.md` or `.markdown`, in the folder and its sub-folders. Hidden folders (like `.github`) and `node_modules` are skipped.
 - **Titles.** A post's title comes from the file's front matter (`title:`), or from a `# heading` at the very top (which then leaves the body, since the post shows its title), or from the file name: `getting-started.md` becomes "Getting started". A `README.md` or `index.md` is named after its folder.
-- **Folders become sub-topics** of the topic you choose, with the same visibility. Each post sits in the chosen topic and in its folder's sub-topic, so a synced post is never visible to more people than the chosen topic. In a private topic, the sub-topics are private too. Their only member is the admin who set up the sync, and you can add more.
+- **Folders become sub-topics** of the topic you choose, with the same visibility. In a private topic, they're private and start with the topic's members. Each post sits in the chosen topic and in its folder's sub-topic.
+- **A synced post is never visible to more people than the chosen topic.** Every sync checks each sub-topic. A sub-topic fails the check if someone made it public, or gave it a member the chosen topic doesn't have (admins don't count, since they see every topic). When one fails:
+  - the source's posts are taken out of it;
+  - its files are skipped, and the result gives the reason;
+  - its visibility is never changed.
+  Make it private with the topic's members, or delete it so the next sync makes a new one; the next sync then puts the posts back.
 - **Links.** Relative links between synced files point at their posts, `#anchors` included; a link to a folder points at its README. Other relative links (source code, files outside the folder) point at the file on GitHub or GitLab.
 - **Images.** PNG, JPEG, GIF, WebP and AVIF images inside the folder, up to 3 MB, are uploaded once and reused until they change. Other images (SVG, larger ones, ones outside the folder) link to the repository, so they only show if the reader can see the repository.
+- **Other uploads stay private.** A synced post only gets the images the sync uploaded itself. If the text names another upload here (`/files/…`), that file isn't attached to the post, so the link opens only for people who could already open it. Anyone who can push to the repository writes these posts, so this keeps them from exposing private files.
 - **Changes.** Each sync that changes a post saves a new version, like an edit, so history and diffs work. Synced changes don't notify anyone.
 - **Renames.** A file moved or renamed without changes keeps its post, with its comments, links and history.
 - **Removed files.** When a file is gone from the repository, its post is **archived, never deleted**. It stays linked to the repository: if the file comes back at the same path, the post is published again.

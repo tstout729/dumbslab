@@ -294,6 +294,9 @@ struct Plan {
     unusable: BTreeSet<String>,
     /// Folders' topics: path → topic id.
     folders: BTreeMap<String, String>,
+    /// Folders whose topic is visible to more people than the source's topic: path → why. Their
+    /// files aren't synced (see [`Audience`]).
+    blocked: BTreeMap<String, String>,
     batch: Vec<Work>,
     fetching: Vec<Fetching>,
 }
@@ -356,6 +359,35 @@ fn items(db: &dyn Db, source_id: &str, kind: &str) -> ApiResult<BTreeMap<String,
             (r.str("path"), item)
         })
         .collect())
+}
+
+/// Who can see a topic's posts besides admins (who see everything).
+struct Audience {
+    name: String,
+    private: bool,
+    /// Members who aren't admins.
+    members: BTreeSet<String>,
+}
+
+impl Audience {
+    fn of(db: &dyn Db, topic_id: &str) -> ApiResult<Option<Audience>> {
+        let Some(t) = db.one("SELECT name, visibility FROM topics WHERE id = ?", &params![topic_id])? else { return Ok(None) };
+        let members = db
+            .query(
+                "SELECT m.user_id FROM topic_members m JOIN users u ON u.id = m.user_id WHERE m.topic_id = ? AND u.role != 'admin'",
+                &params![topic_id],
+            )?
+            .iter()
+            .map(|r| r.str("user_id"))
+            .collect();
+        Ok(Some(Audience { name: t.str("name"), private: t.str("visibility") == "private", members }))
+    }
+
+    /// Whether `other` shows posts to someone this topic doesn't: it's public while this one is
+    /// private, or it has a member (not an admin) this one lacks.
+    fn exceeded_by(&self, other: &Audience) -> bool {
+        self.private && (!other.private || !other.members.is_subset(&self.members))
+    }
 }
 
 /// Archives a synced post (it's gone from the repository) or publishes it again (it's back).
@@ -523,6 +555,47 @@ fn listing(db: &dyn Db, cfg: &HostConfig, j: &mut DocsJob, replies: &[HttpReply]
     plan.images = tree_images;
     plan.folders = items(db, &source_id, "folder")?.into_iter().map(|(p, i)| (p, i.target_id)).collect();
 
+    // A synced post is never visible to more people than the source's topic. A folder's topic
+    // that is, now (made public, or given other members since the last sync), gets none: the
+    // source's posts come out of it, and its files wait until it's fixed. Its visibility is
+    // never changed here.
+    let Some(target) = Audience::of(db, &j.source.topic_id)? else {
+        return fail(db, j, "The source's topic was deleted.", now);
+    };
+    for (folder, topic_id) in &plan.folders {
+        if let Some(a) = Audience::of(db, topic_id)?
+            && target.exceeded_by(&a)
+        {
+            db.execute(
+                "DELETE FROM post_topics WHERE topic_id = ? AND post_id IN (SELECT target_id FROM docs_items WHERE source_id = ? AND kind = 'doc')",
+                &params![topic_id.clone(), source_id.clone()],
+            )?;
+            let why = format!(
+                "the topic “{}” for its folder shows posts to people who can't see “{}”. Make it private with only their shared members, or delete it and the next sync makes a new one",
+                a.name, target.name
+            );
+            plan.blocked.insert(folder.clone(), why);
+        }
+    }
+    let blocked = |path: &str| -> Option<String> {
+        let mut dir = dir_of(path);
+        while !dir.is_empty() {
+            if let Some(why) = plan.blocked.get(dir) {
+                return Some(why.clone());
+            }
+            dir = dir_of(dir);
+        }
+        None
+    };
+    // Synced again once their folder's topic is fixed, to be put back in it.
+    for (path, d) in docs.iter_mut().filter(|(p, d)| d.sha.is_some() && blocked(p).is_some()) {
+        db.execute(
+            "UPDATE docs_items SET sha = NULL WHERE source_id = ? AND kind = 'doc' AND path = ?",
+            &params![source_id.clone(), path.clone()],
+        )?;
+        d.sha = None;
+    }
+
     // Files that link to a changed path are synced again, now or in a later run.
     let dependents: Vec<String> =
         docs.iter().filter(|(_, d)| d.sha.is_some() && d.refs.iter().any(|x| changed.contains(x))).map(|(p, _)| p.clone()).collect();
@@ -556,6 +629,8 @@ fn listing(db: &dyn Db, cfg: &HostConfig, j: &mut DocsJob, replies: &[HttpReply]
         let item = &docs[path];
         if item.sha.as_deref() == Some(entry.sha.as_str()) {
             j.result.unchanged += 1;
+        } else if let Some(why) = blocked(path) {
+            j.result.skip(path, why);
         } else if trashed.contains(&item.target_id) {
             j.result.skip(path, "its post is in the trash; restore it to sync it again");
         } else if entry.size.is_some_and(|s| s > MAX_DOC_BYTES) {
@@ -701,8 +776,19 @@ fn folder_topic(ctx: &mut Ctx, j: &DocsJob, plan: &mut Plan, dir: &str) -> ApiRe
         return Ok(id.clone());
     }
     let parent = folder_topic(ctx, j, plan, dir_of(dir))?;
+    // As visible as the source's topic: in a private one, private with its members.
     let visibility =
         ctx.db.one("SELECT visibility FROM topics WHERE id = ?", &params![j.source.topic_id.clone()])?.map(|r| r.str("visibility"));
+    let members = match visibility.as_deref() {
+        Some("private") => Some(
+            ctx.db
+                .query("SELECT user_id FROM topic_members WHERE topic_id = ?", &params![j.source.topic_id.clone()])?
+                .iter()
+                .map(|r| r.str("user_id"))
+                .collect(),
+        ),
+        _ => None,
+    };
     let topic = topics::create_topic(
         ctx,
         topics::CreateTopicInput {
@@ -712,7 +798,7 @@ fn folder_topic(ctx: &mut Ctx, j: &DocsJob, plan: &mut Plan, dir: &str) -> ApiRe
             color: None,
             parent_id: Some(parent),
             visibility,
-            members: None,
+            members,
         },
     )?;
     ctx.db.execute(
@@ -792,6 +878,9 @@ fn write(ctx: &mut Ctx, j: &mut DocsJob, mut plan: Plan, texts: Vec<Text>, ready
     let mut first_post: HashMap<String, String> = HashMap::new();
     let mut reused: BTreeSet<String> = BTreeSet::new();
     for t in &texts {
+        if plan.blocked.contains_key(dir_of(&t.work.path)) {
+            continue;
+        }
         let mut used = BTreeSet::new();
         let (body, refs) = rewrite_links(j, &plan, t, &mut used);
         let folder = folder_topic(ctx, j, &mut plan, dir_of(&t.work.path))?;
@@ -808,6 +897,13 @@ fn write(ctx: &mut Ctx, j: &mut DocsJob, mut plan: Plan, texts: Vec<Text>, ready
         place(ctx, j, &plan, &t.work.post_id, &folder)?;
         if t.work.revive && set_status(ctx, &t.work.post_id, "published")? {
             j.result.restored += 1;
+        }
+        // Images this sync stored earlier that belong to no post yet (the file showing them waited
+        // for a later run) join this one. Only the sync's own records count: text naming some
+        // other upload never attaches it (see `posts::Writer::Sync`).
+        let own: Vec<String> = used.iter().filter_map(|p| plan.uploaded.get(p)).map(|(id, _)| id.clone()).collect();
+        for id in &own {
+            db.execute("UPDATE files SET post_id = ? WHERE id = ? AND post_id IS NULL", &params![t.work.post_id.clone(), id.clone()])?;
         }
         for p in used {
             if ready.iter().any(|r| r.fetching.path == p) {

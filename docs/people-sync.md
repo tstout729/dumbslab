@@ -25,7 +25,12 @@ The result shows how many people were matched and updated, and which employees w
 1. In BambooHR, go to **Settings › Webhooks** and add a webhook. Its URL is the webhook address shown in Settings › People sync: `https://<your workspace>/hooks/people`. Choose the fields to watch (job title, department, location, work email, reports to, work phone, pronouns), or use an employee-updated event.
 2. Copy the webhook's **private key** into **Webhook private key** in Settings › People sync, and save.
 
-BambooHR signs each delivery: `X-BambooHR-Signature` is the hex HMAC-SHA256 of the request body followed by `X-BambooHR-Timestamp`, keyed with the private key. DumbSlab checks it and then runs a full sync. It never uses the details in the delivery itself. A delivery with a wrong signature gets a 401. If a sync is already running, the delivery is noted, and Settings says to sync again.
+BambooHR signs each delivery: `X-BambooHR-Signature` is the hex HMAC-SHA256 of the request body followed by `X-BambooHR-Timestamp`, keyed with the private key. DumbSlab checks the delivery and then runs a full sync. It never uses the details in the delivery itself.
+
+- A wrong signature gets a 401.
+- So does a timestamp more than 5 minutes from now, in either direction. Keep the server's clock right.
+- Each signature works once. A replay of a delivery already received gets a 409.
+- If a sync is already running, the delivery is noted, and Settings says to sync again.
 
 ## How it works
 

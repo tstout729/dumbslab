@@ -42,6 +42,13 @@ CREATE TABLE IF NOT EXISTS people_sync (
   updated_at TEXT NOT NULL
 );
 
+-- Signed webhook deliveries seen in the last few minutes, so a replayed one is refused.
+CREATE TABLE IF NOT EXISTS hook_deliveries (
+  -- Who sent it and its signature, e.g. `bamboohr:<signature>`.
+  key TEXT PRIMARY KEY,
+  seen_at TEXT NOT NULL
+);
+
 -- Docs sync: a repository folder whose Markdown files are kept as posts in a topic.
 CREATE TABLE IF NOT EXISTS docs_sources (
   id TEXT PRIMARY KEY,

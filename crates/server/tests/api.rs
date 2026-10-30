@@ -3865,22 +3865,41 @@ mod syncs {
         let first = job_of(&h.call("POST", "/api/v1/people-sync/run", None, &admin));
         assert_eq!(h.call("POST", "/api/v1/people-sync/run", None, &admin).status, 409);
 
-        // Webhooks: signed with the private key over the body and the timestamp.
-        let body = json!({ "type": "employee.updated", "data": { "employeeId": "2" } }).to_string();
-        let sig = hmac_sha256_hex("bamboo-hook-key", &format!("{body}1700000000"));
-        let signed = [("x-bamboohr-timestamp", "1700000000"), ("x-bamboohr-signature", sig.as_str())];
-        assert_eq!(hook(&h, "/hooks/people", &body, &[("x-bamboohr-timestamp", "1700000000"), ("x-bamboohr-signature", "00")]).status, 401);
-        assert_eq!(hook(&h, "/hooks/people", &format!("{body} "), &signed).status, 401, "the body is signed");
+        // Webhooks: signed with the private key over the body and the timestamp, which must be
+        // within 5 minutes of now. Each delivery works once.
+        let now = chrono::Utc::now().timestamp();
+        let deliver = |change: &str, at: i64| -> Res {
+            let body = json!({ "type": "employee.updated", "data": { "employeeId": change } }).to_string();
+            let at = at.to_string();
+            let sig = hmac_sha256_hex("bamboo-hook-key", &format!("{body}{at}"));
+            hook(&h, "/hooks/people", &body, &[("x-bamboohr-timestamp", &at), ("x-bamboohr-signature", &sig)])
+        };
+        let body = json!({ "type": "employee.updated" }).to_string();
+        let at = now.to_string();
+        assert_eq!(hook(&h, "/hooks/people", &body, &[("x-bamboohr-timestamp", &at), ("x-bamboohr-signature", "00")]).status, 401);
+        let sig = hmac_sha256_hex("bamboo-hook-key", &format!("{body}{at}"));
+        let tampered = format!("{body} ");
+        assert_eq!(
+            hook(&h, "/hooks/people", &tampered, &[("x-bamboohr-timestamp", &at), ("x-bamboohr-signature", &sig)]).status,
+            401,
+            "the body is signed"
+        );
+        assert_eq!(deliver("stale", now - 6 * 60).status, 401, "too old");
+        assert_eq!(deliver("future", now + 6 * 60).status, 401, "from the future");
+        let garbled = hmac_sha256_hex("bamboo-hook-key", &format!("{body}soon"));
+        assert_eq!(hook(&h, "/hooks/people", &body, &[("x-bamboohr-timestamp", "soon"), ("x-bamboohr-signature", &garbled)]).status, 401);
         // While a sync runs, a webhook is noted, and Settings says to sync again.
-        let r = hook(&h, "/hooks/people", &body, &signed);
+        let r = deliver("2", now);
         assert_eq!((r.status, r.body["status"].as_str()), (200, Some("queued")), "{}", r.body);
         assert!(r.effects.is_empty());
+        assert_eq!(deliver("2", now).status, 409, "a replay of the same delivery is refused");
         drive(&h, first, &answer);
         assert_eq!(h.ok("GET", "/api/v1/people-sync", None, &admin)["pending"], true);
-        let r = hook(&h, "/hooks/people", &body, &signed);
+        let r = deliver("3", now - 60);
         assert_eq!(r.status, 200, "{}", r.body);
         filled(drive(&h, job_of(&r), &answer).0);
         assert_eq!(h.ok("GET", "/api/v1/people-sync", None, &admin)["pending"], false);
+        assert_eq!(deliver("3", now - 60).status, 409, "replayed after it ran");
 
         // BambooHR refusing the key fails the sync and says why.
         let r = h.call("POST", "/api/v1/people-sync/run", None, &admin);
@@ -3892,7 +3911,7 @@ mod syncs {
 
         // Without a webhook key, its address is gone; removing the sync keeps the profiles.
         h.ok("PUT", "/api/v1/people-sync", Some(json!({ "subdomain": "acme", "webhook_key": "" })), &admin);
-        assert_eq!(hook(&h, "/hooks/people", &body, &signed).status, 404);
+        assert_eq!(deliver("4", now).status, 404);
         h.ok("DELETE", "/api/v1/people-sync", None, &admin);
         assert_eq!(details(&h, &admin, "mo@acme.test")["title"], "Engineer");
         assert_eq!(count(&h, "SELECT COUNT(*) FROM people_sync"), 0);
@@ -4126,6 +4145,49 @@ mod syncs {
         let v = filled(drive(&h, job_of(&r), &answer).0);
         assert_eq!((v["created"].as_i64(), v["remaining"].as_i64(), v["done"].as_bool()), (Some(3), Some(0), Some(true)), "{v}");
 
+        // Text that names uploads never attaches them: not the admin's own unattached upload (the
+        // sync writes as them), and not a file in a private post.
+        let mine = upload(&h, &admin, "secret.png", None, PNG, None).body["id"].as_str().unwrap().to_string();
+        let vault = h.ok("POST", "/api/v1/topics", Some(json!({ "name": "Vault", "visibility": "private" })), &admin)["id"].clone();
+        let hidden = h.ok("POST", "/api/v1/posts", Some(json!({ "title": "Hidden", "topic_ids": [vault], "status": "published" })), &admin);
+        let hidden_file = upload(&h, &admin, "plan.png", None, PNG, hidden["id"].as_str()).body["id"].as_str().unwrap().to_string();
+        let leak = format!("# Leak\n\n![a](https://kb.test/files/{mine}/secret.png) ![b](https://kb.test/files/{hidden_file}/plan.png)\n");
+        repo.put("leak.md", leak.as_bytes());
+        let r = h.call("POST", &format!("/api/v1/docs-sources/{source}/sync"), None, &admin);
+        assert_eq!(filled(drive(&h, job_of(&r), &answer).0)["created"], 1);
+        let leaked = post(&h, &doc_ids(&h)["leak.md"], &mo);
+        assert!(leaked["content"].as_str().unwrap().contains(&mine), "the text is kept as written");
+        assert_eq!(count(&h, &format!("SELECT COUNT(*) FROM files WHERE id = '{mine}' AND post_id IS NULL")), 1, "still unattached");
+        assert_eq!(fetch(&h, &format!("/files/{mine}/secret.png"), &mo).status, 404);
+        assert_eq!(fetch(&h, &format!("/files/{hidden_file}/plan.png"), &mo).status, 404);
+
+        // A file with more images than one run uploads waits; its images, stored meanwhile, join
+        // its post once it's written.
+        let mut gallery = String::from("# Gallery\n\n");
+        for i in 0..11 {
+            let mut png = PNG.to_vec();
+            png.push(i as u8);
+            repo.put(&format!("gallery/{i:02}.png"), &png);
+            gallery.push_str(&format!("![{i}](gallery/{i:02}.png)\n"));
+        }
+        repo.put("gallery.md", gallery.as_bytes());
+        let r = h.call("POST", &format!("/api/v1/docs-sources/{source}/sync"), None, &admin);
+        let v = filled(drive(&h, job_of(&r), &answer).0);
+        assert_eq!((v["created"].as_i64(), v["images_uploaded"].as_i64(), v["remaining"].as_i64()), (Some(0), Some(10), Some(1)), "{v}");
+        let r = h.call("POST", &format!("/api/v1/docs-sources/{source}/sync"), None, &admin);
+        let v = filled(drive(&h, job_of(&r), &answer).0);
+        assert_eq!(
+            (v["created"].as_i64(), v["images_uploaded"].as_i64(), v["images_reused"].as_i64()),
+            (Some(1), Some(1), Some(10)),
+            "{v}"
+        );
+        let gallery_id = doc_ids(&h)["gallery.md"].clone();
+        assert_eq!(count(&h, &format!("SELECT COUNT(*) FROM files WHERE post_id = '{gallery_id}'")), 11);
+        let first = db_run(&h, |db| db.one("SELECT target_id FROM docs_items WHERE kind = 'image' AND path = 'gallery/00.png'", &[]))
+            .unwrap()
+            .str("target_id");
+        assert_eq!(fetch(&h, &format!("/files/{first}/00.png"), &mo).status, 200, "readers of the post see its images");
+
         // A folder that comes back empty (renamed, or a bad branch) archives nothing.
         let r = h.call("PATCH", &format!("/api/v1/docs-sources/{source}"), Some(json!({ "branch": "gone" })), &admin);
         assert_eq!(r.status, 200);
@@ -4159,10 +4221,10 @@ mod syncs {
         let mut h = H::new();
         let (admin, _) = h.setup();
         with_key(&mut h);
-        let topic = h.ok("POST", "/api/v1/topics", Some(json!({ "name": "Ops", "visibility": "private" })), &admin)["id"]
-            .as_str()
-            .unwrap()
-            .to_string();
+        let (mo_id, mo) = h.user(&admin, "mo@acme.test", "Mo", "member");
+        let (zed_id, zed) = h.user(&admin, "zed@acme.test", "Zed", "member");
+        let ops = json!({ "name": "Ops", "visibility": "private", "members": [mo_id] });
+        let topic = h.ok("POST", "/api/v1/topics", Some(ops), &admin)["id"].as_str().unwrap().to_string();
         let input = json!({ "provider": "gitlab", "repository": "https://git.acme.test/ops/runbooks", "topic_id": topic, "token": "glpat-secret", "branch": "trunk" });
         let created = h.ok("POST", "/api/v1/docs-sources", Some(input), &admin);
         assert_eq!(created["source"]["host"], "git.acme.test");
@@ -4202,13 +4264,46 @@ mod syncs {
         let paging = post(&h, &ids["paging.md"], &admin);
         assert!(paging["content"].as_str().unwrap().contains(&format!("/p/{}", ids["deploys/rollback.md"])));
         assert_eq!(paging["synced_from"]["url"], "https://git.acme.test/ops/runbooks/-/blob/trunk/paging.md");
-        // A private topic's sync makes private sub-topics, so posts stay as private as the topic.
-        let rollback = post(&h, &ids["deploys/rollback.md"], &admin);
-        for t in rollback["topics"].as_array().unwrap() {
-            let topic = h.ok("GET", &format!("/api/v1/topics/{}", t["id"].as_str().unwrap()), None, &admin);
-            assert_eq!(topic["visibility"], "private", "{topic}");
-        }
-        let (_, mo) = h.user(&admin, "mo@acme.test", "Mo", "member");
-        assert_eq!(h.call("GET", &format!("/api/v1/posts/{}", ids["paging.md"]), None, &mo).status, 404);
+        // A private topic's sync makes private sub-topics with its members, so posts stay as
+        // private as the topic.
+        let rollback_id = ids["deploys/rollback.md"].clone();
+        let topic_names = |h: &H| -> Vec<String> {
+            post(h, &rollback_id, &admin)["topics"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap().to_string()).collect()
+        };
+        assert_eq!(topic_names(&h), vec!["Deploys", "Ops"]);
+        let deploys = db_run(&h, |db| db.one("SELECT target_id FROM docs_items WHERE kind = 'folder' AND path = 'deploys'", &[]))
+            .unwrap()
+            .str("target_id");
+        let sub = h.ok("GET", &format!("/api/v1/topics/{deploys}"), None, &admin);
+        assert_eq!(sub["visibility"], "private");
+        assert!(sub["members"].as_array().unwrap().iter().any(|m| m["id"] == mo_id.as_str()), "{sub}");
+        assert_eq!(h.call("GET", &format!("/api/v1/posts/{rollback_id}"), None, &mo).status, 200);
+        assert_eq!(h.call("GET", &format!("/api/v1/posts/{rollback_id}"), None, &zed).status, 404);
+
+        // Someone makes the sub-topic public: the next sync takes the source's posts out of it and
+        // skips its files, and leaves its visibility alone.
+        let sync = |h: &H| -> Value {
+            let r = h.call("POST", &format!("/api/v1/docs-sources/{source}/sync"), None, &admin);
+            filled(drive(h, job_of(&r), &answer).0)
+        };
+        h.ok("PATCH", &format!("/api/v1/topics/{deploys}"), Some(json!({ "visibility": "org" })), &admin);
+        let v = sync(&h);
+        assert_eq!(v["skipped"][0]["path"], "deploys/rollback.md", "{v}");
+        assert!(v["skipped"][0]["reason"].as_str().unwrap().contains("Deploys"), "{v}");
+        assert_eq!(topic_names(&h), vec!["Ops"]);
+        assert_eq!(h.call("GET", &format!("/api/v1/posts/{rollback_id}"), None, &zed).status, 404);
+        assert_eq!(h.ok("GET", &format!("/api/v1/topics/{deploys}"), None, &admin)["visibility"], "org");
+        // Private again, but with a member the source's topic doesn't have: still skipped.
+        h.ok("PATCH", &format!("/api/v1/topics/{deploys}"), Some(json!({ "visibility": "private" })), &admin);
+        h.ok("POST", &format!("/api/v1/topics/{deploys}/members"), Some(json!({ "user": zed_id })), &admin);
+        let v = sync(&h);
+        assert_eq!(v["skipped"][0]["path"], "deploys/rollback.md", "{v}");
+        assert_eq!(h.call("GET", &format!("/api/v1/posts/{rollback_id}"), None, &zed).status, 404);
+        // Fixed: the post goes back in.
+        h.ok("DELETE", &format!("/api/v1/topics/{deploys}/members/{zed_id}"), None, &admin);
+        let v = sync(&h);
+        assert_eq!(v["skipped"], json!([]), "{v}");
+        assert_eq!(topic_names(&h), vec!["Deploys", "Ops"]);
+        assert_eq!(h.call("GET", &format!("/api/v1/posts/{}", ids["paging.md"]), None, &zed).status, 404);
     }
 }

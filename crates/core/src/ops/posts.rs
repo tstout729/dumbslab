@@ -405,12 +405,24 @@ fn save_revision(ctx: &Ctx, post: &Row, title: &str, content: &str, note: &str) 
     if title != post.str("title") || content != post.str("content") {
         crate::sync::docs::refuse_edit(ctx.db, &post.str("id"), &post.str("title"))?;
     }
-    write_revision(ctx, post, title, content, note, true)
+    write_revision(ctx, post, title, content, note, Writer::Person)
+}
+
+/// Who changes a post's text.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum Writer {
+    /// Someone editing here: mentions and followers are notified, and the person's own unattached
+    /// uploads the text shows join the post.
+    Person,
+    /// Docs sync: the text was written in a repository by people who may not be able to see
+    /// anything here. Nobody is notified, and no upload joins the post because the text mentions
+    /// it; docs sync attaches only the images it stored itself.
+    Sync,
 }
 
 /// Saves a new version when the title or content changed: the path every change to a post's
-/// text takes, edits and docs sync alike. `notify: false` sends no notifications.
-pub(crate) fn write_revision(ctx: &Ctx, post: &Row, title: &str, content: &str, note: &str, notify: bool) -> ApiResult<bool> {
+/// text takes, edits and docs sync alike (see [`Writer`]).
+pub(crate) fn write_revision(ctx: &Ctx, post: &Row, title: &str, content: &str, note: &str, writer: Writer) -> ApiResult<bool> {
     let old_title = post.str("title");
     let old_content = post.str("content");
     if title == old_title && content == old_content {
@@ -439,12 +451,14 @@ pub(crate) fn write_revision(ctx: &Ctx, post: &Row, title: &str, content: &str, 
         &params![id.clone(), version, title, content, ctx.actor.user_id.clone(), note, ctx.now_s()],
     )?;
     update_links(ctx, &id, content)?;
-    crate::ops::files::attach_referenced(ctx, &id, content)?;
+    if writer == Writer::Person {
+        crate::ops::files::attach_referenced(ctx, &id, content)?;
+    }
     search::index_post(ctx.db, &id)?;
     if title != old_title {
         search::reindex_post_comments(ctx.db, &id)?;
     }
-    if notify && post.str("status") == "published" {
+    if writer == Writer::Person && post.str("status") == "published" {
         let before: HashSet<String> = markdown::mentions(&old_content).into_iter().collect();
         let new: Vec<String> = markdown::mentions(content).into_iter().filter(|m| !before.contains(m)).collect();
         notify_mentions(ctx, &id, title, &new)?;
@@ -556,14 +570,14 @@ pub(crate) enum Synced {
 
 /// Docs sync: sets a post's title and content, creating it (published) with this id when there's
 /// no such post. Changes take the same path as edits ([`write_revision`]), so each one is a version
-/// in the history; but they notify nobody, since the text was written elsewhere.
+/// in the history; but they notify nobody and attach no uploads ([`Writer::Sync`]).
 pub(crate) fn sync_post(ctx: &mut Ctx, id: &str, title: &str, content: &str, note: &str) -> ApiResult<Synced> {
     let title = required(title, "title", 300)?;
     if let Some(post) = ctx.db.one(&format!("SELECT {POST_COLS}, p.content FROM posts p WHERE p.id = ?"), &params![id])? {
         if post.opt_str("deleted_at").is_some() {
             return Ok(Synced::Trashed);
         }
-        if !write_revision(ctx, &post, &title, content, note, false)? {
+        if !write_revision(ctx, &post, &title, content, note, Writer::Sync)? {
             return Ok(Synced::Unchanged);
         }
         emit(
@@ -597,8 +611,8 @@ pub(crate) fn sync_post(ctx: &mut Ctx, id: &str, title: &str, content: &str, not
         "INSERT INTO post_versions (post_id, version, title, content, editor_id, note, created_at) VALUES (?, 1, ?, ?, ?, ?, ?)",
         &params![id, title.clone(), content, ctx.actor.user_id.clone(), note, now],
     )?;
+    // No upload joins the post because its text mentions one (see `Writer::Sync`).
     update_links(ctx, id, content)?;
-    crate::ops::files::attach_referenced(ctx, id, content)?;
     search::index_post(ctx.db, id)?;
     emit(
         ctx,

@@ -334,8 +334,24 @@ fn apply(db: &dyn Db, cfg: &HostConfig, j: &PeopleJob, truncated: bool, now: Dat
     Ok(Step::Done(Finish::Fill(value)))
 }
 
+/// How far a webhook's timestamp may be from now, either way.
+pub const HOOK_WINDOW_SECS: u64 = 300;
+
+/// When BambooHR sent a delivery, in Unix seconds, from `X-BambooHR-Timestamp` (seconds,
+/// milliseconds or RFC 3339). `None` when it isn't one of those.
+fn sent_at(raw: &str) -> Option<i64> {
+    let t = raw.trim();
+    if !t.is_empty() && t.len() <= 16 && t.bytes().all(|b| b.is_ascii_digit()) {
+        let n: i64 = t.parse().ok()?;
+        return Some(if n >= 100_000_000_000 { n / 1000 } else { n });
+    }
+    chrono::DateTime::parse_from_rfc3339(t).ok().map(|d| d.timestamp())
+}
+
 /// `POST /hooks/people`: BambooHR says an employee changed. Signed with the webhook's private key:
 /// `X-BambooHR-Signature` is the hex HMAC-SHA256 of the body followed by `X-BambooHR-Timestamp`.
+/// The timestamp must be within [`HOOK_WINDOW_SECS`] of now, and each signature works once, so a
+/// captured delivery can't be replayed.
 pub(crate) fn hook(db: &dyn Db, cfg: &HostConfig, req: &Request, base_url: &str, now: DateTime<Utc>) -> ApiResult<Outcome> {
     let row = db.one("SELECT secret, webhook FROM people_sync WHERE id = 1", &[])?;
     let Some(row) = row.filter(|r| r.bool("webhook")) else {
@@ -348,6 +364,20 @@ pub(crate) fn hook(db: &dyn Db, cfg: &HostConfig, req: &Request, base_url: &str,
     let expected = super::hmac_hex(private_key, &[&req.body, timestamp.as_bytes()]);
     if private_key.is_empty() || !secure_eq(&signature, &expected) {
         return Err(ApiError::unauthorized("the webhook's signature doesn't match its private key"));
+    }
+    match sent_at(timestamp) {
+        Some(sent) if now.timestamp().abs_diff(sent) <= HOOK_WINDOW_SECS => {}
+        _ => return Err(ApiError::unauthorized("the webhook's timestamp is missing or more than 5 minutes from now")),
+    }
+    // Remembered a little longer than a timestamp stays acceptable.
+    let forget = now - chrono::Duration::seconds(2 * HOOK_WINDOW_SECS as i64 + 60);
+    db.execute("DELETE FROM hook_deliveries WHERE seen_at < ?", &params![ts(forget)])?;
+    let first = db.execute(
+        "INSERT INTO hook_deliveries (key, seen_at) VALUES (?, ?) ON CONFLICT(key) DO NOTHING",
+        &params![format!("{PROVIDER}:{signature}"), ts(now)],
+    )? > 0;
+    if !first {
+        return Err(ApiError::conflict("this webhook delivery was already received"));
     }
     check_plan(db, cfg, now)?;
     match start(db, cfg, base_url, now)? {
@@ -362,6 +392,16 @@ pub(crate) fn hook(db: &dyn Db, cfg: &HostConfig, req: &Request, base_url: &str,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn webhook_timestamps() {
+        assert_eq!(sent_at("1700000000"), Some(1_700_000_000));
+        assert_eq!(sent_at(" 1700000000123 "), Some(1_700_000_000), "milliseconds");
+        assert_eq!(sent_at("2026-10-30T12:00:00Z"), Some(1_793_361_600));
+        for bad in ["", "abc", "-5", "99999999999999999999999", "1e9"] {
+            assert_eq!(sent_at(bad), None, "{bad}");
+        }
+    }
 
     #[test]
     fn company_domains() {
