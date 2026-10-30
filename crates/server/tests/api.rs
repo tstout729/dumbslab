@@ -2230,6 +2230,14 @@ fn telemetry_settings_reach_the_web_app_only_when_configured() {
     h.cfg.telemetry = Telemetry::new(None, None, Some(dsn)).0;
     let telemetry = h.ok("GET", "/api/v1/auth/state", None, &cookie)["telemetry"].clone();
     assert_eq!((telemetry["quill"].clone(), telemetry["sentry"]["dsn"].clone()), (Value::Null, json!(dsn)));
+
+    // A DSN with a secret never reaches a browser: error reports stay off.
+    let (secret, problems) = Telemetry::new(None, None, Some("https://public:secret@o1.ingest.us.sentry.io/42"));
+    assert_eq!(problems.len(), 1);
+    h.cfg.telemetry = secret;
+    let state = h.ok("GET", "/api/v1/auth/state", None, &Auth::None);
+    assert_eq!(state["telemetry"], Value::Null);
+    assert!(!state.to_string().contains("secret"));
 }
 
 // ---------------------------------------------------------------------------

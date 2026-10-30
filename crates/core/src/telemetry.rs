@@ -101,16 +101,22 @@ pub struct Dsn {
 }
 
 impl Dsn {
+    /// Accepts only a public DSN: a key without a secret, a host and a numeric project id (after an
+    /// optional path prefix), with no query or fragment. Browsers get it, so a DSN carrying a
+    /// secret (`https://public:secret@host/1`) is refused, as the Worker's reporter refuses it.
     pub fn parse(dsn: &str) -> Option<Dsn> {
-        let dsn = dsn.trim();
-        let (scheme, rest) = dsn.split_once("://")?;
+        let (scheme, rest) = dsn.trim().split_once("://")?;
         let (key, rest) = rest.split_once('@')?;
         let (host, path) = rest.split_once('/')?;
-        let project = path.trim_end_matches('/').rsplit('/').next().unwrap_or_default();
-        let key_ok = !key.is_empty() && key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b':');
+        let path = path.trim_end_matches('/');
+        let project = path.rsplit('/').next().unwrap_or_default();
+        let key_ok = !key.is_empty() && key.bytes().all(|b| b.is_ascii_alphanumeric());
         let project_ok = !project.is_empty() && project.bytes().all(|b| b.is_ascii_digit());
+        let path_ok = path.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'-' | b'_' | b'.'));
         let origin = origin_of(&format!("{scheme}://{host}"))?;
-        (key_ok && project_ok).then(|| Dsn { dsn: dsn.to_string(), origin })
+        let (scheme, host) = origin.split_once("://")?;
+        let dsn = format!("{scheme}://{key}@{host}/{path}");
+        (key_ok && project_ok && path_ok).then_some(Dsn { dsn, origin })
     }
 }
 
@@ -123,10 +129,25 @@ mod tests {
     #[test]
     fn dsns_name_their_ingest_origin() {
         assert_eq!(Dsn::parse(DSN).unwrap().origin, "https://o4511072647970816.ingest.us.sentry.io");
-        assert_eq!(Dsn::parse("http://abc@sentry.local:9000/prefix/7").unwrap().origin, "http://sentry.local:9000");
-        for bad in
-            ["", "https://sentry.io/1", "https://key@sentry.io/", "https://key@sentry.io/abc", "ftp://key@sentry.io/1", "https://k@ho st/1"]
-        {
+        let self_hosted = Dsn::parse("http://abc@sentry.local:9000/prefix/7").unwrap();
+        assert_eq!(
+            (self_hosted.origin.as_str(), self_hosted.dsn.as_str()),
+            ("http://sentry.local:9000", "http://abc@sentry.local:9000/prefix/7")
+        );
+        // Only the public DSN is kept, in a normal form.
+        assert_eq!(Dsn::parse(" HTTPS://key@O1.Ingest.Sentry.io/42/ ").unwrap().dsn, "https://key@o1.ingest.sentry.io/42");
+        for bad in [
+            "",
+            "https://sentry.io/1",
+            "https://key@sentry.io/",
+            "https://key@sentry.io/abc",
+            "ftp://key@sentry.io/1",
+            "https://k@ho st/1",
+            "https://public:secret@sentry.io/42",
+            "https://key@sentry.io/42?secret=1",
+            "https://key@sentry.io/42#frag",
+            "https://key@user@sentry.io/42",
+        ] {
             assert!(Dsn::parse(bad).is_none(), "{bad}");
         }
     }
