@@ -17,7 +17,10 @@
 //!   workspace can see are previewed, and only when the person who shared the link can see them.
 //! - Channel messages are webhook deliveries to `chat.postMessage` ([`on_event`]). A post in a
 //!   private topic reaches a channel only if an admin picked that topic for the channel.
-//! - The core does no I/O: calls to Slack's API run as a [`connect::Job`] the host sends.
+//! - The core does no I/O: calls to Slack's API run as a [`connect::Job`] the host sends. Slack
+//!   drops a command's answer after three seconds, so commands and events are acknowledged at
+//!   once and handled by a job the host runs afterwards ([`Effect::Background`]); a command's
+//!   answer goes to its `response_url`, which must be one of Slack's ([`slack_reply_url`]).
 //!
 //! Slack's docs: https://docs.slack.dev/authentication/verifying-requests-from-slack,
 //! https://docs.slack.dev/interactivity/implementing-slash-commands,
@@ -336,10 +339,24 @@ fn reply(message: Value) -> Outcome {
     crate::http::done(Response::json(200, &message))
 }
 
-fn pending(job: SlackJob) -> Outcome {
-    let mut out = reply(json!(connect::PENDING));
-    out.effects.push(Effect::Connect(connect::Job::Slack(job)));
+/// Answers Slack now with `response`, and runs `job` once that's sent: Slack drops a slash
+/// command's answer after three seconds, and retries an event that took longer.
+fn later(response: Response, job: SlackJob) -> Outcome {
+    let mut out = crate::http::done(response);
+    out.effects.push(Effect::Background(connect::Job::Slack(job)));
     out
+}
+
+/// Whether a slash command's `response_url` is one of Slack's: https on `hooks.slack.com` (or
+/// GovSlack's `hooks.slack-gov.com`) with no port or user name, a path under `/commands/` or
+/// `/actions/` made of letters, digits, `/`, `_` and `-`, and no query.
+pub fn slack_reply_url(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("https://") else { return false };
+    let Some((host, path)) = rest.split_once('/') else { return false };
+    matches!(host, "hooks.slack.com" | "hooks.slack-gov.com")
+        && (path.starts_with("commands/") || path.starts_with("actions/"))
+        && path.len() <= 300
+        && path.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '_' | '-'))
 }
 
 /// A Slack user id: letters and digits.
@@ -366,18 +383,22 @@ fn command(db: &dyn Db, app: &App, base: &str, body: &[u8]) -> ApiResult<Outcome
             if rest.chars().count() > 200 {
                 return Ok(reply(ephemeral("Search for at most 200 characters.")));
             }
-            Work::Search { user: field("user_id"), q: rest.to_string() }
+            Work::Search { user: field("user_id"), q: rest.to_string(), reply_to: field("response_url") }
         }
         "new" | "draft" => {
             if rest.is_empty() {
                 return Ok(reply(ephemeral(&format!("Add the draft's title, like `{} new Onboarding checklist`.", escape(&name)))));
             }
-            Work::NewDraft { user: field("user_id"), title: rest.to_string() }
+            Work::NewDraft { user: field("user_id"), title: rest.to_string(), reply_to: field("response_url") }
         }
         _ => return Ok(reply(help(&name, &workspace))),
     };
     if !valid_user(&field("user_id")) {
         return Ok(reply(ephemeral("Slack didn't say who's asking. Try again.")));
+    }
+    // The answer goes to this address later; only Slack's own are trusted with it.
+    if !slack_reply_url(&field("response_url")) {
+        return Ok(reply(ephemeral("Slack sent a reply address DumbSlab doesn't recognize, so it can't answer. Try again.")));
     }
     if app.bot_token.is_none() {
         return Ok(reply(ephemeral(&format!(
@@ -385,7 +406,8 @@ fn command(db: &dyn Db, app: &App, base: &str, body: &[u8]) -> ApiResult<Outcome
             escape(&workspace)
         ))));
     }
-    Ok(pending(SlackJob::new(base, work)))
+    // An empty answer acknowledges the command; the result follows through `response_url`.
+    Ok(later(Response::empty(200), SlackJob::new(base, work)))
 }
 
 fn event(db: &dyn Db, app: &App, base: &str, body: &[u8], now: DateTime<Utc>) -> ApiResult<Outcome> {
@@ -415,7 +437,10 @@ fn event(db: &dyn Db, app: &App, base: &str, body: &[u8], now: DateTime<Utc>) ->
                 channel: e["channel"].as_str().unwrap_or_default().to_string(),
                 ts: e["message_ts"].as_str().unwrap_or_default().to_string(),
             };
-            Ok(pending(SlackJob::new(base, Work::Unfurl { user: user.to_string(), links, target })))
+            Ok(later(
+                Response::json(200, &json!({ "ok": true })),
+                SlackJob::new(base, Work::Unfurl { user: user.to_string(), links, target }),
+            ))
         }
         _ => Ok(ack()),
     }
@@ -777,10 +802,10 @@ pub struct SlackJob {
 
 #[derive(Clone)]
 enum Work {
-    /// `/dumbslab search`: Slack user, words.
-    Search { user: String, q: String },
-    /// `/dumbslab new`: Slack user, title.
-    NewDraft { user: String, title: String },
+    /// `/dumbslab search`: Slack user, words, and the command's `response_url` for the answer.
+    Search { user: String, q: String, reply_to: String },
+    /// `/dumbslab new`: Slack user, title, and the command's `response_url` for the answer.
+    NewDraft { user: String, title: String, reply_to: String },
     /// Preview links someone shared.
     Unfurl { user: String, links: Vec<(String, String)>, target: UnfurlTarget },
     /// An admin saved a bot token: check it with Slack, then save it with the rest of the change.
@@ -809,6 +834,8 @@ enum Phase {
     Checking,
     /// Waiting for `chat.postMessage`.
     Posting,
+    /// Waiting for Slack to take a command's answer at its `response_url`.
+    Replying,
 }
 
 // Jobs carry tokens and what people typed; never print them.
@@ -854,6 +881,17 @@ fn fail(e: ApiError) -> ApiResult<Step> {
     Ok(Step::Done(Finish::Fail(e)))
 }
 
+/// Sends a command's answer to its `response_url`, which [`command`] checked is Slack's.
+fn answer_at(job: &mut SlackJob, reply_to: &str, message: Value) -> ApiResult<Step> {
+    job.phase = Phase::Replying;
+    Ok(Step::Fetch(vec![HttpCall {
+        method: "POST",
+        url: reply_to.to_string(),
+        headers: vec![("content-type".into(), "application/json; charset=utf-8".into())],
+        body: Some(message.to_string()),
+    }]))
+}
+
 fn job_ctx<'a>(db: &'a dyn Db, cfg: &'a HostConfig, base_url: &str, actor: Actor, now: DateTime<Utc>) -> Ctx<'a> {
     Ctx { db, actor, now, cfg, base_url: base_url.to_string(), effects: vec![] }
 }
@@ -866,46 +904,52 @@ pub fn step(db: &dyn Db, cfg: &HostConfig, job: &mut SlackJob, replies: Vec<Http
         (Phase::Start, Work::Search { user, .. } | Work::NewDraft { user, .. } | Work::Unfurl { user, .. }) => {
             let Some(token) = app.bot_token.clone() else {
                 // Disconnected meanwhile.
-                return fill(match job.work {
-                    Work::Unfurl { .. } => json!({ "ok": true }),
-                    _ => ephemeral("Slack isn't connected to DumbSlab any more."),
-                });
+                return match job.work.clone() {
+                    Work::Search { reply_to, .. } | Work::NewDraft { reply_to, .. } => {
+                        answer_at(job, &reply_to, ephemeral("Slack isn't connected to DumbSlab any more."))
+                    }
+                    _ => fill(json!({ "ok": true })),
+                };
             };
             job.phase = Phase::Identifying;
             Ok(Step::Fetch(vec![users_info(&token, &user)]))
         }
-        (Phase::Identifying, Work::Search { q, .. }) => {
+        (Phase::Identifying, Work::Search { q, reply_to, .. }) => {
             let actor = match identify(db, &app, &answer)? {
                 Ok(a) => a,
-                Err(message) => return fill(ephemeral(&message)),
+                Err(message) => return answer_at(job, &reply_to, ephemeral(&message)),
             };
             let mut ctx = job_ctx(db, cfg, &job.base_url, actor, now);
             let op = registry().get("search").expect("search is an operation");
-            match op.call(&mut ctx, json!({ "q": q, "types": ["post"], "limit": MAX_RESULTS })) {
-                Ok(results) => fill(search_reply(&job.base_url, &q, &results)),
-                Err(e) => fill(ephemeral(&escape(&e.message))),
-            }
+            let message = match op.call(&mut ctx, json!({ "q": q, "types": ["post"], "limit": MAX_RESULTS })) {
+                Ok(results) => search_reply(&job.base_url, &q, &results),
+                Err(e) => ephemeral(&escape(&e.message)),
+            };
+            answer_at(job, &reply_to, message)
         }
-        (Phase::Identifying, Work::NewDraft { title, .. }) => {
+        (Phase::Identifying, Work::NewDraft { title, reply_to, .. }) => {
             let actor = match identify(db, &app, &answer)? {
                 Ok(a) => a,
-                Err(message) => return fill(ephemeral(&message)),
+                Err(message) => return answer_at(job, &reply_to, ephemeral(&message)),
             };
             let mut ctx = job_ctx(db, cfg, &job.base_url, actor, now);
             let op = registry().get("create_post").expect("create_post is an operation");
-            match op.call(&mut ctx, json!({ "title": title })) {
+            let message = match op.call(&mut ctx, json!({ "title": title })) {
                 Ok(post) => {
                     job.effects.extend(std::mem::take(&mut ctx.effects));
                     let url = post["url"].as_str().unwrap_or_default();
                     let name = connect::excerpt(post["title"].as_str().unwrap_or_default(), 150);
-                    fill(ephemeral(&format!("Started a draft: *{}*. Only you can see it until you publish it.", link(url, &name))))
+                    ephemeral(&format!("Started a draft: *{}*. Only you can see it until you publish it.", link(url, &name)))
                 }
                 // A refusal (a viewer, a title that's too long, a paused workspace) comes before
                 // anything is written, so the step's transaction can commit. Anything else rolls back.
-                Err(e) if e.status < 500 || e.code == "free_capacity" => fill(ephemeral(&escape(&e.message))),
-                Err(e) => Err(e),
-            }
+                Err(e) if e.status < 500 || e.code == "free_capacity" => ephemeral(&escape(&e.message)),
+                Err(e) => return Err(e),
+            };
+            answer_at(job, &reply_to, message)
         }
+        // Slack has the answer; nothing waits for this result.
+        (Phase::Replying, _) => fill(json!({ "ok": answer.ok() })),
         (Phase::Identifying, Work::Unfurl { links, target, .. }) => {
             let Ok(actor) = identify(db, &app, &answer)? else { return fill(json!({ "ok": true })) };
             let mut unfurls = Map::new();
@@ -1134,6 +1178,28 @@ mod tests {
         assert_eq!(link("https://x.test/a|b>c", "t"), "<https://x.test/a%7Cb%3Ec|t>");
         assert_eq!(plain_snippet("a &lt;b&gt; <mark>c</mark> &amp; d"), "a <b> c & d");
         assert_eq!(clip(&"x".repeat(10), 5), "xxxx…");
+    }
+
+    #[test]
+    fn answers_go_only_to_slacks_hosts() {
+        assert!(slack_reply_url("https://hooks.slack.com/commands/T1DC2JH3J/397700885554/96rGlfmibIGlgcZRskXaIFfN"));
+        assert!(slack_reply_url("https://hooks.slack.com/actions/T1/2/x_y-z"));
+        assert!(slack_reply_url("https://hooks.slack-gov.com/commands/T1/2/x"));
+        for bad in [
+            "http://hooks.slack.com/commands/T1/2/x",
+            "https://hooks.slack.com.evil.test/commands/T1/2/x",
+            "https://hooks.slack.com:443/commands/T1/2/x",
+            "https://a@hooks.slack.com/commands/T1/2/x",
+            "https://HOOKS.slack.com/commands/T1/2/x",
+            "https://hooks.slack.com/commands/T1/2/x?x=1",
+            "https://hooks.slack.com/commands/T1/2/x#f",
+            "https://hooks.slack.com/commands/../services/x",
+            "https://hooks.slack.com/services/T1/B1/x",
+            "https://hooks.slack.com",
+            "",
+        ] {
+            assert!(!slack_reply_url(bad), "{bad}");
+        }
     }
 
     #[test]

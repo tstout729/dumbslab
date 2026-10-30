@@ -459,6 +459,17 @@ fn deliver(app: Arc<App>, effects: Vec<Effect>) -> Vec<oneshot::Receiver<()>> {
     // Address moves and Stripe calls only exist for hosted workspaces, which this server never is.
     for d in effects.into_iter().filter_map(|effect| match effect {
         Effect::Webhook(d) => Some(d),
+        // Slack's commands and events, answered already: run the job on its own. It delivers the
+        // webhooks its operations leave (see `run_job`).
+        Effect::Background(job) => {
+            let app = app.clone();
+            tokio::spawn(async move {
+                if let connect::Finish::Fail(e) = run_job(&app, job).await {
+                    warn!(code = e.code, "a background job failed: {}", e.message);
+                }
+            });
+            None
+        }
         // Jobs for connected apps ran before the response was sent.
         Effect::MoveAddress(_) | Effect::Stripe(_) | Effect::Connect(_) => None,
     }) {

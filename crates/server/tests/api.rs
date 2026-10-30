@@ -3674,10 +3674,21 @@ mod slack {
 
     const SECRET: &str = "8f742231b10e8888abcd99yyyzzz85a5";
     const TOKEN: &str = "xoxb-1-secret-bot-token";
+    const REPLY_TO: &str = "https://hooks.slack.com/commands/T1/1234/abcXYZ";
 
+    /// The job the host runs before answering (settings).
     fn job_of(r: &Res) -> Option<Job> {
         r.effects.iter().find_map(|e| match e {
             Effect::Connect(j) => Some(j.clone()),
+            _ => None,
+        })
+    }
+
+    /// The job the host runs after answering (Slack's commands and events).
+    fn later_of(r: &Res) -> Option<Job> {
+        assert!(job_of(r).is_none(), "Slack's requests never wait on a job");
+        r.effects.iter().find_map(|e| match e {
+            Effect::Background(j) => Some(j.clone()),
             _ => None,
         })
     }
@@ -3718,6 +3729,11 @@ mod slack {
     fn slack_api(call: &HttpCall) -> HttpReply {
         let ok = |v: Value| HttpReply { status: 200, body: v.to_string() };
         let url = call.url.as_str();
+        // A command's answer goes to its response_url, which needs no token.
+        if url.starts_with(REPLY_TO) {
+            assert!(!call.headers.iter().any(|(k, _)| k == "authorization"), "the bot token went to the response_url");
+            return HttpReply { status: 200, body: "ok".into() };
+        }
         assert!(call.headers.iter().any(|(k, v)| k == "authorization" && v == &format!("Bearer {TOKEN}")), "{url} without the bot token");
         if url == "https://slack.com/api/auth.test" {
             return ok(json!({ "ok": true, "team": "Acme Slack", "team_id": "T1", "user_id": "UBOT", "bot_id": "B1" }));
@@ -3780,24 +3796,37 @@ mod slack {
         chrono::Utc::now().timestamp()
     }
 
-    fn command_body(user: &str, text: &str) -> String {
+    fn command_body_to(user: &str, text: &str, reply_to: &str) -> String {
         format!(
-            "token=x&team_id=T1&channel_id=C1&user_id={user}&user_name=x&command=%2Fdumbslab&text={}&response_url=https%3A%2F%2Fhooks.slack.com%2Fcommands%2F1&trigger_id={}",
+            "token=x&team_id=T1&channel_id=C1&user_id={user}&user_name=x&command=%2Fdumbslab&text={}&response_url={}&trigger_id={}",
             urlencoding::encode(text),
+            urlencoding::encode(reply_to),
             dumbslab_core::util::new_id()
         )
     }
 
-    /// Sends `/dumbslab {text}` as a Slack user, and the reply once its job ran.
+    fn command_body(user: &str, text: &str) -> String {
+        command_body_to(user, text, REPLY_TO)
+    }
+
+    /// The answer a job posted to the command's response_url.
+    fn posted_answer(calls: &[HttpCall]) -> Value {
+        let last = calls.last().expect("an answer");
+        assert_eq!((last.method, last.url.as_str()), ("POST", REPLY_TO), "{calls:?}");
+        serde_json::from_str(last.body.as_deref().unwrap()).unwrap()
+    }
+
+    /// Sends `/dumbslab {text}` as a Slack user. The reply: Slack's answer when there's one right
+    /// away, or what the job posted to the response_url afterwards.
     fn command(h: &H, user: &str, text: &str) -> Value {
         let r = h.send(&signed_at("/slack/commands", &command_body(user, text), "application/x-www-form-urlencoded", now(), SECRET));
         assert_eq!(r.status, 200, "{}", r.body);
-        match job_of(&r) {
+        match later_of(&r) {
             None => r.body,
-            Some(job) => match drive(h, job).0 {
-                Finish::Fill(v) => connect::fill(r.body.clone(), Ok(v)).unwrap(),
-                other => panic!("{other:?}"),
-            },
+            Some(job) => {
+                assert_eq!(r.body, json!(""), "acknowledged with an empty answer");
+                posted_answer(&drive(h, job).1)
+            }
         }
     }
 
@@ -3815,8 +3844,9 @@ mod slack {
     /// Shares links in Slack; the `chat.unfurl` call DumbSlab makes, if any.
     fn share(h: &H, links: &[&str], user: &str, source: &str) -> Option<Value> {
         let r = h.send(&signed_at("/slack/events", &event(links, user, source), "application/json", now(), SECRET));
-        assert_eq!(r.status, 200, "{}", r.body);
-        let (_, calls, _) = drive(h, job_of(&r)?);
+        // Acknowledged at once; the preview follows.
+        assert_eq!((r.status, &r.body), (200, &json!({ "ok": true })));
+        let (_, calls, _) = drive(h, later_of(&r)?);
         calls.iter().find(|c| c.url.ends_with("/chat.unfurl")).map(|c| serde_json::from_str(c.body.as_deref().unwrap()).unwrap())
     }
 
@@ -3905,9 +3935,9 @@ mod slack {
         let url = post["url"].as_str().unwrap().to_string();
         let body = event(&[&url], "UADA", "conversations_history");
         let first = h.send(&signed_at("/slack/events", &body, "application/json", now(), SECRET));
-        assert!(job_of(&first).is_some());
+        assert!(later_of(&first).is_some());
         let retry = h.send(&signed_at("/slack/events", &body, "application/json", now() + 1, SECRET));
-        assert_eq!((retry.status, job_of(&retry).is_none()), (200, true), "{}", retry.body);
+        assert_eq!((retry.status, later_of(&retry).is_none()), (200, true), "{}", retry.body);
     }
 
     #[test]
@@ -3978,9 +4008,8 @@ mod slack {
             now(),
             SECRET,
         ));
-        let (finish, _, effects) = drive(&h, job_of(&r).unwrap());
-        let Finish::Fill(reply) = finish else { panic!("{finish:?}") };
-        let text = text_of(&reply);
+        let (_, calls, effects) = drive(&h, later_of(&r).unwrap());
+        let text = text_of(&posted_answer(&calls));
         assert!(text.contains("Started a draft") && text.contains("Onboarding &lt;!channel&gt;"), "{text}");
         let drafts = h.ok("GET", "/api/v1/posts?status=draft&author=me", None, &mo);
         let draft = drafts["items"].as_array().unwrap().iter().find(|p| p["title"] == "Onboarding <!channel>").expect("Mo's draft").clone();
@@ -4138,6 +4167,66 @@ mod slack {
         assert!(to(&r).is_empty());
     }
 
+    /// Slack drops a command's answer after three seconds: DumbSlab acknowledges at once, asks
+    /// Slack who's asking afterwards, and posts the answer to the command's response_url.
+    #[test]
+    fn slack_commands_answer_at_once_and_reply_at_response_url() {
+        let (h, admin) = connected();
+        h.user(&admin, "mo@acme.test", "Mo", "member");
+        h.ok("POST", "/api/v1/posts", Some(json!({ "title": "Onboarding guide", "status": "published" })), &admin);
+        let form = "application/x-www-form-urlencoded";
+
+        // The answer: empty, before anything asks Slack. One job runs after it.
+        let r = h.send(&signed_at("/slack/commands", &command_body("UMO", "search onboarding"), form, now(), SECRET));
+        assert_eq!((r.status, &r.body), (200, &json!("")));
+        assert_eq!(r.effects.len(), 1, "{:?}", r.effects);
+        let (_, calls, _) = drive(&h, later_of(&r).expect("a job for after the answer"));
+        assert_eq!(calls.len(), 2, "{calls:?}");
+        assert_eq!(calls[0].url, "https://slack.com/api/users.info?user=UMO");
+        assert!(calls[1].headers.contains(&("content-type".into(), "application/json; charset=utf-8".into())));
+        let answer = posted_answer(&calls);
+        assert_eq!(answer["response_type"], "ephemeral");
+        assert!(text_of(&answer).contains("Onboarding guide"), "{answer}");
+        // Someone DumbSlab can't match hears so at the response_url too.
+        let r = h.send(&signed_at("/slack/commands", &command_body("USTRANGER", "search onboarding"), form, now(), SECRET));
+        let text = text_of(&posted_answer(&drive(&h, later_of(&r).unwrap()).1));
+        assert!(text.contains("isn't linked") && !text.contains("Onboarding"), "{text}");
+
+        // An answer goes only to Slack's own hosts: anything else is refused before any job.
+        for bad in [
+            "https://evil.test/commands/T1/1/x",
+            "http://hooks.slack.com/commands/T1/1/x",
+            "https://hooks.slack.com.evil.test/commands/T1/1/x",
+            "https://evil.test/hooks.slack.com/commands/T1/1/x",
+            "https://hooks.slack.com:8443/commands/T1/1/x",
+            "https://user@hooks.slack.com/commands/T1/1/x",
+            "https://hooks.slack.com/commands/T1/1/x?to=https://evil.test",
+            "https://hooks.slack.com/services/T1/B1/x",
+            "https://hooks.slack.com/commands/../../services/x",
+            "",
+        ] {
+            let r = h.send(&signed_at("/slack/commands", &command_body_to("UMO", "search onboarding", bad), form, now(), SECRET));
+            assert_eq!(r.status, 200, "{bad}");
+            assert!(r.effects.is_empty(), "{bad}: {:?}", r.effects);
+            assert!(text_of(&r.body).contains("reply address"), "{bad}: {}", r.body);
+        }
+        // GovSlack's hooks host is Slack's too.
+        let gov = "https://hooks.slack-gov.com/commands/T1/1/x";
+        let r = h.send(&signed_at("/slack/commands", &command_body_to("UMO", "search onboarding", gov), form, now(), SECRET));
+        assert!(later_of(&r).is_some());
+
+        // Events are acknowledged at once too; the preview follows.
+        let post = h.ok("POST", "/api/v1/posts", Some(json!({ "title": "Shared", "status": "published" })), &admin);
+        let body = event(&[post["url"].as_str().unwrap()], "UMO", "conversations_history");
+        let r = h.send(&signed_at("/slack/events", &body, "application/json", now(), SECRET));
+        assert_eq!((r.status, &r.body, r.effects.len()), (200, &json!({ "ok": true }), 1));
+        let (_, calls, _) = drive(&h, later_of(&r).unwrap());
+        assert_eq!(
+            calls.iter().map(|c| c.url.as_str()).collect::<Vec<_>>(),
+            vec!["https://slack.com/api/users.info?user=UMO", "https://slack.com/api/chat.unfurl"]
+        );
+    }
+
     /// Several mappings can name one Slack channel: it hears about each post once, and the
     /// per-request limit is the channel's.
     #[test]
@@ -4225,7 +4314,7 @@ mod slack {
         assert!(matches!(done, Step::Done(Finish::Fail(ref e)) if e.message.contains("didn't accept that bot token")), "{done:?}");
         // The working token stays.
         let r = h.send(&signed_at("/slack/commands", &command_body("UMO", "search x"), "application/x-www-form-urlencoded", now(), SECRET));
-        assert!(job_of(&r).is_some());
+        assert!(later_of(&r).is_some());
 
         // Without the connector key, secrets can't be kept.
         let mut h = h;
