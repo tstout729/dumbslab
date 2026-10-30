@@ -937,12 +937,37 @@ pub enum Job {
     Connect(ConnectJob),
     /// Single sign-on (see [`crate::sso`]).
     Sso(crate::sso::SsoJob),
+    /// Slack's slash command, link previews and settings (see [`crate::slack`]).
+    Slack(crate::slack::SlackJob),
 }
 
 impl Job {
     /// Signing in: like a password sign-in, it works even when a hosted workspace is full.
     pub fn is_sign_in(&self) -> bool {
         matches!(self, Job::Sso(_))
+    }
+
+    /// What the job's operations left for the host to deliver once it finishes: a draft started
+    /// from Slack has webhooks to send. Only Slack's jobs leave any. Events a sign-in records send
+    /// no webhooks, and connected apps' jobs record none.
+    pub fn take_effects(&mut self) -> Vec<crate::Effect> {
+        match self {
+            Job::Slack(j) => j.take_effects(),
+            _ => vec![],
+        }
+    }
+
+    /// A request to send when a step failed with `error` and was rolled back (or the host couldn't
+    /// run it), for someone waiting elsewhere: a Slack command's answer. Hosts send it once, best
+    /// effort. `None` for jobs whose failure answers the request itself.
+    ///
+    /// Ask the job as it was *before* the failed step: the rollback undoes whatever that step
+    /// decided, such as having prepared its answer (see [`guarded_step`], which does this).
+    pub fn failure_notice(&self, error: &ApiError) -> Option<HttpCall> {
+        match self {
+            Job::Slack(j) => j.failure_notice(error),
+            _ => None,
+        }
     }
 }
 
@@ -1205,7 +1230,37 @@ pub fn step(db: &dyn Db, cfg: &HostConfig, job: &mut Job, replies: Vec<HttpReply
         Job::Preview(j) => preview_step(db, cfg, j, replies, now),
         Job::Connect(j) => connect_step(db, cfg, j, replies, now),
         Job::Sso(j) => crate::sso::step(db, cfg, j, replies, now),
+        Job::Slack(j) => crate::slack::step(db, cfg, j, replies, now),
     }
+}
+
+/// Runs a job's next step, like [`step`], then the host's own check of what it did (the Worker
+/// refuses a step that grew a full workspace's storage). Either failing means the host rolls the
+/// step back. Then the second value is the notice to send (see [`Job::failure_notice`]), decided
+/// from the job as it was before the step: a step that prepared a Slack command's answer and was
+/// rolled back sent nothing, so the person must still hear something. A job that really sent its
+/// answer in an earlier step has none. Hosts run this inside the step's transaction.
+pub fn guarded_step(
+    db: &dyn Db,
+    cfg: &HostConfig,
+    job: &mut Job,
+    replies: Vec<HttpReply>,
+    now: DateTime<Utc>,
+    guard: impl FnOnce(&dyn Db) -> Option<ApiError>,
+) -> (ApiResult<Step>, Option<HttpCall>) {
+    // Only Slack's jobs have notices; the others needn't be copied.
+    let before = matches!(job, Job::Slack(_)).then(|| job.clone());
+    let mut result = step(db, cfg, job, replies, now);
+    if result.is_ok()
+        && let Some(refused) = guard(db)
+    {
+        result = Err(refused);
+    }
+    let notice = match &result {
+        Err(e) => before.and_then(|b| b.failure_notice(e)),
+        Ok(_) => None,
+    };
+    (result, notice)
 }
 
 fn preview_step(db: &dyn Db, cfg: &HostConfig, j: &mut PreviewJob, replies: Vec<HttpReply>, now: DateTime<Utc>) -> ApiResult<Step> {

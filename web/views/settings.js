@@ -8,6 +8,7 @@ import {
 } from '/ui.js';
 import { state, emit, navigate, canAdmin, canEdit, myId } from '/state.js';
 import { connectionsSection } from '/views/connected.js';
+import { slackSection } from '/views/slack.js';
 import { importSection } from '/views/import.js';
 import { ssoMessage } from '/views/auth.js';
 
@@ -20,6 +21,7 @@ const SECTIONS = [
   { id: 'people', label: 'People', icon: 'users', admin: true },
   { id: 'sso', label: 'Single sign-on', icon: 'lock', admin: true },
   { id: 'webhooks', label: 'Webhooks', icon: 'zap', admin: true },
+  { id: 'slack', label: 'Slack', icon: 'hash', admin: true },
   { id: 'workspace', label: 'Workspace', icon: 'settings', admin: true },
   { id: 'plan', label: 'Plan', icon: 'layers', admin: true, hosted: true },
 ];
@@ -896,6 +898,7 @@ const RENDER = {
   people: peopleSection,
   sso: ssoSection,
   webhooks: webhooksSection,
+  slack: slackSection,
   workspace: workspaceSection,
   plan: planSection,
 };

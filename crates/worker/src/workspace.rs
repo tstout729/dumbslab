@@ -16,6 +16,7 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use chrono::Utc;
+use dumbslab_core::connect::{self, Finish, HttpCall, Job, Step};
 use dumbslab_core::db::{Db, DbExt};
 use dumbslab_core::plan::{self, Capacity, Plan, Subscription};
 use dumbslab_core::telemetry::Telemetry;
@@ -297,58 +298,36 @@ impl Workspace {
         }
     }
 
-    /// Runs a connected-apps job (see `dumbslab_core::connect::step`), each step in its own
-    /// transaction, sending the requests it asks for in between.
-    /// Its writes count against the plan like the request's own. Sign-ins work even when the
-    /// workspace is full, like password sign-ins.
-    async fn run_job(&self, mut job: dumbslab_core::connect::Job, cfg: &HostConfig) -> Result<dumbslab_core::connect::Finish> {
-        use dumbslab_core::connect::{self, Finish, Step};
-        let signs_in = job.is_sign_in();
-        let mut replies = vec![];
-        let mut written = 0;
-        let mut finish = Finish::Fail(ApiError::internal("connected apps took too many steps"));
-        for _ in 0..connect::MAX_STEPS {
-            let storage = self.state.storage();
-            let cfg = cfg.clone();
-            let db = self.db();
-            let sql = db.sql.clone();
-            let ran = transaction(&storage, db.clone(), move |db| {
-                let before = sql.database_size() as u64;
-                let mut job = job;
-                let mut step = connect::step(db, &cfg, &mut job, replies, Utc::now());
-                if let Some(e) = cfg
-                    .hosting
-                    .as_ref()
-                    .filter(|_| step.is_ok() && !signs_in)
-                    .and_then(|h| storage_refusal(db, h, before, sql.database_size() as u64))
-                {
-                    step = Err(e);
-                }
-                let ok = step.is_ok();
-                ((step, job), ok)
-            });
-            written += db.rows_written();
-            let (step, next) = ran?;
-            job = next;
-            match step {
-                Err(e) => {
-                    finish = Finish::Fail(e);
-                    break;
-                }
-                Ok(Step::Done(done)) => {
-                    finish = done;
-                    break;
-                }
-                Ok(Step::Fetch(calls)) => replies = futures_util::future::join_all(calls.iter().map(crate::connect::send)).await,
-            }
-        }
+    /// Runs a connected-apps, sign-in or Slack job (see `dumbslab_core::connect::step`) and sends
+    /// the webhooks its operations left. Its writes count against the plan step by step (see
+    /// [`drive_job`]).
+    async fn run_job(&self, job: Job, cfg: &HostConfig) -> Result<Finish> {
+        let (finish, effects, written) = drive_job(&self.state, job, cfg).await?;
+        send_webhooks(&self.state, effects);
         if let Some(h) = cfg.hosting.as_ref().filter(|_| written > 0) {
-            if let Err(e) = plan::record_writes(&self.db(), Utc::now(), written) {
-                console_error!("recording usage failed: {}", e.message);
-            }
             self.report_usage(&h.home, false);
         }
         Ok(finish)
+    }
+
+    /// Runs a job once the response has gone (Slack's commands and events: Slack wants an answer
+    /// within three seconds). Its steps are storage-checked and metered like any job's (see
+    /// [`drive_job`]); the directory hears about them with this workspace's next report.
+    fn run_job_later(&self, job: Job, cfg: HostConfig) {
+        // The object's state outlives this request; the job holds its own handle to it.
+        let raw: &JsValue = self.state.as_raw().as_ref();
+        let state = State::from(raw.clone().unchecked_into::<worker::worker_sys::DurableObjectState>());
+        self.state.wait_until(async move {
+            match drive_job(&state, job, &cfg).await {
+                Ok((finish, effects, _)) => {
+                    if let Finish::Fail(e) = finish {
+                        console_warn!("a background job failed: {} ({})", e.message, e.code);
+                    }
+                    send_webhooks(&state, effects);
+                }
+                Err(e) => console_error!("a background job failed: {e}"),
+            }
+        });
     }
 
     /// Answers for an address nobody has set up yet, without creating storage.
@@ -613,30 +592,112 @@ impl DurableObject for Workspace {
             }
         }
 
-        for effect in effects {
-            let Effect::Webhook(d) = effect else { continue };
-            let db = self.db();
-            self.state.wait_until(async move {
-                let headers = Headers::new();
-                for (k, v) in &d.headers {
-                    let _ = headers.set(k, v);
-                }
-                let mut init = RequestInit::new();
-                init.with_method(Method::Post).with_headers(headers).with_body(Some(JsValue::from_str(&d.body)));
-                let result = match Request::new_with_init(&d.url, &init) {
-                    Ok(r) => Fetch::Request(r).send().await,
-                    Err(e) => Err(e),
-                };
-                let (status, error) = match result {
-                    Ok(resp) if (200..300).contains(&resp.status_code()) => (Some(resp.status_code()), None),
-                    Ok(resp) => (Some(resp.status_code()), Some(format!("HTTP {}", resp.status_code()))),
-                    Err(e) => (None, Some(e.to_string())),
-                };
-                let _ = dumbslab_core::record_webhook_result(&db, &d.webhook_id, status, error.as_deref());
-            });
+        // The request's own webhooks, once each, and the jobs that run after the response.
+        let (later, effects): (Vec<Effect>, Vec<Effect>) = effects.into_iter().partition(|e| matches!(e, Effect::Background(_)));
+        send_webhooks(&self.state, effects);
+        for effect in later {
+            if let Effect::Background(job) = effect {
+                self.run_job_later(job, move_cfg.clone());
+            }
         }
-
         to_response(response)
+    }
+}
+
+/// Runs a job's steps, each in its own transaction, sending the requests it asks for in between.
+/// A step that grows a full workspace's storage fails, except a sign-in's (like password
+/// sign-ins). On hosted workspaces each step's rows count against the plan as soon as its
+/// transaction ends, rolled back or not, like a request's: while the job waits on another app,
+/// other requests and jobs on this object check the allowance against them. Returns how it
+/// finished, the effects its operations left for the host (see `Job::take_effects`), and the rows
+/// its steps wrote.
+async fn drive_job(state: &State, mut job: Job, cfg: &HostConfig) -> Result<(Finish, Vec<Effect>, u64)> {
+    let signs_in = job.is_sign_in();
+    let mut replies = vec![];
+    let mut written = 0;
+    for _ in 0..connect::MAX_STEPS {
+        // Who to tell if this step can't even run (the job goes with it). Like any failure
+        // notice, it's decided from the job as it is before the step.
+        let unran = job.failure_notice(&ApiError::internal("the step didn't run"));
+        let storage = state.storage();
+        let step_cfg = cfg.clone();
+        let db = DoDb::new(storage.sql());
+        let sql = db.sql.clone();
+        let ran = transaction(&storage, db.clone(), move |db| {
+            let before = sql.database_size() as u64;
+            let mut job = job;
+            // A step that grew a full workspace's storage is refused and rolled back, except a
+            // sign-in's. The notice comes from the job as it was before the step, which had
+            // perhaps prepared an answer the rollback undoes.
+            let hosting = step_cfg.hosting.clone().filter(|_| !signs_in);
+            let guard = |db: &dyn Db| hosting.as_ref().and_then(|h| storage_refusal(db, h, before, sql.database_size() as u64));
+            let (step, notice) = connect::guarded_step(db, &step_cfg, &mut job, replies, Utc::now(), guard);
+            let ok = step.is_ok();
+            ((step, notice, job), ok)
+        });
+        // Nothing awaits between the step's transaction and this, so no other request sees the
+        // allowance without this step's rows.
+        let rows = db.rows_written();
+        written += rows;
+        if cfg.hosting.is_some()
+            && rows > 0
+            && let Err(e) = plan::record_writes(&DoDb::new(state.storage().sql()), Utc::now(), rows)
+        {
+            console_error!("recording usage failed: {}", e.message);
+        }
+        let (step, notice, next) = match ran {
+            Ok(v) => v,
+            Err(e) => {
+                notify_failure(unran).await;
+                return Err(e);
+            }
+        };
+        job = next;
+        match step {
+            Err(e) => {
+                // The step rolled back (a full workspace, a failed operation); whoever is waiting
+                // elsewhere (a Slack command) hears so.
+                notify_failure(notice).await;
+                return Ok((Finish::Fail(e), vec![], written));
+            }
+            Ok(Step::Done(done)) => return Ok((done, job.take_effects(), written)),
+            Ok(Step::Fetch(calls)) => replies = futures_util::future::join_all(calls.iter().map(crate::connect::send)).await,
+        }
+    }
+    Ok((Finish::Fail(ApiError::internal("connected apps took too many steps")), vec![], written))
+}
+
+/// Sends a failed job's notice (see `connect::Job::failure_notice`), best effort.
+async fn notify_failure(notice: Option<HttpCall>) {
+    if let Some(call) = notice {
+        crate::connect::send(&call).await;
+    }
+}
+
+/// Sends webhook deliveries (Slack channel messages among them) after the response, and records
+/// how each went.
+fn send_webhooks(state: &State, effects: Vec<Effect>) {
+    for effect in effects {
+        let Effect::Webhook(d) = effect else { continue };
+        let db = DoDb::new(state.storage().sql());
+        state.wait_until(async move {
+            let headers = Headers::new();
+            for (k, v) in &d.headers {
+                let _ = headers.set(k, v);
+            }
+            let mut init = RequestInit::new();
+            init.with_method(Method::Post).with_headers(headers).with_body(Some(JsValue::from_str(&d.body)));
+            let result = match Request::new_with_init(&d.url, &init) {
+                Ok(r) => Fetch::Request(r).send().await,
+                Err(e) => Err(e),
+            };
+            let (status, error) = match result {
+                Ok(resp) if (200..300).contains(&resp.status_code()) => (Some(resp.status_code()), None),
+                Ok(resp) => (Some(resp.status_code()), Some(format!("HTTP {}", resp.status_code()))),
+                Err(e) => (None, Some(e.to_string())),
+            };
+            let _ = dumbslab_core::record_webhook_result(&db, &d.webhook_id, status, error.as_deref());
+        });
     }
 }
 

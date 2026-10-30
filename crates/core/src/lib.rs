@@ -3,7 +3,8 @@
 //! A host (the native server or the Cloudflare Worker) turns an incoming HTTP request into a
 //! [`Request`], opens a database transaction, calls [`handle`], commits or rolls back according
 //! to [`Outcome::commit`], and then performs the returned [`Effect`]s (webhook deliveries,
-//! requests to connected apps and, for hosted workspaces, address moves and Stripe calls).
+//! requests to connected apps, jobs that run after the response and, for hosted workspaces,
+//! address moves and Stripe calls).
 //!
 //! Every capability is an operation in [`registry`]. Each one is exposed the same way over REST
 //! (`/api/v1/...`), the generic operations endpoint (`/api/v1/operations/{name}`), MCP (`/mcp`)
@@ -27,6 +28,7 @@ pub mod plan;
 pub mod registry;
 pub mod search;
 pub mod seed;
+pub mod slack;
 pub mod sso;
 pub mod telemetry;
 pub mod tenancy;
@@ -135,13 +137,21 @@ impl Response {
     }
 }
 
-/// A webhook the host must deliver after the transaction commits.
-#[derive(Clone, Debug)]
+/// A webhook the host must deliver after the transaction commits. Slack channel messages are
+/// deliveries too, to `chat.postMessage` with the bot token (see [`slack::on_event`]).
+#[derive(Clone)]
 pub struct WebhookDelivery {
     pub webhook_id: String,
     pub url: String,
     pub headers: Vec<(String, String)>,
     pub body: String,
+}
+
+// Headers can carry a bot token; never print them.
+impl std::fmt::Debug for WebhookDelivery {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WebhookDelivery").field("webhook_id", &self.webhook_id).finish_non_exhaustive()
+    }
 }
 
 /// Hosted workspaces only: an admin asked to move the workspace from `from` to `to`. The host
@@ -163,6 +173,11 @@ pub enum Effect {
     Stripe(plan::StripeCall),
     /// Requests to connected apps: run the job with [`connect::step`] and answer with its result.
     Connect(connect::Job),
+    /// A job to run once the response has gone, like [`Effect::Connect`]'s but with nothing
+    /// waiting for its result: Slack wants its requests answered within three seconds, so a
+    /// command or event is acknowledged first and handled here. Its writes count against the plan
+    /// like any job's, and it delivers what [`connect::Job::take_effects`] leaves.
+    Background(connect::Job),
 }
 
 #[derive(Clone, Debug)]
@@ -175,6 +190,10 @@ pub struct Outcome {
 
 /// Records the result of a webhook delivery. Call it in its own transaction.
 pub fn record_webhook_result(db: &dyn Db, webhook_id: &str, status: Option<u16>, error: Option<&str>) -> ApiResult<()> {
+    // Slack channel messages have no webhook to record them on.
+    if webhook_id.starts_with("slack:") {
+        return Ok(());
+    }
     db.execute(
         "UPDATE webhooks SET last_delivery_at = ?, last_status = ?, last_error = ? WHERE id = ?",
         &params![util::ts(chrono::Utc::now()), status.map(|s| s as i64), error, webhook_id],
