@@ -5,6 +5,7 @@ import { h, icon, avatar, kbd, modKey, openMenu, modal, frag, setTheme, themePre
 import { state, on, canEdit, canAdmin, topicTree, navigate } from '/state.js';
 import { openPalette } from '/views/search.js';
 import { openTopicForm } from '/views/topic.js';
+import { stopTelemetry } from '/telemetry.js';
 
 let sidebar;
 let backdrop;
@@ -87,6 +88,7 @@ function themeItems() {
 }
 
 async function signOut() {
+  stopTelemetry();
   try {
     await api.post('/auth/logout', {});
   } catch (e) {

@@ -18,6 +18,7 @@ use std::rc::Rc;
 use chrono::Utc;
 use dumbslab_core::db::{Db, DbExt};
 use dumbslab_core::plan::{self, Capacity, Plan, Subscription};
+use dumbslab_core::telemetry::Telemetry;
 use dumbslab_core::{AddressMove, ApiError, ApiResult, Effect, HostConfig, Hosting, Outcome, params, tenancy};
 use serde_json::{Value, json};
 use wasm_bindgen::prelude::*;
@@ -461,6 +462,13 @@ impl DurableObject for Workspace {
             signup_secret: if multi { signup_secret } else { None },
             workspace: workspace.clone(),
             hosting,
+            // Session recordings and browser error reports; off unless these are set.
+            telemetry: Telemetry::new(
+                var(&self.env, "QUILL_HOST").as_deref(),
+                var(&self.env, "QUILL_TOKEN").as_deref(),
+                var(&self.env, "SENTRY_DSN").as_deref(),
+            )
+            .0,
         };
         let move_cfg = cfg.clone();
 

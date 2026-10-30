@@ -82,6 +82,11 @@ PRO_PRICE_LABEL = "$8 a month"
 BASE_URL = ""
 WORKSPACE_NAME = "main"
 OPEN_SETUP = "false"
+# Session recordings (Quill) and error reports (Sentry). All three are public: the web app sends
+# them to browsers. Empty turns each off. web/_headers must allow both hosts in connect-src.
+QUILL_HOST = "https://t.staykit.ai"
+QUILL_TOKEN = "phc_G0HH1nVnPAe978r7DlSWtaGHNgk8DexefGzVjGos"
+SENTRY_DSN = "https://85b018c97c1c741350b97406e8556a15@o4511072647970816.ingest.us.sentry.io/4512347076427776"
 
 [observability]
 enabled = true
@@ -123,3 +128,7 @@ PRO_PRICE_LABEL = "$8 a month"
 BASE_URL = ""
 WORKSPACE_NAME = "main"
 OPEN_SETUP = "false"
+# Off locally. To try them, pass e.g. --var QUILL_HOST:… to `wrangler dev`.
+QUILL_HOST = ""
+QUILL_TOKEN = ""
+SENTRY_DSN = ""

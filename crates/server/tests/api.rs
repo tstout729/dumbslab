@@ -2160,3 +2160,26 @@ fn directory_budgets_the_free_plan() {
     let entries = db_run(&h, tenancy::list);
     assert_eq!(entries.iter().find(|e| e.slug == "beta").unwrap().billing_status, None);
 }
+
+#[test]
+fn telemetry_settings_reach_the_web_app_only_when_configured() {
+    use dumbslab_core::telemetry::Telemetry;
+    let mut h = H::new();
+    let (cookie, _) = h.setup();
+    // Self-hosted servers report nowhere unless their operator says so.
+    assert_eq!(h.ok("GET", "/api/v1/auth/state", None, &cookie)["telemetry"], Value::Null);
+    assert_eq!(h.ok("GET", "/api/v1/auth/state", None, &Auth::None)["telemetry"], Value::Null);
+
+    let dsn = "https://abc123@o1.ingest.us.sentry.io/42";
+    h.cfg.telemetry = Telemetry::new(Some("https://t.example.com"), Some("phc_public"), Some(dsn)).0;
+    h.cfg.workspace = Some("acme".into());
+    let telemetry = h.ok("GET", "/api/v1/auth/state", None, &cookie)["telemetry"].clone();
+    assert_eq!(telemetry["quill"], json!({ "host": "https://t.example.com", "token": "phc_public" }));
+    assert_eq!(telemetry["sentry"], json!({ "dsn": dsn }));
+    assert_eq!(telemetry["workspace"], "acme");
+
+    // Only error reports: recordings stay off.
+    h.cfg.telemetry = Telemetry::new(None, None, Some(dsn)).0;
+    let telemetry = h.ok("GET", "/api/v1/auth/state", None, &cookie)["telemetry"].clone();
+    assert_eq!((telemetry["quill"].clone(), telemetry["sentry"]["dsn"].clone()), (Value::Null, json!(dsn)));
+}

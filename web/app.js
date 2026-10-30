@@ -17,6 +17,7 @@ import * as notifications from '/views/notifications.js';
 import * as activity from '/views/activity.js';
 import * as insights from '/views/insights.js';
 import * as settings from '/views/settings.js';
+import { startTelemetry, reportError } from '/telemetry.js';
 
 const ROUTES = [
   ['/', home.render],
@@ -212,6 +213,7 @@ async function render({ keepScroll = false } = {}) {
     else if (e instanceof ApiError && e.status === 401) return;
     else {
       console.error(e);
+      reportError(e);
       errorView(e, () => render());
     }
   } finally {
@@ -313,6 +315,8 @@ async function boot() {
     if (e.status !== 401) bootError(root, e);
     return;
   }
+  // Session recordings and error reports, only when the host set them up. Runs in the background.
+  startTelemetry(authState.telemetry, state.me.user);
 
   main = buildShell(root);
   setNavigator(navigate);

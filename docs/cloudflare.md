@@ -143,6 +143,31 @@ Open `https://your-domain/setup?token=<SETUP_TOKEN>` and create the admin accoun
 | `WORKSPACE_NAME` | var | Name of the Durable Object holding the workspace (default `main`) |
 | `OPEN_SETUP` | var | `true` allows setup without a token. Only for local development. |
 
+## Session recordings and error reports
+
+The web app can record sessions in [Quill](https://github.com/164investments/quill) (or any PostHog-compatible server) and report its errors to Sentry. Both are off unless set, and only the parts you set turn on:
+
+| Variable | Native server | Meaning |
+| --- | --- | --- |
+| `QUILL_HOST` | `DUMBSLAB_QUILL_HOST` | Quill's origin, e.g. `https://t.example.com` |
+| `QUILL_TOKEN` | `DUMBSLAB_QUILL_TOKEN` | The Quill project's public `phc_` token |
+| `SENTRY_DSN` | `DUMBSLAB_SENTRY_DSN` | The Sentry project's DSN |
+
+All three are public: the browser needs them, so they go in `wrangler.toml`'s `[vars]`, not secrets. The checked-in file sets them for dumbslab.com; the `dev` environment leaves them empty (pass `--var QUILL_HOST:…` to `wrangler dev` to try them). The Quill project must allow your origins; for hosted mode that's `https://your-domain` and `https://*.your-domain`.
+
+The browser may only connect to hosts the Content-Security-Policy allows. The native server adds the configured hosts itself. On Cloudflare, `web/_headers` lists dumbslab.com's Quill and Sentry ingest hosts in `connect-src`; put yours there instead.
+
+How it works: `GET /api/v1/auth/state` returns the settings as `telemetry` (or `null`), and `web/telemetry.js` loads the SDKs from `web/vendor` (posthog-js with its recorder bundled, and Sentry's errors-only browser bundle) once someone is signed in. Nothing loads on the setup or sign-in pages, or on the sign-up site.
+
+What is recorded, and what never leaves the browser:
+
+- **Who.** Each person is identified by their DumbSlab user id, with their name, email and the workspace's address. Signing out stops the recording and forgets them on that browser.
+- **Recordings** cover every signed-in session and mask all text, every input, and words in attributes (titles, labels, alt text, heading ids). Links and images keep only safe parts of their URLs. No canvas, console logs, network requests or request bodies are recorded.
+- **Page addresses.** Captured URLs lose post and topic slugs (they're titles), file names, the search text, the hash, and every query parameter the app doesn't read, so sign-up tokens, OAuth codes and other secrets in a URL never leave. Another site's URL keeps only its origin. Pageview titles are dropped.
+- **Errors** go to Sentry with the same URL rules, tagged `runtime=browser` and the workspace's address. No session replay, tracing, release-health sessions, console or click breadcrumbs. API errors aren't reported from the browser: the person sees them, and the server's own failures are reported by the Worker.
+
+Server-side failures are reported by the Worker itself, to the same `SENTRY_DSN`. Because `SENTRY_DSN` is in `[vars]`, don't also add it as a secret: a variable and a secret can't share a name. A panic in the Worker (Rust compiled to wasm) aborts the request before any code can report it; a [Tail Worker](https://developers.cloudflare.com/workers/observability/logs/tail-workers/) that forwards `exception` outcomes to Sentry would cover those.
+
 ## Local development
 
 ```sh

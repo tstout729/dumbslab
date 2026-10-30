@@ -16,6 +16,7 @@ use dumbslab_core::auth::{Actor, Role, Scopes, Via};
 use dumbslab_core::db::DbExt;
 use dumbslab_core::mcp::Toolset;
 use dumbslab_core::registry::registry;
+use dumbslab_core::telemetry::Telemetry;
 use dumbslab_core::{Effect, HostConfig, Outcome, Request, WebhookDelivery, params};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{Semaphore, mpsc, oneshot};
@@ -52,6 +53,16 @@ enum Command {
         /// Let anyone who can reach the server create the first admin (local development only).
         #[arg(long)]
         open_setup: bool,
+        /// Record sessions in this Quill (PostHog-compatible) server, e.g. https://t.example.com.
+        /// Needs --quill-token too. Off by default.
+        #[arg(long, env = "DUMBSLAB_QUILL_HOST")]
+        quill_host: Option<String>,
+        /// The Quill project's public token (phc_…).
+        #[arg(long, env = "DUMBSLAB_QUILL_TOKEN")]
+        quill_token: Option<String>,
+        /// Report the web app's errors to this Sentry DSN (public; it ships to browsers). Off by default.
+        #[arg(long, env = "DUMBSLAB_SENTRY_DSN")]
+        sentry_dsn: Option<String>,
     },
     /// Serve MCP over stdio for a local agent, acting as a user.
     Mcp {
@@ -91,6 +102,8 @@ pub struct App {
     pub store: Store,
     pub cfg: HostConfig,
     pub allow_private_webhooks: bool,
+    /// The web app's Content-Security-Policy, which names the configured telemetry hosts.
+    csp: String,
     webhooks: Mutex<HashMap<String, mpsc::Sender<QueuedDelivery>>>,
     sign_ins: Arc<Semaphore>,
 }
@@ -99,6 +112,7 @@ impl App {
     fn new(store: Store, cfg: HostConfig, allow_private_webhooks: bool) -> Arc<App> {
         Arc::new(App {
             store,
+            csp: web::csp(&cfg.telemetry.connect_origins()),
             cfg,
             allow_private_webhooks,
             webhooks: Mutex::new(HashMap::new()),
@@ -125,8 +139,12 @@ async fn main() -> anyhow::Result<()> {
             println!("{}", serde_json::to_string_pretty(&dumbslab_core::openapi::spec(&base_url))?);
             Ok(())
         }
-        Command::Serve { bind, base_url, setup_token, open_setup } => {
-            serve(cli.db, cli.allow_private_webhooks, bind, base_url, setup_token, open_setup).await
+        Command::Serve { bind, base_url, setup_token, open_setup, quill_host, quill_token, sentry_dsn } => {
+            let (telemetry, problems) = Telemetry::new(quill_host.as_deref(), quill_token.as_deref(), sentry_dsn.as_deref());
+            for problem in problems {
+                warn!("{problem}");
+            }
+            serve(cli.db, cli.allow_private_webhooks, bind, base_url, setup_token, open_setup, telemetry).await
         }
         Command::Mcp { user, toolset } => stdio_mcp(cli.db, cli.allow_private_webhooks, user, Toolset::parse(Some(&toolset))).await,
         Command::Call { operation, input, user } => call(cli.db, cli.allow_private_webhooks, operation, input, user).await,
@@ -237,6 +255,7 @@ async fn serve(
     base_url: Option<String>,
     setup_token: Option<String>,
     open_setup: bool,
+    telemetry: Telemetry,
 ) -> anyhow::Result<()> {
     let store = open(&db)?;
     let needs_setup = store.with_tx(|db| (db.scalar_i64("SELECT COUNT(*) FROM users", &[]), true))?? == 0;
@@ -251,7 +270,19 @@ async fn serve(
             _ => info!("first run: create the admin account at {shown_url}/setup"),
         }
     }
-    let cfg = HostConfig { base_url: base_url.map(|u| u.trim_end_matches('/').to_string()), setup_token, open_setup, ..Default::default() };
+    if telemetry.quill_host.is_some() {
+        info!("the web app records sessions in Quill");
+    }
+    if telemetry.sentry.is_some() {
+        info!("the web app reports its errors to Sentry");
+    }
+    let cfg = HostConfig {
+        base_url: base_url.map(|u| u.trim_end_matches('/').to_string()),
+        setup_token,
+        open_setup,
+        telemetry,
+        ..Default::default()
+    };
     let app = App::new(store, cfg, allow_private_webhooks);
     let router = Router::new()
         .fallback(handle)
@@ -276,7 +307,7 @@ async fn handle(
     let (parts, body) = req.into_parts();
     let path = parts.uri.path().to_string();
     if !dumbslab_core::http::is_core_path(&path) {
-        return web::serve(&path, &parts.headers);
+        return web::serve(&path, &parts.headers, &app.csp);
     }
     // Uploads get room for a base64 file; every other route keeps the smaller limit.
     let body = match axum::body::to_bytes(body, dumbslab_core::http::body_limit(&path)).await {
