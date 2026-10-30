@@ -476,7 +476,9 @@ impl DurableObject for Workspace {
                 Some(o) => {
                     // A failed setup leaves no schema behind.
                     let commit = o.commit && (!creating || o.response.status == 200);
-                    if let Some(h) = cfg.hosting.as_ref().filter(|_| !exempt) {
+                    // Upgrading must work when the workspace is full; its first one stores a billing id.
+                    let upgrading = o.effects.iter().any(|e| matches!(e, Effect::Stripe(_)));
+                    if let Some(h) = cfg.hosting.as_ref().filter(|_| !exempt && !upgrading) {
                         let after = sql.database_size() as u64;
                         if commit && after > before {
                             let plan = plan::current(db).map(|s| s.plan()).unwrap_or(Plan::Free);

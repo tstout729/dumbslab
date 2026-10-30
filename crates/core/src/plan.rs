@@ -164,15 +164,17 @@ pub fn billing_id(db: &dyn Db) -> ApiResult<String> {
     Ok(id)
 }
 
-/// Records what Stripe reported about a subscription. Returns `false` when it was ignored: it
-/// belongs to another workspace (by [`billing_id`]), or it's news about an older subscription
-/// that would undo a newer one in good standing.
+/// Records what Stripe reported about a subscription. Returns `false` when it was ignored: a new
+/// subscription that belongs to another workspace (by [`billing_id`]), or news about an older
+/// subscription that would undo a newer one in good standing. Changes to the subscription the
+/// workspace already holds always apply, so a cancellation can't be missed.
 pub fn apply_subscription(db: &dyn Db, sub: &Subscription) -> ApiResult<bool> {
+    let held = current(db)?.subscription;
     let ours = setting(db, "billing_id")?;
-    if ours.is_none() || sub.billing_id != ours {
+    if held.as_ref().is_none_or(|h| h.id != sub.id) && (ours.is_none() || sub.billing_id != ours) {
         return Ok(false);
     }
-    if let Some(cur) = current(db)?.subscription
+    if let Some(cur) = held
         && cur.id != sub.id
         && cur.in_good_standing()
         && !sub.in_good_standing()

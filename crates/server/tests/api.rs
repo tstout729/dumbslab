@@ -2018,6 +2018,12 @@ fn hosted_workspaces_meter_writes() {
     });
     assert_eq!(h.ok("GET", "/api/v1/plan", None, &member)["plan"], "pro");
 
+    // Changes to the subscription the workspace holds apply even if its billing id went missing
+    // (say, metadata edited in the Stripe Dashboard), so a cancellation is never ignored.
+    let edited = plan::Subscription { billing_id: None, cancel_at_period_end: true, ..sub(&h, "sub_1", "active") };
+    assert!(db_run(&h, |db| plan::apply_subscription(db, &edited)));
+    assert_eq!(h.ok("GET", "/api/v1/plan", None, &member)["subscription"]["cancel_at_period_end"], true);
+
     // Cancelled: back to free. Upgrading again reuses the Stripe customer.
     {
         let s = sub(&h, "sub_1", "canceled");
