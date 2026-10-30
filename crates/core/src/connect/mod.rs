@@ -220,6 +220,9 @@ pub struct TokenSet {
     pub refresh_token: Option<String>,
     /// Seconds until the access token expires, when it does.
     pub expires_in: Option<i64>,
+    /// Anything else the answer says that later requests need (e.g. Wrike's API host); kept with
+    /// the credential's fields.
+    pub fields: BTreeMap<String, String>,
 }
 
 /// One result from a connected app.
@@ -345,6 +348,7 @@ pub fn standard_token(name: &str, reply: &HttpReply) -> Result<TokenSet, String>
             access_token: t.to_string(),
             refresh_token: v["refresh_token"].as_str().map(str::to_string),
             expires_in: v["expires_in"].as_i64(),
+            fields: BTreeMap::new(),
         }),
         _ => Err(format!(
             "{name} didn't accept the sign-in ({}). Try connecting again.",
@@ -873,6 +877,7 @@ fn apply_refresh(
     if let Some(r) = tokens.refresh_token.clone() {
         conn.cred.refresh_token = Some(r);
     }
+    conn.cred.fields.extend(tokens.fields.clone());
     conn.expires_at = expiry(now, &tokens);
     save_token(db, cfg, user_id, conn, now)?;
     Ok(true)
@@ -1051,6 +1056,7 @@ fn connect_step(db: &dyn Db, cfg: &HostConfig, j: &mut ConnectJob, replies: Vec<
                 Ok(tokens) => {
                     j.cred.token = tokens.access_token.clone();
                     j.cred.refresh_token = tokens.refresh_token.clone();
+                    j.cred.fields.extend(tokens.fields.clone());
                     j.expires_at = expiry(now, &tokens);
                     j.phase = ConnectPhase::Profiling;
                     Ok(Step::Fetch(connector.profile(&j.cred)))
