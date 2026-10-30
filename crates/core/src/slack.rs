@@ -871,6 +871,26 @@ impl SlackJob {
     pub fn take_effects(&mut self) -> Vec<Effect> {
         std::mem::take(&mut self.effects)
     }
+
+    /// The answer to send when a step failed and was rolled back, so a command Slack was told
+    /// about doesn't vanish: an ephemeral note at its `response_url`. Only messages written for
+    /// people (a full workspace, a paused one) are passed on; anything else could describe
+    /// internals. `None` once the answer went, and for jobs nobody is waiting on.
+    pub fn failure_notice(&self, error: &ApiError) -> Option<HttpCall> {
+        let (reply_to, what) = match &self.work {
+            Work::NewDraft { reply_to, .. } => (reply_to, "Couldn't create the draft"),
+            Work::Search { reply_to, .. } => (reply_to, "Couldn't search DumbSlab"),
+            _ => return None,
+        };
+        if self.phase == Phase::Replying {
+            return None;
+        }
+        let text = match error.code {
+            "storage_full" | "write_limit" | "free_capacity" => format!("{what}. {}", error.message),
+            _ => format!("{what}: something went wrong. Try again in a minute."),
+        };
+        Some(reply_call(reply_to, &ephemeral(&escape(&text))))
+    }
 }
 
 fn fill(value: Value) -> ApiResult<Step> {
@@ -884,12 +904,16 @@ fn fail(e: ApiError) -> ApiResult<Step> {
 /// Sends a command's answer to its `response_url`, which [`command`] checked is Slack's.
 fn answer_at(job: &mut SlackJob, reply_to: &str, message: Value) -> ApiResult<Step> {
     job.phase = Phase::Replying;
-    Ok(Step::Fetch(vec![HttpCall {
+    Ok(Step::Fetch(vec![reply_call(reply_to, &message)]))
+}
+
+fn reply_call(reply_to: &str, message: &Value) -> HttpCall {
+    HttpCall {
         method: "POST",
         url: reply_to.to_string(),
         headers: vec![("content-type".into(), "application/json; charset=utf-8".into())],
         body: Some(message.to_string()),
-    }]))
+    }
 }
 
 fn job_ctx<'a>(db: &'a dyn Db, cfg: &'a HostConfig, base_url: &str, actor: Actor, now: DateTime<Utc>) -> Ctx<'a> {

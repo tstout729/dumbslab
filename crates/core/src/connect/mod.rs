@@ -956,6 +956,16 @@ impl Job {
             _ => vec![],
         }
     }
+
+    /// A request to send when a step failed with `error` and was rolled back (or the host couldn't
+    /// run it), for someone waiting elsewhere: a Slack command's answer. Hosts send it once, best
+    /// effort. `None` for jobs whose failure answers the request itself.
+    pub fn failure_notice(&self, error: &ApiError) -> Option<HttpCall> {
+        match self {
+            Job::Slack(j) => j.failure_notice(error),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]

@@ -16,7 +16,7 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use chrono::Utc;
-use dumbslab_core::connect::{self, Finish, Job, Step};
+use dumbslab_core::connect::{self, Finish, HttpCall, Job, Step};
 use dumbslab_core::db::{Db, DbExt};
 use dumbslab_core::plan::{self, Capacity, Plan, Subscription};
 use dumbslab_core::telemetry::Telemetry;
@@ -621,6 +621,8 @@ async fn drive_job(state: &State, mut job: Job, cfg: &HostConfig) -> Result<(Fin
     let mut replies = vec![];
     let mut written = 0;
     for _ in 0..connect::MAX_STEPS {
+        // Who to tell if this step can't even run (the job goes with it).
+        let unran = job.failure_notice(&ApiError::internal("the step didn't run"));
         let storage = state.storage();
         let cfg = cfg.clone();
         let db = DoDb::new(storage.sql());
@@ -641,15 +643,33 @@ async fn drive_job(state: &State, mut job: Job, cfg: &HostConfig) -> Result<(Fin
             ((step, job), ok)
         });
         written += db.rows_written();
-        let (step, next) = ran?;
+        let (step, next) = match ran {
+            Ok(v) => v,
+            Err(e) => {
+                notify_failure(unran).await;
+                return Err(e);
+            }
+        };
         job = next;
         match step {
-            Err(e) => return Ok((Finish::Fail(e), vec![], written)),
+            Err(e) => {
+                // The step rolled back (a full workspace, a failed operation); whoever is waiting
+                // elsewhere (a Slack command) hears so.
+                notify_failure(job.failure_notice(&e)).await;
+                return Ok((Finish::Fail(e), vec![], written));
+            }
             Ok(Step::Done(done)) => return Ok((done, job.take_effects(), written)),
             Ok(Step::Fetch(calls)) => replies = futures_util::future::join_all(calls.iter().map(crate::connect::send)).await,
         }
     }
     Ok((Finish::Fail(ApiError::internal("connected apps took too many steps")), vec![], written))
+}
+
+/// Sends a failed job's notice (see `connect::Job::failure_notice`), best effort.
+async fn notify_failure(notice: Option<HttpCall>) {
+    if let Some(call) = notice {
+        crate::connect::send(&call).await;
+    }
 }
 
 /// Sends webhook deliveries (Slack channel messages among them) after the response, and records

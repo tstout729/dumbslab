@@ -536,6 +536,8 @@ fn take_job(effects: &mut Vec<Effect>) -> Option<connect::Job> {
 async fn run_job(app: &Arc<App>, mut job: connect::Job) -> connect::Finish {
     let mut replies = vec![];
     for _ in 0..connect::MAX_STEPS {
+        // Who to tell if this step can't even run (the job goes with it).
+        let unran = job.failure_notice(&dumbslab_core::ApiError::internal("the step didn't run"));
         let app2 = app.clone();
         let ran = tokio::task::spawn_blocking(move || {
             app2.store.with_tx(|db| {
@@ -549,16 +551,22 @@ async fn run_job(app: &Arc<App>, mut job: connect::Job) -> connect::Finish {
             Ok(Ok(v)) => v,
             Ok(Err(e)) => {
                 warn!("connected-apps job failed: {e:#}");
+                notify_failure(app, unran).await;
                 return connect::Finish::Fail(dumbslab_core::ApiError::internal("connected apps failed"));
             }
             Err(e) => {
                 warn!("connected-apps task failed: {e}");
+                notify_failure(app, unran).await;
                 return connect::Finish::Fail(dumbslab_core::ApiError::internal("connected apps failed"));
             }
         };
         job = next;
         match step {
-            Err(e) => return connect::Finish::Fail(e),
+            Err(e) => {
+                // The step rolled back; whoever is waiting elsewhere (a Slack command) hears so.
+                notify_failure(app, job.failure_notice(&e)).await;
+                return connect::Finish::Fail(e);
+            }
             Ok(connect::Step::Done(finish)) => {
                 // A job's operations can leave webhooks to send (a draft started from Slack).
                 deliver(app.clone(), job.take_effects());
@@ -576,6 +584,13 @@ async fn run_job(app: &Arc<App>, mut job: connect::Job) -> connect::Finish {
         }
     }
     connect::Finish::Fail(dumbslab_core::ApiError::internal("connected apps took too many steps"))
+}
+
+/// Sends a failed job's notice (see `connect::Job::failure_notice`), best effort.
+async fn notify_failure(app: &Arc<App>, notice: Option<HttpCall>) {
+    if let Some(call) = notice {
+        send_app_call(&call, app.allow_private_webhooks).await;
+    }
 }
 
 /// Answers with a connected-apps job's result, when the request started one.

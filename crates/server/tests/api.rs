@@ -4293,6 +4293,70 @@ mod slack {
         }
     }
 
+    /// A command Slack was told about must not vanish: when a step fails and rolls back, the host
+    /// sends the job's failure notice to the response_url, without internals.
+    #[test]
+    fn slack_failed_drafts_still_get_an_answer() {
+        let (h, admin) = connected();
+        h.user(&admin, "mo@acme.test", "Mo", "member");
+        let post = h.ok("POST", "/api/v1/posts", Some(json!({ "title": "Shared", "status": "published" })), &admin);
+        let form = "application/x-www-form-urlencoded";
+        let one_step = |job: &mut Job, replies: Vec<HttpReply>| {
+            h.store
+                .with_tx(|db| {
+                    let step = connect::step(db, &h.cfg, job, replies, chrono::Utc::now());
+                    let ok = step.is_ok();
+                    (step, ok)
+                })
+                .unwrap()
+        };
+        let r = h.send(&signed_at("/slack/commands", &command_body("UMO", "new Rollback me"), form, now(), SECRET));
+        let mut job = later_of(&r).unwrap();
+        let Ok(Step::Fetch(calls)) = one_step(&mut job, vec![]) else { panic!("asks who's asking") };
+
+        // Creating the post fails part-way (a database error): the step rolls back...
+        db_run(&h, |db| db.execute_batch("DROP TABLE post_versions"));
+        let posts = count(&h, "SELECT COUNT(*) FROM posts");
+        let failed = one_step(&mut job, calls.iter().map(slack_api).collect()).expect_err("the step fails");
+        assert_eq!(failed.status, 500, "{failed:?}");
+        assert_eq!(count(&h, "SELECT COUNT(*) FROM posts"), posts, "nothing was kept");
+        // ...and the person hears so at the response_url, with nothing about why inside.
+        let notice = job.failure_notice(&failed).expect("a notice");
+        assert_eq!((notice.method, notice.url.as_str()), ("POST", REPLY_TO));
+        assert!(!notice.headers.iter().any(|(k, _)| k == "authorization"));
+        let body: Value = serde_json::from_str(notice.body.as_deref().unwrap()).unwrap();
+        assert_eq!(body["response_type"], "ephemeral");
+        let text = text_of(&body);
+        assert!(text.contains("Couldn't create the draft: something went wrong"), "{text}");
+        for internal in ["post_versions", "database", "table", &failed.message] {
+            assert!(!text.contains(internal), "{internal} in {text}");
+        }
+        // The Worker refuses a step that grows a full workspace; that message is for people.
+        let full = dumbslab_core::plan::storage_full(&plans(None), dumbslab_core::plan::Plan::Free, false);
+        let text = text_of(&serde_json::from_str::<Value>(job.failure_notice(&full).unwrap().body.as_deref().unwrap()).unwrap());
+        assert!(text.contains("Couldn't create the draft. This workspace has reached its 50 MB storage limit"), "{text}");
+
+        // A search says so too; once an answer went, or for a preview, there's nothing to send.
+        let r = h.send(&signed_at("/slack/commands", &command_body("UMO", "search anything"), form, now(), SECRET));
+        let mut search = later_of(&r).unwrap();
+        assert!(
+            text_of(&serde_json::from_str::<Value>(search.failure_notice(&failed).unwrap().body.as_deref().unwrap()).unwrap())
+                .contains("Couldn't search DumbSlab")
+        );
+        let Ok(Step::Fetch(calls)) = one_step(&mut search, vec![]) else { panic!() };
+        let Ok(Step::Fetch(answer)) = one_step(&mut search, calls.iter().map(slack_api).collect()) else { panic!() };
+        assert_eq!(answer[0].url, REPLY_TO);
+        assert!(search.failure_notice(&failed).is_none(), "answered already");
+        let r = h.send(&signed_at(
+            "/slack/events",
+            &event(&[post["url"].as_str().unwrap()], "UMO", "composer"),
+            "application/json",
+            now(),
+            SECRET,
+        ));
+        assert!(later_of(&r).unwrap().failure_notice(&failed).is_none());
+    }
+
     #[test]
     fn slack_secrets_are_never_returned() {
         let (h, admin) = connected();
