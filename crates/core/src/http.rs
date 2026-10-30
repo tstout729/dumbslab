@@ -272,6 +272,8 @@ fn auth_state(db: &dyn Db, cfg: &HostConfig, req: &Request) -> Outcome {
             "version": crate::VERSION,
             "mcp_url": format!("{}/mcp", base_url(cfg, req)),
             "api_url": format!("{}{API_PREFIX}", base_url(cfg, req)),
+            // Session recordings and browser error reports, or null when the host didn't set them up.
+            "telemetry": cfg.telemetry.web_config(cfg.workspace.as_deref()),
         }))
     };
     match run() {

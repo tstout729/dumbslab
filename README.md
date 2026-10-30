@@ -44,6 +44,11 @@ Options (flags or environment variables):
 | `--setup-token` | `DUMBSLAB_SETUP_TOKEN` | generated and logged |
 | | `DUMBSLAB_CONNECTOR_KEY` | unset: [connected apps](docs/connected-apps.md) are off |
 | `--open-setup` | | off (local development only: setup without a token) |
+| `--quill-host` | `DUMBSLAB_QUILL_HOST` | off: record sessions in this [Quill](https://github.com/164investments/quill) or other PostHog-compatible server |
+| `--quill-token` | `DUMBSLAB_QUILL_TOKEN` | off: that project's public `phc_` token |
+| `--sentry-dsn` | `DUMBSLAB_SENTRY_DSN` | off: report the web app's errors to this Sentry DSN |
+
+Session recordings and error reports stay off unless you set them, so a self-hosted server sends nothing anywhere. What they record and mask: [docs/cloudflare.md](docs/cloudflare.md#session-recordings-and-error-reports).
 
 ### Docker
 
@@ -107,7 +112,7 @@ Give each agent its own bot account (Settings → People → Add bot) and token.
 crates/core    storage-agnostic core: schema, permissions, operations, REST routing, MCP, OAuth, search
 crates/server  `dumbslab` binary: axum + SQLite (one transaction per request), embedded web app, CLI, stdio MCP
 crates/worker  Cloudflare Worker: a Durable Object per workspace running the same core (wasm), plus the sign-up Directory
-web/           the web app: plain HTML/CSS/JS modules, no build step
+web/           the web app: plain HTML/CSS/JS modules, no build step (web/vendor: the telemetry SDKs)
 ```
 
 The core talks to SQLite through a small synchronous `Db` trait. The native server implements it with `rusqlite`; the Worker implements it with the Durable Object SQL API inside `transactionSync`. Both hosts run every request as a single transaction and roll back when an operation fails.

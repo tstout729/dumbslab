@@ -3,13 +3,19 @@
 // HTML the server has already sanitized (rendered posts, comments, search snippets).
 
 const SVG_NS = 'http://www.w3.org/2000/svg';
+/** posthog-js records an element with this class as an empty box, and autocapture skips it. */
+export const BLOCK_RECORDING = 'ph-no-capture';
 
 function applyProps(el, props) {
   for (const [k, v] of Object.entries(props)) {
     if (v === undefined || v === null || v === false) continue;
     if (k === 'class') el.setAttribute('class', Array.isArray(v) ? v.filter(Boolean).join(' ') : v);
     else if (k === 'text') el.textContent = String(v);
-    else if (k === 'trustedHtml') el.innerHTML = v;
+    else if (k === 'trustedHtml') {
+      el.innerHTML = v;
+      // People's own content: session recordings show an empty box here (web/telemetry.js).
+      el.classList.add(BLOCK_RECORDING);
+    }
     else if (k === 'dataset') Object.assign(el.dataset, v);
     else if (k === 'style' && typeof v === 'object') {
       for (const [sk, sv] of Object.entries(v)) {

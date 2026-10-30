@@ -2382,6 +2382,37 @@ fn directory_budgets_the_free_plan() {
     assert_eq!(entries.iter().find(|e| e.slug == "beta").unwrap().billing_status, None);
 }
 
+#[test]
+fn telemetry_settings_reach_the_web_app_only_when_configured() {
+    use dumbslab_core::telemetry::Telemetry;
+    let mut h = H::new();
+    let (cookie, _) = h.setup();
+    // Self-hosted servers report nowhere unless their operator says so.
+    assert_eq!(h.ok("GET", "/api/v1/auth/state", None, &cookie)["telemetry"], Value::Null);
+    assert_eq!(h.ok("GET", "/api/v1/auth/state", None, &Auth::None)["telemetry"], Value::Null);
+
+    let dsn = "https://abc123@o1.ingest.us.sentry.io/42";
+    h.cfg.telemetry = Telemetry::new(Some("https://t.example.com"), Some("phc_public"), Some(dsn)).0;
+    h.cfg.workspace = Some("acme".into());
+    let telemetry = h.ok("GET", "/api/v1/auth/state", None, &cookie)["telemetry"].clone();
+    assert_eq!(telemetry["quill"], json!({ "host": "https://t.example.com", "token": "phc_public" }));
+    assert_eq!(telemetry["sentry"], json!({ "dsn": dsn }));
+    assert_eq!(telemetry["workspace"], "acme");
+
+    // Only error reports: recordings stay off.
+    h.cfg.telemetry = Telemetry::new(None, None, Some(dsn)).0;
+    let telemetry = h.ok("GET", "/api/v1/auth/state", None, &cookie)["telemetry"].clone();
+    assert_eq!((telemetry["quill"].clone(), telemetry["sentry"]["dsn"].clone()), (Value::Null, json!(dsn)));
+
+    // A DSN with a secret never reaches a browser: error reports stay off.
+    let (secret, problems) = Telemetry::new(None, None, Some("https://public:secret@o1.ingest.us.sentry.io/42"));
+    assert_eq!(problems.len(), 1);
+    h.cfg.telemetry = secret;
+    let state = h.ok("GET", "/api/v1/auth/state", None, &Auth::None);
+    assert_eq!(state["telemetry"], Value::Null);
+    assert!(!state.to_string().contains("secret"));
+}
+
 // ---------------------------------------------------------------------------
 // Connected apps. The tests play the host: they run each job's steps with canned answers.
 
