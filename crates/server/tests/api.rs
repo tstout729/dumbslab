@@ -2035,6 +2035,56 @@ fn imports_never_adopt_someone_elses_post() {
     assert!(again["created"].as_array().unwrap().is_empty());
 }
 
+#[test]
+fn imports_never_widen_a_private_topic() {
+    let h = H::new();
+    let (_, admin) = h.setup();
+    let (_, mia) = h.user(&admin, "mia@acme.test", "Mia Member", "member");
+    let (_, otto) = h.user(&admin, "otto@acme.test", "Otto Outsider", "member");
+    let topic = |body: Value| h.ok("POST", "/api/v1/topics", Some(body), &admin)["id"].as_str().unwrap().to_string();
+    let lead = topic(json!({ "name": "Leadership", "visibility": "private", "members": ["mia@acme.test"] }));
+    let public = topic(json!({ "name": "Public notes", "parent_id": lead }));
+    topic(json!({ "name": "Wider", "parent_id": lead, "visibility": "private", "members": ["mia@acme.test", "otto@acme.test"] }));
+    topic(json!({ "name": "Board", "parent_id": lead, "visibility": "private", "members": ["mia@acme.test"] }));
+    let import = |body: Value, who: &Auth| h.call("POST", "/api/v1/import", Some(body), who);
+    let one = |path: &str| json!({ "documents": [{ "title": "Minutes", "content": "zebracorn", "topic": path }] });
+    let before = h.ok("GET", "/api/v1/topics", None, &admin)["items"].as_array().unwrap().len();
+
+    // A topic inside the private one that more people can see is refused, for pages in it and under it.
+    for path in ["Leadership/Public notes", "Leadership/Public notes/Deeper", "Leadership/Wider"] {
+        let r = import(one(path), &mia);
+        assert_eq!(r.status, 409, "{path}: {}", r.body);
+        assert!(r.body["error"]["message"].as_str().unwrap().contains("inside the private topic “Leadership”"), "{}", r.body);
+    }
+    assert_eq!(h.ok("GET", "/api/v1/topics", None, &admin)["items"].as_array().unwrap().len(), before, "nothing was created");
+    assert_eq!(h.ok("GET", &format!("/api/v1/topics/{public}"), None, &admin)["visibility"], "org", "and nothing changed");
+    assert!(h.ok("GET", "/api/v1/search?q=zebracorn", None, &admin)["items"].as_array().unwrap().is_empty());
+
+    // A private topic with the same members or fewer is fine; topics created in it are private.
+    let ok = h.ok("POST", "/api/v1/import", Some(one("Leadership/Board/2026")), &mia);
+    assert_eq!(ok["topics_created"], 1);
+    let year = h.ok("GET", "/api/v1/topics", None, &mia)["items"].as_array().unwrap().iter().find(|t| t["name"] == "2026").unwrap().clone();
+    assert_eq!(year["visibility"], "private");
+
+    // `topic_id` names the destination itself: paths go inside it, under the same rules.
+    let inside = h.ok(
+        "POST",
+        "/api/v1/import",
+        Some(json!({ "topic_id": lead, "documents": [{ "title": "Charter", "content": "x" }, { "title": "Notes", "content": "y", "topic": "Board" }] })),
+        &mia,
+    );
+    let charter = inside["results"][0]["id"].as_str().unwrap();
+    let topics = h.ok("GET", &format!("/api/v1/posts/{charter}"), None, &mia)["topics"].clone();
+    assert_eq!(topics[0]["id"], json!(lead));
+    assert_eq!(
+        import(json!({ "topic_id": lead, "documents": [{ "title": "x", "content": "y", "topic": "Public notes" }] }), &mia).status,
+        409
+    );
+    assert_eq!(h.call("GET", &format!("/api/v1/posts/{charter}"), None, &otto).status, 404);
+    // A topic the caller can't see can't be a destination.
+    assert_eq!(import(json!({ "topic_id": lead, "documents": [{ "title": "x", "content": "y" }] }), &otto).status, 404);
+}
+
 fn plans(price: Option<&str>) -> dumbslab_core::plan::Plans {
     use dumbslab_core::plan::{Allowance, Plans};
     Plans {

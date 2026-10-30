@@ -39,7 +39,7 @@ pub fn ops() -> Vec<Op> {
             .build(),
         op("admin", "import_documents", "POST", "/import", Access::Write, import_documents)
             .title("Import Markdown documents")
-            .desc("Create many posts at once, e.g. when migrating from Confluence, Guru, a GitHub wiki, Notion or a docs folder. Each document can name a topic path like `Engineering/Runbooks`; missing topics are created, and those created under a private topic are private with the same members. Imports don't notify topic followers or mentioned people. Pass `skip_existing: true` to skip documents whose title is already one of your posts in the same topic, so an interrupted import can be re-run without duplicates; a title someone else's post has there is reported in `taken` and not imported. A failing document rolls back the whole call, so send batches (25 is a good size) and retry a failed batch one document at a time. To migrate a whole export: convert each page to Markdown, import the pages (`results` lists the post for each document in order), upload each page's images with upload_file and that page's `post_id`, then use edit_post to put the returned `/files/...` paths and links to the new posts (`/p/<id>`) in place.")
+            .desc("Create many posts at once, e.g. when migrating from Confluence, Guru, a GitHub wiki, Notion or a docs folder. Each document can name a topic path like `Engineering/Runbooks` (inside `topic_id` when given); missing topics are created. Inside a private topic, new topics are private with the same members, and a path through a topic more people can see is refused. Imports don't notify topic followers or mentioned people. Pass `skip_existing: true` to skip documents whose title is already one of your posts in the same topic, so an interrupted import can be re-run without duplicates; a title someone else's post has there is reported in `taken` and not imported. A failing document rolls back the whole call, so send batches (25 is a good size) and retry a failed batch one document at a time. To migrate a whole export: convert each page to Markdown, import the pages (`results` lists the post for each document in order), upload each page's images with upload_file and that page's `post_id`, then use edit_post to put the returned `/files/...` paths and links to the new posts (`/p/<id>`) in place.")
             .build(),
     ]
 }
@@ -506,8 +506,9 @@ pub struct ImportDocument {
     pub title: String,
     /// Markdown body.
     pub content: String,
-    /// Topic path such as `Engineering/Runbooks`. Missing topics are created; under a private
-    /// topic they are private, with its members.
+    /// Topic path such as `Engineering/Runbooks`, inside `topic_id` when that is given. Missing
+    /// topics are created; inside a private topic they are private, with its members, and a path
+    /// through a topic more people can see than its private parent is refused.
     pub topic: Option<String>,
     /// `published` (default) or `draft`.
     pub status: Option<String>,
@@ -518,6 +519,9 @@ pub struct ImportDocument {
 pub struct ImportInput {
     /// Up to 500 documents per call.
     pub documents: Vec<ImportDocument>,
+    /// An existing topic to import into, by id: each document's `topic` path is created inside it,
+    /// and a document without one goes in this topic. Without it, paths start at the top level.
+    pub topic_id: Option<String>,
     /// Skip a document when a post with exactly the same title is already in its topic (for a
     /// document without a topic: among posts with no topic), and report that post instead. Only
     /// your own posts count as already imported: when the post is someone else's, nothing is
@@ -553,22 +557,50 @@ pub struct ImportResult {
     pub topics_created: i64,
 }
 
-/// Finds or creates each segment of a topic path; returns the leaf topic id. A topic created
-/// under a private topic is private too, with the same members (and the importer), so importing
-/// into a private topic never makes part of the import visible to the whole workspace.
-fn ensure_topic_path(ctx: &mut Ctx, path: &str, created: &mut i64) -> ApiResult<Option<String>> {
-    let mut parent: Option<(String, bool)> = None;
+/// A topic on an import's path.
+#[derive(Clone)]
+struct PathTopic {
+    id: String,
+    name: String,
+    private: bool,
+}
+
+/// Finds or creates each segment of a topic path below `base` (or at the top); returns the leaf
+/// topic id. Inside a private topic, nothing an import does is visible to more people than that
+/// topic: topics it creates there are private with the same members (and the importer), and an
+/// existing topic more people can see is refused rather than used. Visibility doesn't inherit,
+/// so a public topic under a private one would otherwise show the import to everyone.
+fn ensure_topic_path(ctx: &mut Ctx, base: Option<PathTopic>, path: &str, created: &mut i64) -> ApiResult<Option<String>> {
+    let mut parent = base;
     for segment in path.split('/').map(str::trim).filter(|s| !s.is_empty()) {
-        let parent_id = parent.as_ref().map(|(id, _)| id.clone());
+        let parent_id = parent.as_ref().map(|t| t.id.clone());
         let mut p = params![segment, parent_id.clone()];
         let vis = topic_visible_sql(&ctx.actor, "t", &mut p);
-        let existing = ctx
-            .db
-            .one(&format!("SELECT t.id, t.visibility FROM topics t WHERE t.name = ? COLLATE NOCASE AND t.parent_id IS ? AND {vis}"), &p)?;
+        let existing = ctx.db.one(
+            &format!("SELECT t.id, t.name, t.visibility FROM topics t WHERE t.name = ? COLLATE NOCASE AND t.parent_id IS ? AND {vis}"),
+            &p,
+        )?;
         let next = match existing {
-            Some(r) => (r.str("id"), r.str("visibility") == "private"),
+            Some(r) => {
+                let topic = PathTopic { id: r.str("id"), name: r.str("name"), private: r.str("visibility") == "private" };
+                if let Some(up) = parent.as_ref().filter(|up| up.private) {
+                    let wider = !topic.private
+                        || ctx.db.scalar_i64(
+                            "SELECT COUNT(*) FROM topic_members c WHERE c.topic_id = ?
+                               AND NOT EXISTS (SELECT 1 FROM topic_members u WHERE u.topic_id = ? AND u.user_id = c.user_id)",
+                            &params![topic.id.clone(), up.id.clone()],
+                        )? > 0;
+                    if wider {
+                        return Err(ApiError::conflict(format!(
+                            "“{}” is inside the private topic “{}”, but more people can see it, so the import won't put pages in it or add topics under it. Make it private with the same members as “{}”, or import somewhere else.",
+                            topic.name, up.name, up.name
+                        )));
+                    }
+                }
+                topic
+            }
             None => {
-                let private = parent.as_ref().is_some_and(|(_, private)| *private);
+                let private = parent.as_ref().is_some_and(|t| t.private);
                 let id = new_id();
                 let now = ctx.now_s();
                 ctx.db.execute(
@@ -601,12 +633,12 @@ fn ensure_topic_path(ctx: &mut Ctx, path: &str, created: &mut i64) -> ApiResult<
                 }
                 emit(ctx, event)?;
                 *created += 1;
-                (id, private)
+                PathTopic { id, name: segment.to_string(), private }
             }
         };
         parent = Some(next);
     }
-    Ok(parent.map(|(id, _)| id))
+    Ok(parent.map(|t| t.id))
 }
 
 /// A post the actor can see with exactly this title in the topic (or, without a topic, in no
@@ -638,12 +670,16 @@ fn import_documents(ctx: &mut Ctx, input: ImportInput) -> ApiResult<ImportResult
     }
     let skip_existing = input.skip_existing.unwrap_or(false);
     let (mut created, mut skipped, mut taken, mut results) = (vec![], vec![], vec![], vec![]);
+    let base = match clean(input.topic_id) {
+        Some(id) => {
+            let t = load_topic(ctx, &id)?;
+            Some(PathTopic { id: t.str("id"), name: t.str("name"), private: t.str("visibility") == "private" })
+        }
+        None => None,
+    };
     let mut topics_created = 0;
     for doc in input.documents {
-        let topic_id = match clean(doc.topic) {
-            Some(path) => ensure_topic_path(ctx, &path, &mut topics_created)?,
-            None => None,
-        };
+        let topic_id = ensure_topic_path(ctx, base.clone(), doc.topic.as_deref().unwrap_or_default(), &mut topics_created)?;
         // Only the caller's own post counts as this document already imported. Someone else's post
         // with the title is neither adopted (a retry would then change it) nor duplicated.
         if skip_existing && let Some((post, own)) = existing_post(ctx, doc.title.trim(), topic_id.as_deref())? {
