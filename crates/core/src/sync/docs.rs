@@ -53,6 +53,8 @@ pub const MAX_IMAGE_BYTES: u64 = 3_000_000;
 const MAX_REFS: usize = 200;
 /// Skipped files a result lists.
 const LISTED: usize = 100;
+/// The longest topic name (see `topics::create_topic`).
+const MAX_TOPIC_NAME: usize = 120;
 
 const DOC_EXTENSIONS: &[&str] = &["md", "markdown"];
 const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "avif"];
@@ -428,7 +430,35 @@ fn guard(db: &dyn Db, j: &DocsJob, plan: &mut Plan, now: DateTime<Utc>) -> ApiRe
     };
     plan.blocked.clear();
     let source_id = j.source.id.clone();
+    let writer = super::actor(db, &j.source.owner_id)?.user_id;
+    let lapsed = "SELECT id FROM users WHERE role != 'admin' OR deactivated_at IS NOT NULL";
+    // Someone who wrote for this source while an admin, and isn't one now, keeps nothing through
+    // it: its posts and images pass to the admin it writes as now (authors and uploaders always
+    // see their own)...
+    db.execute(
+        &format!(
+            "UPDATE posts SET author_id = ? WHERE author_id IN ({lapsed})
+               AND id IN (SELECT target_id FROM docs_items WHERE source_id = ? AND kind = 'doc')"
+        ),
+        &params![writer.clone(), source_id.clone()],
+    )?;
+    db.execute(
+        &format!(
+            "UPDATE files SET uploaded_by = ? WHERE uploaded_by IN ({lapsed})
+               AND id IN (SELECT target_id FROM docs_items WHERE source_id = ? AND kind = 'image')"
+        ),
+        &params![writer, source_id.clone()],
+    )?;
     for (folder, topic_id) in &plan.folders {
+        // ...and loses the membership it got by creating a private folder topic, unless it's in
+        // the source's topic too.
+        db.execute(
+            &format!(
+                "DELETE FROM topic_members WHERE topic_id = ? AND user_id = (SELECT created_by FROM topics WHERE id = ?)
+                   AND user_id IN ({lapsed}) AND user_id NOT IN (SELECT user_id FROM topic_members WHERE topic_id = ?)"
+            ),
+            &params![topic_id.clone(), topic_id.clone(), j.source.topic_id.clone()],
+        )?;
         let Some(a) = Audience::of(db, topic_id)? else { continue };
         if !target.exceeded_by(&a) {
             continue;
@@ -845,10 +875,11 @@ fn folder_topic(ctx: &mut Ctx, j: &DocsJob, plan: &mut Plan, dir: &str) -> ApiRe
         ),
         _ => None,
     };
+    let name = topic_name(ctx.db, &parent, name_of(dir))?;
     let topic = topics::create_topic(
         ctx,
         topics::CreateTopicInput {
-            name: rewrite::humanize(name_of(dir)),
+            name,
             description: Some(format!("Synced from {}", j.source.repo.repo_path(dir))),
             icon: None,
             color: None,
@@ -857,6 +888,13 @@ fn folder_topic(ctx: &mut Ctx, j: &DocsJob, plan: &mut Plan, dir: &str) -> ApiRe
             members,
         },
     )?;
+    // Creating a private topic makes the writer a member; that's only right if they're in the
+    // source's topic too.
+    ctx.db.execute(
+        "DELETE FROM topic_members WHERE topic_id = ? AND user_id = ?
+           AND NOT EXISTS (SELECT 1 FROM topic_members t WHERE t.topic_id = ? AND t.user_id = ?)",
+        &params![topic.topic.id.clone(), ctx.actor.user_id.clone(), j.source.topic_id.clone(), ctx.actor.user_id.clone()],
+    )?;
     ctx.db.execute(
         "INSERT INTO docs_items (source_id, kind, path, target_id) VALUES (?, 'folder', ?, ?)
          ON CONFLICT(source_id, kind, path) DO UPDATE SET target_id = excluded.target_id",
@@ -864,6 +902,21 @@ fn folder_topic(ctx: &mut Ctx, j: &DocsJob, plan: &mut Plan, dir: &str) -> ApiRe
     )?;
     plan.folders.insert(dir.to_string(), topic.topic.id.clone());
     Ok(topic.topic.id)
+}
+
+/// A folder's topic name: the folder's name, humanized, cut to [`MAX_TOPIC_NAME`] characters, and
+/// numbered when a sibling already has it. The folder's full path stays the mapping's key.
+fn topic_name(db: &dyn Db, parent: &str, folder: &str) -> ApiResult<String> {
+    let base = rewrite::humanize(folder);
+    for n in 1..1000 {
+        let suffix = if n == 1 { String::new() } else { format!(" ({n})") };
+        let head: String = base.chars().take(MAX_TOPIC_NAME - suffix.chars().count()).collect();
+        let name = format!("{}{suffix}", head.trim_end());
+        if db.one("SELECT 1 AS ok FROM topics WHERE parent_id = ? AND name = ?", &params![parent, name.clone()])?.is_none() {
+            return Ok(name);
+        }
+    }
+    Ok(format!("{} {}", base.chars().take(MAX_TOPIC_NAME - 11).collect::<String>().trim_end(), new_id()))
 }
 
 /// Puts a synced post in the source's topic and its folder's, and out of the source's other
@@ -944,6 +997,17 @@ fn write(ctx: &mut Ctx, j: &mut DocsJob, mut plan: Plan, texts: Vec<Text>, ready
         }
         let mut used = BTreeSet::new();
         let (body, refs) = rewrite_links(j, &plan, t, &mut used);
+        if body.len() > crate::ops::MAX_CONTENT {
+            // Its links, pointed here or at the repository, made it longer than a post may be.
+            // Skipped until the file changes, so the rest of the batch goes on.
+            let why = "longer than a post may be (2 MB) once its links point here";
+            db.execute(
+                "UPDATE docs_items SET skipped_sha = ?, skip_reason = ? WHERE source_id = ? AND kind = 'doc' AND path = ?",
+                &params![t.work.sha.clone(), why, source_id.clone(), t.work.path.clone()],
+            )?;
+            j.result.skip(&t.work.path, why);
+            continue;
+        }
         let folder = folder_topic(ctx, j, &mut plan, dir_of(&t.work.path))?;
         let synced = posts::sync_post(ctx, &t.work.post_id, &t.title, &body, &note)?;
         match synced {

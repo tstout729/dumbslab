@@ -121,10 +121,13 @@ pub(crate) fn state_of(r: &Row, now: DateTime<Utc>) -> SyncState {
     }
 }
 
-/// Who a sync writes as: the admin who set it up, with an admin's reach, so the sync keeps
-/// working in private topics. If they're gone, the workspace's first admin.
+/// Who a sync writes as: the admin who set it up, while they're still an active admin; otherwise
+/// the workspace's first active admin. Checked at every sync, however it started: someone who's no
+/// longer an admin must not author, or join topics for, content they can't see any more.
 pub(crate) fn actor(db: &dyn Db, owner_id: &str) -> ApiResult<Actor> {
-    let row = match db.one("SELECT id, name, handle, email FROM users WHERE id = ? AND deactivated_at IS NULL", &params![owner_id])? {
+    let owner =
+        db.one("SELECT id, name, handle, email FROM users WHERE id = ? AND role = 'admin' AND deactivated_at IS NULL", &params![owner_id])?;
+    let row = match owner {
         Some(r) => r,
         None => db
             .one(

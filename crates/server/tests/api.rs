@@ -4694,6 +4694,99 @@ mod syncs {
     }
 
     #[test]
+    fn docs_sync_writes_only_as_an_admin() {
+        let mut h = H::new();
+        let (admin, _) = h.setup();
+        with_key(&mut h);
+        let ada_id = h.ok("GET", "/api/v1/me", None, &admin)["user"]["id"].as_str().unwrap().to_string();
+        let (mo_id, mo) = h.user(&admin, "mo@acme.test", "Mo", "member");
+        let (ann_id, _) = h.user(&admin, "ann@acme.test", "Ann", "admin");
+        let ann_admin =
+            h.ok("POST", "/api/v1/tokens", Some(json!({ "name": "ann", "user": ann_id, "scopes": ["read", "write", "admin"] })), &admin);
+        let ann_admin = Auth::Bearer(ann_admin["token"].as_str().unwrap().to_string());
+        let ann = sign_in(&h, "ann@acme.test", "password123");
+        let ops = json!({ "name": "Ops", "visibility": "private", "members": [mo_id] });
+        let topic = h.ok("POST", "/api/v1/topics", Some(ops), &admin)["id"].as_str().unwrap().to_string();
+        // Ann, an admin, sets the source up; its posts are first written as her.
+        let (source, _) = gitlab_source(&h, &ann_admin, &topic);
+        let lab = Lab::new(&[("paging.md", b"# Paging\n")]);
+        let answer = |c: &HttpCall| lab.answer(c);
+        let sync = || -> Value {
+            let r = h.call("POST", &format!("/api/v1/docs-sources/{source}/sync"), None, &admin);
+            filled(drive(&h, job_of(&r), &answer).0)
+        };
+        sync();
+        let paging_id = doc_ids(&h)["paging.md"].clone();
+        assert_eq!(post(&h, &paging_id, &admin)["author"]["id"].as_str(), Some(ann_id.as_str()));
+
+        // Ann stops being an admin: she can't see the topic, and syncs no longer write as her.
+        h.ok("PATCH", &format!("/api/v1/users/{ann_id}"), Some(json!({ "role": "member" })), &admin);
+        assert_eq!(h.call("GET", &format!("/api/v1/topics/{topic}"), None, &ann).status, 404);
+        lab.put("paging.md", b"# Paging\n\nThe new private rota.\n");
+        lab.put("deploys/rollback.md", b"# Rollback\n\nPrivate steps.\n");
+        let v = sync();
+        assert_eq!((v["created"].as_i64(), v["updated"].as_i64()), (Some(1), Some(1)), "{v}");
+        let ids = doc_ids(&h);
+        for id in [&ids["paging.md"], &ids["deploys/rollback.md"]] {
+            assert_eq!(h.call("GET", &format!("/api/v1/posts/{id}"), None, &ann).status, 404, "Ann can't read new synced content");
+            assert_eq!(post(&h, id, &admin)["author"]["id"].as_str(), Some(ada_id.as_str()), "written as an active admin");
+            assert_eq!(h.call("GET", &format!("/api/v1/posts/{id}"), None, &mo).status, 200);
+        }
+        let deploys = db_run(&h, |db| db.one("SELECT target_id FROM docs_items WHERE kind = 'folder' AND path = 'deploys'", &[]))
+            .unwrap()
+            .str("target_id");
+        assert_eq!(h.call("GET", &format!("/api/v1/topics/{deploys}"), None, &ann).status, 404);
+        let members = h.ok("GET", &format!("/api/v1/topics/{deploys}"), None, &admin)["members"].clone();
+        assert!(members.as_array().unwrap().iter().all(|m| m["id"] != ann_id.as_str()), "{members}");
+    }
+
+    #[test]
+    fn docs_sync_survives_long_folder_names_and_long_rewrites() {
+        let mut h = H::new();
+        let (admin, _) = h.setup();
+        with_key(&mut h);
+        let topic = h.ok("POST", "/api/v1/topics", Some(json!({ "name": "Runbooks" })), &admin)["id"].as_str().unwrap().to_string();
+        let (source, _) = gitlab_source(&h, &admin, &topic);
+        // Two folders with 121-character names that share their first 120 characters.
+        let long_a = format!("{}a", "x".repeat(120));
+        let long_b = format!("{}b", "x".repeat(120));
+        // 780 KB of links to a missing file: allowed as Markdown, but longer than a post once each
+        // link points at GitLab.
+        let links = "[x](missing) ".repeat(60_000);
+        let lab = Lab::new(&[]);
+        lab.put(&format!("{long_a}/one.md"), b"# One\n");
+        lab.put(&format!("{long_b}/two.md"), b"# Two\n");
+        lab.put("links.md", format!("# Links\n\n{links}\n").as_bytes());
+        lab.put("ok.md", b"# Fine\n");
+        let answer = |c: &HttpCall| lab.answer(c);
+        let sync = || -> (Value, usize) {
+            let r = h.call("POST", &format!("/api/v1/docs-sources/{source}/sync"), None, &admin);
+            let (finish, sent) = drive(&h, job_of(&r), &answer);
+            (filled(finish), sent.iter().filter(|c| c.url.contains("/blobs/")).count())
+        };
+        let (v, _) = sync();
+        assert_eq!(v["created"], 3, "the rest of the batch goes on: {v}");
+        assert_eq!(v["skipped"][0]["path"], "links.md", "{v}");
+        assert!(v["skipped"][0]["reason"].as_str().unwrap().contains("2 MB"), "{v}");
+        let folders = db_run(&h, |db| db.query("SELECT path, target_id FROM docs_items WHERE kind = 'folder' ORDER BY path", &[]));
+        assert_eq!(
+            folders.iter().map(|r| r.str("path")).collect::<Vec<_>>(),
+            vec![long_a.clone(), long_b.clone()],
+            "full paths are the keys"
+        );
+        let names: Vec<String> = folders
+            .iter()
+            .map(|r| h.ok("GET", &format!("/api/v1/topics/{}", r.str("target_id")), None, &admin)["name"].as_str().unwrap().to_string())
+            .collect();
+        assert!(names.iter().all(|n| n.chars().count() <= 120), "{names:?}");
+        assert_ne!(names[0], names[1], "unique among siblings");
+        assert!(names[1].ends_with(" (2)"), "{names:?}");
+        // The long file isn't read again until it changes.
+        let (v, read) = sync();
+        assert_eq!((read, v["skipped"][0]["path"].as_str()), (0, Some("links.md")), "{v}");
+    }
+
+    #[test]
     fn docs_sync_skips_large_files_for_good() {
         let mut h = H::new();
         let (admin, _) = h.setup();
