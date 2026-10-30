@@ -23,7 +23,7 @@ pub fn ops() -> Vec<Op> {
             .build(),
         op("sso", "update_sso", "PATCH", "/sso", Access::Admin, update_sso)
             .title("Set up single sign-on")
-            .desc("Set up signing in with the workspace's identity provider. Register an OpenID Connect app (web, authorization code) with the provider, with the `redirect_uri` from get_sso, then give its `client_id` and `client_secret`. `provider` fills in the issuer for `google` and `slack`; `microsoft` takes the directory `tenant` ID; `okta`, `onelogin` and `oidc` take the `issuer` URL. A first sign-in joins an existing account only when the provider says the email is verified and its domain is in `allowed_domains`; `auto_provision` adds such people as members when nobody has their email yet. `require_sso` stops non-admins signing in with a password (admins keep theirs, in case the provider fails). Each save checks the provider's discovery document and answers with the result in `check`. Changing `provider` or `client_id` forgets the saved client secret.")
+            .desc("Set up signing in with the workspace's identity provider. Register an OpenID Connect app (web, authorization code) with the provider, with the `redirect_uri` from get_sso, then give its `client_id` and `client_secret`. `provider` fills in the issuer for `google` and `slack` (which takes its workspace `team` ID); `microsoft` takes the directory `tenant` ID; `okta`, `onelogin` and `oidc` take the `issuer` URL. A first sign-in joins an existing account only when the provider says the email is verified and its domain is in `allowed_domains`; `auto_provision` adds such people as members when nobody has their email yet. `require_sso` stops non-admins signing in with a password (admins keep theirs, in case the provider fails). Each save checks the provider's discovery document and answers with the result in `check`. Changing `provider` or `client_id` forgets the saved client secret.")
             .build(),
         op("sso", "list_sso_identities", "GET", "/sso/identities", Access::Read, list_identities)
             .title("Linked sign-in accounts")
@@ -54,7 +54,7 @@ pub struct UpdateSsoInput {
     pub issuer: Option<String>,
     /// Microsoft: the directory (tenant) ID, a GUID from Microsoft Entra admin center › Overview.
     pub tenant: Option<String>,
-    /// Slack, optional: only people in this Slack workspace (its team ID, `T…`) may sign in. Empty to allow any.
+    /// Slack: the Slack workspace (its team ID, `T…`) whose members may sign in. Required for Slack.
     pub team: Option<String>,
     /// The client (application) ID of the app registered with the provider.
     pub client_id: Option<String>,
@@ -189,6 +189,7 @@ fn update_sso(ctx: &mut Ctx, input: UpdateSsoInput) -> ApiResult<Deferred<SsoSet
         }
         match provider {
             Some(Provider::Microsoft) if conf.tenant.is_empty() => missing.push("`tenant`"),
+            Some(Provider::Slack) if conf.team.is_empty() => missing.push("`team` (your Slack workspace ID, like T0123ABCD)"),
             Some(Provider::Okta | Provider::Onelogin | Provider::Oidc) if conf.issuer.is_empty() => missing.push("`issuer`"),
             Some(Provider::Google) if conf.allowed_domains.is_empty() => missing.push("`allowed_domains` (your Google Workspace domains)"),
             _ => {}
