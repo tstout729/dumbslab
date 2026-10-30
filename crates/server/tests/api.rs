@@ -3320,6 +3320,16 @@ mod sso {
         );
         assert!(landing.session().is_some(), "{}", landing.error());
 
+        // Slack needs its workspace, like Microsoft's tenant: otherwise anyone's Slack account would do.
+        let r = h.call(
+            "PATCH",
+            "/api/v1/sso",
+            Some(json!({ "provider": "slack", "client_id": "app-id", "client_secret": "s", "enabled": true })),
+            &admin,
+        );
+        assert_eq!(r.status, 400, "{}", r.body);
+        assert!(r.body["error"]["message"].as_str().unwrap().contains("`team`"), "{}", r.body);
+
         let slack = "https://slack.com";
         set_up(
             &h,
