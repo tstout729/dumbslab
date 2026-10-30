@@ -48,7 +48,11 @@ pub fn ops() -> Vec<Op> {
             .build(),
         op("files", "get_file", "GET", "/files/{id}", Access::Read, get_file)
             .title("Get a file's details")
-            .desc("A file's name, type, size, SHA-256, uploader and post. Download the bytes from `url` with the same credentials.")
+            .desc("A file's name, type, size, SHA-256, uploader and post. Download the bytes from `url` with the same credentials, or with download_file.")
+            .build(),
+        op("files", "download_file", "GET", "/files/{id}/content", Access::Read, download_file)
+            .title("Download a file")
+            .desc("A file's details and its bytes as base64 (`data_base64`), for agents that can't fetch `url` with a token, for example to look at a screenshot in a post.")
             .build(),
         op("files", "list_files", "GET", "/files", Access::Read, list_files)
             .title("List files")
@@ -339,6 +343,37 @@ fn get_file(ctx: &mut Ctx, input: FileIdInput) -> ApiResult<FileInfo> {
     info_for(ctx, input.id.trim())
 }
 
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct DownloadedFile {
+    pub file: FileInfo,
+    /// The file's bytes, base64-encoded (standard alphabet, padded).
+    pub data_base64: String,
+}
+
+fn download_file(ctx: &mut Ctx, input: FileIdInput) -> ApiResult<DownloadedFile> {
+    let row = load_file(ctx.db, &ctx.actor, input.id.trim())?;
+    let bytes = read_bytes(ctx.db, &row.str("id"), row.i64("size"))?;
+    let file = infos(ctx, std::slice::from_ref(&row))?.remove(0);
+    Ok(DownloadedFile { file, data_base64: base64::engine::general_purpose::STANDARD.encode(bytes) })
+}
+
+/// A file's bytes, read one chunk at a time so the peak memory stays near the file's size.
+fn read_bytes(db: &dyn Db, id: &str, size: i64) -> ApiResult<Vec<u8>> {
+    let size = size.max(0) as usize;
+    let mut body = Vec::with_capacity(size);
+    for seq in 0..size.div_ceil(CHUNK_SIZE) {
+        let chunk = db.one("SELECT data FROM file_chunks WHERE file_id = ? AND seq = ?", &params![id, seq])?;
+        match chunk.as_ref().map(|r| r.get("data")) {
+            Some(SqlValue::Blob(b)) => body.extend_from_slice(b),
+            _ => return Err(ApiError::internal(format!("file `{id}` is missing part of its data"))),
+        }
+    }
+    if body.len() != size {
+        return Err(ApiError::internal(format!("file `{id}` is missing part of its data")));
+    }
+    Ok(body)
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ListFilesInput {
@@ -481,19 +516,7 @@ fn file_response(db: &dyn Db, actor: &Actor, id: &str, if_none_match: Option<&st
     let mut resp = if cached {
         Response::empty(304)
     } else {
-        let size = row.i64("size").max(0) as usize;
-        let mut body = Vec::with_capacity(size);
-        // One chunk at a time keeps the peak memory near the file's size.
-        for seq in 0..size.div_ceil(CHUNK_SIZE) {
-            let chunk = db.one("SELECT data FROM file_chunks WHERE file_id = ? AND seq = ?", &params![id.clone(), seq])?;
-            match chunk.as_ref().map(|r| r.get("data")) {
-                Some(SqlValue::Blob(b)) => body.extend_from_slice(b),
-                _ => return Err(ApiError::internal(format!("file `{id}` is missing part of its data"))),
-            }
-        }
-        if body.len() != size {
-            return Err(ApiError::internal(format!("file `{id}` is missing part of its data")));
-        }
+        let body = read_bytes(db, &id, row.i64("size"))?;
         Response { status: 200, headers: vec![("content-type".into(), content_type)], body }
     };
     let h = &mut resp.headers;

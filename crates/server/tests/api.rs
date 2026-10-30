@@ -1613,6 +1613,11 @@ fn files_upload_serve_and_stay_safe() {
     assert_eq!(fetch(&h, &path, &viewer).status, 404);
     h.ok("POST", "/api/v1/posts", Some(json!({ "title": "Screenshot", "content": f["markdown"], "status": "published" })), &member);
 
+    // Agents without a way to fetch the URL get the bytes through the API.
+    let dl = h.ok("GET", &format!("/api/v1/files/{id}/content"), None, &viewer);
+    assert_eq!(dl["data_base64"], b64(PNG));
+    assert_eq!(dl["file"]["id"], id);
+
     // Members, viewers and browser sessions can open it, inline, with protective headers.
     assert!(dumbslab_core::http::is_core_path(&path));
     for who in [&member, &viewer, &cookie] {
@@ -1750,6 +1755,7 @@ fn file_access_follows_posts() {
     let early_path = early.body["path"].as_str().unwrap().to_string();
     assert_eq!(fetch(&h, &early_path, &otto).status, 404);
     assert_eq!(h.call("GET", &format!("/api/v1/files/{early_id}"), None, &otto).status, 404);
+    assert_eq!(h.call("GET", &format!("/api/v1/files/{early_id}/content"), None, &otto).status, 404);
     assert_eq!(fetch(&h, &early_path, &mia).status, 200);
     assert!(!ids(&h.ok("GET", "/api/v1/files", None, &otto)).contains(&early_id));
     let feed = h.ok("GET", "/api/v1/activity?event=file.&limit=200", None, &otto);
