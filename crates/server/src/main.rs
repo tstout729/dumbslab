@@ -80,6 +80,9 @@ enum Command {
         /// `all` (default), `core` or `read`.
         #[arg(long, default_value = "all")]
         toolset: String,
+        /// The server's public URL, as for `serve` (links, and where apps send sign-ins back).
+        #[arg(long, env = "DUMBSLAB_BASE_URL")]
+        base_url: Option<String>,
     },
     /// Run any operation, e.g. `dumbslab call search '{"q":"onboarding"}'`.
     Call {
@@ -88,6 +91,9 @@ enum Command {
         input: Option<String>,
         #[arg(long = "as")]
         user: Option<String>,
+        /// The server's public URL, as for `serve` (links, and where apps send sign-ins back).
+        #[arg(long, env = "DUMBSLAB_BASE_URL")]
+        base_url: Option<String>,
     },
     /// List every operation.
     Ops,
@@ -147,8 +153,12 @@ async fn main() -> anyhow::Result<()> {
         Command::Serve { bind, base_url, setup_token, open_setup } => {
             serve(cli.db, cli.allow_private_webhooks, bind, base_url, setup_token, open_setup).await
         }
-        Command::Mcp { user, toolset } => stdio_mcp(cli.db, cli.allow_private_webhooks, user, Toolset::parse(Some(&toolset))).await,
-        Command::Call { operation, input, user } => call(cli.db, cli.allow_private_webhooks, operation, input, user).await,
+        Command::Mcp { user, toolset, base_url } => {
+            stdio_mcp(cli.db, cli.allow_private_webhooks, user, Toolset::parse(Some(&toolset)), base_url).await
+        }
+        Command::Call { operation, input, user, base_url } => {
+            call(cli.db, cli.allow_private_webhooks, operation, input, user, base_url).await
+        }
     }
 }
 
@@ -183,14 +193,20 @@ fn local_actor(store: &Store, user: Option<&str>, via: Via) -> anyhow::Result<Ac
     })
 }
 
+/// Settings for commands that act on the database directly (`call`, `mcp`).
+fn local_config(base_url: Option<String>) -> HostConfig {
+    HostConfig { base_url: base_url.map(|u| u.trim_end_matches('/').to_string()), connectors: connectors_from_env(), ..Default::default() }
+}
+
 async fn call(
     db: PathBuf,
     allow_private_webhooks: bool,
     operation: String,
     input: Option<String>,
     user: Option<String>,
+    base_url: Option<String>,
 ) -> anyhow::Result<()> {
-    let app = App::new(open(&db)?, HostConfig { connectors: connectors_from_env(), ..Default::default() }, allow_private_webhooks);
+    let app = App::new(open(&db)?, local_config(base_url), allow_private_webhooks);
     let actor = local_actor(&app.store, user.as_deref(), Via::Cli)?;
     let op = registry().get(&operation).ok_or_else(|| anyhow!("unknown operation `{operation}`; run `dumbslab ops`"))?;
     let input: serde_json::Value = serde_json::from_str(input.as_deref().unwrap_or("{}")).context("input must be JSON")?;
@@ -225,8 +241,14 @@ async fn call(
     }
 }
 
-async fn stdio_mcp(db: PathBuf, allow_private_webhooks: bool, user: Option<String>, toolset: Toolset) -> anyhow::Result<()> {
-    let app = App::new(open(&db)?, HostConfig { connectors: connectors_from_env(), ..Default::default() }, allow_private_webhooks);
+async fn stdio_mcp(
+    db: PathBuf,
+    allow_private_webhooks: bool,
+    user: Option<String>,
+    toolset: Toolset,
+    base_url: Option<String>,
+) -> anyhow::Result<()> {
+    let app = App::new(open(&db)?, local_config(base_url), allow_private_webhooks);
     let mut pending = vec![];
     let actor = local_actor(&app.store, user.as_deref(), Via::Mcp)?;
     info!(user = %actor.email, "serving MCP over stdio");

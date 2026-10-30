@@ -5,10 +5,15 @@ import { api, enc } from '/api.js';
 import { h, icon, button, busy, toast, toastError, confirmDialog, field, input, emptyState, timeEl, openPopover } from '/ui.js';
 
 let listing = null;
+/** Link previews by URL. They depend on the person's connections, so they go when those change. */
+const previews = new Map();
 
 /** The apps and the person's connections, fetched once per page load. */
 export function connections({ fresh = false } = {}) {
-  if (!listing || fresh) listing = api.get('/connections').catch((e) => { listing = null; throw e; });
+  if (!listing || fresh) {
+    previews.clear();
+    listing = api.get('/connections').catch((e) => { listing = null; throw e; });
+  }
   return listing;
 }
 
@@ -91,10 +96,12 @@ function hitRow(hit) {
 // ---------------------------------------------------------------------------
 // Link previews
 
-const previews = new Map();
-
 function previewOf(url) {
-  if (!previews.has(url)) previews.set(url, api.get('/connections/preview', { url }).catch(() => null));
+  if (!previews.has(url)) {
+    // Failures and errors (a rate limit, an app that didn't answer) are asked again next time.
+    const forget = () => { previews.delete(url); return null; };
+    previews.set(url, api.get('/connections/preview', { url }).then((r) => { if (r.error) forget(); return r; }, forget));
+  }
   return previews.get(url);
 }
 

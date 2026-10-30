@@ -2434,19 +2434,22 @@ mod connected {
         let (admin, _) = h.setup();
         with_key(&mut h);
         h.cfg.connectors.apps.insert("google-drive".into(), OAuthApp { client_id: "gid".into(), client_secret: "gsecret".into() });
+        h.cfg.connectors.apps.insert("linear".into(), OAuthApp { client_id: "lid".into(), client_secret: "lsecret".into() });
         let user_id = h.ok("GET", "/api/v1/me", None, &admin)["user"]["id"].as_str().unwrap().to_string();
         // A Drive connection whose access token expired an hour ago.
         let cred = connect::Credential { token: "old".into(), refresh_token: Some("refresh-1".into()), ..Default::default() };
         let sealed = connect::seal("connector-key", &user_id, "google-drive", &cred).unwrap();
         let past = dumbslab_core::util::ts(chrono::Utc::now() - chrono::Duration::hours(1));
+        // And an expired Linear one: Linear only previews links, so searching leaves it alone.
+        let linear = connect::seal("connector-key", &user_id, "linear", &cred).unwrap();
         h.store
             .with_tx(|db| {
-                (db.execute(
-                    "INSERT INTO connections (user_id, provider, account, settings, secret, expires_at, created_at, updated_at) VALUES (?, 'google-drive', 'ada@acme.test', '{}', ?, ?, ?, ?)",
-                    &dumbslab_core::params![user_id.clone(), sealed, past.clone(), past.clone(), past.clone()],
-                ), true)
+                let insert = "INSERT INTO connections (user_id, provider, account, settings, secret, expires_at, created_at, updated_at) VALUES (?, ?, 'ada@acme.test', '{}', ?, ?, ?, ?)";
+                for (app, sealed) in [("google-drive", &sealed), ("linear", &linear)] {
+                    db.execute(insert, &dumbslab_core::params![user_id.clone(), app, sealed.clone(), past.clone(), past.clone(), past.clone()]).unwrap();
+                }
+                ((), true)
             })
-            .unwrap()
             .unwrap();
         let r = h.call("GET", "/api/v1/search/connected?q=budget", None, &admin);
         let (finish, sent) = drive(&h, job_of(&r), &|c: &HttpCall| {
@@ -2463,12 +2466,14 @@ mod connected {
                 && sent[0].body.as_deref().unwrap().contains("refresh_token=refresh-1")
         );
         assert!(sent[1].headers.contains(&("authorization".into(), "Bearer new".into())), "searches with the new token");
-        assert_eq!(filled(&r, finish)["items"][0]["kind"], "spreadsheet");
+        assert!(!sent.iter().any(|c| c.url.contains("linear")), "{sent:?}");
+        let v = filled(&r, finish);
+        assert_eq!((v["items"][0]["kind"].as_str(), v["apps"].as_array().unwrap().len()), (Some("spreadsheet"), 1), "{v}");
         // The new token was saved, encrypted.
         let (secret, expires): (String, String) = h
             .store
             .with_tx(|db| {
-                let row = db.one("SELECT secret, expires_at FROM connections", &[]).unwrap().unwrap();
+                let row = db.one("SELECT secret, expires_at FROM connections WHERE provider = 'google-drive'", &[]).unwrap().unwrap();
                 ((row.str("secret"), row.str("expires_at")), true)
             })
             .unwrap();
@@ -2482,7 +2487,13 @@ mod connected {
             let sealed = connect::seal("connector-key", &user_id, "google-drive", &cred).unwrap();
             h.store
                 .with_tx(|db| {
-                    (db.execute("UPDATE connections SET secret = ?, expires_at = ?", &dumbslab_core::params![sealed, expires]), true)
+                    (
+                        db.execute(
+                            "UPDATE connections SET secret = ?, expires_at = ? WHERE provider = 'google-drive'",
+                            &dumbslab_core::params![sealed, expires],
+                        ),
+                        true,
+                    )
                 })
                 .unwrap()
                 .unwrap();

@@ -40,14 +40,20 @@ const SIGN_IN_MINUTES: i64 = 15;
 const REFRESH_MARGIN_SECS: i64 = 300;
 
 /// An OAuth app registered with a provider, so people can connect by signing in.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct OAuthApp {
     pub client_id: String,
     pub client_secret: String,
 }
 
+impl std::fmt::Debug for OAuthApp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OAuthApp").field("client_id", &self.client_id).finish_non_exhaustive()
+    }
+}
+
 /// The host's settings for connected apps.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct Connectors {
     /// Encrypts the credentials people connect. Without it, connecting apps is off.
     pub key: Option<String>,
@@ -57,6 +63,16 @@ pub struct Connectors {
     /// Where apps send people back after they sign in. Defaults to this server's
     /// `/connect/callback`; hosted DumbSlab uses the root domain's, which forwards to the workspace.
     pub callback_url: Option<String>,
+}
+
+impl std::fmt::Debug for Connectors {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Connectors")
+            .field("key", &self.key.as_ref().map(|_| "…"))
+            .field("apps", &self.apps)
+            .field("callback_url", &self.callback_url)
+            .finish()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -213,8 +229,8 @@ pub struct Account {
     pub settings: Value,
 }
 
-/// Tokens from an OAuth token endpoint.
-#[derive(Clone, Debug, Default, PartialEq)]
+/// Tokens from an OAuth token endpoint. Never printed.
+#[derive(Clone, Default, PartialEq)]
 pub struct TokenSet {
     pub access_token: String,
     pub refresh_token: Option<String>,
@@ -223,6 +239,12 @@ pub struct TokenSet {
     /// Anything else the answer says that later requests need (e.g. Wrike's API host); kept with
     /// the credential's fields.
     pub fields: BTreeMap<String, String>,
+}
+
+impl std::fmt::Debug for TokenSet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TokenSet").field("expires_in", &self.expires_in).finish_non_exhaustive()
+    }
 }
 
 /// One result from a connected app.
@@ -1142,7 +1164,7 @@ fn search_calls(j: &SearchJob, conns: Vec<Connection>) -> (Vec<HttpCall>, Vec<(C
     let mut calls = vec![];
     let mut plan = vec![];
     for c in conns {
-        let Some(p) = providers::get(c.provider).filter(|p| p.info().search) else { continue };
+        let p = providers::get(c.provider).expect("known provider");
         let these = p.search(&c.cred, &c.account, &j.q, j.limit);
         plan.push((c, these.len()));
         calls.extend(these);
@@ -1155,7 +1177,8 @@ fn search_step(db: &dyn Db, cfg: &HostConfig, j: &mut SearchJob, replies: Vec<Ht
         SearchPhase::Start => {
             let (mut fresh, mut stale, mut failed) = (vec![], vec![], vec![]);
             for c in connections(db, cfg, &j.user_id)? {
-                if !(j.only.is_empty() || j.only.iter().any(|o| o == c.provider)) {
+                let searches = providers::get(c.provider).is_some_and(|p| p.info().search);
+                if !searches || !(j.only.is_empty() || j.only.iter().any(|o| o == c.provider)) {
                     continue;
                 }
                 if !needs_refresh(cfg, &c, now) {
@@ -1310,6 +1333,13 @@ mod tests {
         assert!(open("k1", "u1", "gitlab", &sealed).is_err(), "another app's");
         assert_ne!(seal("k1", "u1", "github", &cred).unwrap(), sealed, "a fresh nonce each time");
         assert!(format!("{cred:?}").find("ghp_secret").is_none(), "never printed");
+        let app = OAuthApp { client_id: "id".into(), client_secret: "client-secret".into() };
+        let host = Connectors { key: Some("connector-key".into()), apps: [("github".into(), app)].into(), callback_url: None };
+        let tokens = TokenSet { access_token: "at".into(), refresh_token: Some("rt".into()), ..Default::default() };
+        let printed = format!("{host:?} {tokens:?}");
+        for secret in ["client-secret", "connector-key", "\"at\"", "\"rt\""] {
+            assert!(!printed.contains(secret), "{secret} in {printed}");
+        }
     }
 
     #[test]
