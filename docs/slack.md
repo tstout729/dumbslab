@@ -32,7 +32,7 @@ You need to be a DumbSlab admin and able to create apps in your Slack workspace.
 2. **Install it.** In the app, open **Install App** and install it to your workspace.
 3. **Connect it to DumbSlab.** Copy the **Bot User OAuth Token** (`xoxb-…`, from **OAuth & Permissions**) and the **Signing Secret** (from **Basic Information › App Credentials**) into Settings › Slack, and save. DumbSlab checks the token with Slack first.
 4. **Let Slack check the events URL.** Back in the Slack app, open **App Manifest** (or **Event Subscriptions**) and click **Verify** next to the Request URL. Slack can only check it once the signing secret is saved.
-5. **Pick channels** (optional). Under Channels, add a Slack channel by its ID (open the channel's details; the ID is at the bottom) or `#name`, pick which posts it gets, and send a test message. The app posts in public channels by itself; type `/invite @dumbslab` in a private channel first.
+5. **Pick channels** (optional). Under Channels, add a Slack channel by its ID, like `C0123ABCD` (open the channel, click its name at the top, and copy the Channel ID at the bottom of the About tab; names aren't accepted, because they change), pick which posts it gets, and send a test message. The app posts in public channels by itself; type `/invite @dumbslab` in a private channel first.
 
 Agents and scripts can do the same with `get_slack`, `update_slack`, `add_slack_channel`, `update_slack_channel`, `delete_slack_channel`, `test_slack_channel` and `disconnect_slack` (admins only).
 

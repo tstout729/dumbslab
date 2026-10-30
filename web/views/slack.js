@@ -87,14 +87,14 @@ function topicOptions(topics, selected) {
 }
 
 function addChannelForm(topics, reload) {
-  const channel = input({ required: true, spellcheck: 'false', placeholder: 'C0123ABCD or #announcements' });
+  const channel = input({ required: true, spellcheck: 'false', autocapitalize: 'characters', placeholder: 'C0123ABCD', pattern: '[CG][A-Z0-9]{8,23}' });
   const topic = select(topicOptions(topics, null));
   const fresh = checkbox('New posts', { checked: true });
   const updated = checkbox('Updated posts');
   const add = button('Add channel', { icon: 'plus', variant: 'primary', size: 'sm', type: 'submit' });
   const f = h('form', { class: 'stack', novalidate: true },
     h('div', { class: 'grid-2' },
-      field('Slack channel', channel, { hint: 'Its ID (open the channel’s details; it’s at the bottom) keeps working if it’s renamed. Invite the app to private channels.' }),
+      field('Slack channel ID', channel, { hint: 'Open the channel in Slack, click its name at the top, and copy the Channel ID at the bottom of the About tab. Invite the app to private channels.' }),
       field('Posts from', topic, { hint: 'A topic includes its org-wide subtopics. A private topic’s posts go only to channels you pick it for.' })),
     h('div', { class: 'row gap-md wrap' }, fresh, updated),
     h('div', null, add));

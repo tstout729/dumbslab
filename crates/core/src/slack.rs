@@ -771,7 +771,7 @@ fn post_refused(code: &str, channel: &str) -> ApiError {
             format!("The DumbSlab app isn't in {c}. Invite it there (type /invite @dumbslab in the channel), then try again.")
         }
         "channel_not_found" => format!(
-            "Slack can't find {c}. Use the channel's ID (open the channel's details; it's at the bottom), and invite the app to a private channel first."
+            "Slack can't find {c}. Check the channel's ID (open the channel, click its name, and copy the Channel ID from the About tab), and invite the app to a private channel first."
         ),
         "is_archived" => format!("{c} is archived."),
         "missing_scope" => {

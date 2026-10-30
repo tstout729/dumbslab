@@ -4091,7 +4091,7 @@ mod slack {
         let sub_private =
             h.ok("POST", "/api/v1/topics", Some(json!({ "name": "Incidents", "visibility": "private", "parent_id": eng["id"] })), &admin);
         let all = h.ok("POST", "/api/v1/slack/channels", Some(json!({ "channel": "C0ALLPOSTS", "updated_posts": true })), &admin);
-        h.ok("POST", "/api/v1/slack/channels", Some(json!({ "channel": "#leadership", "topic_id": private["id"] })), &admin);
+        h.ok("POST", "/api/v1/slack/channels", Some(json!({ "channel": "C0LEADERS1", "topic_id": private["id"] })), &admin);
         h.ok("POST", "/api/v1/slack/channels", Some(json!({ "channel": "C0ENGINEERING", "topic_id": eng["id"] })), &admin);
         assert_eq!(h.call("POST", "/api/v1/slack/channels", Some(json!({ "channel": "general chat" })), &admin).status, 400);
         assert_eq!(
@@ -4125,7 +4125,7 @@ mod slack {
             Some(json!({ "title": "Board notes", "status": "published", "topic_ids": [private["id"]] })),
             &admin,
         );
-        assert_eq!(to(&r), vec!["#leadership"]);
+        assert_eq!(to(&r), vec!["C0LEADERS1"]);
         assert!(slack_messages(&r.effects)[0].to_string().contains("Leadership"));
         // A private subtopic wasn't picked with its parent.
         let r = h.call(
@@ -4250,6 +4250,18 @@ mod slack {
         ] {
             h.ok("POST", "/api/v1/slack/channels", Some(mapping), &admin);
         }
+        // A channel has one ID but many names over time: only IDs are taken, so a name can't
+        // become a second queue for a channel that's already mapped by its ID.
+        for name in ["#announcements", "announcements", "c0samechan", "#C0SAMECHAN", "C0SAME CHAN", "D0DIRECTMSG", "C0SHORT"] {
+            let r = h.call("POST", "/api/v1/slack/channels", Some(json!({ "channel": name })), &admin);
+            assert_eq!(r.status, 400, "{name}");
+            assert!(r.body["error"]["message"].as_str().unwrap().contains("copy the Channel ID"), "{name}: {}", r.body);
+        }
+        let mapped = h.ok("GET", "/api/v1/slack", None, &admin)["channels"].clone();
+        let first = mapped[0]["id"].as_str().unwrap();
+        let renamed = h.call("PATCH", &format!("/api/v1/slack/channels/{first}"), Some(json!({ "channel": "#announcements" })), &admin);
+        assert_eq!(renamed.status, 400);
+        assert_eq!(h.ok("GET", "/api/v1/slack", None, &admin)["channels"], mapped, "nothing changed");
         let to =
             |r: &Res| -> Vec<String> { slack_messages(&r.effects).iter().map(|m| m["channel"].as_str().unwrap().to_string()).collect() };
 

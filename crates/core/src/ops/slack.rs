@@ -55,7 +55,7 @@ pub fn ops() -> Vec<Op> {
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct SlackChannel {
     pub id: String,
-    /// The Slack channel's ID (`C0123ABCD`) or `#name`.
+    /// The Slack channel's ID, like `C0123ABCD`.
     pub channel: String,
     /// Posts in this topic and its org-wide subtopics go to the channel. Null: every post everyone in the workspace can see.
     pub topic: Option<TopicRef>,
@@ -196,22 +196,15 @@ fn disconnect_slack(ctx: &mut Ctx, _: NoInput) -> ApiResult<Done> {
     Ok(DONE)
 }
 
-/// A channel as Slack names it: an ID like `C0123ABCD`, or `#name`.
+/// A Slack channel's ID, like `C0123ABCD` (`G…` for older private channels). Only IDs: a channel
+/// has one ID but its name changes, and two spellings of one channel would each get every post.
 fn check_channel(raw: &str) -> ApiResult<String> {
     let c = raw.trim();
-    if let Some(name) = c.strip_prefix('#') {
-        let ok = !name.is_empty()
-            && name.len() <= 80
-            && name.chars().all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || "-_.".contains(ch));
-        if ok {
-            return Ok(c.to_string());
-        }
-    } else if (8..=24).contains(&c.len()) && c.starts_with(['C', 'G']) && c.chars().all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit())
-    {
+    if (9..=24).contains(&c.len()) && c.starts_with(['C', 'G']) && c.chars().all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit()) {
         return Ok(c.to_string());
     }
     Err(ApiError::bad_request(
-        "`channel` must be a Slack channel's ID, like C0123ABCD (open the channel's details; it's at the bottom), or its #name",
+        "`channel` must be the Slack channel's ID, like C0123ABCD, not its name: open the channel in Slack, click its name at the top, and copy the Channel ID at the bottom of the About tab",
     ))
 }
 
@@ -229,7 +222,7 @@ fn read_channel(ctx: &Ctx, id: &str) -> ApiResult<SlackChannel> {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AddChannelInput {
-    /// The Slack channel's ID, like `C0123ABCD` (open the channel's details; it's at the bottom), or `#name`. IDs keep working when a channel is renamed.
+    /// The Slack channel's ID, like `C0123ABCD`, not its name: open the channel in Slack, click its name at the top, and copy the Channel ID at the bottom of the About tab.
     pub channel: String,
     /// Only posts in this topic and its org-wide subtopics. Leave out for every post everyone in the workspace can see.
     pub topic_id: Option<String>,
@@ -268,7 +261,7 @@ fn add_channel(ctx: &mut Ctx, input: AddChannelInput) -> ApiResult<SlackChannel>
 #[serde(deny_unknown_fields)]
 pub struct UpdateChannelInput {
     pub id: String,
-    /// The Slack channel's ID or `#name`.
+    /// The Slack channel's ID, like `C0123ABCD`.
     pub channel: Option<String>,
     /// Only posts in this topic and its org-wide subtopics; an empty string for every post everyone in the workspace can see.
     pub topic_id: Option<String>,

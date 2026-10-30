@@ -20,7 +20,7 @@ CREATE TABLE IF NOT EXISTS slack_app (
 -- Slack channels that get a message when posts are published or updated.
 CREATE TABLE IF NOT EXISTS slack_channels (
   id TEXT PRIMARY KEY,
-  -- A Slack channel id (C0123ABCD) or `#name`.
+  -- A Slack channel's ID (C0123ABCD). Never a name: names change, and one channel must have one key.
   channel TEXT NOT NULL,
   -- Posts in this topic (and its org-wide subtopics); every post everyone can see when NULL.
   topic_id TEXT REFERENCES topics(id) ON DELETE CASCADE,
