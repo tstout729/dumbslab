@@ -1,5 +1,5 @@
-// Settings: profile, connecting agents, API tokens, and (for admins) people, webhooks, workspace
-// and, on hosted DumbSlab, the plan.
+// Settings: profile, connecting agents, API tokens, and (for admins) people, single sign-on,
+// webhooks, workspace and, on hosted DumbSlab, the plan.
 
 import { api, enc } from '/api.js';
 import {
@@ -9,6 +9,7 @@ import {
 import { state, emit, navigate, canAdmin, myId } from '/state.js';
 import { connectionsSection } from '/views/connected.js';
 import { slackSection } from '/views/slack.js';
+import { ssoMessage } from '/views/auth.js';
 
 const SECTIONS = [
   { id: 'profile', label: 'Profile', icon: 'user' },
@@ -16,6 +17,7 @@ const SECTIONS = [
   { id: 'tokens', label: 'API tokens', icon: 'key' },
   { id: 'connections', label: 'Connected apps', icon: 'link' },
   { id: 'people', label: 'People', icon: 'users', admin: true },
+  { id: 'sso', label: 'Single sign-on', icon: 'lock', admin: true },
   { id: 'webhooks', label: 'Webhooks', icon: 'zap', admin: true },
   { id: 'slack', label: 'Slack', icon: 'hash', admin: true },
   { id: 'workspace', label: 'Workspace', icon: 'settings', admin: true },
@@ -116,8 +118,54 @@ async function profileSection() {
 
   return frag(
     panel('Profile', null, h('div', { class: 'profile-preview' }, avatar(u, 'lg'), h('div', null, h('strong', null, u.name), h('p', { class: 'muted small' }, `${u.email}, ${u.role}`))), profileForm),
+    await ssoProfilePanel(),
     panel('Appearance', 'Follow your system setting, or pick a theme for this browser.', themeGroup),
     panel('Password', 'Changing your password signs out your other browser sessions.', pwForm));
+}
+
+/** Your account at the workspace's identity provider, when it signs in with one. */
+async function ssoProfilePanel() {
+  const sso = state.auth.sso;
+  if (!sso) return null;
+  const query = new URLSearchParams(location.search);
+  const r = await api.get('/sso/identities');
+  const mine = r.items.filter((i) => i.current);
+  const notes = [];
+  if (query.get('sso_linked')) notes.push(h('p', { class: 'callout', role: 'status' }, icon('check', { size: 15 }), h('span', null, `Your ${sso.name} account is linked. You can sign in with it now.`)));
+  if (query.get('sso_error')) notes.push(h('p', { class: 'callout callout-warn', role: 'alert' }, icon('alert', { size: 15 }), h('span', null, ssoMessage(query.get('sso_error'), sso.name))));
+  const body = h('div', { class: 'stack' }, ...notes);
+  const unlinkButton = (identity, row) => {
+    const b = button('Unlink', { size: 'xs', variant: 'ghost', cls: 'text-danger' });
+    b.addEventListener('click', async () => {
+      const ok = await confirmDialog({ title: `Unlink your ${sso.name} account?`, message: `You can link it again here, or ${sso.name} may match it to you by your verified email the next time you sign in.`, confirmLabel: 'Unlink', danger: true });
+      if (!ok) return;
+      busy(b, async () => {
+        await api.del(`/sso/identities/${enc(identity.id)}`);
+        toast(`${sso.name} account unlinked`);
+        row.remove();
+      }).catch(toastError);
+    });
+    return b;
+  };
+  if (mine.length) {
+    body.append(h('ul', { class: 'token-list' }, mine.map((i) => {
+      const row = h('li', { class: 'token' },
+        h('div', { class: 'token-icon' }, icon('lock', { size: 16 })),
+        h('div', { class: 'token-main' },
+          h('div', { class: 'token-head' }, h('strong', null, i.email || `Your ${sso.name} account`)),
+          h('div', { class: 'token-meta' }, h('span', null, 'Linked ', timeEl(i.linked_at)), i.last_used_at ? h('span', null, 'Last used ', timeEl(i.last_used_at)) : null)));
+      row.append(unlinkButton(i, row));
+      return row;
+    })));
+  } else {
+    const link = button(`Link your ${sso.name} account`, { icon: 'external', variant: 'subtle', size: 'sm' });
+    link.addEventListener('click', () => busy(link, async () => {
+      const started = await api.post('/me/sso');
+      location.assign(started.authorize_url);
+    }).catch(toastError));
+    body.append(h('div', null, link));
+  }
+  return panel('Single sign-on', `This workspace signs in with ${sso.name}. Link your ${sso.name} account to sign in with it, even if ${sso.name} doesn’t share a verified email address with DumbSlab.`, body);
 }
 
 // ---------------------------------------------------------------------------
@@ -432,6 +480,169 @@ async function peopleSection(ctx) {
 }
 
 // ---------------------------------------------------------------------------
+// Single sign-on (admins)
+
+const SSO_DOCS = 'https://github.com/tstout729/dumbslab/blob/main/docs/sso.md';
+
+const SSO_PROVIDERS = {
+  google: {
+    label: 'Google Workspace',
+    help: 'In Google Cloud console › APIs & Services › Credentials, create an OAuth client ID (Web application) with the redirect URI below. Only accounts in your allowed domains can sign in.',
+  },
+  microsoft: {
+    label: 'Microsoft Entra ID',
+    help: 'In Microsoft Entra admin center › App registrations, register a single-tenant app with the redirect URI below (Web), and add a client secret. Add the optional ID token claims email and xms_edov so first sign-ins can find people by email.',
+  },
+  okta: {
+    label: 'Okta',
+    issuer: 'https://acme.okta.com',
+    help: 'In Okta, create an OIDC Web Application with the redirect URI below as its sign-in redirect URI, and assign it to your people. The issuer is your Okta URL, or your authorization server’s.',
+  },
+  onelogin: {
+    label: 'OneLogin',
+    issuer: 'https://acme.onelogin.com/oidc/2',
+    help: 'In OneLogin, add the OpenId Connect (OIDC) app with the redirect URI below and Basic token endpoint authentication, and give your people access. The issuer is in the app’s SSO tab.',
+  },
+  slack: {
+    label: 'Slack',
+    help: 'At api.slack.com/apps, create an app, add the redirect URI below under OAuth & Permissions, and the openid, email and profile scopes. Sign in with Slack works for any Slack workspace unless you name yours.',
+  },
+  oidc: {
+    label: 'Another OpenID Connect provider',
+    issuer: 'https://login.example.com',
+    help: 'Register a confidential web app that uses the authorization code flow, with the redirect URI below. The issuer must be exactly what the provider’s /.well-known/openid-configuration says.',
+  },
+};
+
+function ssoCheckNote(check) {
+  if (!check) return null;
+  return check.ok
+    ? h('p', { class: 'callout', role: 'status' }, icon('check', { size: 15 }), h('span', null, 'The provider’s settings check out. Try signing in from a private window before requiring single sign-on.'))
+    : h('p', { class: 'callout callout-warn', role: 'alert' }, icon('alert', { size: 15 }), h('span', null, `The provider’s settings don’t check out: ${check.error}`));
+}
+
+function ssoStatus(s) {
+  if (s.client_secret_unreadable) {
+    return h('p', { class: 'callout callout-warn', role: 'alert' }, icon('alert', { size: 15 }),
+      h('span', null, 'Single sign-on is off: the saved client secret can’t be read, because the server’s connector key changed. Enter the client secret again and save. Until then everyone can sign in with a password.'));
+  }
+  if (s.active) return h('p', { class: 'callout', role: 'status' }, icon('check', { size: 15 }), h('span', null, `People can sign in with ${s.name}.${s.require_sso ? ' Only admins can sign in with a password.' : ''}`));
+  if (s.enabled) return h('p', { class: 'callout callout-warn' }, icon('alert', { size: 15 }), h('span', null, 'Single sign-on is on but not finished: fill in everything below.'));
+  return h('p', { class: 'muted small' }, 'Single sign-on is off. Everyone signs in with a password.');
+}
+
+async function ssoSection(ctx) {
+  const s = await api.get('/sso');
+  if (!s.available) {
+    return h('section', { class: 'panel' }, emptyState({ iconName: 'lock', title: 'Single sign-on isn’t available on this server',
+      body: 'It needs a connector key to encrypt the client secret. Whoever runs the server can set CONNECTOR_KEY (or DUMBSLAB_CONNECTOR_KEY when self-hosting).' }));
+  }
+  const status = h('div', { class: 'stack' }, ssoStatus(s));
+  const provider = select([
+    { value: '', label: 'Choose a provider', selected: !s.provider, disabled: true },
+    ...Object.entries(SSO_PROVIDERS).map(([value, p]) => ({ value, label: p.label, selected: s.provider === value })),
+  ]);
+  const help = h('span');
+  const issuer = input({ type: 'url', value: s.issuer || '', spellcheck: 'false', autocapitalize: 'off' });
+  const tenant = input({ value: s.tenant || '', spellcheck: 'false', placeholder: '72f988bf-86f1-41af-91ab-2d7cd011db47' });
+  const team = input({ value: s.team || '', spellcheck: 'false', placeholder: 'Optional, like T0123ABCD' });
+  const label = input({ value: s.label || '', maxlength: '40', placeholder: 'SSO' });
+  const clientId = input({ value: s.client_id || '', spellcheck: 'false', autocapitalize: 'off' });
+  const secretHint = (x) => (x.client_secret_unreadable ? 'Enter it again: the saved one can’t be read.' : x.client_secret_set ? 'Saved. Leave empty to keep it.' : '');
+  const clientSecret = input({ type: 'password', autocomplete: 'new-password', placeholder: secretHint(s) });
+  const domains = input({ value: (s.allowed_domains || []).join(', '), spellcheck: 'false', autocapitalize: 'off', placeholder: 'acme.com' });
+  const enabled = checkbox('Show “Sign in with …” on the sign-in page', { checked: s.enabled });
+  const autoProvision = checkbox('Add new people automatically: verified addresses at the allowed domains join as members', { checked: s.auto_provision });
+  const requireSso = checkbox('Require single sign-on: only admins can sign in with a password', { checked: s.require_sso });
+  const issuerField = field('Issuer URL', issuer, { hint: 'Exactly as the provider names it, https and all.' });
+  const tenantField = field('Directory (tenant) ID', tenant, { hint: 'Microsoft Entra admin center › Overview. Only this directory’s accounts can sign in.' });
+  const teamField = field('Slack workspace ID', team, { hint: 'Only people in this Slack workspace can sign in. Leave empty to allow any.' });
+  const labelField = field('Button name', label, { hint: 'Shown as “Sign in with …”.' });
+  const domainsHint = h('span');
+  const domainsField = field('Allowed email domains', domains, { hint: domainsHint });
+  const show = () => {
+    const p = provider.value;
+    const info = SSO_PROVIDERS[p];
+    help.replaceChildren(info ? info.help : 'Pick the provider your organization signs in with.', ' ', h('a', { href: SSO_DOCS, target: '_blank', rel: 'noopener' }, 'Setup steps'), '.');
+    issuerField.hidden = !['okta', 'onelogin', 'oidc'].includes(p);
+    if (info && info.issuer) issuer.placeholder = info.issuer;
+    tenantField.hidden = p !== 'microsoft';
+    teamField.hidden = p !== 'slack';
+    labelField.hidden = p !== 'oidc';
+    domainsHint.textContent = p === 'google'
+      ? 'Your Google Workspace domains, separated by commas. Only accounts in them can sign in.'
+      : 'Separated by commas. A first sign-in finds someone here by email only when the provider says it’s verified and it’s at one of these.';
+  };
+  provider.addEventListener('change', show);
+  show();
+  const checks = h('div', { class: 'stack' });
+  const f = form(async () => {
+    const p = provider.value;
+    if (!p) {
+      toast('Choose a provider.', { type: 'error' });
+      provider.focus();
+      return;
+    }
+    const body = {
+      provider: p,
+      client_id: clientId.value.trim(),
+      allowed_domains: domains.value.split(/[\s,]+/).map((d) => d.trim()).filter(Boolean),
+      enabled: enabled.querySelector('input').checked,
+      auto_provision: autoProvision.querySelector('input').checked,
+      require_sso: requireSso.querySelector('input').checked,
+    };
+    if (['okta', 'onelogin', 'oidc'].includes(p)) body.issuer = issuer.value.trim();
+    if (p === 'microsoft' && tenant.value.trim()) body.tenant = tenant.value.trim();
+    if (p === 'slack') body.team = team.value.trim();
+    if (p === 'oidc') body.label = label.value.trim();
+    if (clientSecret.value.trim()) body.client_secret = clientSecret.value.trim();
+    const saved = await api.patch('/sso', body);
+    clientSecret.value = '';
+    clientSecret.placeholder = secretHint(saved);
+    status.replaceChildren(ssoStatus(saved));
+    checks.replaceChildren(...[ssoCheckNote(saved.check)].filter(Boolean));
+    // The sign-in page's button follows the new settings.
+    state.auth.sso = saved.active ? { name: saved.name, url: `${location.origin}/sso/start`, required: saved.require_sso } : null;
+    toast('Single sign-on saved');
+  },
+  field('Provider', provider, { hint: help }),
+  issuerField, tenantField, teamField, labelField,
+  h('div', { class: 'field' }, h('span', { class: 'field-label' }, 'Redirect URI'), copyField(s.redirect_uri, { label: 'Redirect URI' }),
+    h('p', { class: 'field-hint' }, 'Register this in the provider’s app. It changes if the workspace’s address does.')),
+  h('div', { class: 'grid-2' }, field('Client ID', clientId), field('Client secret', clientSecret, { hint: 'Stored encrypted and never shown again.' })),
+  domainsField,
+  h('fieldset', { class: 'field fieldset' }, h('legend', { class: 'field-label' }, 'Sign-in'), h('div', { class: 'stack' }, enabled, autoProvision, requireSso),
+    h('p', { class: 'field-hint' }, 'API tokens and MCP connections keep working either way. Admins keep their password in case the provider is down.')),
+  checks,
+  h('div', null, button('Save single sign-on', { variant: 'primary', type: 'submit' })));
+
+  const linked = await api.get('/sso/identities', { user: 'all' });
+  const reload = () => ctx.reload();
+  const row = (i) => {
+    const unlink = button('Unlink', { size: 'xs', variant: 'ghost', cls: 'text-danger' });
+    unlink.addEventListener('click', async () => {
+      const ok = await confirmDialog({ title: `Unlink ${i.user.name}’s account?`, message: 'It can’t sign in here until it’s linked again, or matched by a verified email on its next sign-in.', confirmLabel: 'Unlink', danger: true });
+      if (!ok) return;
+      busy(unlink, async () => {
+        await api.del(`/sso/identities/${enc(i.id)}`);
+        toast('Account unlinked');
+        reload();
+      }).catch(toastError);
+    });
+    return h('li', { class: 'person' },
+      avatar(i.user, 'sm'),
+      h('div', { class: 'person-main' },
+        h('div', { class: 'person-head' }, h('span', { class: 'person-name' }, i.user.name), i.current ? null : badge('Old provider', 'trash')),
+        h('div', { class: 'person-meta' }, h('span', null, i.email || i.issuer), h('span', null, 'Linked ', timeEl(i.linked_at)), i.last_used_at ? h('span', null, 'Used ', timeEl(i.last_used_at)) : null)),
+      unlink);
+  };
+  return frag(
+    panel('Single sign-on', 'People sign in with your organization’s identity provider. You register an app with the provider and paste its details here.', status, f),
+    panel('Linked accounts', 'Accounts at the provider that sign in as people here.',
+      linked.items.length ? h('ul', { class: 'people-list' }, linked.items.map(row)) : h('p', { class: 'muted small' }, 'Nobody has signed in with single sign-on yet.')));
+}
+
+// ---------------------------------------------------------------------------
 // Webhooks (admins)
 
 function addWebhookDialog(onDone) {
@@ -681,6 +892,7 @@ const RENDER = {
   tokens: tokensSection,
   connections: connectionsSection,
   people: peopleSection,
+  sso: ssoSection,
   webhooks: webhooksSection,
   slack: slackSection,
   workspace: workspaceSection,

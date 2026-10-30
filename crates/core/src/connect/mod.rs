@@ -535,29 +535,37 @@ fn aad(user_id: &str, provider: &str) -> String {
     format!("{user_id}|{provider}")
 }
 
-/// Encrypts a credential for one person's connection to one app.
-pub fn seal(key: &str, user_id: &str, provider: &str, cred: &Credential) -> ApiResult<String> {
-    let plain = serde_json::to_vec(cred).map_err(|e| ApiError::internal(e.to_string()))?;
+/// Encrypts `plain`, bound to `aad`: it opens only with the same key and the same `aad`.
+pub fn seal_bytes(key: &str, aad: &str, plain: &[u8]) -> ApiResult<String> {
     let nonce: [u8; 12] = crate::util::random_bytes();
-    let aad = aad(user_id, provider);
     let sealed = cipher(key)
-        .encrypt(Nonce::from_slice(&nonce), Payload { msg: &plain, aad: aad.as_bytes() })
+        .encrypt(Nonce::from_slice(&nonce), Payload { msg: plain, aad: aad.as_bytes() })
         .map_err(|_| ApiError::internal("couldn't encrypt the credentials"))?;
     let mut out = nonce.to_vec();
     out.extend(sealed);
     Ok(format!("v1.{}", URL_SAFE_NO_PAD.encode(out)))
 }
 
+/// Decrypts what [`seal_bytes`] made, or `None` for another key or `aad`.
+pub fn open_bytes(key: &str, aad: &str, sealed: &str) -> Option<Vec<u8>> {
+    let bytes = URL_SAFE_NO_PAD.decode(sealed.strip_prefix("v1.")?).ok()?;
+    if bytes.len() < 13 {
+        return None;
+    }
+    let (nonce, body) = bytes.split_at(12);
+    cipher(key).decrypt(Nonce::from_slice(nonce), Payload { msg: body, aad: aad.as_bytes() }).ok()
+}
+
+/// Encrypts a credential for one person's connection to one app.
+pub fn seal(key: &str, user_id: &str, provider: &str, cred: &Credential) -> ApiResult<String> {
+    let plain = serde_json::to_vec(cred).map_err(|e| ApiError::internal(e.to_string()))?;
+    seal_bytes(key, &aad(user_id, provider), &plain)
+}
+
 /// Decrypts what [`seal`] made. Fails for another person's or app's credentials, or another key.
 pub fn open(key: &str, user_id: &str, provider: &str, sealed: &str) -> ApiResult<Credential> {
     let bad = || ApiError::internal("stored credentials can't be read; reconnect the app");
-    let bytes = URL_SAFE_NO_PAD.decode(sealed.strip_prefix("v1.").ok_or_else(bad)?).map_err(|_| bad())?;
-    if bytes.len() < 13 {
-        return Err(bad());
-    }
-    let (nonce, body) = bytes.split_at(12);
-    let aad = aad(user_id, provider);
-    let plain = cipher(key).decrypt(Nonce::from_slice(nonce), Payload { msg: body, aad: aad.as_bytes() }).map_err(|_| bad())?;
+    let plain = open_bytes(key, &aad(user_id, provider), sealed).ok_or_else(bad)?;
     serde_json::from_slice(&plain).map_err(|_| bad())
 }
 
@@ -587,6 +595,11 @@ fn key_of(cfg: &HostConfig) -> ApiResult<&str> {
 
 pub fn enabled(cfg: &HostConfig) -> bool {
     key_of(cfg).is_ok()
+}
+
+/// The host's connector key, which also encrypts single sign-on's client secret.
+pub fn key(cfg: &HostConfig) -> Option<&str> {
+    key_of(cfg).ok()
 }
 
 fn read_row(cfg: &HostConfig, user_id: &str, r: &crate::db::Row) -> ApiResult<Option<Connection>> {
@@ -876,6 +889,9 @@ pub fn fill(mut answer: Value, result: Result<Value, ApiError>) -> Result<Value,
 pub fn respond(mut response: crate::Response, finish: Finish) -> crate::Response {
     let result = match finish {
         Finish::Redirect(url) => return crate::Response::redirect(&url).with_header("cache-control", "no-store"),
+        Finish::Respond(r) => return r,
+        // A request that redirects (a sign-in's callback) says where to go when its job fails.
+        Finish::Fail(_) if (300..400).contains(&response.status) => return response,
         Finish::Fill(value) => Ok(value),
         Finish::Fail(e) => Err(e),
     };
@@ -907,6 +923,8 @@ pub enum Finish {
     Fill(Value),
     /// Send the browser here.
     Redirect(String),
+    /// Answer with this response as it is: a sign-in's redirect, with its cookies.
+    Respond(crate::Response),
     /// Answer with this error.
     Fail(ApiError),
 }
@@ -917,8 +935,27 @@ pub enum Job {
     Search(SearchJob),
     Preview(PreviewJob),
     Connect(ConnectJob),
+    /// Single sign-on (see [`crate::sso`]).
+    Sso(crate::sso::SsoJob),
     /// Slack's slash command, link previews and settings (see [`crate::slack`]).
     Slack(crate::slack::SlackJob),
+}
+
+impl Job {
+    /// Signing in: like a password sign-in, it works even when a hosted workspace is full.
+    pub fn is_sign_in(&self) -> bool {
+        matches!(self, Job::Sso(_))
+    }
+
+    /// What the job's operations left for the host to deliver once it finishes: a draft started
+    /// from Slack has webhooks to send. Only Slack's jobs leave any. Events a sign-in records send
+    /// no webhooks, and connected apps' jobs record none.
+    pub fn take_effects(&mut self) -> Vec<crate::Effect> {
+        match self {
+            Job::Slack(j) => j.take_effects(),
+            _ => vec![],
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1179,18 +1216,8 @@ pub fn step(db: &dyn Db, cfg: &HostConfig, job: &mut Job, replies: Vec<HttpReply
         Job::Search(j) => search_step(db, cfg, j, replies, now),
         Job::Preview(j) => preview_step(db, cfg, j, replies, now),
         Job::Connect(j) => connect_step(db, cfg, j, replies, now),
+        Job::Sso(j) => crate::sso::step(db, cfg, j, replies, now),
         Job::Slack(j) => crate::slack::step(db, cfg, j, replies, now),
-    }
-}
-
-impl Job {
-    /// What the job's operations left for the host to deliver once it finishes, like a request's
-    /// own effects: a draft started from Slack has webhooks to send.
-    pub fn take_effects(&mut self) -> Vec<crate::Effect> {
-        match self {
-            Job::Slack(j) => j.take_effects(),
-            _ => vec![],
-        }
     }
 }
 
