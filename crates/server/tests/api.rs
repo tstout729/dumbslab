@@ -2723,3 +2723,943 @@ mod connected {
         assert!(v["apps"][0]["error"].as_str().unwrap().contains("connect it again"), "{v}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Single sign-on. The tests play the host and the identity provider: they run each job's steps
+// with canned answers, and make the ID tokens the provider's token endpoint would send.
+
+mod sso {
+    use super::*;
+    use dumbslab_core::connect::{self, Finish, HttpCall, HttpReply, Job, Step};
+
+    const TENANT: &str = "72f988bf-86f1-41af-91ab-2d7cd011db47";
+    const OKTA: &str = "https://acme.okta.test";
+
+    fn ms_issuer() -> String {
+        format!("https://login.microsoftonline.com/{TENANT}/v2.0")
+    }
+
+    fn job_of(r: &Res) -> Job {
+        r.effects
+            .iter()
+            .find_map(|e| match e {
+                Effect::Connect(j) => Some(j.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("a job, but got {} {:?}", r.status, r.header("location")))
+    }
+
+    /// Runs a job, answering each step's requests with `answer`. Returns how it finished and every
+    /// request it made.
+    fn drive(h: &H, mut job: Job, answer: &dyn Fn(&HttpCall) -> HttpReply) -> (Finish, Vec<HttpCall>) {
+        let mut replies = vec![];
+        let mut sent = vec![];
+        for _ in 0..connect::MAX_STEPS {
+            let (step, next) = h
+                .store
+                .with_tx(|db| {
+                    let step = connect::step(db, &h.cfg, &mut job, replies.clone(), chrono::Utc::now());
+                    let ok = step.is_ok();
+                    ((step, job.clone()), ok)
+                })
+                .unwrap();
+            job = next;
+            match step.unwrap() {
+                Step::Done(f) => return (f, sent),
+                Step::Fetch(calls) => {
+                    replies = calls.iter().map(answer).collect();
+                    sent.extend(calls);
+                }
+            }
+        }
+        panic!("job didn't finish");
+    }
+
+    fn ok(body: Value) -> HttpReply {
+        HttpReply { status: 200, body: body.to_string() }
+    }
+
+    fn discovery(issuer: &str) -> Value {
+        let base = issuer.trim_end_matches('/');
+        json!({
+            "issuer": issuer,
+            "authorization_endpoint": format!("{base}/authorize"),
+            "token_endpoint": format!("{base}/token"),
+            "userinfo_endpoint": format!("{base}/userinfo"),
+            // Slack takes the client secret in the form only.
+            "token_endpoint_auth_methods_supported": if issuer == "https://slack.com" { json!(["client_secret_post"]) } else { json!(["client_secret_basic", "client_secret_post"]) },
+        })
+    }
+
+    /// An ID token as a provider signs it. Its signature isn't checked: it comes from the token endpoint over TLS.
+    fn jwt(claims: &Value) -> String {
+        let part = |v: Value| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(v.to_string());
+        format!("{}.{}.c2lnbmF0dXJl", part(json!({ "alg": "RS256", "kid": "k1" })), part(claims.clone()))
+    }
+
+    fn claims(issuer: &str, sub: &str, email: &str, extra: Value) -> Value {
+        let now = chrono::Utc::now().timestamp();
+        let mut c =
+            json!({ "iss": issuer, "aud": "app-id", "sub": sub, "email": email, "exp": now + 300, "iat": now, "name": "Mo Member" });
+        for (k, v) in extra.as_object().unwrap() {
+            c[k] = v.clone();
+        }
+        c
+    }
+
+    /// Where a request finally sent the browser, and the cookies it set.
+    struct Landing {
+        location: String,
+        cookies: Vec<String>,
+    }
+
+    impl Landing {
+        fn session(&self) -> Option<Auth> {
+            self.cookies
+                .iter()
+                .find_map(|c| c.strip_prefix("dumbslab_session="))
+                .map(|c| c.split(';').next().unwrap())
+                .filter(|v| !v.is_empty())
+                .map(|v| Auth::Cookie(v.to_string()))
+        }
+        /// What went wrong. Redirects carry a known code and nothing else, so nobody can put their
+        /// own words on the sign-in page, and nothing from the provider ends up there.
+        fn error(&self) -> String {
+            let q = query_of(&self.location);
+            let Some(code) = q.get("sso_error") else { return String::new() };
+            let known: Vec<&str> = dumbslab_core::sso::Problem::ALL.iter().map(|p| p.code()).collect();
+            assert!(known.contains(&code.as_str()), "unknown code `{code}` in {}", self.location);
+            assert!(q.keys().all(|k| k == "sso_error" || k == "next"), "only a code and where to go: {}", self.location);
+            code.clone()
+        }
+    }
+
+    /// The answer a request gets once its job (if any) finished.
+    fn land(r: &Res, finish: Option<Finish>) -> Landing {
+        let original = dumbslab_core::Response { status: r.status, headers: r.headers.clone(), body: r.bytes.clone() };
+        let resp = match finish {
+            Some(f) => connect::respond(original, f),
+            None => original,
+        };
+        let header = |n: &str| resp.headers.iter().filter(|(k, _)| k == n).map(|(_, v)| v.clone()).collect::<Vec<_>>();
+        assert!((300..400).contains(&resp.status), "a redirect, not {} {}", resp.status, String::from_utf8_lossy(&resp.body));
+        Landing { location: header("location").into_iter().next().unwrap_or_default(), cookies: header("set-cookie") }
+    }
+
+    /// Saves single sign-on settings as `admin`, answering the check with the issuer's discovery document.
+    fn set_up(h: &H, admin: &Auth, body: Value, issuer: &str) -> Value {
+        let r = h.call("PATCH", "/api/v1/sso", Some(body), admin);
+        assert_eq!(r.status, 200, "{}", r.body);
+        let (finish, sent) = drive(h, job_of(&r), &|_| ok(discovery(issuer)));
+        assert_eq!(sent[0].url, format!("{}/.well-known/openid-configuration", issuer.trim_end_matches('/')));
+        match finish {
+            Finish::Fill(v) => connect::fill(r.body.clone(), Ok(v)).unwrap(),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// A workspace with a connector key, and its admin (ada@acme.test).
+    fn workspace() -> (H, Auth) {
+        let mut h = H::new();
+        let (admin, _) = h.setup();
+        h.cfg.connectors.key = Some("connector-key".into());
+        (h, admin)
+    }
+
+    fn okta(h: &H, admin: &Auth, extra: Value) {
+        let mut body = json!({ "provider": "okta", "issuer": OKTA, "client_id": "app-id", "client_secret": "shh-client-secret",
+            "allowed_domains": ["acme.test"], "enabled": true });
+        for (k, v) in extra.as_object().unwrap() {
+            body[k] = v.clone();
+        }
+        let v = set_up(h, admin, body, OKTA);
+        assert_eq!((v["check"]["ok"].as_bool(), v["active"].as_bool()), (Some(true), Some(true)), "{v}");
+    }
+
+    /// A sign-in under way: the provider's sign-in URL's query, and the cookie the browser got.
+    struct Started {
+        query: std::collections::HashMap<String, String>,
+        url: String,
+        cookie: String,
+    }
+
+    fn start(h: &H, issuer: &str) -> Started {
+        let r = h.call("GET", "/sso/start?next=%2Fp%2Fabc", None, &Auth::None);
+        let (finish, sent) = drive(h, job_of(&r), &|_| ok(discovery(issuer)));
+        assert_eq!(sent.len(), 1);
+        let landing = land(&r, Some(finish));
+        let cookie = landing.cookies.iter().find_map(|c| c.strip_prefix("dumbslab_sso=")).expect("the browser's cookie");
+        assert!(cookie.contains("HttpOnly") && cookie.contains("SameSite=Lax") && cookie.contains("Path=/sso"), "{cookie}");
+        Started { query: query_of(&landing.location), url: landing.location.clone(), cookie: cookie.split(';').next().unwrap().to_string() }
+    }
+
+    fn callback_request(query: &str, cookies: &[String]) -> Request {
+        Request {
+            method: "GET".into(),
+            path: "/sso/callback".into(),
+            query: query.into(),
+            headers: if cookies.is_empty() { vec![] } else { vec![("cookie".into(), cookies.join("; "))] },
+            origin: "https://kb.test".into(),
+            ..Default::default()
+        }
+    }
+
+    /// The provider sends the browser back with a code; its token endpoint answers with `id_token`
+    /// (the started sign-in's nonce is filled in unless the claims have one).
+    fn come_back(h: &H, s: &Started, mut id_claims: Value, token: &dyn Fn(&HttpCall, &str) -> HttpReply) -> (Landing, Vec<HttpCall>) {
+        if id_claims.get("nonce").is_none() {
+            id_claims["nonce"] = json!(s.query["nonce"]);
+        }
+        let q = format!("code=the-code&state={}", urlencoding::encode(&s.query["state"]));
+        let r = h.send(&callback_request(&q, &[format!("dumbslab_sso={}", s.cookie)]));
+        if r.effects.is_empty() {
+            return (land(&r, None), vec![]);
+        }
+        let jwt = jwt(&id_claims);
+        let (finish, sent) = drive(h, job_of(&r), &|c| token(c, &jwt));
+        (land(&r, Some(finish)), sent)
+    }
+
+    /// The token endpoint, answering with the ID token.
+    fn tokens(_: &HttpCall, jwt: &str) -> HttpReply {
+        ok(json!({ "access_token": "provider-access-token", "token_type": "Bearer", "id_token": jwt }))
+    }
+
+    fn sign_in_with(h: &H, issuer: &str, id_claims: Value) -> Landing {
+        let s = start(h, issuer);
+        come_back(h, &s, id_claims, &tokens).0
+    }
+
+    fn me(h: &H, auth: &Auth) -> Value {
+        h.ok("GET", "/api/v1/me", None, auth)["user"].clone()
+    }
+
+    #[test]
+    fn settings_are_for_admins_and_never_show_the_secret() {
+        let mut h = H::new();
+        let (admin, _) = h.setup();
+        let (_, mo) = h.user(&admin, "mo@acme.test", "Mo", "member");
+        assert_eq!(h.call("GET", "/api/v1/sso", None, &mo).status, 403);
+        assert_eq!(h.call("PATCH", "/api/v1/sso", Some(json!({ "provider": "okta" })), &mo).status, 403);
+
+        // Without a connector key there's nowhere safe for a client secret, so it's off.
+        let s = h.ok("GET", "/api/v1/sso", None, &admin);
+        assert_eq!((s["available"].as_bool(), s["active"].as_bool()), (Some(false), Some(false)));
+        assert_eq!(s["redirect_uri"], "https://kb.test/sso/callback");
+        let body = json!({ "provider": "okta", "issuer": OKTA, "client_id": "app-id", "client_secret": "shh-client-secret" });
+        assert_eq!(h.call("PATCH", "/api/v1/sso", Some(body), &admin).status, 503);
+        assert!(h.ok("GET", "/api/v1/auth/state", None, &Auth::None)["sso"].is_null());
+
+        h.cfg.connectors.key = Some("connector-key".into());
+        let bad = |body: Value| {
+            let r = h.call("PATCH", "/api/v1/sso", Some(body), &admin);
+            assert_eq!(r.status, 400, "{}", r.body);
+            r.body["error"]["message"].as_str().unwrap().to_string()
+        };
+        assert!(bad(json!({ "provider": "okta", "enabled": true })).contains("`issuer`, `client_id`, `client_secret`"));
+        assert!(bad(json!({ "provider": "okta", "issuer": "http://acme.okta.test" })).contains("https"));
+        assert!(bad(json!({ "provider": "microsoft", "tenant": "common" })).contains("GUID"));
+        assert!(bad(json!({ "provider": "microsoft", "tenant": "contoso.onmicrosoft.com" })).contains("GUID"));
+        assert!(bad(json!({ "provider": "google", "client_id": "x", "client_secret": "y", "enabled": true })).contains("allowed_domains"));
+        assert!(bad(json!({ "provider": "okta", "allowed_domains": ["not a domain"] })).contains("domain"));
+
+        let r = h.call(
+            "PATCH",
+            "/api/v1/sso",
+            Some(json!({ "provider": "okta", "issuer": OKTA, "client_id": "app-id", "client_secret": "shh-client-secret",
+                "allowed_domains": ["@Acme.TEST", "acme.test"], "enabled": true })),
+            &admin,
+        );
+        assert!(!r.body.to_string().contains("shh-client-secret"));
+        let (finish, _) = drive(&h, job_of(&r), &|_| ok(discovery(OKTA)));
+        let Finish::Fill(v) = finish else { panic!("{finish:?}") };
+        assert_eq!(
+            (v["check"]["ok"].as_bool(), v["active"].as_bool(), v["client_secret_set"].as_bool()),
+            (Some(true), Some(true), Some(true))
+        );
+        assert_eq!(v["allowed_domains"], json!(["acme.test"]));
+        assert_eq!(v["check"]["authorization_endpoint"], format!("{OKTA}/authorize"));
+        // The secret is stored encrypted and never comes back.
+        let stored: String = h
+            .store
+            .with_tx(|db| (db.one("SELECT value FROM settings WHERE key = 'sso'", &[]).unwrap().unwrap().str("value"), true))
+            .unwrap();
+        assert!(!stored.contains("shh-client-secret"), "{stored}");
+        for shown in
+            [v.to_string(), h.ok("GET", "/api/v1/sso", None, &admin).to_string(), h.ok("GET", "/api/v1/export", None, &admin).to_string()]
+        {
+            assert!(!shown.contains("shh-client-secret") && !shown.contains(&stored), "{shown}");
+        }
+        // The sign-in page learns only the button.
+        let state = h.ok("GET", "/api/v1/auth/state", None, &Auth::None);
+        assert_eq!(state["sso"], json!({ "name": "Okta", "url": "https://kb.test/sso/start", "required": false }));
+
+        // A discovery document naming another issuer fails the check.
+        let r = h.call("PATCH", "/api/v1/sso", Some(json!({ "auto_provision": false })), &admin);
+        let (finish, _) = drive(&h, job_of(&r), &|_| ok(discovery("https://evil.test")));
+        let Finish::Fill(v) = finish else { panic!("{finish:?}") };
+        assert_eq!(v["check"]["ok"], false);
+        assert!(v["check"]["error"].as_str().unwrap().contains("match exactly"), "{v}");
+        // So does one that isn't there.
+        let r = h.call("PATCH", "/api/v1/sso", Some(json!({ "auto_provision": false })), &admin);
+        let (finish, _) = drive(&h, job_of(&r), &|_| HttpReply { status: 404, body: "not found".into() });
+        let Finish::Fill(v) = finish else { panic!("{finish:?}") };
+        assert!(v["check"]["error"].as_str().unwrap().contains("HTTP 404"), "{v}");
+
+        // A secret belongs to its app: another client ID needs its own.
+        assert!(bad(json!({ "client_id": "another-app" })).contains("client_secret"));
+        let v = set_up(&h, &admin, json!({ "client_id": "another-app", "enabled": false }), OKTA);
+        assert_eq!((v["client_secret_set"].as_bool(), v["active"].as_bool()), (Some(false), Some(false)));
+        assert!(h.ok("GET", "/api/v1/auth/state", None, &Auth::None)["sso"].is_null());
+        // Settings changes are in the admins' activity, without the secret.
+        let activity = h.ok("GET", "/api/v1/activity", None, &admin).to_string();
+        assert!(activity.contains("sso.updated") && !activity.contains("shh-client-secret"));
+    }
+
+    #[test]
+    fn signing_in_with_each_provider() {
+        let cases = [
+            (
+                json!({ "provider": "google", "allowed_domains": ["acme.test"] }),
+                "https://accounts.google.com".to_string(),
+                json!({ "email_verified": true, "hd": "acme.test" }),
+                "Google",
+            ),
+            (
+                json!({ "provider": "microsoft", "tenant": TENANT.to_uppercase(), "allowed_domains": ["acme.test"] }),
+                ms_issuer(),
+                json!({ "tid": TENANT, "xms_edov": true }),
+                "Microsoft",
+            ),
+            (
+                json!({ "provider": "okta", "issuer": OKTA, "allowed_domains": ["acme.test"] }),
+                OKTA.to_string(),
+                json!({ "email_verified": true }),
+                "Okta",
+            ),
+            (
+                json!({ "provider": "onelogin", "issuer": "https://acme.onelogin.test/oidc/2", "allowed_domains": ["acme.test"] }),
+                "https://acme.onelogin.test/oidc/2".to_string(),
+                json!({ "email_verified": "true" }),
+                "OneLogin",
+            ),
+            (
+                json!({ "provider": "slack", "team": "T0ACME", "allowed_domains": ["acme.test"] }),
+                "https://slack.com".to_string(),
+                json!({ "email_verified": true, "https://slack.com/team_id": "T0ACME" }),
+                "Slack",
+            ),
+            (
+                json!({ "provider": "oidc", "issuer": "https://id.acme.test/", "label": "Acme ID", "allowed_domains": ["acme.test"] }),
+                "https://id.acme.test/".to_string(),
+                json!({ "email_verified": true }),
+                "Acme ID",
+            ),
+        ];
+        for (mut body, issuer, extra, name) in cases {
+            let (h, admin) = workspace();
+            h.user(&admin, "mo@acme.test", "Mo", "member");
+            body["client_id"] = json!("app-id");
+            body["client_secret"] = json!("shh-client-secret");
+            body["enabled"] = json!(true);
+            let v = set_up(&h, &admin, body, &issuer);
+            assert_eq!(
+                (v["check"]["ok"].as_bool(), v["active"].as_bool(), v["issuer"].as_str()),
+                (Some(true), Some(true), Some(issuer.as_str())),
+                "{name}: {v}"
+            );
+            assert_eq!(h.ok("GET", "/api/v1/auth/state", None, &Auth::None)["sso"]["name"], name);
+
+            let s = start(&h, &issuer);
+            assert!(s.url.starts_with(&format!("{}/authorize?", issuer.trim_end_matches('/'))), "{name}: {}", s.url);
+            let q = &s.query;
+            assert_eq!((q["response_type"].as_str(), q["client_id"].as_str()), ("code", "app-id"), "{name}");
+            assert_eq!((q["redirect_uri"].as_str(), q["scope"].as_str()), ("https://kb.test/sso/callback", "openid email profile"));
+            assert_eq!(q["code_challenge_method"], "S256");
+            assert!(q["state"].len() >= 32 && q["nonce"].len() >= 32 && q["code_challenge"].len() == 43, "{name}: {q:?}");
+            match name {
+                "Google" => assert_eq!((q["hd"].as_str(), q["prompt"].as_str()), ("acme.test", "select_account")),
+                "Slack" => assert_eq!(q["team"], "T0ACME"),
+                _ => {}
+            }
+
+            let (landing, sent) = come_back(&h, &s, claims(&issuer, "sub-mo", "Mo@acme.test", extra.clone()), &tokens);
+            assert_eq!(landing.location, "https://kb.test/p/abc", "{name}: {}", landing.error());
+            let session = landing.session().unwrap_or_else(|| panic!("{name}: a session"));
+            assert!(landing.cookies.iter().any(|c| c.starts_with("dumbslab_session=") && c.contains("Secure") && c.contains("HttpOnly")));
+            assert!(landing.cookies.iter().any(|c| c.starts_with("dumbslab_sso=;")), "the browser cookie is cleared");
+            assert_eq!(me(&h, &session)["email"], "mo@acme.test", "{name}");
+
+            // The code went to the token endpoint with the PKCE verifier and the client secret.
+            let exchange = &sent[0];
+            assert_eq!(exchange.url, format!("{}/token", issuer.trim_end_matches('/')));
+            let form = query_of(&format!("?{}", exchange.body.clone().unwrap()));
+            assert_eq!((form["grant_type"].as_str(), form["code"].as_str()), ("authorization_code", "the-code"));
+            assert_eq!(form["redirect_uri"], "https://kb.test/sso/callback");
+            let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(Sha256::digest(form["code_verifier"].as_bytes()));
+            assert_eq!(challenge, q["code_challenge"], "{name}");
+            let basic = exchange.headers.iter().find(|(k, _)| k == "authorization").map(|(_, v)| v.clone());
+            if name == "Slack" {
+                assert_eq!((form["client_id"].as_str(), form["client_secret"].as_str(), basic), ("app-id", "shh-client-secret", None));
+            } else {
+                let expected = format!("Basic {}", base64::engine::general_purpose::STANDARD.encode("app-id:shh-client-secret"));
+                assert_eq!(basic.as_deref(), Some(expected.as_str()), "{name}");
+                assert!(!form.contains_key("client_secret"));
+            }
+
+            // Linked by subject now: the next sign-in finds Mo whatever email the provider gives.
+            let again = sign_in_with(
+                &h,
+                &issuer,
+                claims(
+                    &issuer,
+                    "sub-mo",
+                    "renamed@elsewhere.test",
+                    json!({ "tid": TENANT, "hd": "acme.test", "https://slack.com/team_id": "T0ACME" }),
+                ),
+            );
+            assert_eq!(me(&h, &again.session().unwrap_or_else(|| panic!("{name}: {}", again.error())))["email"], "mo@acme.test");
+            let linked = h.ok("GET", "/api/v1/sso/identities?user=all", None, &admin);
+            assert_eq!(linked["items"].as_array().unwrap().len(), 1, "{name}");
+            assert_eq!(linked["items"][0]["email"], "Mo@acme.test");
+        }
+    }
+
+    #[test]
+    fn tokens_that_dont_check_out_are_refused() {
+        let (h, admin) = workspace();
+        h.user(&admin, "mo@acme.test", "Mo", "member");
+        okta(&h, &admin, json!({}));
+        let now = chrono::Utc::now().timestamp();
+        let verified = || json!({ "email_verified": true });
+        let no_session = |l: &Landing| l.session().is_none() && l.location.starts_with("https://kb.test/login?sso_error=");
+
+        for (claim, value) in [
+            ("aud", json!("someone-elses-app")),
+            ("azp", json!("someone-elses-app")),
+            ("iss", json!("https://evil.test")),
+            ("exp", json!(now - 600)),
+            ("iat", json!(now + 7200)),
+            ("nonce", json!("not-this-sign-ins-nonce")),
+        ] {
+            let mut c = claims(OKTA, "sub-mo", "mo@acme.test", verified());
+            c[claim] = value;
+            let landing = sign_in_with(&h, OKTA, c);
+            assert!(no_session(&landing), "{claim}: {}", landing.location);
+            assert_eq!(landing.error(), "invalid_token", "{claim}");
+            assert!(landing.location.contains("next=%2Fp%2Fabc"), "keeps where they were going");
+        }
+
+        // A discovery document naming another issuer: no sign-in starts.
+        let r = h.call("GET", "/sso/start", None, &Auth::None);
+        let (finish, _) = drive(&h, job_of(&r), &|_| ok(discovery("https://evil.test")));
+        let landing = land(&r, Some(finish));
+        assert_eq!(landing.error(), "provider_error");
+        assert_eq!(count(&h, "SELECT COUNT(*) FROM sso_requests"), 0);
+        // No answer at all: the request's own fallback, not an error page.
+        let r = h.call("GET", "/sso/start", None, &Auth::None);
+        let landing = land(&r, Some(Finish::Fail(dumbslab_core::ApiError::internal("the host gave up"))));
+        assert_eq!(landing.error(), "failed");
+
+        // Each sign-in link works once.
+        let s = start(&h, OKTA);
+        let (first, _) = come_back(&h, &s, claims(OKTA, "sub-mo", "mo@acme.test", verified()), &tokens);
+        assert!(first.session().is_some(), "{}", first.error());
+        let (replayed, _) = come_back(&h, &s, claims(OKTA, "sub-mo", "mo@acme.test", verified()), &tokens);
+        assert!(no_session(&replayed) && replayed.error() == "expired", "{}", replayed.location);
+
+        // Only the browser that started can finish (no signing someone in to the attacker's account).
+        for cookies in [vec![], vec!["dumbslab_sso=someone-elses".to_string()]] {
+            let s = start(&h, OKTA);
+            let q = format!("code=attackers-code&state={}", urlencoding::encode(&s.query["state"]));
+            let r = h.send(&callback_request(&q, &cookies));
+            assert!(r.effects.is_empty());
+            assert_eq!(land(&r, None).error(), "other_browser");
+        }
+
+        // Too slow.
+        let s = start(&h, OKTA);
+        let past = dumbslab_core::util::ts(chrono::Utc::now() - chrono::Duration::minutes(16));
+        h.store.with_tx(|db| (db.execute("UPDATE sso_requests SET created_at = ?", &dumbslab_core::params![past]), true)).unwrap().unwrap();
+        let (late, _) = come_back(&h, &s, claims(OKTA, "sub-mo", "mo@acme.test", verified()), &tokens);
+        assert_eq!(late.error(), "expired");
+
+        // The provider saying no, or refusing the code: a readable message, nothing raw.
+        let s = start(&h, OKTA);
+        let q = format!("error=access_denied&error_description=User+cancelled&state={}", urlencoding::encode(&s.query["state"]));
+        let r = h.send(&callback_request(&q, &[format!("dumbslab_sso={}", s.cookie)]));
+        assert_eq!(land(&r, None).error(), "denied");
+        // Any other error, with whatever text the provider (or someone) puts in the link, is just that: an error.
+        let s = start(&h, OKTA);
+        let q = format!(
+            "error=server_error&error_description=Your+account+is+locked.+Call+555-0100&state={}",
+            urlencoding::encode(&s.query["state"])
+        );
+        let landing = land(&h.send(&callback_request(&q, &[format!("dumbslab_sso={}", s.cookie)])), None);
+        assert_eq!(landing.error(), "provider_error");
+        assert!(!landing.location.contains("locked") && !landing.location.contains("555"), "{}", landing.location);
+        let s = start(&h, OKTA);
+        let refused = |_: &HttpCall, _: &str| HttpReply {
+            status: 400,
+            body: json!({ "error": "invalid_grant", "error_description": "code expired", "access_token": "leaked?" }).to_string(),
+        };
+        let (landing, _) = come_back(&h, &s, claims(OKTA, "sub-mo", "mo@acme.test", verified()), &refused);
+        assert_eq!(landing.error(), "provider_error");
+        assert!(!landing.location.contains("invalid_grant") && !landing.location.contains("leaked"), "{}", landing.location);
+        // An answer that isn't a signed ID token.
+        let s = start(&h, OKTA);
+        let unsigned = |_: &HttpCall, _: &str| ok(json!({ "access_token": "at", "id_token": "eyJhbGciOiJub25lIn0.eyJzdWIiOiJ4In0." }));
+        let (landing, _) = come_back(&h, &s, json!({}), &unsigned);
+        assert_eq!(landing.error(), "invalid_token");
+
+        // Settings changing mid-sign-in.
+        let s = start(&h, OKTA);
+        set_up(&h, &admin, json!({ "issuer": "https://acme-new.okta.test" }), "https://acme-new.okta.test");
+        let (landing, _) = come_back(&h, &s, claims(OKTA, "sub-mo", "mo@acme.test", verified()), &tokens);
+        assert_eq!(landing.error(), "expired");
+    }
+
+    #[test]
+    fn first_sign_ins_match_only_vouched_emails_at_allowed_domains() {
+        let (h, admin) = workspace();
+        let (mo_id, _) = h.user(&admin, "mo@acme.test", "Mo", "member");
+        okta(&h, &admin, json!({}));
+        let refused = |c: Value, why: &str| {
+            let landing = sign_in_with(&h, OKTA, c);
+            assert!(landing.session().is_none(), "{why}");
+            assert_eq!(landing.error(), why);
+        };
+        refused(claims(OKTA, "sub-mo", "mo@acme.test", json!({ "email_verified": false })), "unverified_email");
+        refused(claims(OKTA, "sub-mo", "mo@acme.test", json!({})), "unverified_email");
+        refused(claims(OKTA, "sub-mo", "mo@other.test", json!({ "email_verified": true })), "domain_not_allowed");
+        refused(claims(OKTA, "sub-new", "new@acme.test", json!({ "email_verified": true })), "no_account");
+        assert_eq!(count(&h, "SELECT COUNT(*) FROM sso_identities"), 0);
+
+        // Some providers give the email in the userinfo answer only; it must be about the same account.
+        let s = start(&h, OKTA);
+        let mut c = claims(OKTA, "sub-mo", "", json!({}));
+        c.as_object_mut().unwrap().remove("email");
+        let provider = |call: &HttpCall, jwt: &str| {
+            if call.url.ends_with("/userinfo") {
+                assert!(call.headers.contains(&("authorization".into(), "Bearer provider-access-token".into())));
+                ok(json!({ "sub": "sub-mo", "email": "mo@acme.test", "email_verified": true }))
+            } else {
+                tokens(call, jwt)
+            }
+        };
+        let (landing, sent) = come_back(&h, &s, c.clone(), &provider);
+        assert_eq!(sent.len(), 2);
+        assert_eq!(me(&h, &landing.session().unwrap_or_else(|| panic!("{}", landing.error())))["id"], mo_id.as_str());
+        // Linking by email is a new way into Mo's account: the admins' activity log says so.
+        assert_eq!(links_logged(&h, &admin), vec![(mo_id.clone(), "email".to_string())]);
+        h.store.with_tx(|db| (db.execute("DELETE FROM sso_identities", &[]), true)).unwrap().unwrap();
+        let s = start(&h, OKTA);
+        let someone_else = |call: &HttpCall, jwt: &str| {
+            if call.url.ends_with("/userinfo") {
+                ok(json!({ "sub": "sub-other", "email": "mo@acme.test", "email_verified": true }))
+            } else {
+                tokens(call, jwt)
+            }
+        };
+        let (landing, _) = come_back(&h, &s, c, &someone_else);
+        assert_eq!(landing.error(), "unverified_email");
+
+        // Deactivated people can't sign in, linked or not.
+        assert!(sign_in_with(&h, OKTA, claims(OKTA, "sub-mo", "mo@acme.test", json!({ "email_verified": true }))).session().is_some());
+        h.ok("PATCH", &format!("/api/v1/users/{mo_id}"), Some(json!({ "deactivated": true })), &admin);
+        refused(claims(OKTA, "sub-mo", "mo@acme.test", json!({ "email_verified": true })), "deactivated");
+        refused(claims(OKTA, "sub-mo-2", "mo@acme.test", json!({ "email_verified": true })), "deactivated");
+        // Nor bots.
+        h.ok("POST", "/api/v1/users", Some(json!({ "email": "bot@acme.test", "name": "Bot", "is_bot": true })), &admin);
+        refused(claims(OKTA, "sub-bot", "bot@acme.test", json!({ "email_verified": true })), "bot");
+        // An address already linked to another account at this provider isn't taken over.
+        h.ok("PATCH", &format!("/api/v1/users/{mo_id}"), Some(json!({ "deactivated": false })), &admin);
+        refused(claims(OKTA, "sub-mo-2", "mo@acme.test", json!({ "email_verified": true })), "email_linked");
+
+        // Auto-provisioning: people the provider vouches for join as members.
+        set_up(&h, &admin, json!({ "auto_provision": true }), OKTA);
+        let landing =
+            sign_in_with(&h, OKTA, claims(OKTA, "sub-new", "New@Acme.test", json!({ "email_verified": true, "name": "Nia New" })));
+        let new = me(&h, &landing.session().unwrap_or_else(|| panic!("{}", landing.error())));
+        assert_eq!(
+            (new["email"].as_str(), new["name"].as_str(), new["role"].as_str()),
+            (Some("new@acme.test"), Some("Nia New"), Some("member"))
+        );
+        let activity = h.ok("GET", "/api/v1/activity", None, &admin).to_string();
+        assert!(activity.contains("joined by signing in with Okta"), "{activity}");
+        assert_eq!(
+            links_logged(&h, &admin).last().map(|(who, how)| (who.as_str(), how.as_str())),
+            Some((new["id"].as_str().unwrap(), "provisioned"))
+        );
+        // Still only from allowed domains, with verified emails.
+        refused(claims(OKTA, "sub-x", "x@other.test", json!({ "email_verified": true })), "domain_not_allowed");
+        refused(claims(OKTA, "sub-y", "y@acme.test", json!({ "email_verified": false })), "unverified_email");
+    }
+
+    #[test]
+    fn google_and_slack_sign_ins_stay_inside_the_organization() {
+        let (h, admin) = workspace();
+        h.user(&admin, "mo@acme.test", "Mo", "member");
+        let google = "https://accounts.google.com";
+        set_up(
+            &h,
+            &admin,
+            json!({ "provider": "google", "allowed_domains": ["acme.test"], "client_id": "app-id", "client_secret": "s", "enabled": true }),
+            google,
+        );
+        // A personal Google account (no hosted domain), or another company's, never signs in.
+        for extra in [json!({ "email_verified": true }), json!({ "email_verified": true, "hd": "other.test" })] {
+            let landing = sign_in_with(&h, google, claims(google, "g-mo", "mo@acme.test", extra));
+            assert!(landing.session().is_none() && landing.error() == "not_in_org", "{}", landing.location);
+        }
+        // Google's ID tokens may name the issuer without its scheme.
+        let landing = sign_in_with(
+            &h,
+            google,
+            claims("accounts.google.com", "g-mo", "mo@acme.test", json!({ "email_verified": true, "hd": "acme.test" })),
+        );
+        assert!(landing.session().is_some(), "{}", landing.error());
+
+        let slack = "https://slack.com";
+        set_up(
+            &h,
+            &admin,
+            json!({ "provider": "slack", "team": "t0acme", "client_id": "app-id", "client_secret": "s", "enabled": true }),
+            slack,
+        );
+        let landing = sign_in_with(
+            &h,
+            slack,
+            claims(slack, "U1", "mo@acme.test", json!({ "email_verified": true, "https://slack.com/team_id": "T0OTHER" })),
+        );
+        assert_eq!(landing.error(), "not_in_org");
+    }
+
+    #[test]
+    fn microsoft_needs_xms_edov_or_a_linked_account() {
+        let (h, admin) = workspace();
+        let (mo_id, mo_token) = h.user(&admin, "mo@acme.test", "Mo", "member");
+        let issuer = ms_issuer();
+        let v = set_up(
+            &h,
+            &admin,
+            json!({ "provider": "microsoft", "tenant": TENANT, "allowed_domains": ["acme.test"], "client_id": "app-id", "client_secret": "s", "enabled": true }),
+            &issuer,
+        );
+        assert_eq!(v["issuer"], issuer);
+        // `email` alone, even "verified" and matching the UPN, isn't proof of the address (nOAuth).
+        let unproven = json!({ "tid": TENANT, "email_verified": true, "upn": "mo@acme.test", "preferred_username": "mo@acme.test" });
+        let landing = sign_in_with(&h, &issuer, claims(&issuer, "ms-mo", "mo@acme.test", unproven.clone()));
+        assert!(landing.session().is_none() && landing.error() == "unverified_email", "{}", landing.location);
+        // Another directory's account, even with xms_edov.
+        let landing = sign_in_with(
+            &h,
+            &issuer,
+            claims(&issuer, "ms-mo", "mo@acme.test", json!({ "tid": "00000000-0000-0000-0000-000000000000", "xms_edov": true })),
+        );
+        assert_eq!(landing.error(), "not_in_org");
+
+        // Mo links their Microsoft account while signed in with a password...
+        let mo = sign_in(&h, "mo@acme.test", "password123");
+        assert_eq!(h.call("POST", "/api/v1/me/sso", None, &mo_token).status, 403, "only from a signed-in browser");
+        let r = h.call("POST", "/api/v1/me/sso", None, &mo);
+        assert_eq!(r.status, 200, "{}", r.body);
+        let (finish, _) = drive(&h, job_of(&r), &|_| ok(discovery(&issuer)));
+        let Finish::Fill(v) = finish else { panic!("{finish:?}") };
+        let q = query_of(v["authorize_url"].as_str().unwrap());
+        let link = |auth: &Auth, sub: &str| {
+            let Auth::Cookie(session) = auth else { unreachable!() };
+            let r = h.send(&callback_request(
+                &format!("code=c&state={}", urlencoding::encode(&q["state"])),
+                &[format!("dumbslab_session={session}")],
+            ));
+            if r.effects.is_empty() {
+                return land(&r, None);
+            }
+            let id = jwt(&claims(&issuer, sub, "mo@acme.test", json!({ "tid": TENANT, "nonce": q["nonce"] })));
+            let (finish, _) = drive(&h, job_of(&r), &|c| tokens(c, &id));
+            land(&r, Some(finish))
+        };
+        // ...in their own browser only.
+        let landing = link(&admin, "ms-mo");
+        assert_eq!(landing.location, "https://kb.test/settings/profile?sso_error=other_session");
+        assert_eq!(landing.error(), "other_session");
+        let r = h.call("POST", "/api/v1/me/sso", None, &mo);
+        let (finish, _) = drive(&h, job_of(&r), &|_| ok(discovery(&issuer)));
+        let Finish::Fill(v) = finish else { panic!("{finish:?}") };
+        let q2 = query_of(v["authorize_url"].as_str().unwrap());
+        let r = h.send(&callback_request(
+            &format!("code=c&state={}", urlencoding::encode(&q2["state"])),
+            &[{
+                let Auth::Cookie(c) = &mo else { unreachable!() };
+                format!("dumbslab_session={c}")
+            }],
+        ));
+        let id = jwt(&claims(&issuer, "ms-mo", "mo@acme.test", json!({ "tid": TENANT, "nonce": q2["nonce"] })));
+        let (finish, _) = drive(&h, job_of(&r), &|c| tokens(c, &id));
+        let landing = land(&r, Some(finish));
+        assert_eq!(landing.location, "https://kb.test/settings/profile?sso_linked=1");
+        assert!(landing.session().is_none(), "linking doesn't start another session");
+        let mine = h.ok("GET", "/api/v1/sso/identities", None, &mo);
+        assert_eq!((mine["items"][0]["current"].as_bool(), mine["items"][0]["user"]["id"].as_str()), (Some(true), Some(mo_id.as_str())));
+
+        // Now Mo signs in with Microsoft, no xms_edov needed.
+        let landing = sign_in_with(&h, &issuer, claims(&issuer, "ms-mo", "mo@acme.test", unproven.clone()));
+        assert_eq!(me(&h, &landing.session().unwrap_or_else(|| panic!("{}", landing.error())))["id"], mo_id.as_str());
+
+        // Nobody else can claim that Microsoft account.
+        let ada = sign_in(&h, "ada@acme.test", "correct horse");
+        let r = h.call("POST", "/api/v1/me/sso", None, &ada);
+        let (finish, _) = drive(&h, job_of(&r), &|_| ok(discovery(&issuer)));
+        let Finish::Fill(v) = finish else { panic!("{finish:?}") };
+        let q3 = query_of(v["authorize_url"].as_str().unwrap());
+        let Auth::Cookie(ada_session) = &ada else { unreachable!() };
+        let r = h.send(&callback_request(
+            &format!("code=c&state={}", urlencoding::encode(&q3["state"])),
+            &[format!("dumbslab_session={ada_session}")],
+        ));
+        let id = jwt(&claims(&issuer, "ms-mo", "mo@acme.test", json!({ "tid": TENANT, "nonce": q3["nonce"] })));
+        let (finish, _) = drive(&h, job_of(&r), &|c| tokens(c, &id));
+        assert_eq!(land(&r, Some(finish)).error(), "already_linked");
+
+        // Unlinking (yours, or anyone's for admins) stops it signing in.
+        let id = mine["items"][0]["id"].as_str().unwrap().to_string();
+        let (_, other) = h.user(&admin, "zed@acme.test", "Zed", "member");
+        assert_eq!(h.call("DELETE", &format!("/api/v1/sso/identities/{id}"), None, &other).status, 403);
+        h.ok("DELETE", &format!("/api/v1/sso/identities/{id}"), None, &mo);
+        let landing = sign_in_with(&h, &issuer, claims(&issuer, "ms-mo", "mo@acme.test", unproven));
+        assert!(landing.session().is_none());
+        // With xms_edov, a first sign-in matches the email.
+        let landing = sign_in_with(&h, &issuer, claims(&issuer, "ms-mo", "mo@acme.test", json!({ "tid": TENANT, "xms_edov": true })));
+        assert_eq!(me(&h, &landing.session().unwrap_or_else(|| panic!("{}", landing.error())))["id"], mo_id.as_str());
+    }
+
+    #[test]
+    fn requiring_sso_keeps_passwords_for_admins_only() {
+        let (h, admin) = workspace();
+        let (_, mo_token) = h.user(&admin, "mo@acme.test", "Mo", "member");
+        okta(&h, &admin, json!({ "require_sso": true }));
+        assert_eq!(h.ok("GET", "/api/v1/auth/state", None, &Auth::None)["sso"]["required"], true);
+        let login = |email: &str, password: &str| {
+            h.call("POST", "/api/v1/auth/login", Some(json!({ "email": email, "password": password })), &Auth::None)
+        };
+        let r = login("mo@acme.test", "password123");
+        assert_eq!((r.status, r.body["error"]["code"].as_str()), (403, Some("sso_required")), "{}", r.body);
+        assert!(r.header("set-cookie").is_none());
+        assert!(r.body["error"]["message"].as_str().unwrap().contains("Sign in with Okta"));
+        // A wrong password still says only that.
+        assert_eq!(login("mo@acme.test", "wrong password").status, 401);
+        // Admins keep their password, in case the provider fails.
+        assert_eq!(login("ada@acme.test", "correct horse").status, 200);
+        // Tokens (scripts, agents, MCP) are unaffected.
+        assert_eq!(h.ok("GET", "/api/v1/me", None, &mo_token)["user"]["email"], "mo@acme.test");
+        // Mo signs in with Okta instead.
+        let landing = sign_in_with(&h, OKTA, claims(OKTA, "sub-mo", "mo@acme.test", json!({ "email_verified": true })));
+        assert!(landing.session().is_some(), "{}", landing.error());
+        // If single sign-on is turned off, passwords work again: nobody is locked out.
+        set_up(&h, &admin, json!({ "enabled": false }), OKTA);
+        assert_eq!(login("mo@acme.test", "password123").status, 200);
+        let r = h.call("GET", "/sso/start", None, &Auth::None);
+        assert!(r.effects.is_empty() && land(&r, None).error() == "not_configured");
+    }
+
+    /// The `sso.linked` events in the admins' activity log, oldest first: who, and how it was matched.
+    fn links_logged(h: &H, admin: &Auth) -> Vec<(String, String)> {
+        let activity = h.ok("GET", "/api/v1/activity?limit=100", None, admin);
+        let mut links: Vec<(String, String)> = activity["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["event"] == "sso.linked")
+            .map(|e| {
+                (
+                    e["actor"]["id"].as_str().unwrap_or_default().to_string(),
+                    e["data"]["matched_by"].as_str().unwrap_or_default().to_string(),
+                )
+            })
+            .collect();
+        links.reverse();
+        links
+    }
+
+    #[test]
+    fn links_finish_only_in_the_session_that_started_them() {
+        let (h, admin) = workspace();
+        let (mo_id, _) = h.user(&admin, "mo@acme.test", "Mo", "member");
+        okta(&h, &admin, json!({}));
+        let session = |auth: &Auth| match auth {
+            Auth::Cookie(c) => format!("dumbslab_session={c}"),
+            _ => unreachable!(),
+        };
+        // Starts linking in `auth`'s session; returns the provider's sign-in URL's query.
+        let start_link = |auth: &Auth| {
+            let r = h.call("POST", "/api/v1/me/sso", None, auth);
+            assert_eq!(r.status, 200, "{}", r.body);
+            let (finish, _) = drive(&h, job_of(&r), &|_| ok(discovery(OKTA)));
+            let Finish::Fill(v) = finish else { panic!("{finish:?}") };
+            query_of(v["authorize_url"].as_str().unwrap())
+        };
+        // The provider sends the browser, signed in as `auth`, back.
+        let come_back_to = |auth: &Auth, q: &std::collections::HashMap<String, String>| {
+            h.send(&callback_request(&format!("code=c&state={}", urlencoding::encode(&q["state"])), &[session(auth)]))
+        };
+        let answer = |r: &Res, q: &std::collections::HashMap<String, String>| {
+            if r.effects.is_empty() {
+                return land(r, None);
+            }
+            let id = jwt(&claims(OKTA, "okta-mo", "mo@acme.test", json!({ "nonce": q["nonce"] })));
+            let (finish, _) = drive(&h, job_of(r), &|c| tokens(c, &id));
+            land(r, Some(finish))
+        };
+        let linked = || count(&h, "SELECT COUNT(*) FROM sso_identities");
+        let sign_out = |auth: &Auth| assert_eq!(h.call("POST", "/api/v1/auth/logout", None, auth).status, 200);
+
+        // Started in session A, which is then signed out (say it was stolen and revoked):
+        // finishing in Mo's other session B is refused, so the pending link dies with A.
+        let a = sign_in(&h, "mo@acme.test", "password123");
+        let b = sign_in(&h, "mo@acme.test", "password123");
+        let q = start_link(&a);
+        sign_out(&a);
+        let landing = answer(&come_back_to(&b, &q), &q);
+        assert_eq!(landing.location, "https://kb.test/settings/profile?sso_error=other_session");
+        assert_eq!(linked(), 0);
+        // Another live session of the same person can't finish it either.
+        let c = sign_in(&h, "mo@acme.test", "password123");
+        let q = start_link(&b);
+        assert_eq!(answer(&come_back_to(&c, &q), &q).error(), "other_session");
+        assert_eq!(linked(), 0);
+        // Signed out after the provider answered but before the link is made: still refused.
+        let q = start_link(&b);
+        let r = come_back_to(&b, &q);
+        assert!(!r.effects.is_empty(), "the callback itself was fine");
+        sign_out(&b);
+        assert_eq!(answer(&r, &q).error(), "other_session");
+        assert_eq!(linked(), 0);
+        // The same session, still signed in, links.
+        let q = start_link(&c);
+        let landing = answer(&come_back_to(&c, &q), &q);
+        assert_eq!(landing.location, "https://kb.test/settings/profile?sso_linked=1");
+        assert_eq!(linked(), 1);
+        assert_eq!(links_logged(&h, &admin), vec![(mo_id, "self".to_string())]);
+    }
+
+    #[test]
+    fn a_client_secret_the_server_cant_read_turns_sso_off() {
+        let (mut h, admin) = workspace();
+        h.user(&admin, "mo@acme.test", "Mo", "member");
+        okta(&h, &admin, json!({ "require_sso": true }));
+        let login = |h: &H| {
+            h.call("POST", "/api/v1/auth/login", Some(json!({ "email": "mo@acme.test", "password": "password123" })), &Auth::None).status
+        };
+        assert_eq!(login(&h), 403);
+        assert!(h.ok("GET", "/api/v1/sso", None, &admin)["client_secret_unreadable"] == false);
+
+        // The server's connector key changes: the secret sealed with the old one can't be read.
+        h.cfg.connectors.key = Some("a-rotated-connector-key".into());
+        let s = h.ok("GET", "/api/v1/sso", None, &admin);
+        assert_eq!(
+            (s["active"].as_bool(), s["enabled"].as_bool(), s["client_secret_set"].as_bool(), s["client_secret_unreadable"].as_bool()),
+            (Some(false), Some(true), Some(true), Some(true)),
+            "{s}"
+        );
+        // So single sign-on is off: no button, no sign-ins, and passwords work for everyone.
+        assert!(h.ok("GET", "/api/v1/auth/state", None, &Auth::None)["sso"].is_null());
+        let r = h.call("GET", "/sso/start", None, &Auth::None);
+        assert!(r.effects.is_empty() && land(&r, None).error() == "not_configured");
+        assert_eq!(login(&h), 200, "Require SSO doesn't lock people out while SSO can't work");
+
+        // Saving it on without the secret says to enter it again; entering it turns it back on.
+        let r = h.call("PATCH", "/api/v1/sso", Some(json!({ "auto_provision": false })), &admin);
+        assert_eq!(r.status, 400);
+        assert!(r.body["error"]["message"].as_str().unwrap().contains("`client_secret` again"), "{}", r.body);
+        let v = set_up(&h, &admin, json!({ "client_secret": "shh-client-secret" }), OKTA);
+        assert_eq!((v["active"].as_bool(), v["client_secret_unreadable"].as_bool()), (Some(true), Some(false)));
+        assert_eq!(h.ok("GET", "/api/v1/auth/state", None, &Auth::None)["sso"]["required"], true);
+        assert_eq!(login(&h), 403);
+    }
+
+    #[test]
+    fn userinfo_can_vouch_for_the_id_tokens_email() {
+        let (h, admin) = workspace();
+        let (mo_id, _) = h.user(&admin, "mo@acme.test", "Mo", "member");
+        okta(&h, &admin, json!({}));
+        // The ID token gives Mo's address but doesn't say whether it's verified.
+        let id_token = || claims(OKTA, "sub-mo", "mo@acme.test", json!({}));
+        let provider = |info: HttpReply| {
+            move |call: &HttpCall, jwt: &str| {
+                if call.url.ends_with("/userinfo") {
+                    assert!(call.headers.contains(&("authorization".into(), "Bearer provider-access-token".into())));
+                    info.clone()
+                } else {
+                    tokens(call, jwt)
+                }
+            }
+        };
+        let sign_in = |info: HttpReply, c: Value| {
+            let s = start(&h, OKTA);
+            come_back(&h, &s, c, &provider(info))
+        };
+        let refused = |info: HttpReply, c: Value| {
+            let (landing, sent) = sign_in(info, c);
+            assert!(landing.session().is_none());
+            (landing.error(), sent.len())
+        };
+
+        // An answer about another account, or another address, vouches for nothing.
+        let other_account = ok(json!({ "sub": "sub-eve", "email": "mo@acme.test", "email_verified": true }));
+        assert_eq!(refused(other_account, id_token()), ("unverified_email".to_string(), 2));
+        let other_address = ok(json!({ "sub": "sub-mo", "email": "eve@acme.test", "email_verified": true }));
+        assert_eq!(refused(other_address, id_token()), ("unverified_email".to_string(), 2));
+        // No answer at all (or one that isn't JSON): the ID token alone decides.
+        assert_eq!(refused(HttpReply::default(), id_token()), ("unverified_email".to_string(), 2));
+        assert_eq!(
+            refused(HttpReply { status: 200, body: "eyJhbGciOiJSUzI1NiJ9.e30.c2ln".into() }, id_token()),
+            ("unverified_email".to_string(), 2)
+        );
+        // An ID token that says the address isn't verified isn't overruled, so nobody asks.
+        let unverified = claims(OKTA, "sub-mo", "mo@acme.test", json!({ "email_verified": false }));
+        let verified_answer = || ok(json!({ "sub": "sub-mo", "email": "MO@acme.test", "email_verified": true }));
+        assert_eq!(refused(verified_answer(), unverified), ("unverified_email".to_string(), 1));
+        assert_eq!(count(&h, "SELECT COUNT(*) FROM sso_identities"), 0);
+
+        // The same account vouching for the same address: Mo is matched and linked.
+        let (landing, sent) = sign_in(verified_answer(), id_token());
+        assert_eq!(sent.len(), 2);
+        assert!(sent[1].url.ends_with("/userinfo"));
+        assert_eq!(me(&h, &landing.session().unwrap_or_else(|| panic!("{}", landing.error())))["id"], mo_id.as_str());
+        // Linked now, so later sign-ins don't need to ask.
+        let (landing, sent) = sign_in(HttpReply::default(), id_token());
+        assert!(landing.session().is_some());
+        assert_eq!(sent.len(), 1);
+    }
+
+    #[test]
+    fn saving_settings_keeps_its_webhooks_next_to_the_check() {
+        let (h, admin) = workspace();
+        h.ok("POST", "/api/v1/webhooks", Some(json!({ "url": "https://hooks.test/dumbslab", "events": ["sso.*"] })), &admin);
+        let r = h.call(
+            "PATCH",
+            "/api/v1/sso",
+            Some(json!({ "provider": "okta", "issuer": OKTA, "client_id": "app-id", "client_secret": "shh-client-secret" })),
+            &admin,
+        );
+        assert_eq!(r.status, 200, "{}", r.body);
+        // One job (the discovery check) and the `sso.updated` delivery, which hosts send after the job.
+        let jobs = r.effects.iter().filter(|e| matches!(e, Effect::Connect(_))).count();
+        let hooks: Vec<_> = r
+            .effects
+            .iter()
+            .filter_map(|e| match e {
+                Effect::Webhook(d) => Some(d),
+                _ => None,
+            })
+            .collect();
+        assert_eq!((jobs, hooks.len()), (1, 1), "{:?}", r.effects);
+        assert!(hooks[0].headers.contains(&("x-dumbslab-event".into(), "sso.updated".into())));
+        assert!(!hooks[0].body.contains("shh-client-secret"));
+        // Connected apps' requests are unchanged: just their job.
+        let r = h.call("POST", "/api/v1/connections", Some(json!({ "app": "github", "fields": { "token": "ghp_x" } })), &admin);
+        assert_eq!(r.effects.len(), 1);
+        assert!(matches!(r.effects[0], Effect::Connect(_)));
+    }
+}
