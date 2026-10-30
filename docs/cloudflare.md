@@ -14,6 +14,25 @@ There are two modes:
 | Hosted, like dumbslab.com | `"true"` | The root domain is a sign-up site. Anyone can create a workspace at `name.your-domain`. |
 | One private workspace | `"false"` | Your whole domain is a single workspace, created with a setup token. |
 
+## Automatic production deploys
+
+On a push to `main`, the GitHub Actions `deploy` job waits for the `check` job
+and runs Wrangler from `crates/worker`. Pull requests never deploy.
+
+Set these repository Actions secrets before merging the workflow:
+
+- `CLOUDFLARE_ACCOUNT_ID`: the account that owns the Worker and zone.
+- `CLOUDFLARE_API_TOKEN`: a dedicated API token scoped to that account and the
+  `dumbslab.com` zone. Grant Account / Workers Scripts / Edit and Zone / Workers
+  Routes / Edit, plus Account / Account Settings / Read and Zone / Zone / Read.
+  Static assets and Durable Objects ship with the Worker. Do not use a global
+  API key or an interactive Wrangler OAuth token.
+
+Keep runtime secrets in the Worker; they do not belong in GitHub Actions.
+After merging, confirm the deploy job succeeds and compare the commit returned
+by `https://dumbslab.com/healthz` with the merged commit (once build metadata
+support is merged). Do not trigger a manual production deploy to test a PR.
+
 ## Requirements
 
 - A Cloudflare account on the **Workers Paid** plan. Password hashing (Argon2) needs more than the free plan's 10 ms of CPU per request.

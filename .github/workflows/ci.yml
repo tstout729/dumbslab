@@ -24,3 +24,35 @@ jobs:
       - run: cargo test -p dumbslab-core -p dumbslab
       - name: Check web app scripts parse
         run: for f in $(find web -name '*.js'); do cp "$f" /tmp/check.mjs && node --check /tmp/check.mjs || exit 1; done
+
+  deploy:
+    needs: check
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    concurrency:
+      group: production-worker
+      cancel-in-progress: false
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Check deploy credentials
+        shell: bash
+        run: |
+          test -n "$CLOUDFLARE_API_TOKEN" || { echo 'Missing CLOUDFLARE_API_TOKEN repository secret'; exit 1; }
+          test -n "$CLOUDFLARE_ACCOUNT_ID" || { echo 'Missing CLOUDFLARE_ACCOUNT_ID repository secret'; exit 1; }
+      - name: Install Worker build tool
+        run: cargo install worker-build --version 0.8.7 --locked
+      - name: Deploy Worker
+        working-directory: crates/worker
+        run: npx --yes wrangler@4.156.0 deploy
