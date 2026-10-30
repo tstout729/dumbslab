@@ -29,12 +29,13 @@ const EVENT_ICON = {
   import: 'download',
 };
 
-const VIA_LABEL = { web: 'Web', api: 'API', mcp: 'MCP', cli: 'CLI' };
+const VIA_LABEL = { web: 'Web', api: 'API', mcp: 'MCP', cli: 'CLI', slack: 'Slack' };
 const VIA_TITLE = {
   web: 'Done in the web app',
   api: 'Done through the REST API',
   mcp: 'Done by an agent through MCP',
   cli: 'Done from the command line',
+  slack: 'Done from Slack with /dumbslab',
 };
 
 export function viaBadge(via) {

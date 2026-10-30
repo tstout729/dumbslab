@@ -55,6 +55,8 @@ pub enum Via {
     Api,
     Mcp,
     Cli,
+    /// Slack's `/dumbslab` command (see `crate::slack`).
+    Slack,
 }
 
 impl Via {
@@ -64,6 +66,7 @@ impl Via {
             Via::Api => "api",
             Via::Mcp => "mcp",
             Via::Cli => "cli",
+            Via::Slack => "slack",
         }
     }
 }

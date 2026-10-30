@@ -917,6 +917,8 @@ pub enum Job {
     Search(SearchJob),
     Preview(PreviewJob),
     Connect(ConnectJob),
+    /// Slack's slash command, link previews and settings (see [`crate::slack`]).
+    Slack(crate::slack::SlackJob),
 }
 
 #[derive(Clone, Debug)]
@@ -1177,6 +1179,18 @@ pub fn step(db: &dyn Db, cfg: &HostConfig, job: &mut Job, replies: Vec<HttpReply
         Job::Search(j) => search_step(db, cfg, j, replies, now),
         Job::Preview(j) => preview_step(db, cfg, j, replies, now),
         Job::Connect(j) => connect_step(db, cfg, j, replies, now),
+        Job::Slack(j) => crate::slack::step(db, cfg, j, replies, now),
+    }
+}
+
+impl Job {
+    /// What the job's operations left for the host to deliver once it finishes, like a request's
+    /// own effects: a draft started from Slack has webhooks to send.
+    pub fn take_effects(&mut self) -> Vec<crate::Effect> {
+        match self {
+            Job::Slack(j) => j.take_effects(),
+            _ => vec![],
+        }
     }
 }
 

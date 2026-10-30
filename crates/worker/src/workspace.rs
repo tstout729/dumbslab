@@ -330,6 +330,8 @@ impl Workspace {
                     break;
                 }
                 Ok(Step::Done(done)) => {
+                    // A job's operations can leave webhooks to send (a draft started from Slack).
+                    self.send_webhooks(job.take_effects());
                     finish = done;
                     break;
                 }
@@ -597,6 +599,15 @@ impl DurableObject for Workspace {
             }
         }
 
+        self.send_webhooks(effects);
+        to_response(outcome.response)
+    }
+}
+
+impl Workspace {
+    /// Sends webhook deliveries (Slack channel messages among them) after the response, and
+    /// records how each went.
+    fn send_webhooks(&self, effects: Vec<Effect>) {
         for effect in effects {
             let Effect::Webhook(d) = effect else { continue };
             let db = self.db();
@@ -619,8 +630,6 @@ impl DurableObject for Workspace {
                 let _ = dumbslab_core::record_webhook_result(&db, &d.webhook_id, status, error.as_deref());
             });
         }
-
-        to_response(outcome.response)
     }
 }
 

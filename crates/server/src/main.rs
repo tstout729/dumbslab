@@ -519,7 +519,11 @@ async fn run_job(app: &Arc<App>, mut job: connect::Job) -> connect::Finish {
         job = next;
         match step {
             Err(e) => return connect::Finish::Fail(e),
-            Ok(connect::Step::Done(finish)) => return finish,
+            Ok(connect::Step::Done(finish)) => {
+                // A job's operations can leave webhooks to send (a draft started from Slack).
+                deliver(app.clone(), job.take_effects());
+                return finish;
+            }
             Ok(connect::Step::Fetch(calls)) => {
                 // All at once; answers keep the requests' order.
                 let allow = app.allow_private_webhooks;

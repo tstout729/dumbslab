@@ -96,6 +96,7 @@ pub fn emit(ctx: &mut Ctx, e: Event) -> ApiResult<i64> {
         ],
     )?;
     let id = row.map(|r| r.i64("id")).unwrap_or_default();
+    crate::slack::on_event(ctx, e.event, e.post_id)?;
 
     let hooks = ctx.db.query("SELECT id, url, secret, events FROM webhooks WHERE active = 1", &[])?;
     if hooks.is_empty() {

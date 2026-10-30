@@ -2692,3 +2692,534 @@ mod connected {
         assert!(v["apps"][0]["error"].as_str().unwrap().contains("connect it again"), "{v}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Slack. The tests play Slack (signed requests, and canned answers from its API) and the host.
+
+mod slack {
+    use super::*;
+    use dumbslab_core::connect::{self, Finish, HttpCall, HttpReply, Job, Step};
+    use dumbslab_core::util::hmac_sha256_hex;
+
+    const SECRET: &str = "8f742231b10e8888abcd99yyyzzz85a5";
+    const TOKEN: &str = "xoxb-1-secret-bot-token";
+
+    fn job_of(r: &Res) -> Option<Job> {
+        r.effects.iter().find_map(|e| match e {
+            Effect::Connect(j) => Some(j.clone()),
+            _ => None,
+        })
+    }
+
+    /// Runs a job with Slack's canned answers: how it finished, every call it made, and the
+    /// effects it left for the host.
+    fn drive(h: &H, mut job: Job) -> (Finish, Vec<HttpCall>, Vec<Effect>) {
+        let mut replies = vec![];
+        let mut sent = vec![];
+        for _ in 0..connect::MAX_STEPS {
+            let (step, next) = h
+                .store
+                .with_tx(|db| {
+                    let step = connect::step(db, &h.cfg, &mut job, replies.clone(), chrono::Utc::now());
+                    let ok = step.is_ok();
+                    ((step, job.clone()), ok)
+                })
+                .unwrap();
+            job = next;
+            match step.unwrap() {
+                Step::Done(f) => return (f, sent, job.take_effects()),
+                Step::Fetch(calls) => {
+                    replies = calls.iter().map(slack_api).collect();
+                    sent.extend(calls);
+                }
+            }
+        }
+        panic!("job didn't finish");
+    }
+
+    fn person(id: &str, email: &str, confirmed: bool, team: &str) -> HttpReply {
+        let user = json!({ "id": id, "team_id": team, "deleted": false, "is_bot": false, "is_email_confirmed": confirmed,
+            "profile": { "email": email, "real_name": id } });
+        HttpReply { status: 200, body: json!({ "ok": true, "user": user }).to_string() }
+    }
+
+    /// Slack's API for the Slack workspace T1.
+    fn slack_api(call: &HttpCall) -> HttpReply {
+        let ok = |v: Value| HttpReply { status: 200, body: v.to_string() };
+        let url = call.url.as_str();
+        assert!(call.headers.iter().any(|(k, v)| k == "authorization" && v == &format!("Bearer {TOKEN}")), "{url} without the bot token");
+        if url == "https://slack.com/api/auth.test" {
+            return ok(json!({ "ok": true, "team": "Acme Slack", "team_id": "T1", "user_id": "UBOT", "bot_id": "B1" }));
+        }
+        if let Some(user) = url.strip_prefix("https://slack.com/api/users.info?user=") {
+            return match user {
+                "UADA" => person("UADA", "ADA@acme.test", true, "T1"),
+                "UMO" => person("UMO", "mo@acme.test", true, "T1"),
+                "UVI" => person("UVI", "vi@acme.test", true, "T1"),
+                "UGONE" => person("UGONE", "gone@acme.test", true, "T1"),
+                "UNEW" => person("UNEW", "mo@acme.test", false, "T1"),
+                "UOUT" => person("UOUT", "mo@acme.test", true, "T9"),
+                "USTRANGER" => person("USTRANGER", "someone@else.test", true, "T1"),
+                _ => ok(json!({ "ok": false, "error": "user_not_found" })),
+            };
+        }
+        if url == "https://slack.com/api/chat.unfurl" {
+            return ok(json!({ "ok": true }));
+        }
+        if url == "https://slack.com/api/chat.postMessage" {
+            let body: Value = serde_json::from_str(call.body.as_deref().unwrap()).unwrap();
+            return match body["channel"].as_str() {
+                Some("GPRIVATE1") => ok(json!({ "ok": false, "error": "not_in_channel" })),
+                _ => ok(json!({ "ok": true, "ts": "1.2" })),
+            };
+        }
+        HttpReply { status: 404, body: "{}".into() }
+    }
+
+    /// A workspace with Slack connected, and its admin Ada.
+    fn connected() -> (H, Auth) {
+        let mut h = H::new();
+        let (admin, _) = h.setup();
+        h.cfg.connectors.key = Some("connector-key".into());
+        let r = h.call("PATCH", "/api/v1/slack", Some(json!({ "bot_token": TOKEN, "signing_secret": SECRET })), &admin);
+        assert_eq!(r.status, 200, "{}", r.body);
+        let (finish, _, _) = drive(&h, job_of(&r).expect("a job that checks the token"));
+        let Finish::Fill(v) = finish else { panic!("{finish:?}") };
+        assert_eq!((v["connected"].as_bool(), v["slack_workspace"].as_str()), (Some(true), Some("Acme Slack")), "{v}");
+        (h, admin)
+    }
+
+    fn signed_at(path: &str, body: &str, content_type: &str, at: i64, secret: &str) -> Request {
+        let signature = format!("v0={}", hmac_sha256_hex(secret, &format!("v0:{at}:{body}")));
+        Request {
+            method: "POST".into(),
+            path: path.into(),
+            headers: vec![
+                ("content-type".into(), content_type.into()),
+                ("x-slack-request-timestamp".into(), at.to_string()),
+                ("x-slack-signature".into(), signature),
+            ],
+            body: body.as_bytes().to_vec(),
+            origin: "https://kb.test".into(),
+            ..Default::default()
+        }
+    }
+
+    fn now() -> i64 {
+        chrono::Utc::now().timestamp()
+    }
+
+    fn command_body(user: &str, text: &str) -> String {
+        format!(
+            "token=x&team_id=T1&channel_id=C1&user_id={user}&user_name=x&command=%2Fdumbslab&text={}&response_url=https%3A%2F%2Fhooks.slack.com%2Fcommands%2F1&trigger_id={}",
+            urlencoding::encode(text),
+            dumbslab_core::util::new_id()
+        )
+    }
+
+    /// Sends `/dumbslab {text}` as a Slack user, and the reply once its job ran.
+    fn command(h: &H, user: &str, text: &str) -> Value {
+        let r = h.send(&signed_at("/slack/commands", &command_body(user, text), "application/x-www-form-urlencoded", now(), SECRET));
+        assert_eq!(r.status, 200, "{}", r.body);
+        match job_of(&r) {
+            None => r.body,
+            Some(job) => match drive(h, job).0 {
+                Finish::Fill(v) => connect::fill(r.body.clone(), Ok(v)).unwrap(),
+                other => panic!("{other:?}"),
+            },
+        }
+    }
+
+    fn event(links: &[&str], user: &str, source: &str) -> String {
+        let links: Vec<Value> = links.iter().map(|u| json!({ "url": u, "domain": "kb.test" })).collect();
+        json!({
+            "token": "x", "team_id": "T1", "api_app_id": "A1", "type": "event_callback",
+            "event_id": format!("Ev{}", dumbslab_core::util::new_id()), "event_time": now(),
+            "event": { "type": "link_shared", "channel": "C1", "is_bot_user_member": true, "user": user, "message_ts": "123.456",
+                       "unfurl_id": "U123", "source": source, "links": links },
+        })
+        .to_string()
+    }
+
+    /// Shares links in Slack; the `chat.unfurl` call DumbSlab makes, if any.
+    fn share(h: &H, links: &[&str], user: &str, source: &str) -> Option<Value> {
+        let r = h.send(&signed_at("/slack/events", &event(links, user, source), "application/json", now(), SECRET));
+        assert_eq!(r.status, 200, "{}", r.body);
+        let (_, calls, _) = drive(h, job_of(&r)?);
+        calls.iter().find(|c| c.url.ends_with("/chat.unfurl")).map(|c| serde_json::from_str(c.body.as_deref().unwrap()).unwrap())
+    }
+
+    fn text_of(reply: &Value) -> String {
+        reply.to_string()
+    }
+
+    fn slack_messages(effects: &[Effect]) -> Vec<Value> {
+        effects
+            .iter()
+            .filter_map(|e| match e {
+                Effect::Webhook(d) if d.url == "https://slack.com/api/chat.postMessage" => {
+                    assert!(d.headers.contains(&("authorization".into(), format!("Bearer {TOKEN}"))));
+                    Some(serde_json::from_str(&d.body).unwrap())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn slack_requests_must_be_signed_fresh_and_new() {
+        let mut h = H::new();
+        let (admin, _) = h.setup();
+        let verification = json!({ "token": "x", "challenge": "3eZbrw1aBm2rZgRNFdxV", "type": "url_verification" }).to_string();
+        // Before anyone connects Slack, nothing answers.
+        let r = h.send(&signed_at("/slack/events", &verification, "application/json", now(), SECRET));
+        assert_eq!((r.status, r.body["error"]["code"].as_str()), (404, Some("slack_off")));
+
+        // A signing secret alone is enough for Slack to check the events URL.
+        h.cfg.connectors.key = Some("connector-key".into());
+        h.ok("PATCH", "/api/v1/slack", Some(json!({ "signing_secret": SECRET })), &admin);
+        let r = h.send(&signed_at("/slack/events", &verification, "application/json", now(), SECRET));
+        assert_eq!((r.status, &r.body), (200, &json!({ "challenge": "3eZbrw1aBm2rZgRNFdxV" })));
+        assert_eq!(r.header("cache-control"), Some("no-store"));
+
+        // The same request again is refused: each signature is good once.
+        let other = verification.replace("3eZbrw1aBm2rZgRNFdxV", "another-challenge");
+        let again = signed_at("/slack/events", &other, "application/json", now(), SECRET);
+        assert_eq!(h.send(&again).status, 200);
+        let replayed = h.send(&again);
+        assert_eq!((replayed.status, replayed.body["error"]["code"].as_str()), (401, Some("replayed")));
+
+        let code = |req: &Request| {
+            let r = h.send(req);
+            (r.status, r.body["error"]["code"].as_str().unwrap_or_default().to_string())
+        };
+        let mut unsigned = signed_at("/slack/events", &verification, "application/json", now(), SECRET);
+        unsigned.headers.retain(|(k, _)| k != "x-slack-signature");
+        assert_eq!(code(&unsigned), (401, "unsigned".into()));
+        assert_eq!(
+            code(&signed_at("/slack/events", &verification, "application/json", now(), "another-secret")),
+            (401, "bad_signature".into())
+        );
+        let mut tampered = signed_at("/slack/events", &verification, "application/json", now(), SECRET);
+        tampered.body = verification.replace("3eZbrw1aBm2rZgRNFdxV", "something-else").into_bytes();
+        assert_eq!(code(&tampered), (401, "bad_signature".into()));
+        assert_eq!(
+            code(&signed_at("/slack/events", &verification, "application/json", now() - 301, SECRET)),
+            (401, "stale_request".into())
+        );
+        assert_eq!(
+            code(&signed_at("/slack/events", &verification, "application/json", now() + 301, SECRET)),
+            (401, "stale_request".into())
+        );
+        // Slack only POSTs, keeps its requests small, and reaches only these two paths.
+        let mut get = signed_at("/slack/events", "", "application/json", now(), SECRET);
+        get.method = "GET".into();
+        assert_eq!(code(&get).0, 405);
+        assert_eq!(code(&signed_at("/slack/other", &verification, "application/json", now(), SECRET)).0, 404);
+        assert_eq!(dumbslab_core::http::body_limit("/slack/events"), 64 * 1024);
+        let big = format!("{{\"type\":\"url_verification\",\"challenge\":\"{}\"}}", "x".repeat(70 * 1024));
+        assert_eq!(code(&signed_at("/slack/events", &big, "application/json", now(), SECRET)).0, 413);
+        // No session or token gets past the signature check.
+        let mut with_cookie = unsigned.clone();
+        let Auth::Cookie(c) = &admin else { unreachable!() };
+        with_cookie.headers.push(("cookie".into(), format!("dumbslab_session={c}")));
+        assert_eq!(code(&with_cookie).0, 401);
+    }
+
+    /// Slack sends an event again when an answer was slow, signed anew; it's handled once.
+    #[test]
+    fn slack_events_are_handled_once() {
+        let (h, admin) = connected();
+        let post = h.ok("POST", "/api/v1/posts", Some(json!({ "title": "Retried", "status": "published" })), &admin);
+        let url = post["url"].as_str().unwrap().to_string();
+        let body = event(&[&url], "UADA", "conversations_history");
+        let first = h.send(&signed_at("/slack/events", &body, "application/json", now(), SECRET));
+        assert!(job_of(&first).is_some());
+        let retry = h.send(&signed_at("/slack/events", &body, "application/json", now() + 1, SECRET));
+        assert_eq!((retry.status, job_of(&retry).is_none()), (200, true), "{}", retry.body);
+    }
+
+    #[test]
+    fn slack_search_shows_only_what_the_person_can_see() {
+        let (h, admin) = connected();
+        h.user(&admin, "mo@acme.test", "Mo", "member");
+        let (gone_id, _) = h.user(&admin, "gone@acme.test", "Gone", "member");
+        let topic = h.ok("POST", "/api/v1/topics", Some(json!({ "name": "Leadership", "visibility": "private" })), &admin);
+        let tid = topic["id"].as_str().unwrap();
+        h.ok(
+            "POST",
+            "/api/v1/posts",
+            Some(json!({ "title": "Rotation for everyone", "content": "The on-call rotation & a < b", "status": "published" })),
+            &admin,
+        );
+        h.ok(
+            "POST",
+            "/api/v1/posts",
+            Some(json!({ "title": "Rotation salaries", "content": "Private rotation pay", "status": "published", "topic_ids": [tid] })),
+            &admin,
+        );
+        h.ok("POST", "/api/v1/posts", Some(json!({ "title": "Rotation draft by Ada", "content": "rotation" })), &admin);
+
+        // Mo sees the public post only, in a reply only Mo sees.
+        let reply = command(&h, "UMO", "search rotation");
+        assert_eq!(reply["response_type"], "ephemeral", "{reply}");
+        let text = text_of(&reply);
+        assert!(text.contains("Rotation for everyone"), "{text}");
+        assert!(text.contains("rotation &amp; a &lt; b"), "content is escaped: {text}");
+        assert!(!text.contains("salaries") && !text.contains("draft by Ada"), "{text}");
+        // Ada, an admin, sees the private post and her own draft.
+        let text = text_of(&command(&h, "UADA", "search rotation"));
+        assert!(text.contains("Rotation salaries") && text.contains("Rotation draft by Ada"), "{text}");
+        // Once Mo joins the private topic, Mo finds its post.
+        h.ok("POST", &format!("/api/v1/topics/{tid}/members"), Some(json!({ "user": "mo@acme.test" })), &admin);
+        assert!(text_of(&command(&h, "UMO", "search rotation")).contains("Rotation salaries"));
+
+        // Nobody DumbSlab can match gets anything from the workspace.
+        for user in ["USTRANGER", "UOUT", "UNKNOWN"] {
+            let text = text_of(&command(&h, user, "search rotation"));
+            assert!(text.contains("isn't linked to anyone in Acme"), "{user}: {text}");
+            assert!(!text.contains("Rotation"), "{user}: {text}");
+        }
+        let text = text_of(&command(&h, "UNEW", "search rotation"));
+        assert!(text.contains("hasn't confirmed your email") && !text.contains("Rotation"), "{text}");
+        // A deactivated person is no one either.
+        h.ok("PATCH", &format!("/api/v1/users/{gone_id}"), Some(json!({ "deactivated": true })), &admin);
+        assert!(text_of(&command(&h, "UGONE", "search rotation")).contains("isn't linked"));
+
+        // Anything else gets help; searching needs words.
+        assert!(text_of(&command(&h, "UMO", "")).contains("search &lt;words&gt;"));
+        assert!(text_of(&command(&h, "UMO", "what is this")).contains("new &lt;title&gt;"));
+        assert!(text_of(&command(&h, "UMO", "search")).contains("Add the words"));
+        assert!(text_of(&command(&h, "UMO", "search nothingmatchesthis")).contains("No posts you can see match"));
+    }
+
+    #[test]
+    fn slack_drafts_belong_to_the_person() {
+        let (h, admin) = connected();
+        let (mo_id, mo) = h.user(&admin, "mo@acme.test", "Mo", "member");
+        h.user(&admin, "vi@acme.test", "Vi", "viewer");
+        h.ok("POST", "/api/v1/webhooks", Some(json!({ "url": "https://hooks.test/in", "events": ["post.created"] })), &admin);
+
+        let r = h.send(&signed_at(
+            "/slack/commands",
+            &command_body("UMO", "new Onboarding <!channel>"),
+            "application/x-www-form-urlencoded",
+            now(),
+            SECRET,
+        ));
+        let (finish, _, effects) = drive(&h, job_of(&r).unwrap());
+        let Finish::Fill(reply) = finish else { panic!("{finish:?}") };
+        let text = text_of(&reply);
+        assert!(text.contains("Started a draft") && text.contains("Onboarding &lt;!channel&gt;"), "{text}");
+        let drafts = h.ok("GET", "/api/v1/posts?status=draft&author=me", None, &mo);
+        let draft = drafts["items"].as_array().unwrap().iter().find(|p| p["title"] == "Onboarding <!channel>").expect("Mo's draft").clone();
+        assert_eq!((draft["author"]["id"].as_str(), draft["status"].as_str()), (Some(mo_id.as_str()), Some("draft")));
+        assert!(text.contains(draft["id"].as_str().unwrap()), "the reply links the draft: {text}");
+        // The draft's webhooks go out like any other change's.
+        assert!(effects.iter().any(|e| matches!(e, Effect::Webhook(d) if d.url == "https://hooks.test/in")), "{effects:?}");
+        // Activity shows it came from Slack.
+        let activity = h.ok("GET", "/api/v1/activity?event=post.created", None, &admin);
+        assert_eq!(activity["items"][0]["via"], "slack", "{activity}");
+
+        // A viewer can't write, and is told so.
+        let text = text_of(&command(&h, "UVI", "new Not allowed"));
+        assert!(text.contains("member role"), "{text}");
+        let all = h.ok("GET", "/api/v1/search?q=allowed", None, &admin);
+        assert!(all["items"].as_array().unwrap().is_empty(), "nothing was created");
+        assert!(text_of(&command(&h, "UMO", "new")).contains("Add the draft's title"));
+    }
+
+    #[test]
+    fn slack_previews_only_posts_everyone_can_see() {
+        let (h, admin) = connected();
+        let (_, mo) = h.user(&admin, "mo@acme.test", "Mo", "member");
+        let private = h.ok(
+            "POST",
+            "/api/v1/topics",
+            Some(json!({ "name": "Leadership", "visibility": "private", "members": ["mo@acme.test"] })),
+            &admin,
+        );
+        let public_topic = h.ok("POST", "/api/v1/topics", Some(json!({ "name": "Handbook" })), &admin);
+        let public = h.ok("POST", "/api/v1/posts", Some(json!({ "title": "Expenses <!here>", "content": "File them & smile", "status": "published", "topic_ids": [public_topic["id"]] })), &admin);
+        let secret = h.ok(
+            "POST",
+            "/api/v1/posts",
+            Some(json!({ "title": "Layoff plan", "content": "secret", "status": "published", "topic_ids": [private["id"]] })),
+            &admin,
+        );
+        let draft = h.ok("POST", "/api/v1/posts", Some(json!({ "title": "Mo's draft", "content": "draft" })), &mo);
+        let (pu, su, du) = (public["url"].as_str().unwrap(), secret["url"].as_str().unwrap(), draft["url"].as_str().unwrap());
+
+        // Mo can see all three, but Slack shows previews to the whole channel: only the public one.
+        let call = share(&h, &[pu, su, du, "https://elsewhere.test/p/abc"], "UMO", "conversations_history").expect("a chat.unfurl call");
+        let unfurls = call["unfurls"].as_object().unwrap();
+        assert_eq!(unfurls.keys().collect::<Vec<_>>(), vec![pu], "{call}");
+        let shown = call.to_string();
+        assert!(
+            shown.contains("Expenses &lt;!here&gt;") && shown.contains("File them &amp; smile") && shown.contains("Handbook"),
+            "{shown}"
+        );
+        assert!(!shown.contains("Layoff") && !shown.contains("Leadership") && !shown.contains("Mo's draft"), "{shown}");
+        assert_eq!((call["unfurl_id"].as_str(), call["source"].as_str()), (Some("U123"), Some("conversations_history")));
+
+        // Someone DumbSlab can't match gets no preview, not even a title.
+        assert!(share(&h, &[pu], "USTRANGER", "composer").is_none());
+        assert!(share(&h, &[pu], "UNEW", "composer").is_none());
+        // A private post gets none, whoever shares it.
+        assert!(share(&h, &[su], "UADA", "composer").is_none());
+
+        // Admins can turn previews off.
+        h.ok("PATCH", "/api/v1/slack", Some(json!({ "unfurls": false })), &admin);
+        assert!(share(&h, &[pu], "UMO", "composer").is_none());
+    }
+
+    #[test]
+    fn slack_channels_hear_about_posts_with_escaped_text() {
+        let (h, admin) = connected();
+        let private = h.ok("POST", "/api/v1/topics", Some(json!({ "name": "Leadership", "visibility": "private" })), &admin);
+        let eng = h.ok("POST", "/api/v1/topics", Some(json!({ "name": "Engineering" })), &admin);
+        let sub_private =
+            h.ok("POST", "/api/v1/topics", Some(json!({ "name": "Incidents", "visibility": "private", "parent_id": eng["id"] })), &admin);
+        let all = h.ok("POST", "/api/v1/slack/channels", Some(json!({ "channel": "C0ALLPOSTS", "updated_posts": true })), &admin);
+        h.ok("POST", "/api/v1/slack/channels", Some(json!({ "channel": "#leadership", "topic_id": private["id"] })), &admin);
+        h.ok("POST", "/api/v1/slack/channels", Some(json!({ "channel": "C0ENGINEERING", "topic_id": eng["id"] })), &admin);
+        assert_eq!(h.call("POST", "/api/v1/slack/channels", Some(json!({ "channel": "general chat" })), &admin).status, 400);
+        assert_eq!(
+            h.call("POST", "/api/v1/slack/channels", Some(json!({ "channel": "C0XXXXXXXX", "topic_id": "nope" })), &admin).status,
+            404
+        );
+
+        let to =
+            |r: &Res| -> Vec<String> { slack_messages(&r.effects).iter().map(|m| m["channel"].as_str().unwrap().to_string()).collect() };
+        // A published post everyone can see goes to the channel for every post, with its text escaped.
+        let r = h.call(
+            "POST",
+            "/api/v1/posts",
+            Some(json!({ "title": "<!channel> & <@U1> ship it", "content": "Deploy <https://evil.test|here>", "status": "published", "topic_ids": [eng["id"]] })),
+            &admin,
+        );
+        assert_eq!(to(&r), vec!["C0ALLPOSTS", "C0ENGINEERING"]);
+        let message = &slack_messages(&r.effects)[0];
+        let shown = message.to_string();
+        assert!(!shown.contains("<!channel>") && !shown.contains("<@U1>") && !shown.contains("<https://evil.test"), "{shown}");
+        assert!(message["text"].as_str().unwrap().contains("&lt;!channel&gt; &amp; &lt;@U1&gt; ship it"), "{message}");
+        assert_eq!((message["parse"].as_str(), message["unfurl_links"].as_bool()), (Some("none"), Some(false)));
+        assert!(message["blocks"].as_array().unwrap().iter().all(|b| b.to_string().contains("\"verbatim\":true")), "{message}");
+        let id = r.body["id"].as_str().unwrap().to_string();
+        assert!(shown.contains(&format!("https://kb.test/p/{id}/")), "it links the post: {shown}");
+
+        // A private topic's post goes only where an admin picked that topic.
+        let r = h.call(
+            "POST",
+            "/api/v1/posts",
+            Some(json!({ "title": "Board notes", "status": "published", "topic_ids": [private["id"]] })),
+            &admin,
+        );
+        assert_eq!(to(&r), vec!["#leadership"]);
+        assert!(slack_messages(&r.effects)[0].to_string().contains("Leadership"));
+        // A private subtopic wasn't picked with its parent.
+        let r = h.call(
+            "POST",
+            "/api/v1/posts",
+            Some(json!({ "title": "Outage", "status": "published", "topic_ids": [sub_private["id"]] })),
+            &admin,
+        );
+        assert!(to(&r).is_empty(), "{:?}", to(&r));
+
+        // Drafts stay quiet until they're published.
+        let r = h.call("POST", "/api/v1/posts", Some(json!({ "title": "Later", "topic_ids": [eng["id"]] })), &admin);
+        assert!(to(&r).is_empty());
+        let later = r.body["id"].as_str().unwrap().to_string();
+        let r =
+            h.call("PATCH", &format!("/api/v1/posts/{later}"), Some(json!({ "status": "published", "content": "Now with words" })), &admin);
+        assert_eq!(to(&r), vec!["C0ALLPOSTS", "C0ENGINEERING"], "one message per channel, even with an edit");
+        assert!(slack_messages(&r.effects)[0].to_string().contains("Published by Ada Admin"));
+        // Updates go only where they're wanted.
+        let r = h.call("PATCH", &format!("/api/v1/posts/{later}"), Some(json!({ "content": "Edited" })), &admin);
+        assert_eq!(to(&r), vec!["C0ALLPOSTS"]);
+        assert!(slack_messages(&r.effects)[0].to_string().contains("Updated by Ada Admin"));
+        h.ok("PATCH", &format!("/api/v1/slack/channels/{}", all["id"].as_str().unwrap()), Some(json!({ "updated_posts": false })), &admin);
+        assert!(to(&h.call("PATCH", &format!("/api/v1/posts/{later}"), Some(json!({ "content": "Again" })), &admin)).is_empty());
+
+        // A bulk import sends a few messages per channel, not hundreds.
+        let docs: Vec<Value> = (0..20).map(|i| json!({ "title": format!("Imported {i}"), "content": "x" })).collect();
+        let r = h.call("POST", "/api/v1/import", Some(json!({ "documents": docs })), &admin);
+        assert_eq!(to(&r), vec!["C0ALLPOSTS"; 3]);
+
+        // The test message reports whether Slack took it.
+        let test = |channel: &str| {
+            let channels = h.ok("GET", "/api/v1/slack", None, &admin)["channels"].clone();
+            let id = channels.as_array().unwrap().iter().find(|c| c["channel"] == channel).unwrap()["id"].as_str().unwrap().to_string();
+            let r = h.call("POST", &format!("/api/v1/slack/channels/{id}/test"), None, &admin);
+            assert_eq!(r.status, 200, "{}", r.body);
+            drive(&h, job_of(&r).unwrap()).0
+        };
+        assert!(matches!(test("C0ALLPOSTS"), Finish::Fill(ref v) if v["ok"] == true));
+        let private_channel =
+            h.ok("POST", "/api/v1/slack/channels", Some(json!({ "channel": "GPRIVATE1", "topic_id": private["id"] })), &admin)["id"]
+                .clone();
+        assert!(matches!(test("GPRIVATE1"), Finish::Fail(ref e) if e.message.contains("/invite @dumbslab")));
+        h.ok("DELETE", &format!("/api/v1/slack/channels/{}", private_channel.as_str().unwrap()), None, &admin);
+
+        // Without the bot token, nothing goes to Slack.
+        h.ok("DELETE", "/api/v1/slack", None, &admin);
+        let r = h.call("POST", "/api/v1/posts", Some(json!({ "title": "Quiet", "status": "published" })), &admin);
+        assert!(to(&r).is_empty());
+    }
+
+    #[test]
+    fn slack_secrets_are_never_returned() {
+        let (h, admin) = connected();
+        let (_, mo) = h.user(&admin, "mo@acme.test", "Mo", "member");
+        let leaks = |what: &str, text: &str| {
+            assert!(!text.contains(TOKEN) && !text.contains(SECRET), "{what} shows a secret: {text}");
+        };
+        let settings = h.ok("GET", "/api/v1/slack", None, &admin);
+        leaks("get_slack", &settings.to_string());
+        assert_eq!((settings["bot_token_saved"].as_bool(), settings["signing_secret_saved"].as_bool()), (Some(true), Some(true)));
+        assert_eq!(settings["manifest"]["features"]["slash_commands"][0]["url"], "https://kb.test/slack/commands");
+        assert_eq!(settings["manifest"]["features"]["unfurl_domains"], json!(["kb.test"]));
+        leaks("update_slack", &h.ok("PATCH", "/api/v1/slack", Some(json!({ "unfurls": true })), &admin).to_string());
+        leaks("export", &h.ok("GET", "/api/v1/export", None, &admin).to_string());
+        leaks("activity", &h.ok("GET", "/api/v1/activity", None, &admin).to_string());
+        let mcp = h.mcp(
+            &admin,
+            "",
+            json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": { "name": "get_slack", "arguments": {} } }),
+        );
+        leaks("MCP", &mcp.body.to_string());
+        // Stored encrypted.
+        let stored = db_run(&h, |db| db.one("SELECT bot_token, signing_secret FROM slack_app", &[])).unwrap();
+        leaks("the database", &format!("{} {}", stored.str("bot_token"), stored.str("signing_secret")));
+        // Only admins see Slack's settings.
+        assert_eq!(h.call("GET", "/api/v1/slack", None, &mo).status, 403);
+        assert_eq!(h.call("PATCH", "/api/v1/slack", Some(json!({ "unfurls": false })), &mo).status, 403);
+
+        // A token Slack refuses, or that isn't a bot token, changes nothing.
+        assert_eq!(h.call("PATCH", "/api/v1/slack", Some(json!({ "bot_token": "xoxp-user-token" })), &admin).status, 400);
+        assert_eq!(h.call("PATCH", "/api/v1/slack", Some(json!({ "signing_secret": "short" })), &admin).status, 400);
+        let r = h.call("PATCH", "/api/v1/slack", Some(json!({ "bot_token": "xoxb-revoked" })), &admin);
+        let mut job = job_of(&r).unwrap();
+        let checked = h.store.with_tx(|db| {
+            let s = connect::step(db, &h.cfg, &mut job, vec![], chrono::Utc::now());
+            (s, true)
+        });
+        assert!(matches!(checked, Ok(Ok(Step::Fetch(_)))));
+        let refused = HttpReply { status: 200, body: json!({ "ok": false, "error": "invalid_auth" }).to_string() };
+        let done = h.store.with_tx(|db| (connect::step(db, &h.cfg, &mut job, vec![refused], chrono::Utc::now()), true)).unwrap().unwrap();
+        assert!(matches!(done, Step::Done(Finish::Fail(ref e)) if e.message.contains("didn't accept that bot token")), "{done:?}");
+        // The working token stays.
+        let r = h.send(&signed_at("/slack/commands", &command_body("UMO", "search x"), "application/x-www-form-urlencoded", now(), SECRET));
+        assert!(job_of(&r).is_some());
+
+        // Without the connector key, secrets can't be kept.
+        let mut h = h;
+        h.cfg.connectors.key = None;
+        assert_eq!(h.call("PATCH", "/api/v1/slack", Some(json!({ "signing_secret": SECRET })), &admin).status, 503);
+        let settings = h.ok("GET", "/api/v1/slack", None, &admin);
+        assert_eq!((settings["available"].as_bool(), settings["connected"].as_bool()), (Some(false), Some(false)));
+        // And nothing can be verified: Slack's requests are refused.
+        let r = h.send(&signed_at("/slack/commands", &command_body("UMO", "search x"), "application/x-www-form-urlencoded", now(), SECRET));
+        assert_eq!(r.status, 404);
+    }
+}

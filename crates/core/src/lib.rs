@@ -27,6 +27,7 @@ pub mod plan;
 pub mod registry;
 pub mod search;
 pub mod seed;
+pub mod slack;
 pub mod tenancy;
 pub mod util;
 
@@ -131,13 +132,21 @@ impl Response {
     }
 }
 
-/// A webhook the host must deliver after the transaction commits.
-#[derive(Clone, Debug)]
+/// A webhook the host must deliver after the transaction commits. Slack channel messages are
+/// deliveries too, to `chat.postMessage` with the bot token (see [`slack::on_event`]).
+#[derive(Clone)]
 pub struct WebhookDelivery {
     pub webhook_id: String,
     pub url: String,
     pub headers: Vec<(String, String)>,
     pub body: String,
+}
+
+// Headers can carry a bot token; never print them.
+impl std::fmt::Debug for WebhookDelivery {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WebhookDelivery").field("webhook_id", &self.webhook_id).finish_non_exhaustive()
+    }
 }
 
 /// Hosted workspaces only: an admin asked to move the workspace from `from` to `to`. The host
@@ -171,6 +180,10 @@ pub struct Outcome {
 
 /// Records the result of a webhook delivery. Call it in its own transaction.
 pub fn record_webhook_result(db: &dyn Db, webhook_id: &str, status: Option<u16>, error: Option<&str>) -> ApiResult<()> {
+    // Slack channel messages have no webhook to record them on.
+    if webhook_id.starts_with("slack:") {
+        return Ok(());
+    }
     db.execute(
         "UPDATE webhooks SET last_delivery_at = ?, last_status = ?, last_error = ? WHERE id = ?",
         &params![util::ts(chrono::Utc::now()), status.map(|s| s as i64), error, webhook_id],
