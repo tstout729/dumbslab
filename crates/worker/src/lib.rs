@@ -15,6 +15,7 @@
 mod billing;
 mod connect;
 mod directory;
+mod reporting;
 mod sql;
 mod workspace;
 
@@ -33,7 +34,24 @@ use crate::sql::{call_object, error_response, flag, json_response, read_body, va
 use crate::workspace::{ALIAS_HEADER, HOME_HEADER, WORKSPACE_HEADER};
 
 #[event(fetch)]
-async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
+async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
+    let destination = var(&env, "SENTRY_DSN").and_then(|dsn| reporting::Destination::parse(&dsn));
+    let result = handle_fetch(req, env).await;
+    let failure = match &result {
+        Err(_) => Some(reporting::Failure::Runtime),
+        Ok(response) if response.status_code() >= 500 => Some(reporting::Failure::ServerResponse),
+        _ => None,
+    };
+    if let (Some(destination), Some(failure)) = (destination, failure) {
+        ctx.wait_until(async move {
+            // Never log transport errors: they can contain the DSN.
+            let _ = reporting::send(destination, failure).await;
+        });
+    }
+    result
+}
+
+async fn handle_fetch(req: Request, env: Env) -> Result<Response> {
     let url = req.url()?;
     // Passwords, sign-up links and session cookies never travel over plain HTTP.
     if let Some(target) = tenancy::https_upgrade(url.as_str()) {

@@ -160,3 +160,27 @@ The `dev` environment runs hosted mode on `localhost` with throwaway secrets: op
 
 - Admins can export a workspace as JSON with the `export_workspace` operation: `GET /api/v1/export`.
 - Durable Objects support point-in-time recovery for 30 days. See Cloudflare's [PITR API](https://developers.cloudflare.com/durable-objects/api/sqlite-storage-api/#pitr-point-in-time-recovery-api).
+
+## Optional Sentry error reporting
+
+Set `SENTRY_DSN` as a Worker secret (or in your untracked local `.dev.vars`) to
+report failed Worker requests and HTTP 5xx responses, including failures returned
+by workspace and directory Durable Objects. Leave it unset to disable reporting.
+Use an HTTPS DSN with a public key and numeric project ID; malformed values disable
+reporting. The hosted Sentry project is `164-investments-llc/dumbslab` (Rust). Runtime
+activation is deferred until the user merges/deploys: adding a Wrangler secret
+creates a Worker version, so do not set it during a code-only change. Keep the
+DSN private and configure it as part of that separately authorized release.
+
+The Worker sends minimal Sentry envelopes directly, without a browser or native
+SDK. Events contain a random event ID, fixed failure category, app version and
+logger name. They include no raw error text, stack traces, URLs, request bodies,
+headers, workspace names, user identifiers or breadcrumbs. Categories distinguish
+runtime failures from HTTP 5xx responses; they deliberately do not identify the
+underlying exception. Panics/traps and errors swallowed by the application are
+not captured. Successful requests and HTTP 4xx responses are not reported.
+
+Delivery uses `wait_until` and is best effort, with no retries; delivery failures
+never replace an application's response and are not logged. Redirects are not
+followed. This integration does not configure Sentry, enable reporting for the
+native server, or alter deployment settings.
