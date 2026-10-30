@@ -42,6 +42,9 @@ pub struct Workspace {
     migrated: Cell<bool>,
     alias: RefCell<Option<String>>,
     moving: Cell<bool>,
+    /// Set when an operator disables this address before anyone set it up. A sign-up that passed
+    /// its directory check just before then is still in flight here, and must not finish.
+    setup_blocked: Cell<bool>,
 }
 
 fn rust_err(e: ApiError) -> worker::Error {
@@ -142,6 +145,7 @@ impl Workspace {
             }
             "/_internal/disable" | "/_internal/enable" => {
                 if !matches!(self.stored()?, Stored::Workspace) {
+                    self.setup_blocked.set(path.ends_with("disable"));
                     return error_response(404, "no_workspace", "no workspace here");
                 }
                 self.migrate()?;
@@ -248,7 +252,14 @@ impl Workspace {
 
 impl DurableObject for Workspace {
     fn new(state: State, env: Env) -> Self {
-        Self { state, env, migrated: Cell::new(false), alias: RefCell::new(None), moving: Cell::new(false) }
+        Self {
+            state,
+            env,
+            migrated: Cell::new(false),
+            alias: RefCell::new(None),
+            moving: Cell::new(false),
+            setup_blocked: Cell::new(false),
+        }
     }
 
     async fn fetch(&self, mut req: Request) -> Result<Response> {
@@ -310,6 +321,10 @@ impl DurableObject for Workspace {
                 // A workspace may have moved to this address while the check was running.
                 if !matches!(self.stored()?, Stored::Nothing) {
                     return error_response(409, "conflict", "This address was just taken. Start again from the sign-up page.");
+                }
+                // Or an operator disabled it. Nothing awaits between here and the commit.
+                if self.setup_blocked.get() {
+                    return error_response(403, "forbidden", "This sign-up link is no longer valid. Start again from the sign-up page.");
                 }
                 creating = true;
             } else {

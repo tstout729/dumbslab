@@ -10,10 +10,13 @@ use serde::{Deserialize, Serialize};
 use crate::db::{Db, DbExt};
 use crate::error::{ApiError, ApiResult};
 use crate::util::{parse_ts, sha256_hex, ts};
-use crate::{Request, params};
+use crate::{HostConfig, Request, params};
 
 pub const SESSION_COOKIE: &str = "dumbslab_session";
 pub const SESSION_DAYS: i64 = 30;
+/// Browser sessions kept per person. Signing in again past this ends the oldest one, so repeated
+/// sign-ins (which work even in a full workspace) can't grow storage.
+pub const MAX_SESSIONS: i64 = 50;
 /// Browsers must send this header on cookie-authenticated writes (CSRF protection).
 pub const CSRF_HEADER: &str = "x-dumbslab-client";
 
@@ -229,13 +232,13 @@ fn actor_from_row(row: &crate::db::Row, scopes: Scopes, via: Via) -> Actor {
 }
 
 /// Resolves the caller from a bearer token or session cookie. `Ok(None)` means anonymous.
-pub fn authenticate(db: &dyn Db, req: &Request, now: DateTime<Utc>) -> ApiResult<Option<Actor>> {
+pub fn authenticate(db: &dyn Db, cfg: &HostConfig, req: &Request, now: DateTime<Utc>) -> ApiResult<Option<Actor>> {
     let now_s = ts(now);
     if let Some(token) = bearer_token(req) {
         let row = db
             .one(
                 &format!(
-                    "SELECT {USER_COLS}, t.id AS token_id, t.scopes, t.last_used_at FROM api_tokens t
+                    "SELECT {USER_COLS}, t.id AS token_id, t.scopes, t.last_used_at, t.resource FROM api_tokens t
                      JOIN users u ON u.id = t.user_id
                      WHERE t.token_hash = ? AND t.revoked_at IS NULL AND (t.expires_at IS NULL OR t.expires_at > ?)
                        AND u.deactivated_at IS NULL"
@@ -243,6 +246,12 @@ pub fn authenticate(db: &dyn Db, req: &Request, now: DateTime<Utc>) -> ApiResult
                 &params![sha256_hex(token), now_s.clone()],
             )?
             .ok_or_else(|| ApiError::unauthorized("invalid, expired or revoked token"))?;
+        // A connected app's token works only at the address it was issued for.
+        if let Some(resource) = row.opt_str("resource")
+            && crate::oauth::canonical_resource(&crate::http::base_url(cfg, req), Some(&resource)).is_none()
+        {
+            return Err(ApiError::unauthorized("this token was issued for a different address; connect the app again"));
+        }
         let scopes = Scopes::parse(&row.str("scopes")).unwrap_or(Scopes { read: true, write: false, admin: false });
         let mut actor = actor_from_row(&row, scopes, Via::Api);
         actor.token_id = Some(row.str("token_id"));
@@ -275,10 +284,11 @@ pub fn authenticate(db: &dyn Db, req: &Request, now: DateTime<Utc>) -> ApiResult
 /// Creates a session and returns the raw token for the cookie.
 pub fn create_session(db: &dyn Db, user_id: &str, user_agent: Option<&str>, now: DateTime<Utc>) -> ApiResult<String> {
     let token = crate::util::new_secret("");
+    let hash = sha256_hex(&token);
     db.execute(
         "INSERT INTO sessions (token_hash, user_id, created_at, expires_at, user_agent) VALUES (?, ?, ?, ?, ?)",
         &params![
-            sha256_hex(&token),
+            hash.clone(),
             user_id,
             ts(now),
             ts(now + Duration::days(SESSION_DAYS)),
@@ -286,6 +296,11 @@ pub fn create_session(db: &dyn Db, user_id: &str, user_agent: Option<&str>, now:
         ],
     )?;
     db.execute("DELETE FROM sessions WHERE expires_at < ?", &params![ts(now)])?;
+    db.execute(
+        "DELETE FROM sessions WHERE user_id = ? AND token_hash != ? AND token_hash NOT IN
+           (SELECT token_hash FROM sessions WHERE user_id = ? ORDER BY created_at DESC LIMIT ?)",
+        &params![user_id, hash, user_id, MAX_SESSIONS],
+    )?;
     Ok(token)
 }
 
@@ -306,21 +321,46 @@ pub fn form_csrf(session_hash: &str) -> String {
     sha256_hex(&format!("csrf:{session_hash}"))
 }
 
-const MAX_FAILURES: i64 = 10;
 const WINDOW_MINUTES: i64 = 15;
+/// Failed password checks allowed per window: for one account, from one client address, and in
+/// the whole workspace. The last bounds password hashing (and these records) however many
+/// emails or addresses someone rotates through.
+const MAX_FAILURES: i64 = 10;
+const MAX_CLIENT_FAILURES: i64 = 30;
+const MAX_WORKSPACE_FAILURES: i64 = 200;
 
-/// Rejects a login when there were too many recent failures for this key.
-pub fn check_throttle(db: &dyn Db, key: &str, now: DateTime<Utc>) -> ApiResult<()> {
-    if let Some(row) = db.one("SELECT failures, window_start FROM login_attempts WHERE key = ?", &params![key])? {
-        let start = parse_ts(&row.str("window_start")).unwrap_or(now);
-        if now - start < Duration::minutes(WINDOW_MINUTES) && row.i64("failures") >= MAX_FAILURES {
-            return Err(ApiError::too_many("too many failed attempts; try again in 15 minutes"));
+/// The throttle keys a password check counts against, with each one's limit. `client_ip` is the
+/// caller's address when the host can vouch for it.
+pub fn password_keys(email: &str, client_ip: Option<&str>) -> Vec<(String, i64)> {
+    let mut keys = vec![(format!("login:{}", sha256_hex(&email.trim().to_lowercase())), MAX_FAILURES)];
+    if let Some(ip) = client_ip {
+        keys.push((format!("ip:{}", sha256_hex(ip)), MAX_CLIENT_FAILURES));
+    }
+    keys.push(("workspace".into(), MAX_WORKSPACE_FAILURES));
+    keys
+}
+
+/// Rejects a password check, before any hashing, when one of its keys failed too often recently.
+pub fn check_throttle(db: &dyn Db, keys: &[(String, i64)], now: DateTime<Utc>) -> ApiResult<()> {
+    for (key, limit) in keys {
+        if let Some(row) = db.one("SELECT failures, window_start FROM login_attempts WHERE key = ?", &params![key.clone()])? {
+            let start = parse_ts(&row.str("window_start")).unwrap_or(now);
+            if now - start < Duration::minutes(WINDOW_MINUTES) && row.i64("failures") >= *limit {
+                return Err(ApiError::too_many("too many failed attempts; try again in 15 minutes"));
+            }
         }
     }
     Ok(())
 }
 
-pub fn record_failure(db: &dyn Db, key: &str, now: DateTime<Utc>) -> ApiResult<()> {
+pub fn record_failures(db: &dyn Db, keys: &[(String, i64)], now: DateTime<Utc>) -> ApiResult<()> {
+    for (key, _) in keys {
+        record_failure(db, key, now)?;
+    }
+    Ok(())
+}
+
+fn record_failure(db: &dyn Db, key: &str, now: DateTime<Utc>) -> ApiResult<()> {
     let window_floor = ts(now - Duration::minutes(WINDOW_MINUTES));
     // Anyone can fail a login with any email, so forget windows that have closed.
     db.execute("DELETE FROM login_attempts WHERE window_start < ?", &params![window_floor.clone()])?;

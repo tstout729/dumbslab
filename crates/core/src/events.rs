@@ -17,13 +17,26 @@ pub struct Event<'a> {
     pub topic_id: Option<&'a str>,
     pub summary: String,
     pub data: Value,
+    /// Fields added to `data` for webhooks only. They aren't kept in the activity log, so content
+    /// someone later deletes (a comment's body) doesn't live on there.
+    pub content: Value,
     /// Admin-only events (users, tokens, webhooks, settings) are hidden from other people.
     pub admin_only: bool,
 }
 
 impl<'a> Event<'a> {
     pub fn new(event: &'a str, target_type: &'a str, target_id: &'a str, summary: impl Into<String>) -> Self {
-        Event { event, target_type, target_id, post_id: None, topic_id: None, summary: summary.into(), data: json!({}), admin_only: false }
+        Event {
+            event,
+            target_type,
+            target_id,
+            post_id: None,
+            topic_id: None,
+            summary: summary.into(),
+            data: json!({}),
+            content: json!({}),
+            admin_only: false,
+        }
     }
 
     pub fn post(mut self, id: &'a str) -> Self {
@@ -38,6 +51,11 @@ impl<'a> Event<'a> {
 
     pub fn data(mut self, data: Value) -> Self {
         self.data = data;
+        self
+    }
+
+    pub fn content(mut self, content: Value) -> Self {
+        self.content = content;
         self
     }
 
@@ -83,6 +101,10 @@ pub fn emit(ctx: &mut Ctx, e: Event) -> ApiResult<i64> {
     if hooks.is_empty() {
         return Ok(id);
     }
+    let mut data = e.data.clone();
+    if let (Some(d), Value::Object(extra)) = (data.as_object_mut(), &e.content) {
+        d.extend(extra.clone());
+    }
     let payload = json!({
         "id": id,
         "event": e.event,
@@ -93,7 +115,7 @@ pub fn emit(ctx: &mut Ctx, e: Event) -> ApiResult<i64> {
         "post_id": e.post_id,
         "topic_id": e.topic_id,
         "summary": e.summary,
-        "data": e.data,
+        "data": data,
     });
     let body = payload.to_string();
     let timestamp = ctx.now.timestamp().to_string();

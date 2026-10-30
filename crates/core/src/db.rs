@@ -173,7 +173,12 @@ impl<D: Db + ?Sized> DbExt for D {
 }
 
 /// Schema migrations, applied in order. Never edit a shipped migration; append a new one.
-pub const MIGRATIONS: &[&str] = &[include_str!("migrations/0001_init.sql"), include_str!("migrations/0002_oauth_client_seen.sql")];
+pub const MIGRATIONS: &[&str] = &[
+    include_str!("migrations/0001_init.sql"),
+    include_str!("migrations/0002_oauth_client_seen.sql"),
+    include_str!("migrations/0003_token_resource.sql"),
+    include_str!("migrations/0004_activity_without_comment_bodies.sql"),
+];
 
 /// Brings the schema up to date. Safe to call on every start.
 pub fn migrate(db: &dyn Db) -> ApiResult<()> {

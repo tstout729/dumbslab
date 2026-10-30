@@ -103,6 +103,36 @@ pub fn host_kind(host: &str, root: &str) -> HostKind {
     }
 }
 
+/// Whether a host is a development machine (`wrangler dev` serves these over plain HTTP).
+pub fn is_local_host(host: &str) -> bool {
+    let host = host.to_ascii_lowercase();
+    host == "localhost" || host.ends_with(".localhost") || host == "127.0.0.1" || host == "[::1]"
+}
+
+/// The HTTPS address for a plain-HTTP request, or `None` when it's already HTTPS or for a local
+/// host. Sign-in, setup links and session cookies must never cross the network in the clear.
+pub fn https_upgrade(url: &str) -> Option<String> {
+    let rest = url.strip_prefix("http://")?;
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, path) = rest.split_at(end);
+    let host = match authority.rsplit_once(':') {
+        Some((h, port)) if port.bytes().all(|b| b.is_ascii_digit()) => h,
+        _ => authority,
+    };
+    if is_local_host(host) {
+        return None;
+    }
+    let path = if path.is_empty() { "/" } else { path };
+    Some(format!("https://{}{path}", host.to_ascii_lowercase()))
+}
+
+/// The `Strict-Transport-Security` value, so browsers keep to HTTPS after their first visit. A
+/// hosted deployment covers its workspace subdomains too; a single workspace leaves the rest of
+/// its owner's domain alone.
+pub fn hsts(multi_tenant: bool) -> &'static str {
+    if multi_tenant { "max-age=31536000; includeSubDomains" } else { "max-age=31536000" }
+}
+
 /// A sign-up link token: `{expiry}.{HMAC(secret, "setup|{workspace}|{expiry}")}`.
 pub fn signup_token(secret: &str, workspace: &str, expires_unix: i64) -> String {
     format!("{expires_unix}.{}", hmac_sha256_hex(secret, &format!("setup|{workspace}|{expires_unix}")))
@@ -392,6 +422,18 @@ mod tests {
         assert_eq!(host_kind("a.b.dumbslab.com", "dumbslab.com"), HostKind::Other);
         assert_eq!(host_kind("evil.com", "dumbslab.com"), HostKind::Other);
         assert_eq!(host_kind("xdumbslab.com", "dumbslab.com"), HostKind::Other);
+    }
+
+    #[test]
+    fn plain_http_is_upgraded() {
+        assert_eq!(https_upgrade("http://dumbslab.com/"), Some("https://dumbslab.com/".into()));
+        assert_eq!(https_upgrade("http://Acme.dumbslab.com:80/setup?token=1"), Some("https://acme.dumbslab.com/setup?token=1".into()));
+        assert_eq!(https_upgrade("http://dumbslab.com"), Some("https://dumbslab.com/".into()));
+        assert_eq!(https_upgrade("https://dumbslab.com/"), None);
+        for local in ["http://localhost:8787/", "http://acme.localhost:8787/x", "http://127.0.0.1:8787/", "http://[::1]:8787/"] {
+            assert_eq!(https_upgrade(local), None, "{local}");
+        }
+        assert!(hsts(true).contains("includeSubDomains") && !hsts(false).contains("includeSubDomains"));
     }
 
     #[test]

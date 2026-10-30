@@ -55,11 +55,12 @@ const CORE: &[&str] = &[
     "describe_operation",
 ];
 
-fn query_param<'a>(req: &'a Request, key: &str) -> Option<&'a str> {
-    req.query.split('&').find_map(|kv| {
+/// The toolset a query string asks for, e.g. `toolset=read`.
+pub fn requested_toolset(query: &str) -> Toolset {
+    Toolset::parse(query.split('&').find_map(|kv| {
         let (k, v) = kv.split_once('=')?;
-        (k == key).then_some(v)
-    })
+        (k == "toolset").then_some(v)
+    }))
 }
 
 pub fn cors(mut out: Outcome) -> Outcome {
@@ -87,7 +88,7 @@ fn post(db: &dyn Db, cfg: &HostConfig, req: &Request) -> Outcome {
     if auth::bearer_token(req).is_none() {
         return unauthorized(cfg, req, "MCP needs a bearer token; connect with OAuth or create an API token");
     }
-    let mut actor = match auth::authenticate(db, req, Utc::now()) {
+    let mut actor = match auth::authenticate(db, cfg, req, Utc::now()) {
         Ok(Some(a)) => a,
         Ok(None) => return unauthorized(cfg, req, "invalid token"),
         Err(e) if e.status == 401 => return unauthorized(cfg, req, &e.message),
@@ -104,7 +105,7 @@ fn post(db: &dyn Db, cfg: &HostConfig, req: &Request) -> Outcome {
             &rpc_error(Value::Null, -32600, "JSON-RPC batches are not supported; send one message per request"),
         ));
     }
-    let toolset = Toolset::parse(query_param(req, "toolset"));
+    let toolset = requested_toolset(&req.query);
     let mut ctx = new_ctx(db, cfg, req, actor);
     let (reply, ok) = handle_message(&mut ctx, toolset, &message);
     // Rolled-back calls must not announce writes that never happened.
@@ -248,7 +249,7 @@ fn call_tool(ctx: &mut Ctx, toolset: Toolset, id: Value, params: &Value) -> (Opt
                 true,
             )
         }
-        Err(e) => (Some(rpc_result(id, tool_error(&e))), false),
+        Err(e) => (Some(rpc_result(id, tool_error(&e))), e.keep_writes),
     }
 }
 

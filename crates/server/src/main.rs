@@ -1,8 +1,9 @@
 //! `dumbslab`: the self-hosted server and CLI. One binary, one SQLite file.
 
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, anyhow};
@@ -17,6 +18,7 @@ use dumbslab_core::mcp::Toolset;
 use dumbslab_core::registry::registry;
 use dumbslab_core::{Effect, HostConfig, Outcome, Request, WebhookDelivery, params};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::sync::{Semaphore, mpsc, oneshot};
 use tracing::{info, warn};
 
 use dumbslab::store::Store;
@@ -77,10 +79,32 @@ enum Command {
     },
 }
 
+/// Deliveries that may wait for one webhook. Each webhook gets one delivery at a time, so a slow
+/// endpoint backs up only its own queue; past this, its new events are dropped (and logged).
+const WEBHOOK_QUEUE: usize = 100;
+/// Sign-ins checked at once. Each holds the database while it hashes the password.
+const MAX_SIGN_INS: usize = 4;
+
+type QueuedDelivery = (WebhookDelivery, oneshot::Sender<()>);
+
 pub struct App {
     pub store: Store,
     pub cfg: HostConfig,
     pub allow_private_webhooks: bool,
+    webhooks: Mutex<HashMap<String, mpsc::Sender<QueuedDelivery>>>,
+    sign_ins: Arc<Semaphore>,
+}
+
+impl App {
+    fn new(store: Store, cfg: HostConfig, allow_private_webhooks: bool) -> Arc<App> {
+        Arc::new(App {
+            store,
+            cfg,
+            allow_private_webhooks,
+            webhooks: Mutex::new(HashMap::new()),
+            sign_ins: Arc::new(Semaphore::new(MAX_SIGN_INS)),
+        })
+    }
 }
 
 #[tokio::main]
@@ -147,7 +171,7 @@ async fn call(
     input: Option<String>,
     user: Option<String>,
 ) -> anyhow::Result<()> {
-    let app = Arc::new(App { store: open(&db)?, cfg: HostConfig::default(), allow_private_webhooks });
+    let app = App::new(open(&db)?, HostConfig::default(), allow_private_webhooks);
     let actor = local_actor(&app.store, user.as_deref(), Via::Cli)?;
     let op = registry().get(&operation).ok_or_else(|| anyhow!("unknown operation `{operation}`; run `dumbslab ops`"))?;
     let input: serde_json::Value = serde_json::from_str(input.as_deref().unwrap_or("{}")).context("input must be JSON")?;
@@ -156,14 +180,17 @@ async fn call(
         let mut ctx = dumbslab_core::http::new_ctx(db, &app.cfg, &req, actor);
         match op.call(&mut ctx, input) {
             Ok(v) => (Ok((v, ctx.effects)), true),
-            Err(e) => (Err(e), false),
+            Err(e) => {
+                let keep = e.keep_writes;
+                (Err(e), keep)
+            }
         }
     })?;
     match result {
         Ok((v, effects)) => {
             println!("{}", serde_json::to_string_pretty(&v)?);
-            for handle in deliver(app, effects) {
-                let _ = handle.await;
+            for delivered in deliver(app, effects) {
+                let _ = delivered.await;
             }
             Ok(())
         }
@@ -172,7 +199,7 @@ async fn call(
 }
 
 async fn stdio_mcp(db: PathBuf, allow_private_webhooks: bool, user: Option<String>, toolset: Toolset) -> anyhow::Result<()> {
-    let app = Arc::new(App { store: open(&db)?, cfg: HostConfig::default(), allow_private_webhooks });
+    let app = App::new(open(&db)?, HostConfig::default(), allow_private_webhooks);
     let mut pending = vec![];
     let actor = local_actor(&app.store, user.as_deref(), Via::Mcp)?;
     info!(user = %actor.email, "serving MCP over stdio");
@@ -191,14 +218,14 @@ async fn stdio_mcp(db: PathBuf, allow_private_webhooks: bool, user: Option<Strin
         })
         .await??;
         pending.extend(deliver(app.clone(), effects));
-        pending.retain(|h: &tokio::task::JoinHandle<()>| !h.is_finished());
+        pending.retain_mut(|d: &mut oneshot::Receiver<()>| d.try_recv().is_err_and(|e| e == oneshot::error::TryRecvError::Empty));
         if let Some(reply) = reply {
             stdout.write_all(format!("{reply}\n").as_bytes()).await?;
             stdout.flush().await?;
         }
     }
-    for handle in pending {
-        let _ = handle.await;
+    for delivered in pending {
+        let _ = delivered.await;
     }
     Ok(())
 }
@@ -225,7 +252,7 @@ async fn serve(
         }
     }
     let cfg = HostConfig { base_url: base_url.map(|u| u.trim_end_matches('/').to_string()), setup_token, open_setup, ..Default::default() };
-    let app = Arc::new(App { store, cfg, allow_private_webhooks });
+    let app = App::new(store, cfg, allow_private_webhooks);
     let router = Router::new()
         .fallback(handle)
         .with_state(app)
@@ -253,6 +280,16 @@ async fn handle(
     if !dumbslab_core::http::is_core_path(&path) {
         return web::serve(&path, &parts.headers);
     }
+    // Rotating emails can't get around this: the core's sign-in limits stop repeated failures, and
+    // this keeps a burst from queueing password checks in front of every other request.
+    let _sign_in = if path == "/api/v1/auth/login" {
+        match app.sign_ins.clone().try_acquire_owned() {
+            Ok(permit) => Some(permit),
+            Err(_) => return plain(StatusCode::TOO_MANY_REQUESTS, "too many sign-ins at once; try again in a moment"),
+        }
+    } else {
+        None
+    };
     let body = match axum::body::to_bytes(body, MAX_BODY).await {
         Ok(b) => b.to_vec(),
         Err(_) => return plain(StatusCode::PAYLOAD_TOO_LARGE, "request body too large"),
@@ -267,7 +304,9 @@ async fn handle(
         headers: parts.headers.iter().filter_map(|(k, v)| Some((k.as_str().to_lowercase(), v.to_str().ok()?.to_string()))).collect(),
         body,
         origin: format!("{scheme}://{host}"),
-        client_ip: Some(peer.ip().to_string()),
+        // A private or loopback peer is usually a reverse proxy, whose address says nothing about
+        // the client; sign-in limits then count per account and per workspace only.
+        client_ip: is_public(peer.ip()).then(|| peer.ip().to_string()),
     };
     let app2 = app.clone();
     let result = tokio::task::spawn_blocking(move || {
@@ -314,37 +353,62 @@ fn respond(app: Arc<App>, outcome: Outcome) -> axum::response::Response {
     builder.body(Body::from(response.body)).unwrap_or_default()
 }
 
-/// Delivers webhooks in the background with a few retries, then records the outcome.
-fn deliver(app: Arc<App>, effects: Vec<Effect>) -> Vec<tokio::task::JoinHandle<()>> {
-    effects
-        .into_iter()
-        // Address moves only exist for hosted workspaces, which this server never is.
-        .filter_map(|effect| match effect {
-            Effect::Webhook(d) => Some(d),
-            Effect::MoveAddress(_) => None,
-        })
-        .map(|d| {
-            let app = app.clone();
-            tokio::spawn(async move {
-                let mut last: (Option<u16>, Option<String>) = (None, None);
-                for (attempt, delay) in [0u64, 2, 10].into_iter().enumerate() {
-                    if delay > 0 {
-                        tokio::time::sleep(Duration::from_secs(delay)).await;
-                    }
-                    last = send_webhook(&d, app.allow_private_webhooks).await;
-                    if last.1.is_none() {
-                        break;
-                    }
-                    warn!(url = %d.url, attempt = attempt + 1, error = ?last.1, "webhook delivery failed");
+/// Queues webhook deliveries. Returns, for each one accepted, a receiver that fires once it's done.
+fn deliver(app: Arc<App>, effects: Vec<Effect>) -> Vec<oneshot::Receiver<()>> {
+    let mut accepted = vec![];
+    // Address moves only exist for hosted workspaces, which this server never is.
+    for d in effects.into_iter().filter_map(|effect| match effect {
+        Effect::Webhook(d) => Some(d),
+        Effect::MoveAddress(_) => None,
+    }) {
+        let mut queues = app.webhooks.lock().unwrap_or_else(|e| e.into_inner());
+        let queue = queues.entry(d.webhook_id.clone()).or_insert_with(|| webhook_queue(&app));
+        if queue.is_closed() {
+            *queue = webhook_queue(&app);
+        }
+        let (done, delivered) = oneshot::channel();
+        match queue.try_send((d, done)) {
+            Ok(()) => accepted.push(delivered),
+            Err(e) => {
+                let (d, _) = e.into_inner();
+                warn!(webhook = %d.webhook_id, host = %url_host(&d.url), "webhook is backed up; dropped a delivery");
+            }
+        }
+    }
+    accepted
+}
+
+/// Starts the task that sends one webhook's deliveries, in order.
+fn webhook_queue(app: &Arc<App>) -> mpsc::Sender<QueuedDelivery> {
+    let (queue, mut pending) = mpsc::channel::<QueuedDelivery>(WEBHOOK_QUEUE);
+    let app = app.clone();
+    tokio::spawn(async move {
+        while let Some((d, done)) = pending.recv().await {
+            let mut last: (Option<u16>, Option<String>) = (None, None);
+            for (attempt, delay) in [0u64, 2, 10].into_iter().enumerate() {
+                if delay > 0 {
+                    tokio::time::sleep(Duration::from_secs(delay)).await;
                 }
-                let id = d.webhook_id.clone();
-                let _ = tokio::task::spawn_blocking(move || {
-                    app.store.with_tx(|db| (dumbslab_core::record_webhook_result(db, &id, last.0, last.1.as_deref()), true))
-                })
-                .await;
+                last = send_webhook(&d, app.allow_private_webhooks).await;
+                if last.1.is_none() {
+                    break;
+                }
+                warn!(webhook = %d.webhook_id, host = %url_host(&d.url), attempt = attempt + 1, error = ?last.1, "webhook delivery failed");
+            }
+            let (app, id) = (app.clone(), d.webhook_id.clone());
+            let _ = tokio::task::spawn_blocking(move || {
+                app.store.with_tx(|db| (dumbslab_core::record_webhook_result(db, &id, last.0, last.1.as_deref()), true))
             })
-        })
-        .collect()
+            .await;
+            let _ = done.send(());
+        }
+    });
+    queue
+}
+
+/// A webhook URL's host, for logs. Its path, query and user info can hold credentials.
+fn url_host(url: &str) -> String {
+    reqwest::Url::parse(url).ok().and_then(|u| u.host_str().map(str::to_string)).unwrap_or_else(|| "(invalid URL)".into())
 }
 
 /// Whether an address is on the public internet (not loopback, private, link-local, CGNAT, …).
@@ -410,7 +474,8 @@ async fn send_webhook(d: &WebhookDelivery, allow_private: bool) -> (Option<u16>,
         for (k, v) in &d.headers {
             req = req.header(k, v);
         }
-        Ok::<_, anyhow::Error>(req.send().await?.status())
+        // Errors name the URL, which may hold a credential; they're logged and shown to admins.
+        Ok::<_, anyhow::Error>(req.send().await.map_err(reqwest::Error::without_url)?.status())
     };
     match attempt.await {
         Ok(status) if status.is_success() => (Some(status.as_u16()), None),
@@ -421,7 +486,43 @@ async fn send_webhook(d: &WebhookDelivery, allow_private: bool) -> (Option<u16>,
 
 #[cfg(test)]
 mod tests {
-    use super::is_public;
+    use super::*;
+
+    fn delivery(url: &str) -> WebhookDelivery {
+        WebhookDelivery { webhook_id: "hook".into(), url: url.into(), headers: vec![], body: "{}".into() }
+    }
+
+    #[tokio::test]
+    async fn webhook_errors_hide_the_url() {
+        // Nothing listens on the discard port, so the request fails with a connection error.
+        let (_, error) = send_webhook(&delivery("http://user:hunter2@127.0.0.1:9/hooks/s3cr3t-path?token=abc"), true).await;
+        let error = error.expect("delivery fails");
+        for secret in ["hunter2", "s3cr3t-path", "token=abc"] {
+            assert!(!error.contains(secret), "{error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn webhook_deliveries_are_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = App::new(Store::open(&dir.path().join("t.db")).unwrap(), HostConfig::default(), false);
+        // A private address is refused and retried later, so this webhook's deliveries back up.
+        let effects = (0..500).map(|_| Effect::Webhook(delivery("https://10.0.0.1/hook"))).collect();
+        let accepted = deliver(app, effects).len();
+        assert!(accepted <= 101, "{accepted} deliveries in flight for one webhook");
+    }
+
+    #[tokio::test]
+    async fn sign_ins_beyond_the_limit_wait_their_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = App::new(Store::open(&dir.path().join("t.db")).unwrap(), HostConfig::default(), false);
+        let _busy: Vec<_> = (0..MAX_SIGN_INS).map(|_| app.sign_ins.clone().try_acquire_owned().unwrap()).collect();
+        let login = axum::extract::Request::builder().method("POST").uri("/api/v1/auth/login").body(Body::from("{}")).unwrap();
+        let resp = handle(State(app.clone()), ConnectInfo("203.0.113.1:5000".parse().unwrap()), login).await;
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        let other = axum::extract::Request::builder().uri("/healthz").body(Body::empty()).unwrap();
+        assert_eq!(handle(State(app), ConnectInfo("203.0.113.1:5000".parse().unwrap()), other).await.status(), StatusCode::OK);
+    }
 
     #[test]
     fn private_addresses_are_refused() {

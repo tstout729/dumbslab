@@ -55,17 +55,27 @@ pub fn done(response: Response) -> Outcome {
 }
 
 pub fn failed(err: &ApiError) -> Outcome {
-    Outcome { response: Response::error(err), commit: false, effects: vec![] }
+    Outcome { response: Response::error(err), commit: err.keep_writes, effects: vec![] }
 }
 
 pub fn base_url(cfg: &HostConfig, req: &Request) -> String {
     cfg.base_url.clone().unwrap_or_else(|| req.origin.clone()).trim_end_matches('/').to_string()
 }
 
+/// Whether cookies need `Secure`: the public URL decides when it's configured, so a proxy that
+/// doesn't forward the scheme can't strip it.
+pub fn secure_cookies(cfg: &HostConfig, req: &Request) -> bool {
+    base_url(cfg, req).starts_with("https://")
+}
+
 pub fn unauthorized(cfg: &HostConfig, req: &Request, message: &str) -> Outcome {
-    let metadata = format!("{}/.well-known/oauth-protected-resource", base_url(cfg, req));
+    // The read-only MCP URL points clients at its own metadata, so the access they ask for (and
+    // are granted) is read-only too.
+    let read_only = req.path == "/mcp" && crate::mcp::requested_toolset(&req.query) == crate::mcp::Toolset::Read;
+    let (resource, scope) = if read_only { ("/mcp?toolset=read", ", scope=\"read\"") } else { ("", "") };
+    let metadata = format!("{}/.well-known/oauth-protected-resource{resource}", base_url(cfg, req));
     let mut out = failed(&ApiError::unauthorized(message));
-    out.response.headers.push(("www-authenticate".into(), format!("Bearer resource_metadata=\"{metadata}\"")));
+    out.response.headers.push(("www-authenticate".into(), format!("Bearer resource_metadata=\"{metadata}\"{scope}")));
     out
 }
 
@@ -78,13 +88,13 @@ fn api(db: &dyn Db, cfg: &HostConfig, req: &Request, rest: &str) -> Outcome {
     match (req.method.as_str(), rest) {
         ("GET", "/auth/state") => return auth_state(db, cfg, req),
         ("POST", "/auth/setup") => return setup(db, cfg, req),
-        ("POST", "/auth/login") => return login(db, req),
-        ("POST", "/auth/logout") => return logout(db, req),
+        ("POST", "/auth/login") => return login(db, cfg, req),
+        ("POST", "/auth/logout") => return logout(db, cfg, req),
         ("GET", "/openapi.json") => return done(Response::json(200, &crate::openapi::spec(&base_url(cfg, req)))),
         _ => {}
     }
 
-    let actor = match auth::authenticate(db, req, now) {
+    let actor = match auth::authenticate(db, cfg, req, now) {
         Ok(Some(a)) => a,
         Ok(None) => return unauthorized(cfg, req, "sign in or send `Authorization: Bearer <token>`"),
         Err(e) if e.status == 401 => return unauthorized(cfg, req, &e.message),
@@ -221,7 +231,7 @@ fn user_count(db: &dyn Db) -> ApiResult<i64> {
 fn auth_state(db: &dyn Db, cfg: &HostConfig, req: &Request) -> Outcome {
     let run = || -> ApiResult<Value> {
         let needs_setup = user_count(db)? == 0;
-        let user = match auth::authenticate(db, req, Utc::now()) {
+        let user = match auth::authenticate(db, cfg, req, Utc::now()) {
             Ok(Some(a)) => db.one(&format!("SELECT {USER_COLS} FROM users WHERE id = ?"), &params![a.user_id])?.map(|r| User::from_row(&r)),
             _ => None,
         };
@@ -294,7 +304,7 @@ fn setup(db: &dyn Db, cfg: &HostConfig, req: &Request) -> Outcome {
         crate::seed::seed_workspace(&mut ctx, &workspace)?;
         let token = auth::create_session(db, &uid, req.header("user-agent"), Utc::now())?;
         let out = done(Response::json(200, &json!({ "user": User::from_row(&row) })));
-        Ok(set_cookie(out, auth::session_cookie(&token, req.is_https())))
+        Ok(set_cookie(out, auth::session_cookie(&token, secure_cookies(cfg, req))))
     };
     run().unwrap_or_else(|e| failed(&e))
 }
@@ -319,7 +329,7 @@ struct LoginInput {
     password: String,
 }
 
-fn login(db: &dyn Db, req: &Request) -> Outcome {
+fn login(db: &dyn Db, cfg: &HostConfig, req: &Request) -> Outcome {
     let now = Utc::now();
     let input: LoginInput = match parse_body(&req.body).and_then(|v| serde_json::from_value(v).map_err(ApiError::from)) {
         Ok(i) => i,
@@ -329,14 +339,14 @@ fn login(db: &dyn Db, req: &Request) -> Outcome {
     if input.email.len() > 254 || input.password.len() > 256 {
         return failed(&ApiError::bad_request("email or password is too long"));
     }
-    let key = format!("login:{}", crate::util::sha256_hex(&input.email.trim().to_lowercase()));
+    let keys = auth::password_keys(&input.email, req.client_ip.as_deref());
     let run = || -> ApiResult<Outcome> {
-        auth::check_throttle(db, &key, now)?;
+        auth::check_throttle(db, &keys, now)?;
         let row = db.one("SELECT id, password_hash FROM users WHERE email = ? AND deactivated_at IS NULL", &params![input.email.trim()])?;
         let user_id = match row {
             Some(r) if r.opt_str("password_hash").is_some_and(|h| auth::verify_password(&input.password, &h)) => r.str("id"),
             Some(_) => {
-                auth::record_failure(db, &key, now)?;
+                auth::record_failures(db, &keys, now)?;
                 // Commit the failure count even though the request fails.
                 return Ok(Outcome {
                     response: Response::error(&ApiError::unauthorized("email or password is incorrect")),
@@ -346,7 +356,7 @@ fn login(db: &dyn Db, req: &Request) -> Outcome {
             }
             None => {
                 auth::dummy_verify(&input.password);
-                auth::record_failure(db, &key, now)?;
+                auth::record_failures(db, &keys, now)?;
                 return Ok(Outcome {
                     response: Response::error(&ApiError::unauthorized("email or password is incorrect")),
                     commit: true,
@@ -354,21 +364,22 @@ fn login(db: &dyn Db, req: &Request) -> Outcome {
                 });
             }
         };
-        auth::clear_failures(db, &key)?;
+        // Only the account's own count resets; the address and workspace counts run out their window.
+        auth::clear_failures(db, &keys[0].0)?;
         let token = auth::create_session(db, &user_id, req.header("user-agent"), now)?;
         db.execute("UPDATE users SET last_seen_at = ? WHERE id = ?", &params![ts(now), user_id.clone()])?;
         let user = db.one(&format!("SELECT {USER_COLS} FROM users WHERE id = ?"), &params![user_id])?.map(|r| User::from_row(&r));
-        Ok(set_cookie(done(Response::json(200, &json!({ "user": user }))), auth::session_cookie(&token, req.is_https())))
+        Ok(set_cookie(done(Response::json(200, &json!({ "user": user }))), auth::session_cookie(&token, secure_cookies(cfg, req))))
     };
     run().unwrap_or_else(|e| failed(&e))
 }
 
-fn logout(db: &dyn Db, req: &Request) -> Outcome {
-    if let Ok(Some(actor)) = auth::authenticate(db, req, Utc::now())
+fn logout(db: &dyn Db, cfg: &HostConfig, req: &Request) -> Outcome {
+    if let Ok(Some(actor)) = auth::authenticate(db, cfg, req, Utc::now())
         && let Some(hash) = actor.session_hash
         && let Err(e) = db.execute("DELETE FROM sessions WHERE token_hash = ?", &params![hash])
     {
         return failed(&e);
     }
-    set_cookie(done(Response::json(200, &json!({ "ok": true }))), auth::clear_session_cookie(req.is_https()))
+    set_cookie(done(Response::json(200, &json!({ "ok": true }))), auth::clear_session_cookie(secure_cookies(cfg, req)))
 }

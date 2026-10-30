@@ -4,6 +4,7 @@ DumbSlab runs on Cloudflare Workers with no servers to manage:
 
 - **Static assets** serve the web app from `web/`.
 - **A Worker**, compiled from Rust to WebAssembly, routes every request.
+- **HTTPS only.** The Worker redirects plain HTTP to HTTPS and sends `Strict-Transport-Security` (covering workspace subdomains in hosted mode), except on `localhost` for `wrangler dev`.
 - **SQLite-backed Durable Objects** hold the data. Each workspace is one object with its own private database. It runs the same core as the native server, wrapping every request in `transactionSync`. Cloudflare keeps this storage durable and lets you restore it to any point in the last 30 days.
 
 There are two modes:

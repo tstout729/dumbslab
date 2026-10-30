@@ -44,8 +44,10 @@ Options (flags or environment variables):
 
 ```sh
 docker build -t dumbslab .
-docker run -p 8080:8080 -v dumbslab:/data dumbslab
+docker run -p 127.0.0.1:8080:8080 -v dumbslab:/data dumbslab
 ```
+
+This publishes the server on your machine only. Passwords and session cookies must not cross a network in the clear, so to share it, put it behind a reverse proxy that serves HTTPS (Caddy, nginx, a Cloudflare Tunnel) and start it with `--base-url https://your-host`. The public URL decides whether cookies are marked `Secure`, and connected apps' tokens only work at that address.
 
 ### Cloudflare
 
@@ -61,7 +63,7 @@ claude mcp add --transport http dumbslab https://your-host/mcp
 claude mcp add --transport http dumbslab https://your-host/mcp --header "Authorization: Bearer ds_pat_..."
 ```
 
-- `?toolset=core` exposes about 15 everyday tools plus `call_operation`, which reaches everything else. `?toolset=read` is read-only.
+- `?toolset=core` exposes about 15 everyday tools plus `call_operation`, which reaches everything else. `?toolset=read` lists only read-only tools, and apps that sign in through it get read-only access. With a token, use a read-only one: a token's scopes, not the URL, decide what it can do.
 - Tools carry `readOnlyHint`, `destructiveHint` and `idempotentHint` annotations, typed input and output schemas, and `structuredContent` results.
 - Resources: `dumbslab://guide`, `dumbslab://posts/{id}` (Markdown with front matter) and `dumbslab://topics/{id}`. Prompts: `write_post`, `find_stale_docs`, `summarize_topic`.
 - Local agents can use stdio: `dumbslab mcp --as you@example.com`.
@@ -86,9 +88,9 @@ Give each agent its own bot account (Settings → People → Add bot) and token.
 ## Permissions
 
 - **Roles.** Admins manage everything. Members write and organize. Viewers read, comment and react.
-- **Drafts** are visible only to their author and admins.
-- **Private topics.** A post whose topics are all private is visible only to members of those topics. It is hidden from lists, search, activity and notifications for everyone else.
-- **Tokens** carry `read`, `write` and/or `admin` scopes. A token never exceeds its owner's role, and an MCP connection from a read-only token lists only read-only tools.
+- **Drafts** are visible only to their author and admins. So is the **trash**: a trashed post disappears for everyone else until it's restored.
+- **Private topics.** A post whose topics are all private is visible only to members of those topics. It is hidden from lists, search, activity and notifications for everyone else. Removing its last private topic is refused, because a post without topics is visible to everyone; to share it, add an org-wide topic.
+- **Tokens** carry `read`, `write` and/or `admin` scopes. A token never exceeds its owner's role, and an MCP connection from a read-only token lists only read-only tools. Tokens can't change passwords, and a connected app can't create tokens or revoke other credentials unless it was granted `admin`.
 
 ## Architecture
 
