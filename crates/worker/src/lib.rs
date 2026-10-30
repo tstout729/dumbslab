@@ -25,7 +25,7 @@ use serde_json::{Value, json};
 use worker::*;
 
 use crate::sql::{call_object, error_response, flag, json_response, read_body, var};
-use crate::workspace::WORKSPACE_HEADER;
+use crate::workspace::{ALIAS_HEADER, HOME_HEADER, WORKSPACE_HEADER};
 
 #[event(fetch)]
 async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
@@ -66,23 +66,49 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
 /// Sends a request to a workspace object. Bodies are buffered (and bounded) here: if the object
 /// answered while this Worker was still streaming an upload into it, the isolate would restart.
 async fn forward(env: &Env, object: &str, mut req: Request, workspace: Option<&str>) -> Result<Response> {
+    let body = if matches!(req.method(), Method::Get | Method::Head | Method::Options) {
+        None
+    } else {
+        match read_body(&mut req).await? {
+            Some(b) => Some(b),
+            None => return error_response(413, "too_large", "request body too large"),
+        }
+    };
+    let resp = send(env, object, &req, body.as_deref(), workspace.map(|slug| (slug, slug))).await?;
+    // An address a workspace moved to points at the workspace's home object.
+    if let Some(slug) = workspace
+        && let Some(home) = resp.headers().get(ALIAS_HEADER)?
+    {
+        if home.is_empty() || home == slug {
+            return error_response(500, "internal", "this address points nowhere");
+        }
+        return send(env, &format!("ws:{home}"), &req, body.as_deref(), Some((slug, &home))).await;
+    }
+    Ok(resp)
+}
+
+/// One request to a workspace object. `route` is (requested address, the workspace's home address).
+async fn send(env: &Env, object: &str, req: &Request, body: Option<&[u8]>, route: Option<(&str, &str)>) -> Result<Response> {
     let stub = env.durable_object("WORKSPACE")?.id_from_name(object)?.get_stub()?;
     let headers = req.headers().clone();
     // Only this Worker may say which workspace a request is for.
-    match workspace {
-        Some(slug) => headers.set(WORKSPACE_HEADER, slug)?,
-        None => headers.delete(WORKSPACE_HEADER)?,
+    match route {
+        Some((slug, home)) => {
+            headers.set(WORKSPACE_HEADER, slug)?;
+            headers.set(HOME_HEADER, home)?;
+        }
+        None => {
+            headers.delete(WORKSPACE_HEADER)?;
+            headers.delete(HOME_HEADER)?;
+        }
     }
     let mut init = RequestInit::new();
     init.with_method(req.method())
         .with_headers(headers)
         // Pass redirects (e.g. the OAuth consent 302 back to the client) through to the browser.
         .with_redirect(RequestRedirect::Manual);
-    if !matches!(req.method(), Method::Get | Method::Head | Method::Options) {
-        let Some(body) = read_body(&mut req).await? else {
-            return error_response(413, "too_large", "request body too large");
-        };
-        init.with_body(Some(js_sys::Uint8Array::from(body.as_slice()).into()));
+    if let Some(body) = body {
+        init.with_body(Some(js_sys::Uint8Array::from(body).into()));
     }
     stub.fetch_with_request(Request::new_with_init(req.url()?.as_str(), &init)?).await
 }
@@ -184,7 +210,8 @@ async fn signup(mut req: Request, env: &Env, root: &str) -> Result<Response> {
 /// Operator API for removing abuse: `Authorization: Bearer $OPERATOR_TOKEN`.
 ///
 /// - `GET  /api/operator/workspaces`
-/// - `POST /api/operator/workspaces/{address}/disable` (or `enable`, `delete`)
+/// - `POST /api/operator/workspaces/{address}/disable` (or `enable`, `delete`). Any of a
+///   workspace's addresses works; `delete` frees all of them.
 async fn operator(req: Request, env: &Env, path: &str) -> Result<Response> {
     let Some(expected) = var(env, "OPERATOR_TOKEN") else {
         return error_response(404, "not_found", "not found");
@@ -202,33 +229,52 @@ async fn operator(req: Request, env: &Env, path: &str) -> Result<Response> {
         Some((s, a)) if req.method() == Method::Post && tenancy::validate_slug(s).is_ok() => (s.to_string(), a.to_string()),
         _ => return error_response(404, "not_found", "unknown operator route"),
     };
-    let object = format!("ws:{slug}");
-    let stub = env.durable_object("WORKSPACE")?.id_from_name(&object)?.get_stub()?;
+    // A workspace's data lives in the object named after its first address (its home).
+    let (status, found) = call_object(env, "DIRECTORY", "directory", Method::Post, "/resolve", Some(&json!({ "slug": slug }))).await?;
+    if status != 200 {
+        return json_response(status, &found);
+    }
+    let home = found["home"].as_str().unwrap_or_default().to_string();
     // The workspace's answer decides the directory change: 404 means the address was reserved
     // but never set up.
-    let workspace_call = |internal: &'static str| async move {
-        let mut init = RequestInit::new();
-        init.with_method(Method::Post);
-        let resp = stub.fetch_with_request(Request::new_with_init(&format!("https://internal{internal}"), &init)?).await?;
-        Ok::<u16, worker::Error>(resp.status_code())
-    };
     let directory: (&str, Value) = match action.as_str() {
-        "disable" => match workspace_call("/_internal/disable").await? {
+        "disable" => match internal_call(env, &home, "/_internal/disable").await? {
             // Disabling a reservation also kills its sign-up link.
-            200 | 404 => ("/status", json!({ "slug": slug, "status": "disabled" })),
+            200 | 404 => ("/status", json!({ "slug": home, "status": "disabled" })),
             status => return error_response(status, "failed", "the workspace couldn't be disabled"),
         },
-        "enable" => match workspace_call("/_internal/enable").await? {
-            200 => ("/status", json!({ "slug": slug, "status": "active" })),
-            404 => ("/status", json!({ "slug": slug, "status": "reserved" })),
+        "enable" => match internal_call(env, &home, "/_internal/enable").await? {
+            200 => ("/status", json!({ "slug": home, "status": "active" })),
+            404 => ("/status", json!({ "slug": home, "status": "reserved" })),
             status => return error_response(status, "failed", "the workspace couldn't be enabled"),
         },
-        "delete" => match workspace_call("/_internal/delete").await? {
-            200 => ("/remove", json!({ "slug": slug })),
-            status => return error_response(status, "failed", "the workspace couldn't be deleted"),
-        },
+        "delete" => {
+            // The home object first: it refuses while a move is under way, and once it's empty the
+            // workspace can't move again, so the address list read after it is final.
+            let status = internal_call(env, &home, "/_internal/delete").await?;
+            if status != 200 {
+                return error_response(status, "failed", &format!("{home} couldn't be deleted; try again"));
+            }
+            let (_, found) = call_object(env, "DIRECTORY", "directory", Method::Post, "/resolve", Some(&json!({ "slug": home }))).await?;
+            for address in found["addresses"].as_array().into_iter().flatten().filter_map(Value::as_str) {
+                let status = internal_call(env, address, "/_internal/delete").await?;
+                if status != 200 {
+                    return error_response(status, "failed", &format!("{address} couldn't be deleted; try again"));
+                }
+            }
+            ("/remove", json!({ "slug": home }))
+        }
         _ => return error_response(404, "not_found", "use disable, enable or delete"),
     };
     let (status, body) = call_object(env, "DIRECTORY", "directory", Method::Post, directory.0, Some(&directory.1)).await?;
     json_response(status, &body)
+}
+
+/// Calls an operator action on the object for one address and returns its status.
+async fn internal_call(env: &Env, address: &str, path: &str) -> Result<u16> {
+    let stub = env.durable_object("WORKSPACE")?.id_from_name(&format!("ws:{address}"))?.get_stub()?;
+    let mut init = RequestInit::new();
+    init.with_method(Method::Post);
+    let resp = stub.fetch_with_request(Request::new_with_init(&format!("https://internal{path}"), &init)?).await?;
+    Ok(resp.status_code())
 }

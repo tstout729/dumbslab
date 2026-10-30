@@ -540,7 +540,40 @@ async function workspaceSection() {
 
   return frag(
     panel('Workspace', null, f),
-    panel('Export', 'Download every topic, post (as Markdown), comment and person as JSON, for backups or moving elsewhere.', h('div', null, exportBtn)));
+    s.address ? addressPanel(s.address) : null,
+    panel('Export','Download every topic, post (as Markdown), comment and person as JSON, for backups or moving elsewhere.', h('div', null, exportBtn)));
+}
+
+/** Hosted workspaces: move to another subdomain. */
+function addressPanel(current) {
+  const root = location.host.slice(current.length + 1);
+  const address = input({
+    id: 'settings-address', required: true, value: current, minlength: '3', maxlength: '32',
+    pattern: '[a-z0-9]+(-[a-z0-9]+)*', spellcheck: 'false', autocapitalize: 'off', 'aria-describedby': 'settings-address-hint',
+  });
+  address.addEventListener('input', () => { address.value = address.value.toLowerCase().replace(/[^a-z0-9-]/g, ''); });
+  const f = form(async () => {
+    const next = address.value.trim();
+    if (next === current) {
+      toast('The workspace is already at that address.');
+      return;
+    }
+    const ok = await confirmDialog({
+      title: 'Change the address?',
+      message: `Move this workspace to ${next}.${root}? Everyone signs in again there, and AI tools need the new MCP URL. ${current}.${root} will send people to the new address.`,
+      confirmLabel: 'Change address',
+    });
+    if (!ok) return;
+    const r = await api.post('/settings/address', { address: next });
+    toast(`Moved to ${r.address}.${root}. Taking you there…`);
+    setTimeout(() => location.assign(`${r.url}/login?next=${encodeURIComponent('/settings/workspace')}`), 1200);
+  },
+  h('div', { class: 'field' },
+    h('label', { class: 'field-label', for: address.id }, 'Address'),
+    h('div', { class: 'input-suffix' }, address, h('span', { class: 'input-suffix-text' }, `.${root}`)),
+    h('p', { class: 'field-hint', id: 'settings-address-hint' }, '3 to 32 lowercase letters, numbers or single hyphens.')),
+  h('div', null, button('Change address', { variant: 'subtle', type: 'submit' })));
+  return panel('Address', 'Your workspace’s web address. Posts, people and API tokens all move with it. Everyone signs in again at the new address, and the old one keeps sending people there.', f);
 }
 
 const RENDER = {

@@ -1,5 +1,5 @@
-//! The directory of workspaces (multi-tenant hosting): address reservations, sign-up limits and
-//! the operator's list. Only the front Worker and workspace objects call it.
+//! The directory of workspaces (multi-tenant hosting): address reservations, sign-up limits,
+//! address moves and the operator's list. Only the front Worker and workspace objects call it.
 
 use std::cell::Cell;
 
@@ -36,6 +36,12 @@ struct CheckInput {
 struct SlugInput {
     slug: String,
     status: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct MoveInput {
+    home: String,
+    to: String,
 }
 
 impl Directory {
@@ -115,6 +121,20 @@ impl DurableObject for Directory {
             (Method::Post, "/remove") => {
                 let input: ApiResult<SlugInput> = parse(&body);
                 self.run(move |db| tenancy::remove(db, &input?.slug).map(|_| json!({ "ok": true })))?
+            }
+            (Method::Post, "/move") => {
+                let input: ApiResult<MoveInput> = parse(&body);
+                self.run(move |db| {
+                    let input = input?;
+                    tenancy::move_address(db, &input.home, &input.to, Utc::now()).map(|_| json!({ "ok": true }))
+                })?
+            }
+            (Method::Post, "/resolve") => {
+                let input: ApiResult<SlugInput> = parse(&body);
+                self.run(move |db| match tenancy::resolve(db, &input?.slug)? {
+                    Some((home, moved)) => Ok(json!({ "home": home, "addresses": moved })),
+                    None => Err(ApiError::not_found("a workspace at that address")),
+                })?
             }
             (Method::Get, "/list") => self.run(|db| tenancy::list(db).map(|items| json!({ "items": items })))?,
             _ => Err(ApiError::not_found("directory route")),

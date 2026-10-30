@@ -8,8 +8,10 @@ use serde::Serialize;
 
 use crate::db::{Db, DbExt};
 use crate::error::{ApiError, ApiResult};
-use crate::params;
+use crate::events::{Event, emit};
+use crate::registry::Ctx;
 use crate::util::{hmac_sha256_hex, secure_eq, ts};
+use crate::{AddressMove, Effect, HostConfig, Response, params};
 
 /// Subdomains nobody can claim.
 pub const RESERVED: &[&str] = &[
@@ -128,7 +130,19 @@ CREATE TABLE IF NOT EXISTS workspaces (
 );
 CREATE INDEX IF NOT EXISTS workspaces_ip ON workspaces(ip_hash, created_at);
 CREATE INDEX IF NOT EXISTS workspaces_created ON workspaces(created_at);
+-- Addresses a workspace moved to. `home` is its first address, which names its storage; the
+-- workspace lives at the row marked `current`, or at `home` when none is.
+CREATE TABLE IF NOT EXISTS addresses (
+  slug TEXT PRIMARY KEY,
+  home TEXT NOT NULL,
+  current INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS addresses_home ON addresses(home);
 ";
+
+/// The most addresses one workspace can use, counting its first.
+pub const MAX_ADDRESSES: i64 = 5;
 
 pub fn directory_migrate(db: &dyn Db) -> ApiResult<()> {
     db.execute_batch(DIRECTORY_SCHEMA)
@@ -153,6 +167,9 @@ pub fn reserve(db: &dyn Db, slug: &str, name: &str, ip_hash: &str, now: DateTime
     if let Some(row) = db.one("SELECT status, reserved_until FROM workspaces WHERE slug = ?", &params![slug])?
         && (row.str("status") != "reserved" || row.str("reserved_until") > now_s)
     {
+        return Err(ApiError::conflict(format!("{slug} is taken; pick another address")));
+    }
+    if db.one("SELECT home FROM addresses WHERE slug = ?", &params![slug])?.is_some() {
         return Err(ApiError::conflict(format!("{slug} is taken; pick another address")));
     }
     let day_ago = ts(now - Duration::days(1));
@@ -211,33 +228,144 @@ pub fn set_status(db: &dyn Db, slug: &str, status: &str) -> ApiResult<()> {
     Ok(())
 }
 
-pub fn remove(db: &dyn Db, slug: &str) -> ApiResult<()> {
-    db.execute("DELETE FROM workspaces WHERE slug = ?", &params![slug])?;
+/// Removes a workspace (by its first address) and every address it moved to.
+pub fn remove(db: &dyn Db, home: &str) -> ApiResult<()> {
+    db.execute("DELETE FROM workspaces WHERE slug = ?", &params![home])?;
+    db.execute("DELETE FROM addresses WHERE home = ?", &params![home])?;
     Ok(())
+}
+
+/// Claims `to` for an active workspace and makes it the current address. `home` is the
+/// workspace's first address. Moving back to an address the workspace already holds always works.
+pub fn move_address(db: &dyn Db, home: &str, to: &str, now: DateTime<Utc>) -> ApiResult<()> {
+    validate_slug(to).map_err(ApiError::bad_request)?;
+    let Some(row) = db.one("SELECT status FROM workspaces WHERE slug = ?", &params![home])? else {
+        return Err(ApiError::not_found(format!("workspace `{home}`")));
+    };
+    if row.str("status") != "active" {
+        return Err(ApiError::forbidden("this workspace can't change its address"));
+    }
+    let taken = || ApiError::conflict(format!("{to} is taken; pick another address"));
+    let owner = db.one("SELECT home FROM addresses WHERE slug = ?", &params![to])?.map(|r| r.str("home"));
+    match owner {
+        Some(h) if h != home => return Err(taken()),
+        Some(_) => {}
+        None if to == home => {}
+        None => {
+            // Any reservation blocks a move, even a lapsed one, so a move never races a sign-up
+            // that is finishing setup.
+            if db.one("SELECT slug FROM workspaces WHERE slug = ?", &params![to])?.is_some() {
+                return Err(taken());
+            }
+            let held = db.query("SELECT slug FROM addresses WHERE home = ? ORDER BY created_at", &params![home])?;
+            if held.len() as i64 + 1 >= MAX_ADDRESSES {
+                let names: Vec<String> = std::iter::once(home.to_string()).chain(held.iter().map(|r| r.str("slug"))).collect();
+                return Err(ApiError::conflict(format!(
+                    "this workspace has used {MAX_ADDRESSES} addresses, the most allowed; move back to one of them: {}",
+                    names.join(", ")
+                )));
+            }
+            db.execute("INSERT INTO addresses (slug, home, created_at) VALUES (?, ?, ?)", &params![to, home, ts(now)])?;
+        }
+    }
+    db.execute("UPDATE addresses SET current = CASE WHEN slug = ? THEN 1 ELSE 0 END WHERE home = ?", &params![to, home])?;
+    Ok(())
+}
+
+/// Finds the workspace that holds an address: its first address and every address it moved to.
+pub fn resolve(db: &dyn Db, slug: &str) -> ApiResult<Option<(String, Vec<String>)>> {
+    let home = if db.one("SELECT slug FROM workspaces WHERE slug = ?", &params![slug])?.is_some() {
+        slug.to_string()
+    } else {
+        match db.one("SELECT home FROM addresses WHERE slug = ?", &params![slug])? {
+            Some(r) => r.str("home"),
+            None => return Ok(None),
+        }
+    };
+    let moved = db.query("SELECT slug FROM addresses WHERE home = ? ORDER BY created_at", &params![home.clone()])?;
+    Ok(Some((home, moved.iter().map(|r| r.str("slug")).collect())))
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct DirectoryEntry {
+    /// The workspace's first address, which names its storage.
     pub slug: String,
     pub name: String,
     /// `reserved`, `active` or `disabled`.
     pub status: String,
     pub created_at: String,
     pub activated_at: Option<String>,
+    /// Where the workspace lives now.
+    pub address: String,
+    /// Earlier addresses, which forward to `address` and stay reserved for this workspace.
+    pub previous_addresses: Vec<String>,
 }
 
 pub fn list(db: &dyn Db) -> ApiResult<Vec<DirectoryEntry>> {
+    let moved = db.query("SELECT slug, home, current FROM addresses ORDER BY created_at", &[])?;
     Ok(db
         .query("SELECT slug, name, status, created_at, activated_at FROM workspaces ORDER BY created_at DESC", &[])?
         .iter()
-        .map(|r| DirectoryEntry {
-            slug: r.str("slug"),
-            name: r.str("name"),
-            status: r.str("status"),
-            created_at: r.str("created_at"),
-            activated_at: r.opt_str("activated_at"),
+        .map(|r| {
+            let slug = r.str("slug");
+            let mine: Vec<_> = moved.iter().filter(|m| m.str("home") == slug).collect();
+            let address = mine.iter().find(|m| m.i64("current") == 1).map(|m| m.str("slug")).unwrap_or_else(|| slug.clone());
+            let previous_addresses =
+                std::iter::once(slug.clone()).chain(mine.iter().map(|m| m.str("slug"))).filter(|s| *s != address).collect();
+            DirectoryEntry {
+                slug,
+                name: r.str("name"),
+                status: r.str("status"),
+                created_at: r.str("created_at"),
+                activated_at: r.opt_str("activated_at"),
+                address,
+                previous_addresses,
+            }
         })
         .collect())
+}
+
+// ---------------------------------------------------------------------------
+// Inside a hosted workspace
+
+/// The address a workspace last moved to, if it ever moved. Before that it lives at its first address.
+pub fn moved_to(db: &dyn Db) -> ApiResult<Option<String>> {
+    crate::ops::admin::setting(db, "address")
+}
+
+/// Swaps the workspace address in an origin: `https://acme.dumbslab.com` → `https://docs.dumbslab.com`.
+pub fn origin_for(origin: &str, from: &str, to: &str) -> String {
+    origin.replacen(&format!("://{from}."), &format!("://{to}."), 1)
+}
+
+/// The answer for a request that reached a workspace through an address it moved away from.
+/// Browsers opening a page are redirected; API and MCP clients get an error naming the new address.
+pub fn moved_response(method: &str, accept: &str, new_origin: &str, path_and_query: &str, to: &str) -> Response {
+    let location = format!("{new_origin}{path_and_query}");
+    if matches!(method, "GET" | "HEAD") && accept.contains("text/html") {
+        // Temporary, so browsers don't cache it: the workspace may move back.
+        return Response::empty(307).with_header("location", location).with_header("cache-control", "no-store");
+    }
+    let err = ApiError::new(
+        410,
+        "workspace_moved",
+        format!("This workspace moved to {new_origin}. Use that address from now on (the MCP server is {new_origin}/mcp); you may need to sign in again."),
+    )
+    .with_details(serde_json::json!({ "address": to, "url": new_origin }));
+    Response::error(&err).with_header("location", location).with_header("cache-control", "no-store")
+}
+
+/// Records a move after the host claimed the new address in its directory. Returns the webhook
+/// deliveries for the `workspace.address_changed` event.
+pub fn finish_move(db: &dyn Db, cfg: &HostConfig, mv: &AddressMove, new_origin: &str) -> ApiResult<Vec<Effect>> {
+    crate::ops::admin::put_setting(db, "address", &mv.to)?;
+    let mut ctx = Ctx { db, actor: mv.actor.clone(), now: Utc::now(), cfg, base_url: new_origin.to_string(), effects: vec![] };
+    let summary = format!("moved the workspace from {} to {}", mv.from, mv.to);
+    emit(
+        &mut ctx,
+        Event::new("workspace.address_changed", "workspace", "address", summary).data(serde_json::json!({ "from": mv.from, "to": mv.to })),
+    )?;
+    Ok(ctx.effects)
 }
 
 #[cfg(test)]
@@ -274,5 +402,21 @@ mod tests {
         assert!(!verify_signup_token("s3cret", "other", &t, 1_000), "wrong workspace");
         assert!(!verify_signup_token("nope", "acme", &t, 1_000), "wrong secret");
         assert!(!verify_signup_token("s3cret", "acme", "9999999999.deadbeef", 1_000), "forged");
+    }
+
+    #[test]
+    fn moved_addresses() {
+        assert_eq!(origin_for("https://acme.dumbslab.com", "acme", "docs"), "https://docs.dumbslab.com");
+        assert_eq!(origin_for("http://acme.localhost:8787", "acme", "acme-2"), "http://acme-2.localhost:8787");
+
+        let page = moved_response("GET", "text/html,application/xhtml+xml", "https://docs.x.test", "/oauth/authorize?a=1", "docs");
+        assert_eq!(page.status, 307);
+        assert!(page.headers.contains(&("location".into(), "https://docs.x.test/oauth/authorize?a=1".into())));
+
+        let api = moved_response("POST", "application/json", "https://docs.x.test", "/mcp", "docs");
+        assert_eq!(api.status, 410);
+        let body: serde_json::Value = serde_json::from_slice(&api.body).unwrap();
+        assert_eq!(body["error"]["code"], "workspace_moved");
+        assert_eq!(body["error"]["details"]["url"], "https://docs.x.test");
     }
 }

@@ -32,6 +32,13 @@ export function goToLogin() {
   location.href = '/login?next=' + encodeURIComponent(next);
 }
 
+/** The workspace moved to a new address: continue there, on the same page. */
+function goToNewAddress(origin) {
+  if (redirecting) return;
+  redirecting = true;
+  location.replace(origin + location.pathname + location.search + location.hash);
+}
+
 export async function request(method, path, { query, body, redirectOn401 = true, signal } = {}) {
   let url = '/api/v1' + path;
   const qs = toQuery(query);
@@ -61,6 +68,7 @@ export async function request(method, path, { query, body, redirectOn401 = true,
   if (!res.ok) {
     const err = (data && data.error) || {};
     if (res.status === 401 && redirectOn401) goToLogin();
+    if (err.code === 'workspace_moved' && err.details && err.details.url) goToNewAddress(err.details.url);
     throw new ApiError(res.status, err.code || `http_${res.status}`, err.message || res.statusText || 'Request failed', err.details);
   }
   return data;

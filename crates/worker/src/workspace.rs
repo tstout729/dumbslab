@@ -3,12 +3,16 @@
 //! In multi-tenant hosting the front Worker passes the workspace address in
 //! `x-dumbslab-workspace`. An address nobody has signed up for creates no storage: the object
 //! answers from memory until a valid sign-up link sets it up.
+//!
+//! A workspace keeps its data in the object named after its first address (its "home"). When it
+//! moves, the object for the new address only stores a pointer home; the front Worker follows it.
+//! The home object sends requests for any address but the current one on to the current one.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 
 use chrono::Utc;
 use dumbslab_core::db::{Db, DbExt};
-use dumbslab_core::{ApiError, ApiResult, Effect, HostConfig, Outcome};
+use dumbslab_core::{AddressMove, ApiError, ApiResult, Effect, HostConfig, Outcome, params, tenancy};
 use serde_json::{Value, json};
 use wasm_bindgen::prelude::*;
 use worker::*;
@@ -17,12 +21,46 @@ use crate::sql::{DoDb, api_error_response, call_object, error_response, flag, js
 
 /// The header the front Worker uses to tell a workspace object its address.
 pub const WORKSPACE_HEADER: &str = "x-dumbslab-workspace";
+/// The workspace's first address, which names the object holding its data. Set by the front Worker.
+pub const HOME_HEADER: &str = "x-dumbslab-home";
+/// How an address a workspace moved to answers: it names the workspace's home, and the front
+/// Worker sends the request there. It never reaches a client.
+pub const ALIAS_HEADER: &str = "x-dumbslab-alias-of";
+
+/// What an object stores.
+enum Stored {
+    Nothing,
+    Workspace,
+    /// An address a workspace moved to; the workspace's home address.
+    Alias(String),
+}
 
 #[durable_object]
 pub struct Workspace {
     state: State,
     env: Env,
     migrated: Cell<bool>,
+    alias: RefCell<Option<String>>,
+    moving: Cell<bool>,
+}
+
+fn rust_err(e: ApiError) -> worker::Error {
+    worker::Error::RustError(e.message)
+}
+
+/// Converts a core response, replacing defaults such as `application/octet-stream`. Only cookies repeat.
+fn to_response(r: dumbslab_core::Response) -> Result<Response> {
+    // 204/304 responses must not have a body at all, not even an empty one.
+    let mut resp = if r.body.is_empty() { Response::empty()? } else { Response::from_bytes(r.body)? }.with_status(r.status);
+    let h = resp.headers_mut();
+    for (k, v) in &r.headers {
+        if k == "set-cookie" {
+            h.append(k, v)?;
+        } else {
+            h.set(k, v)?;
+        }
+    }
+    Ok(resp)
 }
 
 impl Workspace {
@@ -30,16 +68,25 @@ impl Workspace {
         DoDb { sql: self.state.storage().sql() }
     }
 
-    /// Whether this workspace's schema exists. Reading `sqlite_master` writes nothing.
-    fn initialized(&self) -> Result<bool> {
+    /// What this object stores. Reading `sqlite_master` writes nothing.
+    fn stored(&self) -> Result<Stored> {
         if self.migrated.get() {
-            return Ok(true);
+            return Ok(Stored::Workspace);
         }
-        let rows = self
-            .db()
-            .query("SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'table' AND name = 'meta'", &[])
-            .map_err(|e| worker::Error::RustError(e.message))?;
-        Ok(rows.first().is_some_and(|r| r.i64("n") > 0))
+        if let Some(home) = self.alias.borrow().clone() {
+            return Ok(Stored::Alias(home));
+        }
+        let tables =
+            self.db().query("SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('meta', 'alias')", &[]).map_err(rust_err)?;
+        if tables.iter().any(|r| r.str("name") == "meta") {
+            return Ok(Stored::Workspace);
+        }
+        if tables.iter().any(|r| r.str("name") == "alias") {
+            let home = self.db().one("SELECT home FROM alias", &[]).map_err(rust_err)?.map(|r| r.str("home")).unwrap_or_default();
+            *self.alias.borrow_mut() = Some(home.clone());
+            return Ok(Stored::Alias(home));
+        }
+        Ok(Stored::Nothing)
     }
 
     fn migrate(&self) -> Result<()> {
@@ -65,11 +112,36 @@ impl Workspace {
         Ok(row.is_some_and(|r| r.str("value") == "1"))
     }
 
-    /// Operator actions, reachable only from the front Worker (it never forwards `/_internal`).
-    async fn internal(&self, path: &str) -> Result<Response> {
+    /// Operator actions and address moves, reachable only from the front Worker and other objects
+    /// (the Worker never forwards `/_internal`).
+    async fn internal(&self, path: &str, req: &mut Request) -> Result<Response> {
         match path {
+            "/_internal/alias" => {
+                let home = req.json::<Value>().await.ok().and_then(|v| v["home"].as_str().map(str::to_string)).unwrap_or_default();
+                if home.is_empty() {
+                    return error_response(400, "bad_request", "send {\"home\": \"…\"}");
+                }
+                match self.stored()? {
+                    Stored::Workspace => return error_response(409, "conflict", "this address holds a workspace"),
+                    Stored::Alias(h) if h != home => return error_response(409, "conflict", "this address belongs to another workspace"),
+                    _ => {}
+                }
+                let storage = self.state.storage();
+                let pointer = home.clone();
+                let saved = transaction(&storage, self.db(), move |db| {
+                    let r = db
+                        .execute_batch("CREATE TABLE IF NOT EXISTS alias (home TEXT NOT NULL)")
+                        .and_then(|_| db.execute("DELETE FROM alias", &[]))
+                        .and_then(|_| db.execute("INSERT INTO alias (home) VALUES (?)", &params![pointer]));
+                    let ok = r.is_ok();
+                    (r, ok)
+                })?;
+                saved.map_err(rust_err)?;
+                *self.alias.borrow_mut() = Some(home);
+                json_response(200, &json!({ "ok": true }))
+            }
             "/_internal/disable" | "/_internal/enable" => {
-                if !self.initialized()? {
+                if !matches!(self.stored()?, Stored::Workspace) {
                     return error_response(404, "no_workspace", "no workspace here");
                 }
                 self.migrate()?;
@@ -82,11 +154,70 @@ impl Workspace {
                 json_response(200, &json!({ "ok": true }))
             }
             "/_internal/delete" => {
+                // The operator deletes the home object first and then reads the final address
+                // list, so no move may be half done.
+                if self.moving.get() {
+                    return error_response(409, "conflict", "the workspace is changing its address; try again");
+                }
                 self.state.storage().delete_all().await?;
                 self.migrated.set(false);
+                *self.alias.borrow_mut() = None;
                 json_response(200, &json!({ "ok": true }))
             }
             _ => error_response(404, "not_found", "not found"),
+        }
+    }
+
+    /// Moves the workspace: claims the new address in the directory, points it here, then records
+    /// the move. A failure part-way leaves the workspace at its current address, and trying again
+    /// finishes the job. Returns the move's webhook deliveries, or the response to send instead.
+    async fn move_address(
+        &self,
+        mv: &AddressMove,
+        home: &str,
+        origin: &str,
+        cfg: &HostConfig,
+    ) -> Result<std::result::Result<Vec<Effect>, Response>> {
+        if self.moving.replace(true) {
+            return Ok(Err(error_response(409, "conflict", "The workspace is already changing its address. Try again in a moment.")?));
+        }
+        let result = self.move_steps(mv, home, origin, cfg).await;
+        self.moving.set(false);
+        result
+    }
+
+    async fn move_steps(
+        &self,
+        mv: &AddressMove,
+        home: &str,
+        origin: &str,
+        cfg: &HostConfig,
+    ) -> Result<std::result::Result<Vec<Effect>, Response>> {
+        let claim = json!({ "home": home, "to": mv.to });
+        let (status, reply) = call_object(&self.env, "DIRECTORY", "directory", Method::Post, "/move", Some(&claim)).await?;
+        if status != 200 {
+            return Ok(Err(json_response(status, &reply)?));
+        }
+        // The home address needs no pointer: this object answers it directly.
+        if mv.to != home {
+            let pointer = json!({ "home": home });
+            let (status, _) =
+                call_object(&self.env, "WORKSPACE", &format!("ws:{}", mv.to), Method::Post, "/_internal/alias", Some(&pointer)).await?;
+            if status != 200 {
+                return Ok(Err(error_response(500, "move_failed", "The new address couldn't be set up. Try again.")?));
+            }
+        }
+        let new_origin = tenancy::origin_for(origin, &mv.from, &mv.to);
+        let (cfg, mv) = (cfg.clone(), mv.clone());
+        let storage = self.state.storage();
+        let recorded = transaction(&storage, self.db(), move |db| {
+            let r = tenancy::finish_move(db, &cfg, &mv, &new_origin);
+            let ok = r.is_ok();
+            (r, ok)
+        })?;
+        match recorded {
+            Ok(effects) => Ok(Ok(effects)),
+            Err(e) => Ok(Err(api_error_response(&e)?)),
         }
     }
 
@@ -117,14 +248,14 @@ impl Workspace {
 
 impl DurableObject for Workspace {
     fn new(state: State, env: Env) -> Self {
-        Self { state, env, migrated: Cell::new(false) }
+        Self { state, env, migrated: Cell::new(false), alias: RefCell::new(None), moving: Cell::new(false) }
     }
 
     async fn fetch(&self, mut req: Request) -> Result<Response> {
         let url = req.url()?;
         let path = url.path().to_string();
         if path.starts_with("/_internal/") {
-            return self.internal(&path).await;
+            return self.internal(&path, &mut req).await;
         }
         let method = req.method();
         let origin = match url.port() {
@@ -132,6 +263,15 @@ impl DurableObject for Workspace {
             None => format!("{}://{}", url.scheme(), url.host_str().unwrap_or_default()),
         };
         let workspace = req.headers().get(WORKSPACE_HEADER)?;
+        // An address a workspace moved to: the front Worker sends the request on to its home.
+        if workspace.is_some()
+            && let Stored::Alias(home) = self.stored()?
+        {
+            let mut resp = Response::empty()?.with_status(204);
+            resp.headers_mut().set(ALIAS_HEADER, &home)?;
+            return Ok(resp);
+        }
+        let home = req.headers().get(HOME_HEADER)?.or_else(|| workspace.clone());
         // Bound the body before anything else runs: one workspace object serves every request.
         let Some(body) = read_body(&mut req).await? else {
             return error_response(413, "too_large", "request body too large");
@@ -141,7 +281,7 @@ impl DurableObject for Workspace {
         // Set when this request creates the workspace: schema and first admin commit together.
         let mut creating = false;
         if let Some(slug) = &workspace {
-            if !self.initialized()? {
+            if matches!(self.stored()?, Stored::Nothing) {
                 // Only a valid sign-up link may create the workspace's storage.
                 let token =
                     serde_json::from_slice::<Value>(&body).ok().and_then(|v| v["setup_token"].as_str().map(|t| t.trim().to_string()));
@@ -167,11 +307,26 @@ impl DurableObject for Workspace {
                 if status != 200 || reply["ok"] != json!(true) {
                     return error_response(403, "forbidden", "This sign-up link is no longer valid. Start again from the sign-up page.");
                 }
+                // A workspace may have moved to this address while the check was running.
+                if !matches!(self.stored()?, Stored::Nothing) {
+                    return error_response(409, "conflict", "This address was just taken. Start again from the sign-up page.");
+                }
                 creating = true;
             } else {
                 self.migrate()?;
                 if self.disabled()? {
                     return error_response(403, "disabled", "This workspace has been disabled for breaking the acceptable use policy.");
+                }
+                // Reached through an address the workspace moved away from: send people on.
+                let current = tenancy::moved_to(&self.db()).map_err(rust_err)?.or_else(|| home.clone()).unwrap_or_else(|| slug.clone());
+                if *slug != current {
+                    let accept = req.headers().get("accept")?.unwrap_or_default();
+                    let target = match url.query() {
+                        Some(q) => format!("{path}?{q}"),
+                        None => path.clone(),
+                    };
+                    let new_origin = tenancy::origin_for(&origin, slug, &current);
+                    return to_response(tenancy::moved_response(method.as_ref(), &accept, &new_origin, &target, &current));
                 }
             }
         } else {
@@ -198,12 +353,13 @@ impl DurableObject for Workspace {
         };
         let multi = workspace.is_some();
         let cfg = HostConfig {
-            base_url: if multi { Some(origin) } else { var(&self.env, "BASE_URL") },
+            base_url: if multi { Some(origin.clone()) } else { var(&self.env, "BASE_URL") },
             setup_token: if multi { None } else { var(&self.env, "SETUP_TOKEN") },
             open_setup: flag(&self.env, "OPEN_SETUP"),
             signup_secret: if multi { signup_secret } else { None },
             workspace: workspace.clone(),
         };
+        let move_cfg = cfg.clone();
 
         let storage = self.state.storage();
         let sql = self.db().sql;
@@ -249,8 +405,18 @@ impl DurableObject for Workspace {
             });
         }
 
-        for effect in outcome.effects {
-            let Effect::Webhook(d) = effect;
+        let mut effects = outcome.effects;
+        if let Some(i) = effects.iter().position(|e| matches!(e, Effect::MoveAddress(_))) {
+            let Effect::MoveAddress(mv) = effects.remove(i) else { unreachable!() };
+            let home = home.clone().unwrap_or_else(|| mv.from.clone());
+            match self.move_address(&mv, &home, &origin, &move_cfg).await? {
+                Ok(more) => effects.extend(more),
+                Err(resp) => return Ok(resp),
+            }
+        }
+
+        for effect in effects {
+            let Effect::Webhook(d) = effect else { continue };
             let db = self.db();
             self.state.wait_until(async move {
                 let headers = Headers::new();
@@ -272,18 +438,6 @@ impl DurableObject for Workspace {
             });
         }
 
-        let r = outcome.response;
-        // 204/304 responses must not have a body at all, not even an empty one.
-        let mut resp = if r.body.is_empty() { Response::empty()? } else { Response::from_bytes(r.body)? }.with_status(r.status);
-        let h = resp.headers_mut();
-        for (k, v) in &r.headers {
-            // Replace defaults such as `application/octet-stream`; only cookies repeat.
-            if k == "set-cookie" {
-                h.append(k, v)?;
-            } else {
-                h.set(k, v)?;
-            }
-        }
-        Ok(resp)
+        to_response(outcome.response)
     }
 }

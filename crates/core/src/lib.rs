@@ -2,7 +2,8 @@
 //!
 //! A host (the native server or the Cloudflare Worker) turns an incoming HTTP request into a
 //! [`Request`], opens a database transaction, calls [`handle`], commits or rolls back according
-//! to [`Outcome::commit`], and then performs the returned [`Effect`]s (webhook deliveries).
+//! to [`Outcome::commit`], and then performs the returned [`Effect`]s (webhook deliveries and,
+//! for hosted workspaces, address moves).
 //!
 //! Every capability is an operation in [`registry`]. Each one is exposed the same way over REST
 //! (`/api/v1/...`), the generic operations endpoint (`/api/v1/operations/{name}`), MCP (`/mcp`)
@@ -121,9 +122,20 @@ pub struct WebhookDelivery {
     pub body: String,
 }
 
+/// Hosted workspaces only: an admin asked to move the workspace from `from` to `to`. The host
+/// claims `to` in its directory, then records the move with [`tenancy::finish_move`] in a new
+/// transaction. Nothing changes if the claim fails.
+#[derive(Clone, Debug)]
+pub struct AddressMove {
+    pub from: String,
+    pub to: String,
+    pub actor: auth::Actor,
+}
+
 #[derive(Clone, Debug)]
 pub enum Effect {
     Webhook(WebhookDelivery),
+    MoveAddress(AddressMove),
 }
 
 #[derive(Clone, Debug)]

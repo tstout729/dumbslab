@@ -43,6 +43,15 @@ How sign-up works:
 
 An address nobody has signed up for answers "no workspace here" and creates no storage.
 
+### Changing a workspace's address
+
+Admins can move a workspace to another address under **Settings › Workspace**, or with the `change_address` operation (`POST /api/v1/settings/address`).
+
+- **Data:** posts, people and API tokens all move with the workspace. Its data stays in the object named after its first address; the object for the new address only points there.
+- **Signing in:** everyone signs in again at the new address, and AI tools need the new MCP URL.
+- **Old addresses:** they stay reserved for the workspace. Browsers opening one are sent to the new address. API and MCP calls get a `410 workspace_moved` error that names it.
+- **Limit:** a workspace can use 5 addresses in total, counting its first. Moving back to an earlier address is always allowed.
+
 ### Limits that keep it free
 
 | Variable | Default | Meaning |
@@ -61,8 +70,10 @@ Remove abuse with `Authorization: Bearer $OPERATOR_TOKEN` on the root domain:
 ```sh
 curl -H "Authorization: Bearer $OPERATOR_TOKEN" https://your-domain/api/operator/workspaces
 curl -X POST -H "Authorization: Bearer $OPERATOR_TOKEN" https://your-domain/api/operator/workspaces/acme/disable   # or enable
-curl -X POST -H "Authorization: Bearer $OPERATOR_TOKEN" https://your-domain/api/operator/workspaces/acme/delete    # erases it; the address becomes free
+curl -X POST -H "Authorization: Bearer $OPERATOR_TOKEN" https://your-domain/api/operator/workspaces/acme/delete    # erases it; its addresses become free
 ```
+
+Any of a workspace's addresses works in these URLs. The list shows each workspace's current `address` and its `previous_addresses`.
 
 ## Single-workspace mode
 

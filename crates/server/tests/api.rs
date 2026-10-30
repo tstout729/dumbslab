@@ -848,7 +848,7 @@ fn webhooks_are_signed() {
     let r = h.call("POST", "/api/v1/posts", Some(json!({ "title": "Hooked", "status": "published" })), &admin);
     assert_eq!(r.status, 200);
     assert_eq!(r.effects.len(), 1);
-    let Effect::Webhook(d) = &r.effects[0];
+    let Effect::Webhook(d) = &r.effects[0] else { panic!("expected a webhook delivery") };
     assert_eq!(d.url, "https://hooks.test/in");
     let header = |n: &str| d.headers.iter().find(|(k, _)| k == n).unwrap().1.clone();
     let expected = dumbslab_core::util::hmac_sha256_hex(&secret, &format!("{}.{}", header("x-dumbslab-timestamp"), d.body));
@@ -981,4 +981,148 @@ fn directory_reserves_addresses_within_limits() {
     assert!(entries.iter().any(|e| e.slug == "acme" && e.status == "disabled"));
     assert!(!entries.iter().any(|e| e.slug == "eps"));
     assert_eq!(status(reserve("www", "ip8", t1)), Some(400));
+}
+
+#[test]
+fn hosted_workspaces_change_address() {
+    use dumbslab_core::tenancy::{self, signup_token};
+    // A self-hosted server has no address to change.
+    let plain = H::new();
+    let (_, plain_admin) = plain.setup();
+    let r = plain.call("POST", "/api/v1/settings/address", Some(json!({ "address": "wiki" })), &plain_admin);
+    assert_eq!(r.status, 400, "{}", r.body);
+    assert!(plain.ok("GET", "/api/v1/settings", None, &plain_admin)["address"].is_null());
+
+    let mut h = H::new();
+    h.cfg = HostConfig {
+        base_url: Some("https://acme.kb.test".into()),
+        signup_secret: Some("sekret".into()),
+        workspace: Some("acme".into()),
+        ..Default::default()
+    };
+    let token = signup_token("sekret", "acme", chrono::Utc::now().timestamp() + 3600);
+    let r = h.call(
+        "POST",
+        "/api/v1/auth/setup",
+        Some(json!({ "setup_token": token, "workspace_name": "Acme", "name": "Ada", "email": "ada@acme.test", "password": "password123" })),
+        &Auth::None,
+    );
+    assert_eq!(r.status, 200, "{}", r.body);
+    let admin = session_from(&r);
+    assert_eq!(h.ok("GET", "/api/v1/settings", None, &admin)["address"], "acme");
+    let (_, member) = h.user(&admin, "mo@acme.test", "Mo", "member");
+    let change = |to: &str, auth: &Auth| h.call("POST", "/api/v1/settings/address", Some(json!({ "address": to })), auth);
+    assert_eq!(change("wiki", &member).status, 403, "admins only");
+    assert_eq!(change("not valid", &admin).status, 400);
+    assert_eq!(change("www", &admin).status, 400, "reserved");
+    assert_eq!(change("acme", &admin).status, 409, "already there");
+
+    // The operation asks the host to move; nothing changes until the host has claimed the address.
+    let r = change(" Wiki ", &admin);
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert_eq!(r.body["url"], "https://wiki.kb.test");
+    assert_eq!(r.body["mcp_url"], "https://wiki.kb.test/mcp");
+    assert_eq!(r.body["previous_address"], "acme");
+    let mv = r
+        .effects
+        .iter()
+        .find_map(|e| match e {
+            Effect::MoveAddress(m) => Some(m.clone()),
+            _ => None,
+        })
+        .expect("a move");
+    assert_eq!((mv.from.as_str(), mv.to.as_str()), ("acme", "wiki"));
+    let moved_to = |h: &H| h.store.with_tx(|db| (tenancy::moved_to(db), true)).unwrap().unwrap();
+    assert_eq!(moved_to(&h), None);
+    let has_event = |h: &H| {
+        h.ok("GET", "/api/v1/activity", None, &member)["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|a| a["event"] == "workspace.address_changed")
+    };
+    assert!(!has_event(&h));
+
+    let effects = h
+        .store
+        .with_tx(|db| {
+            let r = tenancy::finish_move(db, &h.cfg, &mv, "https://wiki.kb.test");
+            let ok = r.is_ok();
+            (r, ok)
+        })
+        .unwrap()
+        .unwrap();
+    assert!(effects.is_empty(), "no webhooks to deliver");
+    assert_eq!(moved_to(&h).as_deref(), Some("wiki"));
+    assert!(has_event(&h), "everyone sees the move");
+}
+
+#[test]
+fn directory_moves_addresses() {
+    use chrono::{Duration, Utc};
+    use dumbslab_core::tenancy::{self, Limits};
+    let h = H::new();
+    let limits = Limits { per_ip_per_day: 50, per_day: 50, max_workspaces: 50 };
+    let t0 = Utc::now();
+    let run = |f: &dyn Fn(&dyn dumbslab_core::Db) -> dumbslab_core::ApiResult<()>| {
+        h.store
+            .with_tx(|db| {
+                let r = f(db);
+                let ok = r.is_ok();
+                (r, ok)
+            })
+            .unwrap()
+    };
+    let status = |r: dumbslab_core::ApiResult<()>| r.err().map(|e| e.status);
+    let reserve = |slug: &'static str, at| run(&move |db| tenancy::reserve(db, slug, "Name", "ip", at, limits).map(|_| ()));
+    let mv = |home: &'static str, to: &'static str, at| run(&move |db| tenancy::move_address(db, home, to, at));
+    let resolve = |slug: &str| h.store.with_tx(|db| (tenancy::resolve(db, slug), true)).unwrap().unwrap();
+    let entry = |slug: &str| {
+        let list = h.store.with_tx(|db| (tenancy::list(db), true)).unwrap().unwrap();
+        let e = list.into_iter().find(|e| e.slug == slug).unwrap();
+        (e.address, e.previous_addresses)
+    };
+    let owned = |home: &str, moved: &[&str]| Some((home.to_string(), moved.iter().map(|s| s.to_string()).collect::<Vec<_>>()));
+    run(&|db| tenancy::directory_migrate(db)).unwrap();
+    for slug in ["acme", "beta"] {
+        reserve(slug, t0).unwrap();
+        run(&move |db| tenancy::activate(db, slug, t0)).unwrap();
+    }
+    reserve("held", t0).unwrap();
+    reserve("stale", t0).unwrap();
+
+    assert_eq!(status(mv("acme", "beta", t0)), Some(409), "another workspace");
+    assert_eq!(status(mv("acme", "held", t0)), Some(409), "a live reservation");
+    assert_eq!(status(mv("held", "zeta", t0)), Some(403), "not set up yet");
+    assert_eq!(status(mv("nope", "zeta", t0)), Some(404));
+    assert_eq!(status(mv("acme", "www", t0)), Some(400));
+    assert_eq!(status(mv("acme", "wiki", t0)), None);
+    // Both addresses now belong to acme, for good.
+    assert_eq!(status(reserve("wiki", t0)), Some(409));
+    assert_eq!(status(reserve("acme", t0 + Duration::days(3))), Some(409));
+    assert_eq!(status(mv("beta", "wiki", t0)), Some(409));
+    assert_eq!(resolve("wiki"), owned("acme", &["wiki"]));
+    assert_eq!(resolve("acme"), owned("acme", &["wiki"]));
+    assert_eq!(resolve("nobody"), None);
+    assert_eq!(entry("acme"), ("wiki".to_string(), vec!["acme".to_string()]));
+    // Moving back doesn't use up another address.
+    assert_eq!(status(mv("acme", "acme", t0)), None);
+    assert_eq!(entry("acme"), ("acme".to_string(), vec!["wiki".to_string()]));
+    assert_eq!(status(mv("acme", "wiki", t0)), None);
+    // A lapsed reservation still blocks moves (its sign-up may be finishing), but not sign-ups.
+    assert_eq!(status(mv("acme", "stale", t0 + Duration::hours(2))), Some(409));
+    assert_eq!(status(reserve("stale", t0 + Duration::hours(2))), None);
+    // Five addresses at most, counting the first; earlier ones keep working at the cap.
+    assert_eq!(status(mv("acme", "three", t0)), None);
+    assert_eq!(resolve("three"), owned("acme", &["wiki", "three"]));
+    assert_eq!(status(mv("acme", "four", t0)), None);
+    assert_eq!(status(mv("acme", "five", t0)), None);
+    assert_eq!(status(mv("acme", "six", t0)), Some(409));
+    assert_eq!(status(mv("acme", "wiki", t0)), None);
+    // Disabled workspaces can't move, and removing one frees all its addresses.
+    run(&|db| tenancy::set_status(db, "acme", "disabled")).unwrap();
+    assert_eq!(status(mv("acme", "four", t0)), Some(403));
+    run(&|db| tenancy::remove(db, "acme")).unwrap();
+    assert_eq!(resolve("wiki"), None);
+    assert_eq!(status(reserve("wiki", t0)), None);
 }
