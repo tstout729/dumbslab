@@ -156,3 +156,22 @@ The `dev` environment runs hosted mode on `localhost` with throwaway secrets: op
 
 - Admins can export a workspace as JSON with the `export_workspace` operation: `GET /api/v1/export`.
 - Durable Objects support point-in-time recovery for 30 days. See Cloudflare's [PITR API](https://developers.cloudflare.com/durable-objects/api/sqlite-storage-api/#pitr-point-in-time-recovery-api).
+
+## Automatic production deploys
+
+On a push to `main`, the GitHub Actions `deploy` job waits for the `check` job
+and runs Wrangler from `crates/worker`. Pull requests never deploy.
+
+Set these repository Actions secrets before merging the workflow:
+
+- `CLOUDFLARE_ACCOUNT_ID`: the account that owns the Worker and zone.
+- `CLOUDFLARE_API_TOKEN`: a dedicated API token scoped to that account and the
+  `dumbslab.com` zone. Grant Account / Workers Scripts / Edit and Zone / Workers
+  Routes / Edit, plus Account / Account Settings / Read and Zone / Zone / Read.
+  Static assets and Durable Objects ship with the Worker. Do not use a global
+  API key or an interactive Wrangler OAuth token.
+
+Keep runtime secrets in the Worker; they do not belong in GitHub Actions.
+After merging, confirm the deploy job succeeds and compare the commit returned
+by `https://dumbslab.com/healthz` with the merged commit (once build metadata
+support is merged). Do not trigger a manual production deploy to test a PR.
