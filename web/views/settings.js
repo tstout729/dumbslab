@@ -543,7 +543,7 @@ async function ssoSection(ctx) {
   const help = h('span');
   const issuer = input({ type: 'url', value: s.issuer || '', spellcheck: 'false', autocapitalize: 'off' });
   const tenant = input({ value: s.tenant || '', spellcheck: 'false', placeholder: '72f988bf-86f1-41af-91ab-2d7cd011db47' });
-  const team = input({ value: s.team || '', spellcheck: 'false', placeholder: 'Optional, like T0123ABCD' });
+  const team = input({ value: s.team || '', spellcheck: 'false', placeholder: 'Like T0123ABCD' });
   const label = input({ value: s.label || '', maxlength: '40', placeholder: 'SSO' });
   const clientId = input({ value: s.client_id || '', spellcheck: 'false', autocapitalize: 'off' });
   const secretHint = (x) => (x.client_secret_unreadable ? 'Enter it again: the saved one can’t be read.' : x.client_secret_set ? 'Saved. Leave empty to keep it.' : '');
@@ -554,7 +554,7 @@ async function ssoSection(ctx) {
   const requireSso = checkbox('Require single sign-on: only admins can sign in with a password', { checked: s.require_sso });
   const issuerField = field('Issuer URL', issuer, { hint: 'Exactly as the provider names it, https and all.' });
   const tenantField = field('Directory (tenant) ID', tenant, { hint: 'Microsoft Entra admin center › Overview. Only this directory’s accounts can sign in.' });
-  const teamField = field('Slack workspace ID', team, { hint: 'Only people in this Slack workspace can sign in. Leave empty to allow any.' });
+  const teamField = field('Slack workspace ID', team, { hint: 'Only people in this Slack workspace can sign in. It’s in Slack’s address in a browser: app.slack.com/client/T…' });
   const labelField = field('Button name', label, { hint: 'Shown as “Sign in with …”.' });
   const domainsHint = h('span');
   const domainsField = field('Allowed email domains', domains, { hint: domainsHint });

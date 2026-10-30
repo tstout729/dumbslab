@@ -165,6 +165,7 @@ impl Config {
         let specific = match provider {
             Provider::Google => !self.allowed_domains.is_empty(),
             Provider::Microsoft => !self.tenant.is_empty(),
+            Provider::Slack => !self.team.is_empty(),
             _ => true,
         };
         specific && !self.issuer.is_empty() && !self.client_id.is_empty() && self.client_secret.is_some()
@@ -495,7 +496,8 @@ fn org_check(conf: &Config, claims: &Value) -> Result<(), Problem> {
     let belongs = match conf.provider {
         Some(Provider::Google) => claims["hd"].as_str().is_some_and(|hd| !hd.is_empty() && conf.domain_allowed(hd)),
         Some(Provider::Microsoft) => claims["tid"].as_str().is_some_and(|t| t.eq_ignore_ascii_case(&conf.tenant)),
-        Some(Provider::Slack) => conf.team.is_empty() || claims["https://slack.com/team_id"].as_str() == Some(conf.team.as_str()),
+        // Required, like Microsoft's tenant: without it, anyone's Slack account would do.
+        Some(Provider::Slack) => !conf.team.is_empty() && claims["https://slack.com/team_id"].as_str() == Some(conf.team.as_str()),
         _ => true,
     };
     if belongs { Ok(()) } else { Err(Problem::NotInOrg) }
