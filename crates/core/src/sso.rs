@@ -211,9 +211,16 @@ pub fn off() -> ApiError {
     )
 }
 
+/// A client secret is saved, but this server can't read it: its connector key changed since.
+/// An admin must enter the secret again.
+pub fn secret_unreadable(cfg: &HostConfig, conf: &Config) -> bool {
+    conf.client_secret.is_some() && connect::key(cfg).is_some() && client_secret(cfg, conf).is_none()
+}
+
 /// People can sign in with the provider now: it's on, set up, and the server can read the secret.
+/// Everything that depends on single sign-on working (the sign-in button, requiring it) checks this.
 pub fn active(cfg: &HostConfig, conf: &Config) -> bool {
-    conf.enabled && conf.complete() && connect::key(cfg).is_some()
+    conf.enabled && conf.complete() && client_secret(cfg, conf).is_some()
 }
 
 pub fn callback_url(base_url: &str) -> String {
@@ -314,6 +321,9 @@ pub struct SsoSettings {
     pub client_id: String,
     /// A client secret is saved.
     pub client_secret_set: bool,
+    /// The saved client secret can't be read: the server's connector key changed since it was
+    /// saved. Single sign-on is off until an admin enters the secret again.
+    pub client_secret_unreadable: bool,
     /// Email domains whose verified addresses may sign in to existing accounts, and join when `auto_provision` is on.
     pub allowed_domains: Vec<String>,
     pub auto_provision: bool,
@@ -341,6 +351,7 @@ pub fn settings_view(db: &dyn Db, cfg: &HostConfig, base_url: &str, check: Optio
         team: some(&conf.team),
         client_id: conf.client_id.clone(),
         client_secret_set: conf.client_secret.is_some(),
+        client_secret_unreadable: secret_unreadable(cfg, &conf),
         allowed_domains: conf.allowed_domains.clone(),
         auto_provision: conf.auto_provision,
         require_sso: conf.require_sso,
@@ -569,8 +580,8 @@ pub enum Problem {
     Bot,
     /// The person with that email has a different account at the provider linked.
     EmailLinked,
-    /// Linking: finished signed in as someone else.
-    WrongPerson,
+    /// Linking: finished in another browser session than the one that started (or it was signed out).
+    OtherSession,
     /// Linking: the provider account is someone else's here.
     AlreadyLinked,
     /// Anything else.
@@ -592,7 +603,7 @@ impl Problem {
         Problem::Deactivated,
         Problem::Bot,
         Problem::EmailLinked,
-        Problem::WrongPerson,
+        Problem::OtherSession,
         Problem::AlreadyLinked,
         Problem::Failed,
     ];
@@ -612,7 +623,7 @@ impl Problem {
             Problem::Deactivated => "deactivated",
             Problem::Bot => "bot",
             Problem::EmailLinked => "email_linked",
-            Problem::WrongPerson => "wrong_person",
+            Problem::OtherSession => "other_session",
             Problem::AlreadyLinked => "already_linked",
             Problem::Failed => "failed",
         }
@@ -676,8 +687,8 @@ pub struct SsoJob {
 enum Kind {
     /// Someone signing in from the sign-in page.
     SignIn { next: String },
-    /// A signed-in person linking their account (`link_sso`).
-    Link { user_id: String },
+    /// A signed-in person linking their account (`link_sso`), from one browser session.
+    Link { user_id: String, session_hash: String },
     /// An admin saved the settings (`update_sso`): check the provider's discovery document.
     Check,
     /// The provider sent someone back.
@@ -690,6 +701,8 @@ struct Returned {
     flow: Flow,
     /// Linking: who.
     link_user: Option<String>,
+    /// Linking: the session that started it, which must still be signed in to finish.
+    link_session: Option<String>,
     user_agent: Option<String>,
 }
 
@@ -729,9 +742,11 @@ impl SsoJob {
         SsoJob { base_url: base_url.into(), kind: Kind::Check, phase: Phase::Start }
     }
 
-    /// Starts linking `user_id`'s account at the provider; fills in `{ "authorize_url": … }`.
-    pub fn link(base_url: &str, user_id: &str) -> SsoJob {
-        SsoJob { base_url: base_url.into(), kind: Kind::Link { user_id: user_id.into() }, phase: Phase::Start }
+    /// Starts linking `user_id`'s account at the provider, for the browser session whose token
+    /// hashes to `session_hash`; fills in `{ "authorize_url": … }`.
+    pub fn link(base_url: &str, user_id: &str, session_hash: &str) -> SsoJob {
+        let kind = Kind::Link { user_id: user_id.into(), session_hash: session_hash.into() };
+        SsoJob { base_url: base_url.into(), kind, phase: Phase::Start }
     }
 }
 
@@ -754,7 +769,8 @@ pub fn start(db: &dyn Db, cfg: &HostConfig, req: &Request) -> Outcome {
 }
 
 /// `GET /sso/callback`: the provider sent someone back. The sign-in must be one this browser
-/// started (or, when linking, the signed-in person's own), unused and recent, for the same app.
+/// started (or, when linking, one this very browser session started, still signed in), unused and
+/// recent, for the same app.
 /// Answers with a job that exchanges the code and signs them in.
 pub fn callback(db: &dyn Db, cfg: &HostConfig, req: &Request) -> Outcome {
     let base = crate::http::base_url(cfg, req);
@@ -780,14 +796,19 @@ pub fn callback(db: &dyn Db, cfg: &HostConfig, req: &Request) -> Outcome {
         if now - started > Duration::minutes(SIGN_IN_MINUTES) {
             return Ok(back(Problem::Expired));
         }
-        match &link_user {
-            Some(user_id) => {
+        let link_session = link_user.as_ref().map(|_| row.str("browser_hash"));
+        match (&link_user, &link_session) {
+            (Some(user_id), Some(expected)) => {
+                // The session that started linking, and still a live one: a link started in a
+                // session that was signed out (or stolen, then revoked) can't be finished elsewhere.
                 let actor = auth::authenticate(db, cfg, req, now).ok().flatten();
-                if actor.is_none_or(|a| a.user_id != *user_id || a.session_hash.is_none()) {
-                    return Ok(back(Problem::WrongPerson));
+                let same =
+                    actor.is_some_and(|a| a.user_id == *user_id && a.session_hash.is_some_and(|h| crate::util::secure_eq(&h, expected)));
+                if !same {
+                    return Ok(back(Problem::OtherSession));
                 }
             }
-            None => {
+            _ => {
                 let cookie = auth::cookie_value(req, BROWSER_COOKIE).unwrap_or_default();
                 let expected = row.str("browser_hash");
                 if cookie.is_empty() || !crate::util::secure_eq(&sha256_hex(cookie), &expected) {
@@ -809,7 +830,7 @@ pub fn callback(db: &dyn Db, cfg: &HostConfig, req: &Request) -> Outcome {
             (None, _) => return Ok(back(Problem::ProviderError)),
         };
         let mut out = back(Problem::Failed);
-        let returned = Returned { code, flow, link_user, user_agent: req.header("user-agent").map(str::to_string) };
+        let returned = Returned { code, flow, link_user, link_session, user_agent: req.header("user-agent").map(str::to_string) };
         let job = SsoJob { base_url: base.clone(), kind: Kind::Finish(Box::new(returned)), phase: Phase::Start };
         out.effects.push(Effect::Connect(Job::Sso(job)));
         Ok(out)
@@ -822,14 +843,15 @@ fn pkce_challenge(verifier: &str) -> String {
 }
 
 /// Records a sign-in under way and returns the provider's sign-in URL and, for a sign-in from the
-/// sign-in page, the cookie naming this browser.
+/// sign-in page, the cookie naming this browser. `link` is (who, their session's hash) when a
+/// signed-in person is linking their account: that session is what ties it to their browser.
 fn begin(
     db: &dyn Db,
     conf: &Config,
     d: &Discovery,
     base_url: &str,
     next: &str,
-    link_user: Option<&str>,
+    link: Option<(&str, &str)>,
     now: DateTime<Utc>,
 ) -> ApiResult<(String, Option<String>)> {
     db.execute("DELETE FROM sso_requests WHERE created_at < ?", &params![ts(now - Duration::minutes(SIGN_IN_MINUTES))])?;
@@ -841,7 +863,11 @@ fn begin(
     let state = crate::util::new_secret("");
     let nonce = crate::util::new_secret("");
     let verifier = crate::util::new_secret("") + &crate::util::new_secret("");
-    let browser = link_user.is_none().then(|| crate::util::new_secret(""));
+    let browser = link.is_none().then(|| crate::util::new_secret(""));
+    let binding = match link {
+        Some((_, session_hash)) => session_hash.to_string(),
+        None => sha256_hex(browser.as_deref().unwrap_or_default()),
+    };
     let flow = Flow {
         nonce: nonce.clone(),
         verifier: verifier.clone(),
@@ -856,8 +882,8 @@ fn begin(
         "INSERT INTO sso_requests (state_hash, browser_hash, user_id, flow, created_at) VALUES (?, ?, ?, ?, ?)",
         &params![
             sha256_hex(&state),
-            browser.as_deref().map(sha256_hex),
-            link_user,
+            binding,
+            link.map(|(user_id, _)| user_id),
             serde_json::to_string(&flow).map_err(|e| ApiError::internal(e.to_string()))?,
             ts(now)
         ],
@@ -949,9 +975,9 @@ pub fn step(db: &dyn Db, cfg: &HostConfig, j: &mut SsoJob, replies: Vec<HttpRepl
             }
             Err(_) => Ok(respond(to_login(&base, Problem::ProviderError, next))),
         },
-        (Kind::Link { user_id }, _) => match read_discovery(&conf, &reply) {
+        (Kind::Link { user_id, session_hash }, _) => match read_discovery(&conf, &reply) {
             Ok(d) => {
-                let (url, _) = begin(db, &conf, &d, &base, "/settings/profile", Some(user_id), now)?;
+                let (url, _) = begin(db, &conf, &d, &base, "/settings/profile", Some((user_id, session_hash)), now)?;
                 fill(json!({ "authorize_url": url }))
             }
             Err(e) => Ok(Step::Done(Finish::Fail(ApiError::new(502, "sso_unavailable", e)))),
@@ -1105,9 +1131,33 @@ fn link_identity(db: &dyn Db, user_id: &str, conf: &Config, claims: &Value, now:
     Ok(())
 }
 
+/// How an account at the provider came to be linked to someone here.
+#[derive(Clone, Copy)]
+enum Matched {
+    /// They linked it while signed in.
+    Themselves,
+    /// Their first sign-in, by the email the provider vouched for.
+    Email,
+    /// They joined by signing in (auto-provisioning).
+    Provisioned,
+}
+
+/// Records a new link in the admins' activity log: it's a new way into the account.
+fn record_link(db: &dyn Db, cfg: &HostConfig, base: &str, p: &Person, conf: &Config, how: Matched, now: DateTime<Utc>) -> ApiResult<()> {
+    let name = conf.name();
+    let (matched, summary) = match how {
+        Matched::Themselves => ("self", format!("linked their {name} account")),
+        Matched::Email => ("email", format!("signed in with {name} for the first time, linked by their verified email")),
+        Matched::Provisioned => ("provisioned", format!("joined with their {name} account")),
+    };
+    let mut ctx = ctx_for(db, cfg, base, p, now);
+    let data = json!({ "issuer": conf.issuer, "matched_by": matched });
+    emit(&mut ctx, Event::new("sso.linked", "user", &p.id, summary).data(data).admin_only())?;
+    Ok(())
+}
+
 /// The ID token checked out: link the account, or sign the person in.
 fn complete(db: &dyn Db, cfg: &HostConfig, base: &str, conf: &Config, r: &Returned, claims: &Value, now: DateTime<Utc>) -> ApiResult<Step> {
-    let name = conf.name();
     let back = |problem: Problem| match r.link_user {
         Some(_) => respond(to_profile(base, Err(problem))),
         None => respond(to_login(base, problem, &r.flow.next)),
@@ -1122,6 +1172,14 @@ fn complete(db: &dyn Db, cfg: &HostConfig, base: &str, conf: &Config, r: &Return
     )?;
 
     if let Some(user_id) = &r.link_user {
+        // The session that started linking must still be signed in as it finishes.
+        let live = db.scalar_i64(
+            "SELECT COUNT(*) FROM sessions WHERE token_hash = ? AND user_id = ? AND expires_at > ?",
+            &params![r.link_session.clone().unwrap_or_default(), user_id.clone(), ts(now)],
+        )? > 0;
+        if !live {
+            return Ok(back(Problem::OtherSession));
+        }
         let Some(p) = find_person(db, user_id)? else { return Ok(back(Problem::Failed)) };
         if let Some(problem) = refusal(&p) {
             return Ok(back(problem));
@@ -1131,8 +1189,7 @@ fn complete(db: &dyn Db, cfg: &HostConfig, base: &str, conf: &Config, r: &Return
             Some(_) => {}
             None => {
                 link_identity(db, &p.id, conf, claims, now)?;
-                let mut ctx = ctx_for(db, cfg, base, &p, now);
-                emit(&mut ctx, Event::new("sso.linked", "user", &p.id, format!("linked their {name} account")).admin_only())?;
+                record_link(db, cfg, base, &p, conf, Matched::Themselves, now)?;
             }
         }
         return Ok(respond(to_profile(base, Ok(()))));
@@ -1162,6 +1219,7 @@ fn complete(db: &dyn Db, cfg: &HostConfig, base: &str, conf: &Config, r: &Return
                         return Ok(back(Problem::EmailLinked));
                     }
                     link_identity(db, &p.id, conf, claims, now)?;
+                    record_link(db, cfg, base, &p, conf, Matched::Email, now)?;
                     p
                 }
                 None if conf.auto_provision => provision(db, cfg, base, conf, claims, &email, now)?,
@@ -1222,6 +1280,7 @@ fn provision(
             .data(json!({ "role": "member", "is_bot": false, "sso": true }))
             .admin_only(),
     )?;
+    record_link(db, cfg, base, &p, conf, Matched::Provisioned, now)?;
     Ok(p)
 }
 
@@ -1339,7 +1398,7 @@ mod tests {
             basic_auth: true,
             next: "/".into(),
         };
-        let returned = Returned { code: "the-code".into(), flow, link_user: None, user_agent: None };
+        let returned = Returned { code: "the-code".into(), flow, link_user: None, link_session: None, user_agent: None };
         let job = SsoJob { base_url: "https://kb.test".into(), kind: Kind::Finish(Box::new(returned)), phase: Phase::Exchanging };
         let printed = format!("{job:?}");
         for secret in ["the-nonce", "the-verifier", "the-code"] {

@@ -3219,6 +3219,8 @@ mod sso {
         let (landing, sent) = come_back(&h, &s, c.clone(), &provider);
         assert_eq!(sent.len(), 2);
         assert_eq!(me(&h, &landing.session().unwrap_or_else(|| panic!("{}", landing.error())))["id"], mo_id.as_str());
+        // Linking by email is a new way into Mo's account: the admins' activity log says so.
+        assert_eq!(links_logged(&h, &admin), vec![(mo_id.clone(), "email".to_string())]);
         h.store.with_tx(|db| (db.execute("DELETE FROM sso_identities", &[]), true)).unwrap().unwrap();
         let s = start(&h, OKTA);
         let someone_else = |call: &HttpCall, jwt: &str| {
@@ -3254,6 +3256,10 @@ mod sso {
         );
         let activity = h.ok("GET", "/api/v1/activity", None, &admin).to_string();
         assert!(activity.contains("joined by signing in with Okta"), "{activity}");
+        assert_eq!(
+            links_logged(&h, &admin).last().map(|(who, how)| (who.as_str(), how.as_str())),
+            Some((new["id"].as_str().unwrap(), "provisioned"))
+        );
         // Still only from allowed domains, with verified emails.
         refused(claims(OKTA, "sub-x", "x@other.test", json!({ "email_verified": true })), "domain_not_allowed");
         refused(claims(OKTA, "sub-y", "y@acme.test", json!({ "email_verified": false })), "unverified_email");
@@ -3345,8 +3351,8 @@ mod sso {
         };
         // ...in their own browser only.
         let landing = link(&admin, "ms-mo");
-        assert_eq!(landing.location, "https://kb.test/settings/profile?sso_error=wrong_person");
-        assert_eq!(landing.error(), "wrong_person");
+        assert_eq!(landing.location, "https://kb.test/settings/profile?sso_error=other_session");
+        assert_eq!(landing.error(), "other_session");
         let r = h.call("POST", "/api/v1/me/sso", None, &mo);
         let (finish, _) = drive(&h, job_of(&r), &|_| ok(discovery(&issuer)));
         let Finish::Fill(v) = finish else { panic!("{finish:?}") };
@@ -3424,5 +3430,120 @@ mod sso {
         assert_eq!(login("mo@acme.test", "password123").status, 200);
         let r = h.call("GET", "/sso/start", None, &Auth::None);
         assert!(r.effects.is_empty() && land(&r, None).error() == "not_configured");
+    }
+
+    /// The `sso.linked` events in the admins' activity log, oldest first: who, and how it was matched.
+    fn links_logged(h: &H, admin: &Auth) -> Vec<(String, String)> {
+        let activity = h.ok("GET", "/api/v1/activity?limit=100", None, admin);
+        let mut links: Vec<(String, String)> = activity["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["event"] == "sso.linked")
+            .map(|e| {
+                (
+                    e["actor"]["id"].as_str().unwrap_or_default().to_string(),
+                    e["data"]["matched_by"].as_str().unwrap_or_default().to_string(),
+                )
+            })
+            .collect();
+        links.reverse();
+        links
+    }
+
+    #[test]
+    fn links_finish_only_in_the_session_that_started_them() {
+        let (h, admin) = workspace();
+        let (mo_id, _) = h.user(&admin, "mo@acme.test", "Mo", "member");
+        okta(&h, &admin, json!({}));
+        let session = |auth: &Auth| match auth {
+            Auth::Cookie(c) => format!("dumbslab_session={c}"),
+            _ => unreachable!(),
+        };
+        // Starts linking in `auth`'s session; returns the provider's sign-in URL's query.
+        let start_link = |auth: &Auth| {
+            let r = h.call("POST", "/api/v1/me/sso", None, auth);
+            assert_eq!(r.status, 200, "{}", r.body);
+            let (finish, _) = drive(&h, job_of(&r), &|_| ok(discovery(OKTA)));
+            let Finish::Fill(v) = finish else { panic!("{finish:?}") };
+            query_of(v["authorize_url"].as_str().unwrap())
+        };
+        // The provider sends the browser, signed in as `auth`, back.
+        let come_back_to = |auth: &Auth, q: &std::collections::HashMap<String, String>| {
+            h.send(&callback_request(&format!("code=c&state={}", urlencoding::encode(&q["state"])), &[session(auth)]))
+        };
+        let answer = |r: &Res, q: &std::collections::HashMap<String, String>| {
+            if r.effects.is_empty() {
+                return land(r, None);
+            }
+            let id = jwt(&claims(OKTA, "okta-mo", "mo@acme.test", json!({ "nonce": q["nonce"] })));
+            let (finish, _) = drive(&h, job_of(r), &|c| tokens(c, &id));
+            land(r, Some(finish))
+        };
+        let linked = || count(&h, "SELECT COUNT(*) FROM sso_identities");
+        let sign_out = |auth: &Auth| assert_eq!(h.call("POST", "/api/v1/auth/logout", None, auth).status, 200);
+
+        // Started in session A, which is then signed out (say it was stolen and revoked):
+        // finishing in Mo's other session B is refused, so the pending link dies with A.
+        let a = sign_in(&h, "mo@acme.test", "password123");
+        let b = sign_in(&h, "mo@acme.test", "password123");
+        let q = start_link(&a);
+        sign_out(&a);
+        let landing = answer(&come_back_to(&b, &q), &q);
+        assert_eq!(landing.location, "https://kb.test/settings/profile?sso_error=other_session");
+        assert_eq!(linked(), 0);
+        // Another live session of the same person can't finish it either.
+        let c = sign_in(&h, "mo@acme.test", "password123");
+        let q = start_link(&b);
+        assert_eq!(answer(&come_back_to(&c, &q), &q).error(), "other_session");
+        assert_eq!(linked(), 0);
+        // Signed out after the provider answered but before the link is made: still refused.
+        let q = start_link(&b);
+        let r = come_back_to(&b, &q);
+        assert!(!r.effects.is_empty(), "the callback itself was fine");
+        sign_out(&b);
+        assert_eq!(answer(&r, &q).error(), "other_session");
+        assert_eq!(linked(), 0);
+        // The same session, still signed in, links.
+        let q = start_link(&c);
+        let landing = answer(&come_back_to(&c, &q), &q);
+        assert_eq!(landing.location, "https://kb.test/settings/profile?sso_linked=1");
+        assert_eq!(linked(), 1);
+        assert_eq!(links_logged(&h, &admin), vec![(mo_id, "self".to_string())]);
+    }
+
+    #[test]
+    fn a_client_secret_the_server_cant_read_turns_sso_off() {
+        let (mut h, admin) = workspace();
+        h.user(&admin, "mo@acme.test", "Mo", "member");
+        okta(&h, &admin, json!({ "require_sso": true }));
+        let login = |h: &H| {
+            h.call("POST", "/api/v1/auth/login", Some(json!({ "email": "mo@acme.test", "password": "password123" })), &Auth::None).status
+        };
+        assert_eq!(login(&h), 403);
+        assert!(h.ok("GET", "/api/v1/sso", None, &admin)["client_secret_unreadable"] == false);
+
+        // The server's connector key changes: the secret sealed with the old one can't be read.
+        h.cfg.connectors.key = Some("a-rotated-connector-key".into());
+        let s = h.ok("GET", "/api/v1/sso", None, &admin);
+        assert_eq!(
+            (s["active"].as_bool(), s["enabled"].as_bool(), s["client_secret_set"].as_bool(), s["client_secret_unreadable"].as_bool()),
+            (Some(false), Some(true), Some(true), Some(true)),
+            "{s}"
+        );
+        // So single sign-on is off: no button, no sign-ins, and passwords work for everyone.
+        assert!(h.ok("GET", "/api/v1/auth/state", None, &Auth::None)["sso"].is_null());
+        let r = h.call("GET", "/sso/start", None, &Auth::None);
+        assert!(r.effects.is_empty() && land(&r, None).error() == "not_configured");
+        assert_eq!(login(&h), 200, "Require SSO doesn't lock people out while SSO can't work");
+
+        // Saving it on without the secret says to enter it again; entering it turns it back on.
+        let r = h.call("PATCH", "/api/v1/sso", Some(json!({ "auto_provision": false })), &admin);
+        assert_eq!(r.status, 400);
+        assert!(r.body["error"]["message"].as_str().unwrap().contains("`client_secret` again"), "{}", r.body);
+        let v = set_up(&h, &admin, json!({ "client_secret": "shh-client-secret" }), OKTA);
+        assert_eq!((v["active"].as_bool(), v["client_secret_unreadable"].as_bool()), (Some(true), Some(false)));
+        assert_eq!(h.ok("GET", "/api/v1/auth/state", None, &Auth::None)["sso"]["required"], true);
+        assert_eq!(login(&h), 403);
     }
 }

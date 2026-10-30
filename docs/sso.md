@@ -11,7 +11,7 @@ The server needs a **connector key**, the same one [connected apps](connected-ap
 | Cloudflare | `npx wrangler secret put CONNECTOR_KEY` |
 | Self-hosted | `DUMBSLAB_CONNECTOR_KEY` in the environment |
 
-If the key changes or is lost, an admin enters the client secret again.
+If the key changes or is lost, the saved client secret can't be read. Single sign-on then turns itself off (so "Require single sign-on" no longer blocks passwords) until an admin enters the secret again; Settings › Single sign-on says so.
 
 You register an app with your provider. Its **redirect URI** is your workspace's own address followed by `/sso/callback`:
 
@@ -31,7 +31,7 @@ Settings › Single sign-on shows it with a copy button. If the workspace's addr
 
 - **Linked accounts.** DumbSlab links each account at the provider to one person here, by the provider's issuer and its permanent ID for the account (`sub`). A linked account signs in as that person, whatever email it has later.
 - **First sign-in.** An account that isn't linked yet joins the person here with the same email only when the provider says the address is verified and its domain is one of the allowed domains. The rules for each provider are in the table below.
-- **Linking your own account.** When the provider doesn't vouch for someone's email, or their email there differs from the one here, they sign in with their password and choose Settings › Profile › "Link your … account".
+- **Linking your own account.** When the provider doesn't vouch for someone's email, or their email there differs from the one here, they sign in with their password and choose Settings › Profile › "Link your … account". Linking must finish in the same browser session that started it, while it's still signed in: a link started in a session that is then signed out (or revoked) can't be finished anywhere.
 - **Auto-provisioning** is off by default. When it's on, someone whose verified email is at an allowed domain, and who has no account here, joins as a member.
 - **Deactivated people and bot accounts** can't sign in with single sign-on.
 - An email that's already linked to a different account at the same provider isn't taken over: an admin unlinks the old one first, under Settings › Single sign-on › Linked accounts.
@@ -108,7 +108,7 @@ Auth0, Keycloak, JumpCloud, Ping, Authentik and others work the same way.
 - The core builds every request and reads every answer; the host only sends them, over https, without following redirects, within 8 seconds and reading at most 4 MB. The self-hosted server refuses private network addresses unless it runs with `--allow-private-webhooks`.
 - A sign-in starts an ordinary browser session, with the same cookie rules and 30-day length as a password sign-in.
 - Problems send people back to the sign-in page (or Settings › Profile, when linking) with only an error code, such as `?sso_error=unverified_email`. The page shows its own message for each code, so a link can't make the sign-in page say anything else, and nothing the provider sends (error text, tokens) ever reaches it. The admin's settings check gives the details of a provider that doesn't check out.
-- Changes to the settings, linked accounts and people who join appear in the admins' activity log (`sso.updated`, `sso.linked`, `sso.unlinked`, `user.created`). Events that happen during a sign-in aren't sent to webhooks.
+- Changes to the settings, every newly linked account (linked by the person, matched by a verified email on a first sign-in, or created by auto-provisioning) and people who join appear in the admins' activity log (`sso.updated`, `sso.linked`, `sso.unlinked`, `user.created`). Events that happen during a sign-in aren't sent to webhooks.
 
 ## For agents and scripts
 

@@ -19,7 +19,8 @@ CREATE INDEX IF NOT EXISTS sso_identities_user ON sso_identities(user_id);
 -- Sign-ins under way: the OAuth `state` (hashed) names one, for 15 minutes and one use.
 CREATE TABLE IF NOT EXISTS sso_requests (
   state_hash TEXT PRIMARY KEY,
-  -- Signing in: the hash of the cookie the browser that started got.
+  -- What ties it to the browser that started: the hash of the cookie that browser got when
+  -- signing in, or of its session when linking an account.
   browser_hash TEXT,
   -- Linking an account: the signed-in person who started.
   user_id TEXT REFERENCES users(id) ON DELETE CASCADE,

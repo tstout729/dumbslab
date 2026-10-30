@@ -520,6 +520,10 @@ function ssoCheckNote(check) {
 }
 
 function ssoStatus(s) {
+  if (s.client_secret_unreadable) {
+    return h('p', { class: 'callout callout-warn', role: 'alert' }, icon('alert', { size: 15 }),
+      h('span', null, 'Single sign-on is off: the saved client secret can’t be read, because the server’s connector key changed. Enter the client secret again and save. Until then everyone can sign in with a password.'));
+  }
   if (s.active) return h('p', { class: 'callout', role: 'status' }, icon('check', { size: 15 }), h('span', null, `People can sign in with ${s.name}.${s.require_sso ? ' Only admins can sign in with a password.' : ''}`));
   if (s.enabled) return h('p', { class: 'callout callout-warn' }, icon('alert', { size: 15 }), h('span', null, 'Single sign-on is on but not finished: fill in everything below.'));
   return h('p', { class: 'muted small' }, 'Single sign-on is off. Everyone signs in with a password.');
@@ -542,7 +546,8 @@ async function ssoSection(ctx) {
   const team = input({ value: s.team || '', spellcheck: 'false', placeholder: 'Optional, like T0123ABCD' });
   const label = input({ value: s.label || '', maxlength: '40', placeholder: 'SSO' });
   const clientId = input({ value: s.client_id || '', spellcheck: 'false', autocapitalize: 'off' });
-  const clientSecret = input({ type: 'password', autocomplete: 'new-password', placeholder: s.client_secret_set ? 'Saved. Leave empty to keep it.' : '' });
+  const secretHint = (x) => (x.client_secret_unreadable ? 'Enter it again: the saved one can’t be read.' : x.client_secret_set ? 'Saved. Leave empty to keep it.' : '');
+  const clientSecret = input({ type: 'password', autocomplete: 'new-password', placeholder: secretHint(s) });
   const domains = input({ value: (s.allowed_domains || []).join(', '), spellcheck: 'false', autocapitalize: 'off', placeholder: 'acme.com' });
   const enabled = checkbox('Show “Sign in with …” on the sign-in page', { checked: s.enabled });
   const autoProvision = checkbox('Add new people automatically: verified addresses at the allowed domains join as members', { checked: s.auto_provision });
@@ -591,7 +596,7 @@ async function ssoSection(ctx) {
     if (clientSecret.value.trim()) body.client_secret = clientSecret.value.trim();
     const saved = await api.patch('/sso', body);
     clientSecret.value = '';
-    clientSecret.placeholder = saved.client_secret_set ? 'Saved. Leave empty to keep it.' : '';
+    clientSecret.placeholder = secretHint(saved);
     status.replaceChildren(ssoStatus(saved));
     checks.replaceChildren(...[ssoCheckNote(saved.check)].filter(Boolean));
     // The sign-in page's button follows the new settings.

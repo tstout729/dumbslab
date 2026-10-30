@@ -198,6 +198,8 @@ fn update_sso(ctx: &mut Ctx, input: UpdateSsoInput) -> ApiResult<Deferred<SsoSet
         }
         if conf.client_secret.is_none() {
             missing.push("`client_secret`");
+        } else if sso::secret_unreadable(ctx.cfg, &conf) {
+            missing.push("`client_secret` again (the saved one can't be read since the server's connector key changed)");
         }
         if !missing.is_empty() {
             return Err(ApiError::bad_request(format!("to turn single sign-on on, also set {}", missing.join(", "))));
@@ -227,14 +229,15 @@ pub struct LinkStart {
 }
 
 fn link_sso(ctx: &mut Ctx, _: NoInput) -> ApiResult<Deferred<LinkStart>> {
-    // The provider sends the person back to their browser, which must be signed in as them.
-    if ctx.actor.session_hash.is_none() {
+    // The provider sends the person back to their browser, which must still be signed in to this
+    // same session to finish.
+    let Some(session_hash) = ctx.actor.session_hash.clone() else {
         return Err(ApiError::forbidden("link your sign-in account in the web app, under Settings › Profile"));
-    }
+    };
     if !sso::active(ctx.cfg, &sso::load(ctx.db)?) {
         return Err(ApiError::bad_request("single sign-on isn't set up for this workspace"));
     }
-    ctx.effects.push(Effect::Connect(Job::Sso(SsoJob::link(&ctx.base_url, &ctx.actor.user_id))));
+    ctx.effects.push(Effect::Connect(Job::Sso(SsoJob::link(&ctx.base_url, &ctx.actor.user_id, &session_hash))));
     Ok(Deferred::Pending)
 }
 

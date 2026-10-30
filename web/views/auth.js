@@ -97,7 +97,7 @@ export function ssoMessage(code, name) {
     deactivated: 'Your account here is deactivated. Ask a workspace admin to reactivate it.',
     bot: 'Bot accounts sign in with API tokens, not single sign-on.',
     email_linked: `Your email address is linked to a different ${p} account here. Ask a workspace admin to unlink it.`,
-    wrong_person: 'Sign in as the person who started linking, then try again.',
+    other_session: 'Finish linking in the same signed-in browser you started in. Start again from Settings › Profile.',
     already_linked: `That ${p} account is already linked to someone else here.`,
   };
   return Object.hasOwn(messages, code) ? messages[code] : `Signing in with ${p} didn’t work. Try again or use your password.`;
