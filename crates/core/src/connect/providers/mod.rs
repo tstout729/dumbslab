@@ -2,11 +2,14 @@
 
 use super::Connector;
 
+pub mod freshdesk;
 pub mod github;
 pub mod google_drive;
+pub mod slack;
+pub mod zendesk;
 
 /// Every app this build can connect to, in the order Settings shows them.
-pub static ALL: &[&dyn Connector] = &[&github::GitHub, &google_drive::GoogleDrive];
+pub static ALL: &[&dyn Connector] = &[&github::GitHub, &google_drive::GoogleDrive, &slack::Slack, &zendesk::Zendesk, &freshdesk::Freshdesk];
 
 pub fn get(id: &str) -> Option<&'static dyn Connector> {
     ALL.iter().copied().find(|c| c.info().id == id)
