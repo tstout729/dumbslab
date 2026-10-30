@@ -930,12 +930,15 @@ fn signed_signup_links_set_up_hosted_workspaces() {
     assert_eq!(setup(&signup_token("sekret", "acme", now + 3600)).status, 409, "only once");
 }
 
+/// A free-plan budget no test reaches.
+const ROOMY: dumbslab_core::tenancy::FreeBudget = dumbslab_core::tenancy::FreeBudget { writes_per_day: u64::MAX, storage_bytes: u64::MAX };
+
 #[test]
 fn directory_reserves_addresses_within_limits() {
     use chrono::{Duration, Utc};
     use dumbslab_core::tenancy::{self, Limits};
     let h = H::new();
-    let limits = Limits { per_ip_per_day: 2, per_day: 4, max_workspaces: 5 };
+    let limits = Limits { per_ip_per_day: 2, per_day: 4, max_workspaces: 5, free: ROOMY };
     let t0 = Utc::now();
     let t1 = t0 + Duration::days(2);
     let run = |f: &dyn Fn(&dyn dumbslab_core::Db) -> dumbslab_core::ApiResult<()>| {
@@ -1078,7 +1081,7 @@ fn directory_moves_addresses() {
     use chrono::{Duration, Utc};
     use dumbslab_core::tenancy::{self, Limits};
     let h = H::new();
-    let limits = Limits { per_ip_per_day: 50, per_day: 50, max_workspaces: 50 };
+    let limits = Limits { per_ip_per_day: 50, per_day: 50, max_workspaces: 50, free: ROOMY };
     let t0 = Utc::now();
     let run = |f: &dyn Fn(&dyn dumbslab_core::Db) -> dumbslab_core::ApiResult<()>| {
         h.store
@@ -1806,4 +1809,354 @@ fn file_access_follows_posts() {
     h.ok("DELETE", &format!("/api/v1/posts/{}?permanent=true", bands["id"].as_str().unwrap()), None, &admin);
     assert_eq!(count(&h, &format!("SELECT COUNT(*) FROM files WHERE id = '{early_id}'")), 0);
     assert_eq!(count(&h, &format!("SELECT COUNT(*) FROM file_chunks WHERE file_id = '{early_id}'")), 0);
+}
+
+// ---------------------------------------------------------------------------
+// Plans for hosted workspaces.
+
+fn plans(price: Option<&str>) -> dumbslab_core::plan::Plans {
+    use dumbslab_core::plan::{Allowance, Plans};
+    Plans {
+        free: Allowance { storage_bytes: 50 << 20, writes_per_day: 1_000 },
+        pro: Allowance { storage_bytes: 5 << 30, writes_per_day: 100_000 },
+        stripe_price: price.map(str::to_string),
+        price_label: "$8 a month".into(),
+        portal_configuration: None,
+    }
+}
+
+/// A hosted workspace at acme.kb.test (first address `acme`), and its admin.
+fn hosted(price: Option<&str>) -> (H, Auth) {
+    use dumbslab_core::tenancy::signup_token;
+    let mut h = H::new();
+    h.cfg = HostConfig {
+        base_url: Some("https://acme.kb.test".into()),
+        signup_secret: Some("sekret".into()),
+        workspace: Some("acme".into()),
+        hosting: Some(dumbslab_core::Hosting {
+            plans: plans(price),
+            home: "acme".into(),
+            storage_bytes: 300_000,
+            capacity: Default::default(),
+        }),
+        ..Default::default()
+    };
+    let token = signup_token("sekret", "acme", chrono::Utc::now().timestamp() + 3600);
+    let r = h.call(
+        "POST",
+        "/api/v1/auth/setup",
+        Some(json!({ "setup_token": token, "workspace_name": "Acme", "name": "Ada", "email": "ada@acme.test", "password": "password123" })),
+        &Auth::None,
+    );
+    assert_eq!(r.status, 200, "{}", r.body);
+    let admin = session_from(&r);
+    (h, admin)
+}
+
+fn db_run<T>(h: &H, f: impl FnOnce(&dyn dumbslab_core::Db) -> dumbslab_core::ApiResult<T>) -> T {
+    h.store
+        .with_tx(|db| {
+            let r = f(db);
+            let ok = r.is_ok();
+            (r, ok)
+        })
+        .unwrap()
+        .unwrap()
+}
+
+fn stripe_call(r: &Res) -> dumbslab_core::plan::StripeCall {
+    r.effects
+        .iter()
+        .find_map(|e| match e {
+            Effect::Stripe(c) => Some(c.clone()),
+            _ => None,
+        })
+        .expect("a Stripe call")
+}
+
+/// A subscription bought through this workspace's Checkout (it carries the workspace's billing id).
+fn sub(h: &H, id: &str, status: &str) -> dumbslab_core::plan::Subscription {
+    dumbslab_core::plan::Subscription {
+        id: id.into(),
+        customer: "cus_1".into(),
+        status: status.into(),
+        period_end: Some(1_800_000_000),
+        cancel_at_period_end: false,
+        billing_id: Some(db_run(h, dumbslab_core::plan::billing_id)),
+    }
+}
+
+#[test]
+fn self_hosted_servers_have_no_plan() {
+    let h = H::new();
+    let (_, admin) = h.setup();
+    let p = h.ok("GET", "/api/v1/plan", None, &admin);
+    assert_eq!(p["hosted"], false);
+    assert!(p["plan"].is_null() && p["usage"].is_null());
+    assert_eq!(h.call("POST", "/api/v1/plan/upgrade", None, &admin).status, 400);
+    assert_eq!(h.call("POST", "/api/v1/plan/billing", None, &admin).status, 400);
+    // Nothing is metered: writes keep working however many rows were written.
+    db_run(&h, |db| dumbslab_core::plan::record_writes(db, chrono::Utc::now(), 1_000_000_000));
+    h.ok("POST", "/api/v1/posts", Some(json!({ "title": "Unmetered" })), &admin);
+}
+
+#[test]
+fn hosted_workspaces_meter_writes() {
+    use chrono::{Duration, Utc};
+    use dumbslab_core::plan;
+    let (mut h, admin) = hosted(Some("price_pro"));
+    let (_, member) = h.user(&admin, "mo@acme.test", "Mo", "member");
+    let admin_token = Auth::Bearer(
+        h.ok("POST", "/api/v1/tokens", Some(json!({ "name": "agent", "scopes": ["read", "write", "admin"] })), &admin)["token"]
+            .as_str()
+            .unwrap()
+            .to_string(),
+    );
+    let post = h.ok("POST", "/api/v1/posts", Some(json!({ "title": "Runbook", "status": "published" })), &member);
+    let post_id = post["id"].as_str().unwrap().to_string();
+
+    let views = || count(&h, &format!("SELECT view_count FROM posts WHERE id = '{post_id}'"));
+    let read_page = |h: &H| h.ok("GET", &format!("/api/v1/posts/{post_id}?format=html"), None, &admin);
+    read_page(&h);
+    assert_eq!(views(), 1, "a person reading the page counts as a view");
+
+    let p = h.ok("GET", "/api/v1/plan", None, &member);
+    assert_eq!((p["hosted"].as_bool(), p["plan"].as_str()), (Some(true), Some("free")));
+    assert_eq!(p["allowance"]["writes_per_day"], 1_000);
+    assert_eq!(p["usage"]["storage_bytes"], 300_000);
+    assert_eq!(p["pro"]["available"], true);
+    assert_eq!(p["pro"]["price"], "$8 a month");
+
+    // Rows written in the last 24 hours count; older ones don't.
+    let now = Utc::now();
+    db_run(&h, |db| plan::record_writes(db, now - Duration::hours(25), 5_000));
+    db_run(&h, |db| plan::record_writes(db, now, 600));
+    assert_eq!(h.ok("GET", "/api/v1/plan", None, &member)["usage"]["writes_24h"], 600);
+    h.ok("POST", "/api/v1/posts", Some(json!({ "title": "Still room" })), &member);
+
+    // At the allowance, every way of changing things is refused; reading keeps working.
+    db_run(&h, |db| plan::record_writes(db, now, 400));
+    let r = h.call("POST", "/api/v1/posts", Some(json!({ "title": "Too many" })), &member);
+    assert_eq!((r.status, r.body["error"]["code"].as_str()), (429, Some("write_limit")), "{}", r.body);
+    assert!(r.body["error"]["message"].as_str().unwrap().contains("Upgrade to Pro"));
+    let r = h.call("POST", "/api/v1/operations/create_post", Some(json!({ "title": "Too many" })), &member);
+    assert_eq!(r.status, 429);
+    let r = h.mcp(&member, "", json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": { "name": "create_post", "arguments": { "title": "Too many" } } }));
+    assert_eq!(r.body["result"]["isError"], true, "{}", r.body);
+    // A day later the same reader would count again, but not while writes are paused.
+    db_run(&h, |db| db.execute("DELETE FROM post_views", &[]).map(|_| ()));
+    read_page(&h);
+    assert_eq!(views(), 1, "reads stop counting views once writes are paused");
+    h.ok("GET", "/api/v1/search?q=runbook", None, &member);
+    h.ok("GET", "/api/v1/export", None, &admin);
+    let reg = h.call(
+        "POST",
+        "/oauth/register",
+        Some(json!({ "client_name": "App", "redirect_uris": ["http://localhost:9999/cb"] })),
+        &Auth::None,
+    );
+    assert_eq!(reg.status, 429, "anonymous app registration is a change too: {}", reg.body);
+
+    // Upgrading still works, for admins only, and hands the host a Checkout session for this workspace.
+    assert_eq!(h.call("POST", "/api/v1/plan/upgrade", None, &member).status, 403);
+    let r = h.call("POST", "/api/v1/plan/upgrade", None, &admin);
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert_eq!(r.body["url"], plan::STRIPE_URL_PENDING, "the host puts Stripe's URL here");
+    let via_mcp = h.mcp(
+        &admin_token,
+        "",
+        json!({ "jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": { "name": "upgrade_plan", "arguments": {} } }),
+    );
+    assert_eq!(via_mcp.body["result"]["structuredContent"]["url"], plan::STRIPE_URL_PENDING, "{}", via_mcp.body);
+    assert!(stripe_call(&via_mcp).path == "checkout/sessions");
+    let call = stripe_call(&r);
+    assert_eq!(call.path, "checkout/sessions");
+    let form = |k: &str| call.form.iter().find(|(key, _)| key == k).map(|(_, v)| v.clone());
+    assert_eq!(form("client_reference_id").as_deref(), Some("acme"));
+    assert_eq!(form("line_items[0][price]").as_deref(), Some("price_pro"));
+    assert_eq!(form("customer_email").as_deref(), Some("ada@acme.test"));
+    assert_eq!(h.call("POST", "/api/v1/plan/billing", None, &admin).status, 409, "nothing bought yet");
+
+    // A subscription some other workspace bought (or one made by hand in Stripe) doesn't apply.
+    let foreign = plan::Subscription { billing_id: Some("someone-else".into()), ..sub(&h, "sub_x", "active") };
+    assert!(!db_run(&h, |db| plan::apply_subscription(db, &foreign)));
+    assert!(!db_run(&h, |db| plan::apply_subscription(db, &plan::Subscription { billing_id: None, ..foreign.clone() })));
+    assert_eq!(h.ok("GET", "/api/v1/plan", None, &member)["plan"], "free");
+    assert_eq!(form("subscription_data[metadata][billing_id]"), sub(&h, "s", "active").billing_id);
+
+    // Stripe reports the subscription: Pro, with its larger allowance.
+    assert!({
+        let s = sub(&h, "sub_1", "active");
+        db_run(&h, |db| plan::apply_subscription(db, &s))
+    });
+    let p = h.ok("GET", "/api/v1/plan", None, &member);
+    assert_eq!(p["plan"], "pro");
+    assert_eq!(p["subscription"]["status"], "active");
+    assert!(p["subscription"].get("customer").is_none(), "billing ids stay with the host");
+    h.ok("POST", "/api/v1/posts", Some(json!({ "title": "Room again" })), &member);
+    assert_eq!(h.call("POST", "/api/v1/plan/upgrade", None, &admin).status, 409, "already Pro");
+    let r = h.call("POST", "/api/v1/plan/billing", None, &admin);
+    assert_eq!(r.status, 200, "{}", r.body);
+    let portal = stripe_call(&r);
+    assert_eq!(portal.path, "billing_portal/sessions");
+    assert!(portal.form.contains(&("customer".into(), "cus_1".into())));
+    assert!(portal.form.contains(&("return_url".into(), "https://acme.kb.test/settings/plan".into())));
+
+    // A failed renewal keeps Pro while Stripe retries; news about an older subscription is ignored.
+    {
+        let s = sub(&h, "sub_1", "past_due");
+        db_run(&h, |db| plan::apply_subscription(db, &s))
+    };
+    assert_eq!(h.ok("GET", "/api/v1/plan", None, &member)["plan"], "pro");
+    {
+        let s = sub(&h, "sub_1", "active");
+        db_run(&h, |db| plan::apply_subscription(db, &s))
+    };
+    assert!(!{
+        let s = sub(&h, "sub_0", "canceled");
+        db_run(&h, |db| plan::apply_subscription(db, &s))
+    });
+    assert_eq!(h.ok("GET", "/api/v1/plan", None, &member)["plan"], "pro");
+
+    // Changes to the subscription the workspace holds apply even if its billing id went missing
+    // (say, metadata edited in the Stripe Dashboard), so a cancellation is never ignored.
+    let edited = plan::Subscription { billing_id: None, cancel_at_period_end: true, ..sub(&h, "sub_1", "active") };
+    assert!(db_run(&h, |db| plan::apply_subscription(db, &edited)));
+    assert_eq!(h.ok("GET", "/api/v1/plan", None, &member)["subscription"]["cancel_at_period_end"], true);
+
+    // Cancelled: back to free. Upgrading again reuses the Stripe customer.
+    {
+        let s = sub(&h, "sub_1", "canceled");
+        db_run(&h, |db| plan::apply_subscription(db, &s))
+    };
+    assert_eq!(h.ok("GET", "/api/v1/plan", None, &member)["plan"], "free");
+    assert_eq!(h.call("POST", "/api/v1/posts", Some(json!({ "title": "Over" })), &member).status, 429);
+    let call = stripe_call(&h.call("POST", "/api/v1/plan/upgrade", None, &admin));
+    assert!(call.form.contains(&("customer".into(), "cus_1".into())));
+    assert_eq!(h.call("POST", "/api/v1/plan/billing", None, &admin).status, 200, "invoices stay reachable");
+
+    // When the free plan is at capacity, free workspaces pause; Pro ones (here, granted) don't.
+    db_run(&h, |db| db.execute("DELETE FROM usage_hours", &[]).map(|_| ()));
+    h.cfg.hosting.as_mut().unwrap().capacity.writes_paused = true;
+    let r = h.call("POST", "/api/v1/posts", Some(json!({ "title": "Busy" })), &member);
+    assert_eq!((r.status, r.body["error"]["code"].as_str()), (503, Some("free_capacity")), "{}", r.body);
+    db_run(&h, |db| plan::set_grant(db, true));
+    let p = h.ok("GET", "/api/v1/plan", None, &member);
+    assert_eq!((p["plan"].as_str(), p["granted"].as_bool()), (Some("pro"), Some(true)));
+    h.ok("POST", "/api/v1/posts", Some(json!({ "title": "Granted" })), &member);
+    db_run(&h, |db| plan::set_grant(db, false));
+    assert_eq!(h.call("POST", "/api/v1/posts", Some(json!({ "title": "Busy" })), &member).status, 503);
+}
+
+#[test]
+fn hosted_bookkeeping_stays_within_limits() {
+    let (mut h, admin) = hosted(Some("price_pro"));
+    let post = h.ok("POST", "/api/v1/posts", Some(json!({ "title": "Page", "status": "published" })), &admin);
+    let id = post["id"].as_str().unwrap().to_string();
+    let views = |h: &H| count(h, &format!("SELECT COUNT(*) FROM post_views WHERE post_id = '{id}'"));
+    // A full workspace stops recording views, which would grow it.
+    h.cfg.hosting.as_mut().unwrap().storage_bytes = 50 << 20;
+    h.ok("GET", &format!("/api/v1/posts/{id}?format=html"), None, &admin);
+    assert_eq!(views(&h), 0);
+    h.cfg.hosting.as_mut().unwrap().storage_bytes = 300_000;
+    h.ok("GET", &format!("/api/v1/posts/{id}?format=html"), None, &admin);
+    assert_eq!(views(&h), 1);
+
+    // Anonymous app registration is capped per hour.
+    for _ in 0..dumbslab_core::oauth::HOSTED_REGISTRATIONS_PER_HOUR {
+        register_app(&h);
+    }
+    let r = h.call(
+        "POST",
+        "/oauth/register",
+        Some(json!({ "client_name": "One more", "redirect_uris": ["http://localhost:9999/cb"] })),
+        &Auth::None,
+    );
+    assert_eq!(r.status, 429, "{}", r.body);
+}
+
+#[test]
+fn pro_is_not_for_sale_without_stripe() {
+    let (h, admin) = hosted(None);
+    let p = h.ok("GET", "/api/v1/plan", None, &admin);
+    assert_eq!(p["pro"]["available"], false);
+    let r = h.call("POST", "/api/v1/plan/upgrade", None, &admin);
+    assert_eq!((r.status, r.body["error"]["code"].as_str()), (503, Some("unavailable")));
+    assert!(r.effects.is_empty());
+    // Limit messages don't offer what can't be bought.
+    db_run(&h, |db| dumbslab_core::plan::record_writes(db, chrono::Utc::now(), 1_000));
+    let r = h.call("POST", "/api/v1/posts", Some(json!({ "title": "x" })), &admin);
+    assert!(r.body["error"]["message"].as_str().unwrap().contains("self-host"), "{}", r.body);
+}
+
+#[test]
+fn directory_budgets_the_free_plan() {
+    use chrono::{Duration, Utc};
+    use dumbslab_core::tenancy::{self, FreeBudget, Limits};
+    let h = H::new();
+    let budget = FreeBudget { writes_per_day: 1_000, storage_bytes: 10_000 };
+    let limits = Limits { per_ip_per_day: 50, per_day: 50, max_workspaces: 50, free: budget };
+    let t0 = Utc::now();
+    db_run(&h, tenancy::directory_migrate);
+    let cap = |at| db_run(&h, |db| tenancy::free_capacity(db, at, budget));
+    let report = |home: &'static str, plan: &'static str, writes, storage, at| {
+        db_run(&h, move |db| tenancy::report_usage(db, home, plan, writes, storage, at))
+    };
+    for slug in ["acme", "beta", "gamma"] {
+        db_run(&h, |db| tenancy::reserve(db, slug, "Name", slug, t0, limits).map(|_| ()));
+        db_run(&h, |db| tenancy::activate(db, slug, t0));
+    }
+    assert_eq!(cap(t0), Default::default());
+
+    // Free workspaces' latest reports add up; Pro ones don't count.
+    report("acme", "free", 600, 4_000, t0);
+    report("beta", "pro", 50_000, 900_000, t0);
+    assert_eq!(cap(t0), Default::default());
+    report("gamma", "free", 400, 6_000, t0);
+    let full = cap(t0);
+    assert!(full.writes_paused && full.growth_paused);
+    let r = h.store.with_tx(|db| (tenancy::reserve(db, "delta", "Name", "ip", t0, limits), false)).unwrap();
+    assert_eq!(r.map_err(|e| e.status).err(), Some(503), "sign-ups pause at capacity");
+    // A newer report replaces the old one, and day-old reports stop counting toward writes.
+    report("gamma", "free", 100, 1_000, t0);
+    assert_eq!(cap(t0), Default::default());
+    report("acme", "free", 990, 4_000, t0 - Duration::hours(30));
+    assert!(!cap(t0).writes_paused);
+    assert!(db_run(&h, |db| tenancy::free_usage(db, t0)).storage_bytes == 5_000);
+    // A plan name the directory doesn't know is refused.
+    assert!(h.store.with_tx(|db| (tenancy::report_usage(db, "acme", "gold", 1, 1, t0), false)).unwrap().is_err());
+
+    // Stripe customers map to their workspace; a paying workspace says so.
+    assert!(!db_run(&h, |db| tenancy::paying(db, "beta")));
+    db_run(&h, |db| tenancy::link_customer(db, "cus_9", "beta", t0));
+    assert_eq!(db_run(&h, |db| tenancy::customer_home(db, "cus_9")), tenancy::Payer::Workspace("beta".into()));
+    assert_eq!(db_run(&h, |db| tenancy::customer_home(db, "cus_x")), tenancy::Payer::Unknown);
+    db_run(&h, |db| tenancy::record_subscription(db, "cus_9", "sub_9", "active", t0));
+    assert!(db_run(&h, |db| tenancy::paying(db, "beta")));
+    db_run(&h, |db| tenancy::record_risk(db, "cus_9", "charge.dispute.created", t0));
+    let entries = db_run(&h, tenancy::list);
+    let beta = entries.iter().find(|e| e.slug == "beta").unwrap();
+    assert_eq!((beta.plan.as_deref(), beta.billing_status.as_deref()), (Some("pro"), Some("active")));
+    assert!(beta.billing_risk.as_deref().unwrap().starts_with("charge.dispute.created"));
+    let acme = entries.iter().find(|e| e.slug == "acme").unwrap();
+    assert_eq!((acme.writes_24h, acme.storage_bytes, acme.billing_status.clone()), (Some(990), Some(4_000), None));
+    db_run(&h, |db| tenancy::record_subscription(db, "cus_9", "sub_9", "canceled", t0));
+    assert!(!db_run(&h, |db| tenancy::paying(db, "beta")));
+
+    // Removing a workspace drops its usage and detaches who paid for it, for good: someone else
+    // may claim the address, and the old customer's late events must not reach them.
+    db_run(&h, |db| tenancy::remove(db, "acme"));
+    assert_eq!(db_run(&h, |db| tenancy::free_usage(db, t0)).storage_bytes, 1_000);
+    db_run(&h, |db| tenancy::record_subscription(db, "cus_9", "sub_9", "active", t0));
+    db_run(&h, |db| tenancy::remove(db, "beta"));
+    assert_eq!(db_run(&h, |db| tenancy::customer_home(db, "cus_9")), tenancy::Payer::Detached);
+    db_run(&h, |db| tenancy::reserve(db, "beta", "Name", "ip-new", t0 + Duration::days(2), limits).map(|_| ()));
+    db_run(&h, |db| tenancy::activate(db, "beta", t0 + Duration::days(2)));
+    assert!(!db_run(&h, |db| tenancy::paying(db, "beta")), "the new owner isn't the old payer");
+    db_run(&h, |db| tenancy::link_customer(db, "cus_9", "beta", t0));
+    assert_eq!(db_run(&h, |db| tenancy::customer_home(db, "cus_9")), tenancy::Payer::Detached, "stays detached");
+    db_run(&h, |db| tenancy::link_customer(db, "cus_new", "beta", t0));
+    assert_eq!(db_run(&h, |db| tenancy::customer_home(db, "cus_new")), tenancy::Payer::Workspace("beta".into()));
+    let entries = db_run(&h, tenancy::list);
+    assert_eq!(entries.iter().find(|e| e.slug == "beta").unwrap().billing_status, None);
 }

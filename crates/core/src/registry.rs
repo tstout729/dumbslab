@@ -62,6 +62,9 @@ pub struct Op {
     pub access: Access,
     pub destructive: bool,
     pub idempotent: bool,
+    /// Hosted workspaces: whether the operation, unless it's a GET, counts against the plan's write
+    /// allowance. Ones that don't (upgrading, managing billing) keep working once it's used up.
+    pub metered: bool,
     pub input_schema: Value,
     pub output_schema: Value,
     handler: Handler,
@@ -81,6 +84,12 @@ impl Op {
             }
             Access::Admin => ctx.actor.require_admin()?,
             _ => {}
+        }
+        if self.metered
+            && self.method != "GET"
+            && let Some(hosting) = ctx.cfg.hosting.as_ref()
+        {
+            crate::plan::check_write(ctx.db, hosting, ctx.now)?;
         }
         (self.handler)(ctx, input)
     }
@@ -116,6 +125,10 @@ impl OpBuilder {
     }
     pub fn idempotent(mut self) -> Self {
         self.0.idempotent = true;
+        self
+    }
+    pub fn unmetered(mut self) -> Self {
+        self.0.metered = false;
         self
     }
     pub fn build(self) -> Op {
@@ -163,6 +176,7 @@ where
         access,
         destructive: false,
         idempotent: method == "GET" || method == "PUT" || method == "DELETE",
+        metered: true,
         input_schema: schema_of::<I>(),
         output_schema: schema_of::<O>(),
         handler,

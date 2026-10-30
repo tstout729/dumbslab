@@ -1,5 +1,6 @@
 //! The directory of workspaces (multi-tenant hosting): address reservations, sign-up limits,
-//! address moves and the operator's list. Only the front Worker and workspace objects call it.
+//! address moves, usage reports and the free plan's capacity, Stripe customers, and the
+//! operator's list. Only the front Worker and workspace objects call it.
 
 use std::cell::Cell;
 
@@ -10,6 +11,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use worker::*;
 
+use crate::billing::free_budget;
 use crate::sql::{DoDb, api_error_response, json_response, read_body, transaction, var_i64};
 
 #[durable_object]
@@ -44,19 +46,37 @@ struct MoveInput {
     to: String,
 }
 
+#[derive(Deserialize)]
+struct UsageInput {
+    home: String,
+    plan: String,
+    writes_24h: u64,
+    storage_bytes: u64,
+}
+
+#[derive(Deserialize)]
+struct BillingInput {
+    customer: String,
+    home: Option<String>,
+    subscription: Option<String>,
+    status: Option<String>,
+    kind: Option<String>,
+}
+
 impl Directory {
     fn limits(&self) -> Limits {
         Limits {
             per_ip_per_day: var_i64(&self.env, "SIGNUPS_PER_IP_PER_DAY", 3),
             per_day: var_i64(&self.env, "SIGNUPS_PER_DAY", 200),
             max_workspaces: var_i64(&self.env, "MAX_WORKSPACES", 1000),
+            free: free_budget(&self.env),
         }
     }
 
     /// Runs one directory change in a transaction; errors roll back.
     fn run<T: 'static>(&self, f: impl FnOnce(&dyn dumbslab_core::Db) -> ApiResult<T> + 'static) -> Result<ApiResult<T>> {
         let storage = self.state.storage();
-        let db = DoDb { sql: storage.sql() };
+        let db = DoDb::new(storage.sql());
         transaction(&storage, db, move |db| {
             let out = f(db);
             let ok = out.is_ok();
@@ -139,11 +159,70 @@ impl DurableObject for Directory {
             (Method::Post, "/resolve") => {
                 let input: ApiResult<SlugInput> = parse(&body);
                 self.run(move |db| match tenancy::resolve(db, &input?.slug)? {
-                    Some((home, moved)) => Ok(json!({ "home": home, "addresses": moved })),
+                    Some((home, moved)) => {
+                        let paying = tenancy::paying(db, &home)?;
+                        Ok(json!({ "home": home, "addresses": moved, "paying": paying }))
+                    }
                     None => Err(ApiError::not_found("a workspace at that address")),
                 })?
             }
-            (Method::Get, "/list") => self.run(|db| tenancy::list(db).map(|items| json!({ "items": items })))?,
+            (Method::Get, "/list") => {
+                let budget = limits.free;
+                self.run(move |db| {
+                    let used = tenancy::free_usage(db, Utc::now())?;
+                    let free = json!({
+                        "writes_24h": used.writes_24h,
+                        "writes_per_day": budget.writes_per_day,
+                        "storage_bytes": used.storage_bytes,
+                        "storage_budget_bytes": budget.storage_bytes,
+                    });
+                    tenancy::list(db).map(|items| json!({ "items": items, "free_plan": free }))
+                })?
+            }
+            // A workspace's usage report. The answer tells it whether the free plan is at capacity.
+            (Method::Post, "/usage") => {
+                let input: ApiResult<UsageInput> = parse(&body);
+                self.run(move |db| {
+                    let input = input?;
+                    let now = Utc::now();
+                    tenancy::report_usage(db, &input.home, &input.plan, input.writes_24h, input.storage_bytes, now)?;
+                    let capacity = tenancy::free_capacity(db, now, limits.free)?;
+                    serde_json::to_value(capacity).map_err(|e| ApiError::internal(e.to_string()))
+                })?
+            }
+            (Method::Post, "/billing/link") => {
+                let input: ApiResult<BillingInput> = parse(&body);
+                self.run(move |db| {
+                    let input = input?;
+                    let home = input.home.ok_or_else(|| ApiError::bad_request("send the workspace's home"))?;
+                    tenancy::link_customer(db, &input.customer, &home, Utc::now()).map(|_| json!({ "ok": true }))
+                })?
+            }
+            (Method::Post, "/billing/lookup") => {
+                let input: ApiResult<BillingInput> = parse(&body);
+                self.run(move |db| {
+                    Ok(match tenancy::customer_home(db, &input?.customer)? {
+                        tenancy::Payer::Unknown => json!({ "home": null }),
+                        tenancy::Payer::Workspace(home) => json!({ "home": home }),
+                        tenancy::Payer::Detached => json!({ "home": null, "detached": true }),
+                    })
+                })?
+            }
+            (Method::Post, "/billing/subscription") => {
+                let input: ApiResult<BillingInput> = parse(&body);
+                self.run(move |db| {
+                    let input = input?;
+                    let (sub, status) = (input.subscription.unwrap_or_default(), input.status.unwrap_or_default());
+                    tenancy::record_subscription(db, &input.customer, &sub, &status, Utc::now()).map(|_| json!({ "ok": true }))
+                })?
+            }
+            (Method::Post, "/billing/risk") => {
+                let input: ApiResult<BillingInput> = parse(&body);
+                self.run(move |db| {
+                    let input = input?;
+                    tenancy::record_risk(db, &input.customer, &input.kind.unwrap_or_default(), Utc::now()).map(|_| json!({ "ok": true }))
+                })?
+            }
             _ => Err(ApiError::not_found("directory route")),
         };
         respond(result)

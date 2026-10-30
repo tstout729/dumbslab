@@ -9,6 +9,7 @@ use serde::Serialize;
 use crate::db::{Db, DbExt};
 use crate::error::{ApiError, ApiResult};
 use crate::events::{Event, emit};
+use crate::plan::Capacity;
 use crate::registry::Ctx;
 use crate::util::{hmac_sha256_hex, secure_eq, ts};
 use crate::{AddressMove, Effect, HostConfig, Response, params};
@@ -218,6 +219,28 @@ CREATE TABLE IF NOT EXISTS addresses (
   created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS addresses_home ON addresses(home);
+-- What each workspace (by its first address) last reported: its plan, the rows it wrote in the
+-- 24 hours before the report, and its size. The free plan's totals decide whether it's at capacity.
+CREATE TABLE IF NOT EXISTS usage (
+  home TEXT PRIMARY KEY,
+  plan TEXT NOT NULL,
+  writes_24h INTEGER NOT NULL,
+  storage_bytes INTEGER NOT NULL,
+  reported_at TEXT NOT NULL
+);
+-- Stripe customers and the workspace each one pays for. When the workspace is deleted its rows
+-- stay, detached, so Stripe's later events about them never reach a new workspace at that address.
+CREATE TABLE IF NOT EXISTS billing (
+  customer TEXT PRIMARY KEY,
+  home TEXT NOT NULL,
+  detached INTEGER NOT NULL DEFAULT 0,
+  subscription TEXT,
+  status TEXT,
+  -- The last refund, dispute or fraud warning, e.g. `charge.dispute.created 2026-11-02T…`.
+  risk TEXT,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS billing_home ON billing(home);
 ";
 
 /// The most addresses one workspace can use, counting its first.
@@ -233,6 +256,16 @@ pub struct Limits {
     pub per_ip_per_day: i64,
     pub per_day: i64,
     pub max_workspaces: i64,
+    /// What all free workspaces together may use. Sign-ups pause while it's used up.
+    pub free: FreeBudget,
+}
+
+/// The free plan's share of the hosting bill: rows all free workspaces may write in 24 hours and
+/// what they may store, together. Keep both inside what the hosting plan includes.
+#[derive(Debug, Clone, Copy)]
+pub struct FreeBudget {
+    pub writes_per_day: u64,
+    pub storage_bytes: u64,
 }
 
 /// Reserves an address for a new workspace. Returns the reservation's expiry.
@@ -260,6 +293,14 @@ pub fn reserve(db: &dyn Db, slug: &str, name: &str, ip_hash: &str, now: DateTime
         db.scalar_i64("SELECT COUNT(*) FROM workspaces WHERE status != 'reserved' OR reserved_until > ?", &params![now_s.clone()])?;
     if live >= limits.max_workspaces {
         return Err(ApiError::new(503, "full", "DumbSlab has reached its workspace limit for now; you can self-host it for free"));
+    }
+    let capacity = free_capacity(db, now, limits.free)?;
+    if capacity.writes_paused || capacity.growth_paused {
+        return Err(ApiError::new(
+            503,
+            "full",
+            "DumbSlab's free plan is at capacity right now; try again tomorrow, or self-host it for free",
+        ));
     }
     // Whole seconds, so a sign-up link's expiry names exactly this reservation.
     let until = DateTime::from_timestamp(now.timestamp() + RESERVATION_MINUTES * 60, 0).unwrap_or(now);
@@ -325,10 +366,14 @@ pub fn set_status(db: &dyn Db, slug: &str, status: &str) -> ApiResult<()> {
     Ok(())
 }
 
-/// Removes a workspace (by its first address) and every address it moved to.
+/// Removes a workspace (by its first address) and every address it moved to. Its billing records
+/// are detached: someone may claim the address again, and Stripe's later events about the old
+/// customers must not reach their workspace.
 pub fn remove(db: &dyn Db, home: &str) -> ApiResult<()> {
     db.execute("DELETE FROM workspaces WHERE slug = ?", &params![home])?;
     db.execute("DELETE FROM addresses WHERE home = ?", &params![home])?;
+    db.execute("DELETE FROM usage WHERE home = ?", &params![home])?;
+    db.execute("UPDATE billing SET detached = 1 WHERE home = ?", &params![home])?;
     Ok(())
 }
 
@@ -383,6 +428,99 @@ pub fn resolve(db: &dyn Db, slug: &str) -> ApiResult<Option<(String, Vec<String>
     Ok(Some((home, moved.iter().map(|r| r.str("slug")).collect())))
 }
 
+// ---------------------------------------------------------------------------
+// Usage and billing
+
+/// Records a workspace's report: its plan (`free` or `pro`), rows written in the last 24 hours and size.
+pub fn report_usage(db: &dyn Db, home: &str, plan: &str, writes_24h: u64, storage_bytes: u64, now: DateTime<Utc>) -> ApiResult<()> {
+    if !matches!(plan, "free" | "pro") {
+        return Err(ApiError::bad_request("plan must be free or pro"));
+    }
+    db.execute(
+        "INSERT INTO usage (home, plan, writes_24h, storage_bytes, reported_at) VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(home) DO UPDATE SET plan = excluded.plan, writes_24h = excluded.writes_24h,
+           storage_bytes = excluded.storage_bytes, reported_at = excluded.reported_at",
+        &params![home, plan, writes_24h as i64, storage_bytes as i64, ts(now)],
+    )?;
+    Ok(())
+}
+
+/// What all free workspaces used, by their latest reports: rows written in 24 hours (reports
+/// older than a day don't count) and storage.
+#[derive(Debug, Clone, Copy, Serialize, JsonSchema)]
+pub struct FreeUsage {
+    pub writes_24h: u64,
+    pub storage_bytes: u64,
+}
+
+pub fn free_usage(db: &dyn Db, now: DateTime<Utc>) -> ApiResult<FreeUsage> {
+    let day_ago = ts(now - Duration::days(1));
+    let writes =
+        db.scalar_i64("SELECT COALESCE(SUM(writes_24h), 0) FROM usage WHERE plan = 'free' AND reported_at > ?", &params![day_ago])?;
+    let storage = db.scalar_i64("SELECT COALESCE(SUM(storage_bytes), 0) FROM usage WHERE plan = 'free'", &[])?;
+    Ok(FreeUsage { writes_24h: writes.max(0) as u64, storage_bytes: storage.max(0) as u64 })
+}
+
+pub fn free_capacity(db: &dyn Db, now: DateTime<Utc>, budget: FreeBudget) -> ApiResult<Capacity> {
+    let used = free_usage(db, now)?;
+    Ok(Capacity { writes_paused: used.writes_24h >= budget.writes_per_day, growth_paused: used.storage_bytes >= budget.storage_bytes })
+}
+
+/// Checkout finished: `customer` pays for the workspace whose first address is `home`. A
+/// customer whose workspace was deleted stays detached.
+pub fn link_customer(db: &dyn Db, customer: &str, home: &str, now: DateTime<Utc>) -> ApiResult<()> {
+    db.execute(
+        "INSERT INTO billing (customer, home, updated_at) VALUES (?, ?, ?)
+         ON CONFLICT(customer) DO UPDATE SET home = excluded.home, updated_at = excluded.updated_at WHERE billing.detached = 0",
+        &params![customer, home, ts(now)],
+    )?;
+    Ok(())
+}
+
+/// Who a Stripe customer pays for, as far as the directory knows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Payer {
+    Unknown,
+    /// Pays for the workspace whose first address this is.
+    Workspace(String),
+    /// Paid for a workspace that was deleted.
+    Detached,
+}
+
+pub fn customer_home(db: &dyn Db, customer: &str) -> ApiResult<Payer> {
+    Ok(match db.one("SELECT home, detached FROM billing WHERE customer = ?", &params![customer])? {
+        None => Payer::Unknown,
+        Some(r) if r.i64("detached") != 0 => Payer::Detached,
+        Some(r) => Payer::Workspace(r.str("home")),
+    })
+}
+
+pub fn record_subscription(db: &dyn Db, customer: &str, subscription: &str, status: &str, now: DateTime<Utc>) -> ApiResult<()> {
+    db.execute(
+        "UPDATE billing SET subscription = ?, status = ?, updated_at = ? WHERE customer = ?",
+        &params![subscription, status, ts(now), customer],
+    )?;
+    Ok(())
+}
+
+/// Notes a refund, dispute or fraud warning on the customer's record for the operator.
+pub fn record_risk(db: &dyn Db, customer: &str, kind: &str, now: DateTime<Utc>) -> ApiResult<()> {
+    db.execute(
+        "UPDATE billing SET risk = ?, updated_at = ? WHERE customer = ?",
+        &params![format!("{kind} {}", ts(now)), ts(now), customer],
+    )?;
+    Ok(())
+}
+
+/// Whether someone still pays for the workspace. Deleting it would keep charging them.
+pub fn paying(db: &dyn Db, home: &str) -> ApiResult<bool> {
+    let n = db.scalar_i64(
+        "SELECT COUNT(*) FROM billing WHERE home = ? AND detached = 0 AND status IN ('active', 'trialing', 'past_due')",
+        &params![home],
+    )?;
+    Ok(n > 0)
+}
+
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct DirectoryEntry {
     /// The workspace's first address, which names its storage.
@@ -396,12 +534,27 @@ pub struct DirectoryEntry {
     pub address: String,
     /// Earlier addresses, which forward to `address` and stay reserved for this workspace.
     pub previous_addresses: Vec<String>,
+    /// `free` or `pro`, from the workspace's latest usage report.
+    pub plan: Option<String>,
+    pub writes_24h: Option<i64>,
+    pub storage_bytes: Option<i64>,
+    pub reported_at: Option<String>,
+    /// The Stripe subscription's status, when the workspace has paid.
+    pub billing_status: Option<String>,
+    /// The last refund, dispute or fraud warning on its payments.
+    pub billing_risk: Option<String>,
 }
 
 pub fn list(db: &dyn Db) -> ApiResult<Vec<DirectoryEntry>> {
     let moved = db.query("SELECT slug, home, current FROM addresses ORDER BY created_at", &[])?;
     Ok(db
-        .query("SELECT slug, name, status, created_at, activated_at FROM workspaces ORDER BY created_at DESC", &[])?
+        .query(
+            "SELECT w.slug, w.name, w.status, w.created_at, w.activated_at, u.plan, u.writes_24h, u.storage_bytes, u.reported_at,
+                    (SELECT b.status FROM billing b WHERE b.home = w.slug AND b.detached = 0 ORDER BY b.updated_at DESC LIMIT 1) AS billing_status,
+                    (SELECT b.risk FROM billing b WHERE b.home = w.slug AND b.detached = 0 AND b.risk IS NOT NULL ORDER BY b.updated_at DESC LIMIT 1) AS billing_risk
+             FROM workspaces w LEFT JOIN usage u ON u.home = w.slug ORDER BY w.created_at DESC",
+            &[],
+        )?
         .iter()
         .map(|r| {
             let slug = r.str("slug");
@@ -417,6 +570,12 @@ pub fn list(db: &dyn Db) -> ApiResult<Vec<DirectoryEntry>> {
                 activated_at: r.opt_str("activated_at"),
                 address,
                 previous_addresses,
+                plan: r.opt_str("plan"),
+                writes_24h: r.opt_i64("writes_24h"),
+                storage_bytes: r.opt_i64("storage_bytes"),
+                reported_at: r.opt_str("reported_at"),
+                billing_status: r.opt_str("billing_status"),
+                billing_risk: r.opt_str("billing_risk"),
             }
         })
         .collect())

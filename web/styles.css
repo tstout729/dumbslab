@@ -1057,6 +1057,16 @@ a.stat:hover { background: var(--bg-hover); text-decoration: none; }
 .panel-hero .copy-field { background: var(--bg); padding: 7px 7px 7px 14px; }
 .panel-hero .copy-value { font-size: 14.5px; font-weight: 550; }
 .profile-preview { display: flex; align-items: center; gap: 14px; }
+.usage { display: flex; flex-direction: column; gap: 6px; }
+.usage-head { display: flex; justify-content: space-between; gap: 12px; font-size: 14px; }
+.usage-label { font-weight: 600; }
+.usage-value { color: var(--ink-2); font-variant-numeric: tabular-nums; }
+.usage-bar { height: 8px; border-radius: 999px; background: var(--bg-sunk); overflow: hidden; }
+.usage-fill { display: block; height: 100%; border-radius: inherit; background: var(--accent); }
+.usage-high .usage-fill { background: var(--amber); }
+.usage-full .usage-fill { background: var(--red); }
+.plan-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.plan-list { margin: 0; padding-left: 18px; display: flex; flex-direction: column; gap: 4px; font-size: 14px; color: var(--ink-2); }
 
 .snippet { display: flex; flex-direction: column; gap: 6px; }
 .snippet-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }

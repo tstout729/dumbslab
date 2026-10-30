@@ -76,7 +76,7 @@
       "@type": "FAQPage",
       "@id": "https://dumbslab.com/#faq",
       "mainEntity": [
-        { "@type": "Question", "name": "Is DumbSlab free?", "acceptedAnswer": { "@type": "Answer", "text": "Yes. Hosted workspaces at dumbslab.com are free, with no credit card and no trial. The code is open source, so you can also run your own copy." } },
+        { "@type": "Question", "name": "Is DumbSlab free?", "acceptedAnswer": { "@type": "Answer", "text": "Yes. Every feature is free at dumbslab.com, with no credit card and no trial; the free plan limits only storage and daily writes. The code is open source, so you can also run your own copy." } },
         { "@type": "Question", "name": "Which AI tools work with DumbSlab?", "acceptedAnswer": { "@type": "Answer", "text": "Any MCP client. Claude, ChatGPT, Cursor and other clients that support OAuth need only your workspace's MCP URL, such as https://acme.dumbslab.com/mcp, and you approve access in the browser. Other tools can use a personal access token with the MCP server or the REST API." } },
         { "@type": "Question", "name": "Can an agent overwrite my team's work?", "acceptedAnswer": { "@type": "Answer", "text": "Not by accident. Agents change one section or one passage at a time instead of rewriting the whole doc, and they send the version they last read. If a teammate saved since then, the edit is refused with a conflict instead of erasing their change. Every save is a version you can compare and restore." } },
         { "@type": "Question", "name": "Who can see my workspace?", "acceptedAnswer": { "@type": "Answer", "text": "Only the people you add. Admins add people and choose each person's role: admin, member or viewer. Private topics are visible only to their members, and drafts only to their author. Search engines are told to stay out of workspaces." } },
@@ -98,6 +98,7 @@
     <a href="#how">How it works</a>
     <a href="#agents">For agents</a>
     <a href="#features">Features</a>
+    <a href="#pricing">Pricing</a>
     <a href="#faq">FAQ</a>
     <a href="https://github.com/tstout729/dumbslab">GitHub</a>
   </nav>
@@ -243,6 +244,32 @@
     </dl>
   </section>
 
+  <section id="pricing" class="w-pricing w-wrap" aria-labelledby="pricing-title">
+    <h2 id="pricing-title">Pricing</h2>
+    <p class="w-section-lede">Every feature is free, including the MCP server, the API, webhooks and uploads. Pay only if your team needs more room.</p>
+    <div class="w-plans">
+      <div class="w-plan">
+        <h3>Free</h3>
+        <p class="w-price">$0</p>
+        <ul>
+          <li><span data-free-storage>50 MB</span> of storage, uploads included</li>
+          <li><span data-free-writes>50,000</span> database writes a day</li>
+          <li>Unlimited people, bots and agents</li>
+        </ul>
+      </div>
+      <div class="w-plan w-plan-pro">
+        <h3>Pro</h3>
+        <p class="w-price" data-pro-price>$8 a month</p>
+        <ul>
+          <li><span data-pro-storage>5 GB</span> of storage, uploads included</li>
+          <li><span data-pro-writes>200,000</span> database writes a day</li>
+          <li>Upgrade any time in Settings › Plan; cancel any time</li>
+        </ul>
+        <p class="w-fine" data-pro-soon hidden>Coming soon.</p>
+      </div>
+    </div>
+  </section>
+
   <section id="open-source" class="w-open w-wrap" aria-labelledby="open-title">
     <div>
       <h2 id="open-title">Dumb on purpose</h2>
@@ -259,7 +286,7 @@ cargo run --release -p dumbslab -- serve</code></pre>
     <div class="w-faq-list">
       <details>
         <summary>Is DumbSlab free?</summary>
-        <p>Yes. Hosted workspaces at dumbslab.com are free, with no credit card and no trial. The code is open source, so you can also run your own copy.</p>
+        <p>Yes. Every feature is free at dumbslab.com, with no credit card and no trial; the free plan limits only storage and daily writes (see <a href="#pricing">Pricing</a>). The code is open source, so you can also run your own copy.</p>
       </details>
       <details>
         <summary>Which AI tools work with DumbSlab?</summary>

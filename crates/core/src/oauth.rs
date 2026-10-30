@@ -23,6 +23,9 @@ const REFRESH_TOKEN_DAYS: i64 = 60;
 const CODE_MINUTES: i64 = 10;
 /// Registered (dynamic) clients kept per workspace.
 pub const MAX_CLIENTS: i64 = 1000;
+/// Hosted workspaces: new app registrations allowed in any hour. Keeps anonymous registration's
+/// writes far below a workspace's daily write allowance.
+pub const HOSTED_REGISTRATIONS_PER_HOUR: i64 = 120;
 /// How long opening a client's consent page protects it from eviction.
 pub const CONSENT_PROTECTION_MINUTES: i64 = 15;
 /// Grants and codes are written even in a full workspace, so each is capped: an app keeps a
@@ -75,7 +78,7 @@ pub fn handle(db: &dyn Db, cfg: &HostConfig, req: &Request) -> Outcome {
                 "service_documentation": format!("{base}/llms.txt"),
             }),
         )),
-        ("POST", "/oauth/register") => register(db, req),
+        ("POST", "/oauth/register") => register(db, cfg, req),
         ("GET", "/oauth/authorize") => authorize_page(db, cfg, req),
         ("POST", "/oauth/authorize") => authorize_decision(db, cfg, req),
         ("POST", "/oauth/token") => token(db, cfg, req),
@@ -145,7 +148,20 @@ fn valid_redirect_uri(uri: &str) -> bool {
     }
 }
 
-fn register(db: &dyn Db, req: &Request) -> Outcome {
+fn register(db: &dyn Db, cfg: &HostConfig, req: &Request) -> Outcome {
+    // Hosted workspaces pay for every row written, and registration is anonymous: refuse it while
+    // the workspace can't change things, and cap how often it happens.
+    if let Some(hosting) = cfg.hosting.as_ref() {
+        if let Err(e) = crate::plan::check_write(db, hosting, Utc::now()) {
+            return crate::http::failed(&e);
+        }
+        let hour_ago = ts(Utc::now() - Duration::hours(1));
+        if db.scalar_i64("SELECT COUNT(*) FROM oauth_clients WHERE created_at > ?", &params![hour_ago]).unwrap_or(0)
+            >= HOSTED_REGISTRATIONS_PER_HOUR
+        {
+            return oauth_error(429, "invalid_client_metadata", "too many apps registered in the last hour; try again later");
+        }
+    }
     let body: Value = match serde_json::from_slice(&req.body) {
         Ok(v) => v,
         Err(_) => return oauth_error(400, "invalid_client_metadata", "body must be JSON"),

@@ -3,7 +3,7 @@
 //! A host (the native server or the Cloudflare Worker) turns an incoming HTTP request into a
 //! [`Request`], opens a database transaction, calls [`handle`], commits or rolls back according
 //! to [`Outcome::commit`], and then performs the returned [`Effect`]s (webhook deliveries and,
-//! for hosted workspaces, address moves).
+//! for hosted workspaces, address moves and Stripe calls).
 //!
 //! Every capability is an operation in [`registry`]. Each one is exposed the same way over REST
 //! (`/api/v1/...`), the generic operations endpoint (`/api/v1/operations/{name}`), MCP (`/mcp`)
@@ -22,6 +22,7 @@ pub mod notify;
 pub mod oauth;
 pub mod openapi;
 pub mod ops;
+pub mod plan;
 pub mod registry;
 pub mod search;
 pub mod seed;
@@ -48,6 +49,21 @@ pub struct HostConfig {
     pub signup_secret: Option<String>,
     /// Multi-tenant hosting: this workspace's address (its subdomain).
     pub workspace: Option<String>,
+    /// Multi-tenant hosting: the plans on offer and what the host measured (see [`plan`]).
+    /// Self-hosted servers leave it unset and have no limits.
+    pub hosting: Option<Hosting>,
+}
+
+/// What a hosted workspace's plan depends on that only the host knows.
+#[derive(Clone, Debug)]
+pub struct Hosting {
+    pub plans: plan::Plans,
+    /// The workspace's first address. It names the workspace's storage and its Stripe customer.
+    pub home: String,
+    /// The workspace database's size, in bytes, when the request arrived.
+    pub storage_bytes: u64,
+    /// Whether the free plan is at capacity across the service.
+    pub capacity: plan::Capacity,
 }
 
 /// A transport-neutral HTTP request.
@@ -135,6 +151,9 @@ pub struct AddressMove {
 pub enum Effect {
     Webhook(WebhookDelivery),
     MoveAddress(AddressMove),
+    /// Hosted workspaces only: ask Stripe for a Checkout or customer portal page, and answer the
+    /// request with its URL.
+    Stripe(plan::StripeCall),
 }
 
 #[derive(Clone, Debug)]
