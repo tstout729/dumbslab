@@ -2,9 +2,9 @@
 //! enough for a Durable Object row, so both hosts store and serve them inside the request's
 //! transaction. Posts show them with `![name](/files/<id>/<name>)`.
 //!
-//! Who can open a file: admins; its uploader; anyone who can see the post it belongs to; and,
-//! while it belongs to no post, any signed-in member who has its id (like a link). Saving a post
-//! that references your own unattached uploads attaches them to it.
+//! Who can open a file: admins, its uploader, and anyone who can see the post it belongs to. A file
+//! that belongs to no post yet is private to its uploader (and admins); saving a post that
+//! references your own unattached uploads attaches them to it.
 
 use std::borrow::Cow;
 
@@ -136,21 +136,20 @@ fn infos(ctx: &Ctx, rows: &[Row]) -> ApiResult<Vec<FileInfo>> {
         .collect())
 }
 
-/// SQL that is true when files alias `f` are visible to the actor. Listing (`listed`) also leaves
-/// out other people's files that belong to no post: those are reachable only by id.
-fn file_visible_sql(actor: &Actor, listed: bool, p: &mut Vec<SqlValue>) -> String {
+/// SQL that is true when files alias `f` are visible to the actor: their own uploads, and files in
+/// posts they can see. Knowing a file's id is never enough on its own.
+fn file_visible_sql(actor: &Actor, p: &mut Vec<SqlValue>) -> String {
     if actor.sees_all() {
         return "1=1".into();
     }
     p.push(actor.user_id.clone().into());
     let vis = post_visible_sql(actor, "fp", p);
-    let unattached = if listed { "" } else { " OR f.post_id IS NULL" };
-    format!("(f.uploaded_by = ?{unattached} OR EXISTS (SELECT 1 FROM posts fp WHERE fp.id = f.post_id AND {vis}))")
+    format!("(f.uploaded_by = ? OR EXISTS (SELECT 1 FROM posts fp WHERE fp.id = f.post_id AND {vis}))")
 }
 
 fn load_file(db: &dyn Db, actor: &Actor, id: &str) -> ApiResult<Row> {
     let mut p = params![id];
-    let vis = file_visible_sql(actor, false, &mut p);
+    let vis = file_visible_sql(actor, &mut p);
     db.one(&format!("SELECT {FILE_COLS} FROM files f WHERE f.id = ? AND {vis}"), &p)?
         .ok_or_else(|| ApiError::not_found(format!("file `{id}`")))
 }
@@ -320,9 +319,12 @@ fn upload_file(ctx: &mut Ctx, input: UploadFileInput) -> ApiResult<FileInfo> {
     let mut event = Event::new("file.uploaded", "file", &id, summary)
         .data(json!({ "size": bytes.len(), "content_type": content_type }))
         .content(json!({ "name": name }));
-    if let Some(pid) = &post_id {
-        event = event.post(pid);
-    }
+    // The post's visibility applies to its files' events. A file in no post is private to its
+    // uploader, so only admins see that it exists.
+    event = match &post_id {
+        Some(pid) => event.post(pid),
+        None => event.admin_only(),
+    };
     emit(ctx, event)?;
     info_for(ctx, &id)
 }
@@ -368,7 +370,7 @@ fn list_files(ctx: &mut Ctx, input: ListFilesInput) -> ApiResult<FileList> {
         conds.push("f.uploaded_by = ?".into());
         p.push(find_user(ctx, &who)?.str("id").into());
     }
-    conds.push(file_visible_sql(&ctx.actor, true, &mut p));
+    conds.push(file_visible_sql(&ctx.actor, &mut p));
     p.push((limit + 1).into());
     p.push(offset.into());
     let mut rows = ctx.db.query(
@@ -399,10 +401,11 @@ fn delete_file(ctx: &mut Ctx, input: FileIdInput) -> ApiResult<DeleteFileResult>
         Some(_) => format!("deleted “{}”", row.str("name")),
         None => "deleted a file".into(),
     };
-    let mut event = Event::new("file.deleted", "file", &id, summary).content(json!({ "name": row.str("name") }));
-    if let Some(pid) = &post_id {
-        event = event.post(pid);
-    }
+    let event = Event::new("file.deleted", "file", &id, summary).content(json!({ "name": row.str("name") }));
+    let event = match &post_id {
+        Some(pid) => event.post(pid),
+        None => event.admin_only(),
+    };
     emit(ctx, event)?;
     Ok(DeleteFileResult { ok: true, id })
 }

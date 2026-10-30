@@ -1609,6 +1609,10 @@ fn files_upload_serve_and_stay_safe() {
     let rendered = h.ok("POST", "/api/v1/render", Some(json!({ "markdown": f["markdown"] })), &member);
     assert!(rendered["html"].as_str().unwrap().contains(&format!("<img src=\"{path}\"")), "{rendered}");
 
+    // It's private to its uploader until a post uses it; then everyone who can see the post can.
+    assert_eq!(fetch(&h, &path, &viewer).status, 404);
+    h.ok("POST", "/api/v1/posts", Some(json!({ "title": "Screenshot", "content": f["markdown"], "status": "published" })), &member);
+
     // Members, viewers and browser sessions can open it, inline, with protective headers.
     assert!(dumbslab_core::http::is_core_path(&path));
     for who in [&member, &viewer, &cookie] {
@@ -1676,7 +1680,7 @@ fn files_upload_serve_and_stay_safe() {
     let big_id = r.body["id"].as_str().unwrap();
     assert_eq!(count(&h, &format!("SELECT COUNT(*) FROM file_chunks WHERE file_id = '{big_id}'")), 3);
     assert!(count(&h, "SELECT MAX(length(data)) FROM file_chunks") <= 1024 * 1024);
-    assert_eq!(fetch(&h, r.body["path"].as_str().unwrap(), &viewer).bytes, big);
+    assert_eq!(fetch(&h, r.body["path"].as_str().unwrap(), &member).bytes, big);
 
     // Too large, empty or not base64: refused before anything is stored.
     let stored = count(&h, "SELECT COUNT(*) FROM files");
@@ -1739,16 +1743,19 @@ fn file_access_follows_posts() {
     // Nobody can add a file to a post they can't see.
     assert_eq!(upload(&h, &otto, "x.png", None, PNG, Some(&post)).status, 404);
 
-    // A file uploaded before its post exists works like a link, unlisted for others, until the
-    // uploader saves a post that uses it. Then it follows that post.
+    // A file uploaded before its post exists is private to its uploader, even to someone who has
+    // its id, until the uploader saves a post that uses it. Then it follows that post.
     let early = upload(&h, &mia, "salary-bands.png", None, PNG, None);
     let early_id = early.body["id"].as_str().unwrap().to_string();
     let early_path = early.body["path"].as_str().unwrap().to_string();
-    assert_eq!(fetch(&h, &early_path, &otto).status, 200);
+    assert_eq!(fetch(&h, &early_path, &otto).status, 404);
+    assert_eq!(h.call("GET", &format!("/api/v1/files/{early_id}"), None, &otto).status, 404);
+    assert_eq!(fetch(&h, &early_path, &mia).status, 200);
     assert!(!ids(&h.ok("GET", "/api/v1/files", None, &otto)).contains(&early_id));
     let feed = h.ok("GET", "/api/v1/activity?event=file.&limit=200", None, &otto);
     let summaries: Vec<&str> = feed["items"].as_array().unwrap().iter().map(|a| a["summary"].as_str().unwrap()).collect();
     assert!(summaries.iter().all(|s| !s.contains("salary") && !s.contains("org-chart")), "{summaries:?}");
+    assert!(feed["items"].as_array().unwrap().iter().all(|a| a["target_id"] != early_id.as_str()), "an unattached file's id stays private");
     let content = format!("See {}", early.body["markdown"].as_str().unwrap());
     let bands = h.ok(
         "POST",
@@ -1772,7 +1779,7 @@ fn file_access_follows_posts() {
     assert_eq!(h.ok("GET", &format!("/api/v1/files?uploaded_by={mia_id}"), None, &admin)["items"].as_array().unwrap().len(), 2);
 
     // Only the uploader or an admin deletes a file, and deleting frees its storage.
-    assert_eq!(h.call("DELETE", &format!("/api/v1/files/{otto_id}"), None, &mia).status, 403);
+    assert_eq!(h.call("DELETE", &format!("/api/v1/files/{otto_id}"), None, &mia).status, 404);
     h.ok("DELETE", &format!("/api/v1/files/{otto_id}"), None, &otto);
     assert_eq!(count(&h, &format!("SELECT COUNT(*) FROM file_chunks WHERE file_id = '{otto_id}'")), 0);
     assert_eq!(fetch(&h, otto_file.body["path"].as_str().unwrap(), &otto).status, 404);
