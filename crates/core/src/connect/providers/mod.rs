@@ -2,11 +2,16 @@
 
 use super::Connector;
 
+pub mod asana;
+pub mod box_com;
+pub mod dropbox;
 pub mod github;
 pub mod google_drive;
+pub mod guru;
 
 /// Every app this build can connect to, in the order Settings shows them.
-pub static ALL: &[&dyn Connector] = &[&github::GitHub, &google_drive::GoogleDrive];
+pub static ALL: &[&dyn Connector] =
+    &[&github::GitHub, &google_drive::GoogleDrive, &asana::Asana, &box_com::BoxCom, &dropbox::Dropbox, &guru::Guru];
 
 pub fn get(id: &str) -> Option<&'static dyn Connector> {
     ALL.iter().copied().find(|c| c.info().id == id)
