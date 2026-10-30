@@ -584,9 +584,13 @@ fn ensure_topic_path(ctx: &mut Ctx, base: Option<PathTopic>, path: &str, created
             Some(r) => {
                 let topic = PathTopic { id: r.str("id"), name: r.str("name"), private: r.str("visibility") == "private" };
                 if let Some(up) = parent.as_ref().filter(|up| up.private) {
+                    // Compare who can read, not member lists: admins read every private topic, so an
+                    // admin among the members (such as an admin importer this import added) widens
+                    // nothing. Anyone else must be a member of the parent too.
                     let wider = !topic.private
                         || ctx.db.scalar_i64(
-                            "SELECT COUNT(*) FROM topic_members c WHERE c.topic_id = ?
+                            "SELECT COUNT(*) FROM topic_members c JOIN users cu ON cu.id = c.user_id
+                             WHERE c.topic_id = ? AND cu.role != 'admin'
                                AND NOT EXISTS (SELECT 1 FROM topic_members u WHERE u.topic_id = ? AND u.user_id = c.user_id)",
                             &params![topic.id.clone(), up.id.clone()],
                         )? > 0;

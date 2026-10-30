@@ -2085,6 +2085,54 @@ fn imports_never_widen_a_private_topic() {
     assert_eq!(import(json!({ "topic_id": lead, "documents": [{ "title": "x", "content": "y" }] }), &otto).status, 404);
 }
 
+#[test]
+fn admins_import_into_private_topics_they_have_not_joined() {
+    let h = H::new();
+    let (_, admin) = h.setup();
+    let (_, mia) = h.user(&admin, "mia@acme.test", "Mia Member", "member");
+    let (_, otto) = h.user(&admin, "otto@acme.test", "Otto Outsider", "member");
+    // Mia's private topic; the admin isn't a member but, as an admin, can see it.
+    let exec =
+        h.ok("POST", "/api/v1/topics", Some(json!({ "name": "Exec", "visibility": "private" })), &mia)["id"].as_str().unwrap().to_string();
+    let members = h.ok("GET", &format!("/api/v1/topics/{exec}"), None, &admin)["members"].as_array().unwrap().len();
+    assert_eq!(members, 1);
+
+    // Two pages share a child the import creates; the importer joining it widens nothing.
+    let batch = json!({ "skip_existing": true, "topic_id": exec, "documents": [
+        { "title": "Q1 plan", "content": "zebracorn one", "topic": "Plans" },
+        { "title": "Q2 plan", "content": "zebracorn two", "topic": "Plans" },
+    ] });
+    let r = h.ok("POST", "/api/v1/import", Some(batch.clone()), &admin);
+    assert_eq!(r["created"].as_array().unwrap().len(), 2, "{r}");
+    assert_eq!(r["topics_created"], 1);
+    let plans =
+        h.ok("GET", "/api/v1/topics", None, &mia)["items"].as_array().unwrap().iter().find(|t| t["name"] == "Plans").unwrap().clone();
+    assert_eq!(plans["visibility"], "private");
+    assert_eq!(h.ok("GET", "/api/v1/search?q=zebracorn", None, &mia)["items"].as_array().unwrap().len(), 2);
+    assert!(h.ok("GET", "/api/v1/search?q=zebracorn", None, &otto)["items"].as_array().unwrap().is_empty());
+
+    // Running it again skips both, and creates nothing.
+    let again = h.ok("POST", "/api/v1/import", Some(batch), &admin);
+    assert_eq!(again["skipped"].as_array().unwrap().len(), 2, "{again}");
+    assert!(again["created"].as_array().unwrap().is_empty());
+    assert_eq!(again["topics_created"], 0);
+
+    // A child with a real extra reader is still refused, for admins too.
+    h.ok(
+        "POST",
+        "/api/v1/topics",
+        Some(json!({ "name": "Shared", "parent_id": exec, "visibility": "private", "members": ["otto@acme.test"] })),
+        &admin,
+    );
+    let wider = h.call(
+        "POST",
+        "/api/v1/import",
+        Some(json!({ "topic_id": exec, "documents": [{ "title": "x", "content": "y", "topic": "Shared" }] })),
+        &admin,
+    );
+    assert_eq!(wider.status, 409, "{}", wider.body);
+}
+
 fn plans(price: Option<&str>) -> dumbslab_core::plan::Plans {
     use dumbslab_core::plan::{Allowance, Plans};
     Plans {
