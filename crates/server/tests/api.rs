@@ -5637,6 +5637,46 @@ mod syncs {
     }
 
     #[test]
+    fn docs_sync_sends_workspace_webhooks() {
+        let mut h = H::new();
+        let (admin, _) = h.setup();
+        with_key(&mut h);
+        h.ok("POST", "/api/v1/webhooks", Some(json!({ "url": "https://hooks.example.com/dumbslab", "events": ["post.*"] })), &admin);
+        let topic = h.ok("POST", "/api/v1/topics", Some(json!({ "name": "Runbooks" })), &admin)["id"].as_str().unwrap().to_string();
+        let (source, _) = gitlab_source(&h, &admin, &topic);
+        let lab = Lab::new(&[("a.md", b"# A\n"), ("b.md", b"# B\n")]);
+        // Like a host: drive the job, then take what it left to deliver.
+        let run = || -> Vec<String> {
+            let r = h.call("POST", &format!("/api/v1/docs-sources/{source}/sync"), None, &admin);
+            let mut job = job_of(&r);
+            let mut replies = vec![];
+            loop {
+                match step_once(&h, &mut job, replies) {
+                    Step::Fetch(calls) => replies = calls.iter().map(|c| lab.answer(c)).collect(),
+                    Step::Done(f) => {
+                        filled(f);
+                        break;
+                    }
+                }
+            }
+            job.take_effects()
+                .iter()
+                .filter_map(|e| match e {
+                    Effect::Webhook(d) => d.headers.iter().find(|(k, _)| k == "x-dumbslab-event").map(|(_, v)| v.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(run(), vec!["post.created", "post.created"]);
+        lab.put("a.md", b"# A\n\nChanged.\n");
+        lab.files.borrow_mut().remove("b.md");
+        let mut events = run();
+        events.sort();
+        assert_eq!(events, vec!["post.archived", "post.updated"]);
+        assert!(run().is_empty(), "nothing changed, nothing sent");
+    }
+
+    #[test]
     fn docs_sync_skips_large_files_for_good() {
         let mut h = H::new();
         let (admin, _) = h.setup();

@@ -952,11 +952,13 @@ impl Job {
     }
 
     /// What the job's operations left for the host to deliver once it finishes: a draft started
-    /// from Slack has webhooks to send. Only Slack's jobs leave any. Events a sign-in records send
+    /// from Slack, and posts a docs sync wrote, have webhooks to send. Events a sign-in records send
     /// no webhooks, and connected apps' jobs record none.
     pub fn take_effects(&mut self) -> Vec<crate::Effect> {
         match self {
             Job::Slack(j) => j.take_effects(),
+            Job::Docs(j) => j.take_effects(),
+            Job::People(j) => j.take_effects(),
             _ => vec![],
         }
     }

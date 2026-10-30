@@ -116,6 +116,14 @@ pub struct PeopleJob {
     employees: Vec<Employee>,
     pages: usize,
     phase: Phase,
+    /// The webhooks of the event the sync records, for the host to send once it finishes.
+    effects: Vec<crate::Effect>,
+}
+
+impl PeopleJob {
+    pub(crate) fn take_effects(&mut self) -> Vec<crate::Effect> {
+        std::mem::take(&mut self.effects)
+    }
 }
 
 /// Starts a sync, unless one is running. `Ok(None)` when one is.
@@ -132,6 +140,7 @@ pub(crate) fn start(db: &dyn Db, cfg: &HostConfig, base_url: &str, now: DateTime
         employees: vec![],
         pages: 0,
         phase: Phase::Start,
+        effects: vec![],
     }))))
 }
 
@@ -231,7 +240,7 @@ struct Here {
     manager: Option<String>,
 }
 
-fn apply(db: &dyn Db, cfg: &HostConfig, j: &PeopleJob, truncated: bool, now: DateTime<Utc>) -> ApiResult<Step> {
+fn apply(db: &dyn Db, cfg: &HostConfig, j: &mut PeopleJob, truncated: bool, now: DateTime<Utc>) -> ApiResult<Step> {
     if !super::holds(db, TABLE, key(), &j.lease)? {
         return Ok(Step::Done(Finish::Fail(super::sync_failed("Another sync took over before this one finished."))));
     }
@@ -331,6 +340,7 @@ fn apply(db: &dyn Db, cfg: &HostConfig, j: &PeopleJob, truncated: bool, now: Dat
             .data(json!({ "matched": result.matched, "updated": result.updated, "not_found": result.not_found_count }))
             .admin_only(),
     )?;
+    j.effects.append(&mut ctx.effects);
     Ok(Step::Done(Finish::Fill(value)))
 }
 

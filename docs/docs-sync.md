@@ -70,4 +70,4 @@ If a listing has no Markdown files at all (a renamed folder or a deleted branch,
 - **One sync at a time** per source.
 - **Plans.** Every post, version and upload counts against the plan's daily writes and storage, like any change.
 - **Removing.** Deleting the chosen topic removes its sources too. Its posts stay, as ordinary posts.
-- **Not sent:** a synced change records activity, but the job that makes it can't send the workspace's own outgoing webhooks yet.
+- **Workspace webhooks** fire for synced changes (`post.created`, `post.updated`, `post.archived`, `post.published` and the rest) like for any change, once the sync's run finishes.

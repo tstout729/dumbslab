@@ -255,6 +255,15 @@ pub struct DocsJob {
     base_url: String,
     phase: Phase,
     result: DocsSyncResult,
+    /// Webhooks for the posts this sync created, changed or archived, from steps that committed,
+    /// for the host to send once it finishes (see [`crate::connect::Job::take_effects`]).
+    effects: Vec<crate::Effect>,
+}
+
+impl DocsJob {
+    pub(crate) fn take_effects(&mut self) -> Vec<crate::Effect> {
+        std::mem::take(&mut self.effects)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -322,6 +331,7 @@ pub(crate) fn start(db: &dyn Db, source: Source, base_url: &str, now: DateTime<U
         base_url: base_url.to_string(),
         phase: Phase::Start,
         result: DocsSyncResult::default(),
+        effects: vec![],
     }))))
 }
 
@@ -660,6 +670,7 @@ fn listing(db: &dyn Db, cfg: &HostConfig, j: &mut DocsJob, replies: &[HttpReply]
     plan.folders = items(db, &source_id, "folder")?.into_iter().map(|(p, i)| (p, i.target_id)).collect();
 
     if let Some(message) = guard(db, j, &mut plan, now)? {
+        j.effects.append(&mut ctx.effects);
         return fail(db, j, &message, now);
     }
     let blocked = |path: &str| blocked_by(&plan, path);
@@ -720,6 +731,7 @@ fn listing(db: &dyn Db, cfg: &HostConfig, j: &mut DocsJob, replies: &[HttpReply]
     let calls = todo.iter().map(|w| j.source.repo.blob_call(&w.sha, j.source.token())).collect();
     plan.batch = todo;
     j.phase = Phase::Reading(plan);
+    j.effects.append(&mut ctx.effects);
     Ok(Step::Fetch(calls))
 }
 
@@ -981,6 +993,7 @@ fn write(ctx: &mut Ctx, j: &mut DocsJob, mut plan: Plan, texts: Vec<Text>, ready
     }
     // Topics may have changed while the files were fetched.
     if let Some(message) = guard(db, j, &mut plan, now)? {
+        j.effects.append(&mut ctx.effects);
         return fail(db, j, &message, now);
     }
     for r in &ready {
@@ -1071,6 +1084,7 @@ fn write(ctx: &mut Ctx, j: &mut DocsJob, mut plan: Plan, texts: Vec<Text>, ready
                 .admin_only(),
         )?;
     }
+    j.effects.append(&mut ctx.effects);
     Ok(Step::Done(Finish::Fill(value)))
 }
 
