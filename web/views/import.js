@@ -10,6 +10,7 @@ import { FORMATS, openSource, detectFormat, convert } from '/importers/index.js'
 import { estimate } from '/importers/plan.js';
 import { runImport } from '/importers/run.js';
 import { formatSize, MAX_ZIP_BYTES, ZipError } from '/importers/zip.js';
+import { resolveDestination } from '/importers/destination.js';
 
 /** The import in this tab. It outlives the page, so leaving Settings doesn't lose it. */
 let current = null;
@@ -110,6 +111,7 @@ async function start(file, format, options = {}) {
       },
     });
     c.rootTopic = c.plan.rootTopic;
+    await refreshTopics().catch(() => {});
     c.status = 'published';
     if (state.settings && state.settings.address) c.usage = await api.get('/plan').catch(() => null);
     c.step = 'preview';
@@ -141,12 +143,16 @@ function previewView(c) {
   const topic = input({ value: c.rootTopic, maxlength: '120', placeholder: 'No top topic' });
   // The tree below names the top topic; keep it in step without re-rendering (a click on Import
   // right after typing must still land).
-  const top = h('strong', null, c.rootTopic.trim() || 'the top level');
-  const privacy = h('span', null, privacyNote(c.rootTopic));
+  // The destination is resolved once here and the run uses the same answer (by topic id when it
+  // exists), so what this says about who will see the import is what happens.
+  c.dest = resolveDestination(c.rootTopic, state.topics);
+  const top = h('strong', null, c.dest.name || 'the top level');
+  const privacy = h('span', null, privacyNote(c.dest));
   topic.addEventListener('input', () => {
     c.rootTopic = topic.value;
-    top.textContent = topic.value.trim() || 'the top level';
-    privacy.textContent = privacyNote(topic.value);
+    c.dest = resolveDestination(topic.value, state.topics);
+    top.textContent = c.dest.name || 'the top level';
+    privacy.textContent = privacyNote(c.dest);
   });
   const status = select([
     { value: 'published', label: 'Published', selected: c.status === 'published' },
@@ -199,14 +205,16 @@ function previewView(c) {
   ];
 }
 
-/** Who will see the import, given the top topic's name. */
-function privacyNote(name) {
-  const wanted = String(name || '').trim().toLowerCase();
-  const existing = wanted ? state.topics.find((t) => !t.parent_id && t.name.toLowerCase() === wanted) : null;
-  if (existing && existing.visibility === 'private') {
-    return `“${existing.name}” is private: the imported pages, and the topics the import creates inside it, are visible only to its members.`;
+/** Who will see the import, given where it goes (see destination.js). */
+function privacyNote(dest) {
+  const renamed = dest.renamed ? ` Slashes separate topics, so the new topic is called “${dest.name}”.` : '';
+  if (dest.exists && dest.private) {
+    return `“${dest.name}” is private: the imported pages, and the topics the import creates inside it, are visible only to its members. Pages that would go into a topic inside it that more people can see aren’t imported; the report lists them.`;
   }
-  return 'Topics the import creates are visible to everyone in the workspace. To keep the import private, create a private topic first and put everything under it: topics created inside a private topic are private too, with the same members.';
+  if (dest.exists) {
+    return `Pages go into the existing topic “${dest.name}”, which everyone in the workspace can see.${renamed}`;
+  }
+  return `Topics the import creates are visible to everyone in the workspace. To keep the import private, create a private topic first and put everything under it: topics created inside a private topic are private too, with the same members.${renamed}`;
 }
 
 const stat = (label, value) => h('li', null, h('span', { class: 'import-stat-value' }, value), h('span', { class: 'import-stat-label' }, label));
@@ -241,7 +249,8 @@ async function run() {
     c.report = await runImport(c.plan, {
       api: importApi,
       source: c.source,
-      rootTopic: c.rootTopic,
+      topicId: c.dest && c.dest.id,
+      rootTopic: c.dest ? c.dest.name : '',
       status: c.status,
       userId: myId(),
       sha256,
@@ -261,8 +270,9 @@ async function run() {
   c.step = 'done';
   try {
     const topics = await refreshTopics();
-    const name = (c.rootTopic || '').trim().toLowerCase();
-    c.topic = name ? topics.find((t) => !t.parent_id && t.name.toLowerCase() === name) : null;
+    // A topic the import created is the destination from now on, by id, for "Run it again".
+    if (c.dest && !c.dest.id) c.dest = resolveDestination(c.dest.name, topics);
+    c.topic = c.dest && c.dest.id ? { id: c.dest.id, name: c.dest.name } : null;
   } catch {
     c.topic = null;
   }

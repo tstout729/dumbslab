@@ -24,6 +24,7 @@ function fakeServer({ rejectContent, rejectFile, loseUploadAnswer, legacyMatch =
   const key = (topic) => (topic || '').split('/').map((s) => s.trim().toLowerCase()).join('/');
   const api = {
     calls: [],
+    imports: [],
     async get(path, query) {
       api.calls.push(['GET', path]);
       if (path === '/files') {
@@ -59,7 +60,10 @@ function fakeServer({ rejectContent, rejectFile, loseUploadAnswer, legacyMatch =
         if (++imports > importCalls) throw fail(429, 'write_limit', 'This workspace has made its 50,000 database writes for the last 24 hours.');
         const staged = [];
         const results = [];
-        for (const d of body.documents) {
+        api.imports.push(body);
+        for (const raw of body.documents) {
+          // A destination given by id is where paths start.
+          const d = body.topic_id ? { ...raw, topic: [`#${body.topic_id}`, raw.topic].filter(Boolean).join('/') } : raw;
           if (rejectContent && d.content.includes(rejectContent)) throw fail(400, 'bad_request', 'content is larger than 2 MB');
           // Like the server: the caller's own post first; someone else's is `taken` (an older
           // server, `legacyMatch`, matched anyone's as skipped).
@@ -237,4 +241,15 @@ test('someone else’s same-titled post is never adopted, uploaded to or changed
       assert.ok(!onboarding.content.includes('/p/pbob000001'), onboarding.content);
     }
   }
+});
+
+test('an existing destination goes by id, with every path inside it', async () => {
+  const p = await plan('confluence');
+  const server = fakeServer();
+  const report = await run(p, server, { topicId: 'tprivate01', rootTopic: 'ignored when there is an id' });
+  assert.equal(report.created.length, 7);
+  assert.ok(server.api.imports.every((b) => b.topic_id === 'tprivate01'));
+  const topics = server.api.imports.flatMap((b) => b.documents.map((d) => d.topic));
+  assert.deepEqual([...new Set(topics)], [undefined, 'Onboarding', 'Runbooks - On-call']);
+  assert.ok(!topics.some((t) => t && t.includes('ignored')));
 });

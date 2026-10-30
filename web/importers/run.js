@@ -43,7 +43,8 @@ const ambiguous = (e) => {
 };
 
 /**
- * opts: { api: { get, post, patch }, source, rootTopic, status, userId (the importer),
+ * opts: { api: { get, post, patch }, source, topicId (an existing destination topic, see
+ * destination.js) or rootTopic (the name of one to create), status, userId (the importer),
  * sha256(bytes), base64(bytes), onProgress(progress), signal, sleep(ms) }. Resolves to a report;
  * never throws for a failed page.
  */
@@ -51,7 +52,10 @@ export async function runImport(plan, opts) {
   const { api, source, sha256, base64, signal } = opts;
   const sleep = opts.sleep || ((ms) => new Promise((r) => setTimeout(r, ms)));
   const status = opts.status === 'draft' ? 'draft' : 'published';
-  const root = topicSegment(opts.rootTopic || '');
+  // An existing destination goes by id, so the server checks it, and nothing is renamed away from it.
+  const topicId = opts.topicId || null;
+  const root = topicId ? '' : topicSegment(opts.rootTopic || '');
+  const importCall = (documents) => api.post('/import', topicId ? { skip_existing: true, topic_id: topicId, documents } : { skip_existing: true, documents });
   const report = {
     created: [], existing: [], taken: [], failed: [], notImported: [], stopped: null,
     files: { uploaded: 0, reused: 0, failed: [] },
@@ -142,14 +146,14 @@ export async function runImport(plan, opts) {
       tell();
       const payload = batch.map((d) => ({ d, doc: { title: d.title, content: content(d), topic: topicOf(d), status } }));
       try {
-        const r = await call(() => api.post('/import', { skip_existing: true, documents: payload.map((p) => p.doc) }));
+        const r = await call(() => importCall(payload.map((p) => p.doc)));
         payload.forEach((p, i) => record(p.d, r.results[i], p.doc.content));
       } catch (e) {
         if (e instanceof StopImport) throw e;
         // One bad page fails its whole batch; import them one by one to find it.
         for (const p of payload) {
           try {
-            const r = await call(() => api.post('/import', { skip_existing: true, documents: [p.doc] }));
+            const r = await call(() => importCall([p.doc]));
             record(p.d, r.results[0], p.doc.content);
           } catch (e2) {
             if (e2 instanceof StopImport) {
