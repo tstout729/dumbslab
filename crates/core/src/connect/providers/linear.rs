@@ -8,7 +8,7 @@
 use serde_json::{Value, json};
 
 use crate::connect::{
-    Account, Connector, Credential, Detail, Field, Hit, HttpCall, HttpReply, OAuthSpec, Preview, ProviderInfo, TokenSet, excerpt, host_of,
+    Account, Connector, Credential, Detail, Field, Hit, HttpCall, HttpReply, OAuthSpec, Preview, ProviderInfo, TokenSet, host_of,
     http_error, opt, path_of, s, standard_token,
 };
 
@@ -193,7 +193,7 @@ impl Connector for Linear {
             created_at: opt(&i["createdAt"]),
             updated_at: opt(&i["updatedAt"]),
             // Markdown, shown as text.
-            description: excerpt(i["description"].as_str().unwrap_or_default(), 300),
+            description: crate::connect::markdown_excerpt(i["description"].as_str().unwrap_or_default(), 300),
             details,
         })
     }
@@ -294,7 +294,7 @@ mod tests {
             (p.reference.as_str(), p.status.as_deref(), p.assignee.as_deref(), p.author.as_deref()),
             ("ENG-123", Some("In Progress"), Some("Bo"), Some("Ada"))
         );
-        assert_eq!(p.description, "Users **loop** forever.");
+        assert_eq!(p.description, "Users loop forever.", "Markdown becomes plain text");
         let labels: Vec<&str> = p.details.iter().map(|d| d.label.as_str()).collect();
         assert_eq!(labels, ["Team", "Priority", "Labels", "Due"]);
 

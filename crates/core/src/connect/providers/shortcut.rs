@@ -7,8 +7,7 @@
 use serde_json::{Value, json};
 
 use crate::connect::{
-    Account, Connector, Credential, Detail, Field, Hit, HttpCall, HttpReply, Preview, ProviderInfo, excerpt, host_of, http_error, opt,
-    path_of, s,
+    Account, Connector, Credential, Detail, Field, Hit, HttpCall, HttpReply, Preview, ProviderInfo, host_of, http_error, opt, path_of, s,
 };
 
 pub struct Shortcut;
@@ -164,7 +163,7 @@ impl Connector for Shortcut {
             author: name_of(&st["requested_by_id"]),
             created_at: opt(&st["created_at"]),
             updated_at: opt(&st["updated_at"]),
-            description: excerpt(st["description"].as_str().unwrap_or_default(), 300),
+            description: crate::connect::markdown_excerpt(st["description"].as_str().unwrap_or_default(), 300),
             details,
         })
     }

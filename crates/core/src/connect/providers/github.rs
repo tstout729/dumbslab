@@ -151,7 +151,7 @@ impl Connector for GitHub {
                     title: s(&i["title"]),
                     url: s(&i["html_url"]),
                     context: format!("{repo} #{} · {}", i["number"].as_i64().unwrap_or_default(), s(&i["state"])),
-                    snippet: excerpt(i["body"].as_str().unwrap_or_default(), 240),
+                    snippet: crate::connect::markdown_excerpt(i["body"].as_str().unwrap_or_default(), 240),
                     updated_at: opt(&i["updated_at"]),
                     author: opt(&i["user"]["login"]).map(|l| format!("@{l}")),
                 }
@@ -229,7 +229,7 @@ impl Connector for GitHub {
             author: opt(&i["user"]["login"]).map(|l| format!("@{l}")),
             created_at: opt(&i["created_at"]),
             updated_at: opt(&i["updated_at"]),
-            description: excerpt(i["body"].as_str().unwrap_or_default(), 300),
+            description: crate::connect::markdown_excerpt(i["body"].as_str().unwrap_or_default(), 300),
             details,
         })
     }
@@ -321,7 +321,7 @@ mod tests {
         let hits = GitHub.read_search(&account, &[reply(200, issues.clone()), reply(200, repos)], 5).unwrap();
         assert_eq!(hits.len(), 3);
         assert_eq!((hits[0].kind.as_str(), hits[0].context.as_str()), ("issue", "acme/api #7 · open"));
-        assert_eq!(hits[0].snippet, "Steps: 1. deploy");
+        assert_eq!(hits[0].snippet, "Steps: deploy", "Markdown becomes plain text");
         assert_eq!((hits[1].kind.as_str(), hits[1].author.as_deref()), ("pull_request", Some("@cy")));
         assert_eq!((hits[2].kind.as_str(), hits[2].context.as_str()), ("repository", "Repository · Rust"));
         // Repositories failing doesn't fail the search; issues failing does.

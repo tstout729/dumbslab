@@ -388,6 +388,11 @@ pub fn excerpt(text: &str, max: usize) -> String {
     format!("{cut}…")
 }
 
+/// A Markdown description (GitHub, GitLab, Linear…) as a plain-text excerpt.
+pub fn markdown_excerpt(md: &str, max: usize) -> String {
+    excerpt(&crate::markdown::plain_text(head(md, 64 * 1024)), max)
+}
+
 /// HTML as plain text, in time linear in its length: tags dropped (all but inline ones leave a
 /// space), scripts and styles skipped with their content, entities decoded. Reads at most 64 KB;
 /// previews and snippets need far less.

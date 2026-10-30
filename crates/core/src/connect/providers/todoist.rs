@@ -9,8 +9,8 @@
 use serde_json::{Value, json};
 
 use crate::connect::{
-    Account, Connector, Credential, Detail, Field, Hit, HttpCall, HttpReply, OAuthSpec, Preview, ProviderInfo, excerpt, host_of,
-    http_error, opt, path_of, s,
+    Account, Connector, Credential, Detail, Field, Hit, HttpCall, HttpReply, OAuthSpec, Preview, ProviderInfo, host_of, http_error, opt,
+    path_of, s,
 };
 
 pub struct Todoist;
@@ -173,7 +173,7 @@ impl Connector for Todoist {
             author: None,
             created_at: opt(&t["added_at"]),
             updated_at: opt(&t["updated_at"]),
-            description: excerpt(t["description"].as_str().unwrap_or_default(), 300),
+            description: crate::connect::markdown_excerpt(t["description"].as_str().unwrap_or_default(), 300),
             details,
         })
     }

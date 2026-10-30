@@ -9,8 +9,8 @@
 use serde_json::{Value, json};
 
 use crate::connect::{
-    Account, Connector, Credential, Detail, Field, Hit, HttpCall, HttpReply, OAuthSpec, Preview, ProviderInfo, excerpt, host_of,
-    http_error, opt, path_of, s,
+    Account, Connector, Credential, Detail, Field, Hit, HttpCall, HttpReply, OAuthSpec, Preview, ProviderInfo, host_of, http_error, opt,
+    path_of, s,
 };
 
 pub struct GitLab;
@@ -230,7 +230,7 @@ impl Connector for GitLab {
             author: opt(&i["author"]["username"]).map(|u| format!("@{u}")),
             created_at: opt(&i["created_at"]),
             updated_at: opt(&i["updated_at"]),
-            description: excerpt(i["description"].as_str().unwrap_or_default(), 300),
+            description: crate::connect::markdown_excerpt(i["description"].as_str().unwrap_or_default(), 300),
             details,
         })
     }
@@ -345,7 +345,7 @@ mod tests {
         let p = GitLab.read_preview(&on("gitlab.com"), "acme/tools/api!34", &[reply(200, mr)]).unwrap();
         assert_eq!((p.kind.as_str(), p.reference.as_str(), p.status.as_deref()), ("merge_request", "acme/tools/api!34", Some("merged")));
         assert_eq!((p.assignee.as_deref(), p.author.as_deref()), (Some("@bo, @di"), Some("@ada")));
-        assert_eq!(p.description, "Retries the **deploy**.");
+        assert_eq!(p.description, "Retries the deploy.", "Markdown becomes plain text");
         let labels: Vec<&str> = p.details.iter().map(|d| d.label.as_str()).collect();
         assert_eq!(labels, ["Labels", "Milestone", "Reviewers", "Branches"]);
         assert_eq!(p.details[3].value, "retry → main");

@@ -206,13 +206,12 @@ function appCard(app, rerender) {
     actions.append(connect);
   }
   if (app.token_fields.length) {
+    // Folded until asked for, so the list stays short.
     const form = tokenForm(app, rerender);
-    form.hidden = app.sign_in;
-    if (app.sign_in) {
-      const show = button('Use a token instead', { variant: 'ghost', size: 'sm' });
-      show.addEventListener('click', () => { form.hidden = false; show.remove(); form.querySelector('input').focus(); });
-      actions.append(show);
-    }
+    form.hidden = true;
+    const show = button(app.sign_in ? 'Use a token instead' : 'Connect with a token', { variant: app.sign_in ? 'ghost' : 'subtle', size: 'sm' });
+    show.addEventListener('click', () => { form.hidden = false; show.remove(); form.querySelector('input').focus(); });
+    actions.append(show);
     body.append(actions, form);
   } else if (app.sign_in) {
     body.append(actions);
@@ -222,11 +221,16 @@ function appCard(app, rerender) {
   return h('div', { class: 'app-card' }, head, body);
 }
 
+/** Help text with `code` spans, as nodes: never as HTML. */
+function richText(text) {
+  return String(text || '').split('`').map((part, i) => (i % 2 ? h('code', null, part) : part));
+}
+
 function tokenForm(app, rerender) {
   const inputs = app.token_fields.map((f) => [f, input({ type: f.secret ? 'password' : 'text', required: !f.optional, autocomplete: 'off', spellcheck: 'false', name: f.key })]);
   const submit = button(`Connect ${app.name}`, { variant: 'primary', size: 'sm', type: 'submit' });
   const form = h('form', { class: 'stack token-form', novalidate: true },
-    ...inputs.map(([f, el]) => field(f.optional ? `${f.label} (optional)` : f.label, el, { hint: f.help })),
+    ...inputs.map(([f, el]) => field(f.optional ? `${f.label} (optional)` : f.label, el, { hint: richText(f.help) })),
     app.token_help ? h('p', { class: 'field-hint' }, 'Make a token at ', external(app.token_help, new URL(app.token_help).host), '.') : null,
     h('div', null, submit));
   form.addEventListener('submit', (e) => {
