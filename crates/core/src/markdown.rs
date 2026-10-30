@@ -521,6 +521,11 @@ mod tests {
         assert!(!html.contains("ds-embed-"), "{html}");
         // An unknown site on its own line is just a link.
         assert!(!render("https://example.com/watch").contains("<iframe"));
+        // Images, video files and link cards come through the same way, without a frame.
+        let html = render("https://www.dropbox.com/s/abc123def456ghi/photo.png?dl=0\n\nhttps://x.com/jack/status/20");
+        assert!(html.contains("<img src=\"https://dl.dropboxusercontent.com/s/abc123def456ghi/photo.png\""), "{html}");
+        assert!(html.contains("<a href=\"https://x.com/jack/status/20\""), "{html}");
+        assert!(!html.contains("<iframe") && !html.contains("ds-embed-"), "{html}");
     }
 
     #[test]

@@ -162,7 +162,7 @@ function embed(ta) {
   const { selectionStart: s, selectionEnd: e, value } = ta;
   const sel = value.slice(s, e).trim();
   const url = /^https?:\/\/\S+$/.test(sel) ? sel : '';
-  const placeholder = 'Paste a YouTube, Vimeo, Loom, Google Docs or Figma link';
+  const placeholder = 'Paste a YouTube, Loom, Google Docs, Figma or Canva link';
   const after = value.slice(e);
   const block = (url || placeholder) + (!after || after.startsWith('\n\n') ? '' : '\n');
   insertBlock(ta, block, url ? block.length : 0, url ? 0 : placeholder.length);

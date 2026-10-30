@@ -124,7 +124,7 @@ pub fn llms_txt(base_url: &str) -> String {
          - New posts are drafts unless you pass `status: \"published\"`. Drafts are visible only to their author and admins.\n\
          - Topics nest. Private topics (and posts only in private topics) are visible to their members.\n\
          - Link posts with `/p/<id>` URLs (backlinks are tracked). Mention people with `@handle` to notify them.\n\
-         - Embeds: a link on a line of its own to {providers} shows the video, document or design inline. Other URLs become links.\n\
+         - Embeds: a link on a line of its own shows inline when it's from {providers}. Other URLs become links.\n\
          - Callouts: start a quote with `> [!NOTE]`, `[!TIP]`, `[!IMPORTANT]`, `[!WARNING]` or `[!CAUTION]`.\n\
          - Images and files: `upload_file` takes the bytes as base64 (up to 10 MB) and returns `markdown` to put in a post, `![name](/files/<id>/<name>)` for images or `[name](/files/<id>/<name>)` for downloads. Fetch a file's bytes from its `url` with your token.\n\
          - Edit precisely with `edit_post` (find/replace, append, section edits by heading) and pass `base_version` from `get_post` to avoid overwriting others.\n\
