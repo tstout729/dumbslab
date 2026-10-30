@@ -119,17 +119,18 @@ fn upgrade_plan(ctx: &mut Ctx, _: NoInput) -> ApiResult<BillingLink> {
         return Err(ApiError::conflict("this workspace already has Pro; change or cancel it with manage_billing"));
     }
     let customer = state.subscription.map(|s| s.customer);
-    let call = plan::checkout_call(price, &h.home, &ctx.base_url, customer.as_deref(), &ctx.actor.email);
+    let billing_id = plan::billing_id(ctx.db)?;
+    let call = plan::checkout_call(price, &h.home, &billing_id, &ctx.base_url, customer.as_deref(), &ctx.actor.email, ctx.now);
     // The host asks Stripe for the page and puts its URL in place of the placeholder.
     ctx.effects.push(Effect::Stripe(call));
     Ok(BillingLink { url: plan::STRIPE_URL_PENDING.into() })
 }
 
 fn manage_billing(ctx: &mut Ctx, _: NoInput) -> ApiResult<BillingLink> {
-    hosting(ctx)?;
+    let configuration = hosting(ctx)?.plans.portal_configuration.clone();
     let Some(sub) = plan::current(ctx.db)?.subscription else {
         return Err(ApiError::conflict("this workspace hasn't bought Pro, so there's no billing to manage; upgrade with upgrade_plan"));
     };
-    ctx.effects.push(Effect::Stripe(plan::portal_call(&sub.customer, &ctx.base_url)));
+    ctx.effects.push(Effect::Stripe(plan::portal_call(&sub.customer, &ctx.base_url, configuration.as_deref())));
     Ok(BillingLink { url: plan::STRIPE_URL_PENDING.into() })
 }

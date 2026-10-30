@@ -30,6 +30,7 @@ pub fn plans(env: &Env) -> Plans {
         },
         stripe_price: var(env, "STRIPE_PRICE_ID").filter(|_| stripe_ready),
         price_label: var(env, "PRO_PRICE_LABEL").unwrap_or_else(|| "$8 a month".into()),
+        portal_configuration: var(env, "STRIPE_PORTAL_CONFIG"),
     }
 }
 
@@ -54,8 +55,8 @@ fn form_body(form: &[(String, String)]) -> String {
     form.iter().map(|(k, v)| format!("{}={}", urlencoding::encode(k), urlencoding::encode(v))).collect::<Vec<_>>().join("&")
 }
 
-/// One Stripe API call. Returns (status, body).
-async fn stripe(env: &Env, method: Method, path: &str, form: &[(String, String)]) -> Result<(u16, Value)> {
+/// One Stripe API call. A POST without its own idempotency key gets a fresh one. Returns (status, body).
+async fn stripe(env: &Env, method: Method, path: &str, form: &[(String, String)], idempotency_key: Option<&str>) -> Result<(u16, Value)> {
     let key = var(env, "STRIPE_SECRET_KEY").ok_or_else(|| Error::RustError("STRIPE_SECRET_KEY is not set".into()))?;
     let headers = Headers::new();
     headers.set("authorization", &format!("Bearer {key}"))?;
@@ -63,7 +64,7 @@ async fn stripe(env: &Env, method: Method, path: &str, form: &[(String, String)]
     let mut init = RequestInit::new();
     if method == Method::Post {
         headers.set("content-type", "application/x-www-form-urlencoded")?;
-        headers.set("idempotency-key", &dumbslab_core::util::new_secret("ds_"))?;
+        headers.set("idempotency-key", &idempotency_key.map(str::to_string).unwrap_or_else(|| dumbslab_core::util::new_secret("ds_")))?;
         init.with_body(Some(JsValue::from_str(&form_body(form))));
     }
     init.with_method(method).with_headers(headers);
@@ -75,7 +76,7 @@ async fn stripe(env: &Env, method: Method, path: &str, form: &[(String, String)]
 /// For `upgrade_plan` and `manage_billing`: asks Stripe for the page and returns its URL, or
 /// `None` when Stripe refused.
 pub async fn page(env: &Env, call: &StripeCall) -> Result<Option<String>> {
-    let (status, body) = stripe(env, Method::Post, call.path, &call.form).await?;
+    let (status, body) = stripe(env, Method::Post, call.path, &call.form, call.idempotency_key.as_deref()).await?;
     match body["url"].as_str() {
         Some(url) if status == 200 => Ok(Some(url.to_string())),
         _ => {
@@ -126,7 +127,7 @@ async fn handle(env: &Env, event: &Value) -> Result<()> {
             let customer = match (customer, charge) {
                 (Some(c), _) => Some(c),
                 (None, Some(charge)) => {
-                    let (status, body) = stripe(env, Method::Get, &format!("charges/{}", urlencoding::encode(&charge)), &[]).await?;
+                    let (status, body) = stripe(env, Method::Get, &format!("charges/{}", urlencoding::encode(&charge)), &[], None).await?;
                     if status != 200 {
                         return Err(Error::RustError(format!("reading charge {charge}: Stripe answered {status}")));
                     }
@@ -146,7 +147,7 @@ async fn handle(env: &Env, event: &Value) -> Result<()> {
 
 /// Reads a subscription from Stripe and records it on its workspace and in the directory.
 async fn sync(env: &Env, id: &str) -> Result<()> {
-    let (status, body) = stripe(env, Method::Get, &format!("subscriptions/{}", urlencoding::encode(id)), &[]).await?;
+    let (status, body) = stripe(env, Method::Get, &format!("subscriptions/{}", urlencoding::encode(id)), &[], None).await?;
     if status != 200 {
         return Err(Error::RustError(format!("reading subscription {id}: Stripe answered {status}")));
     }
@@ -154,7 +155,10 @@ async fn sync(env: &Env, id: &str) -> Result<()> {
     // The customer was linked to its workspace when Checkout finished. The subscription's own
     // metadata is the fallback, for an event that arrives before that one, but never for a
     // customer whose workspace was deleted: someone else may have its address now.
-    let (_, found) = directory(env, "/billing/lookup", json!({ "customer": sub.customer })).await?;
+    let (status, found) = directory(env, "/billing/lookup", json!({ "customer": sub.customer })).await?;
+    if status != 200 {
+        return Err(Error::RustError(format!("looking up customer {}: directory answered {status}", sub.customer)));
+    }
     if found["detached"] == json!(true) {
         console_warn!("subscription {id} is for a deleted workspace; ignored");
         return Ok(());
@@ -163,7 +167,10 @@ async fn sync(env: &Env, id: &str) -> Result<()> {
         Some(h) => h.to_string(),
         None => match body["metadata"]["workspace"].as_str() {
             Some(h) => {
-                directory(env, "/billing/link", json!({ "customer": sub.customer, "home": h })).await?;
+                let (status, _) = directory(env, "/billing/link", json!({ "customer": sub.customer, "home": h })).await?;
+                if status != 200 {
+                    return Err(Error::RustError(format!("linking {} to {h}: directory answered {status}", sub.customer)));
+                }
                 h.to_string()
             }
             None => {

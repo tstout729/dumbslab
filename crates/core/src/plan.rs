@@ -23,7 +23,7 @@ use crate::db::{Db, DbExt};
 use crate::error::{ApiError, ApiResult};
 use crate::ops::admin::{put_setting, setting};
 use crate::params;
-use crate::util::{hmac_sha256_hex, secure_eq};
+use crate::util::{hmac_sha256_hex, secure_eq, sha256_hex};
 
 /// The Stripe API version of every call DumbSlab makes, and of its webhook endpoint.
 pub const STRIPE_API_VERSION: &str = "2026-09-30.endive";
@@ -66,6 +66,8 @@ pub struct Plans {
     pub stripe_price: Option<String>,
     /// How Pro's price reads, e.g. `$8 a month`.
     pub price_label: String,
+    /// The Stripe customer portal configuration to use (`bpc_…`); Stripe's default when unset.
+    pub portal_configuration: Option<String>,
 }
 
 impl Plans {
@@ -94,6 +96,9 @@ pub struct Subscription {
     pub period_end: Option<i64>,
     /// The subscription stops at `period_end` instead of renewing.
     pub cancel_at_period_end: bool,
+    /// The [`billing_id`] of the workspace whose Checkout created it (its `billing_id` metadata).
+    #[serde(default)]
+    pub billing_id: Option<String>,
 }
 
 impl Subscription {
@@ -107,6 +112,7 @@ impl Subscription {
             status: v["status"].as_str()?.to_string(),
             period_end: cancel_at.or(item_end).or_else(|| v["current_period_end"].as_i64()),
             cancel_at_period_end: v["cancel_at_period_end"].as_bool().unwrap_or(false) || cancel_at.is_some(),
+            billing_id: v["metadata"]["billing_id"].as_str().map(str::to_string),
         })
     }
 
@@ -146,9 +152,26 @@ pub fn current(db: &dyn Db) -> ApiResult<PlanState> {
     })
 }
 
-/// Records what Stripe reported about a subscription. Returns `false` when it was ignored: news
-/// about an older subscription doesn't undo a newer one in good standing.
+/// This workspace's identity for billing, made the first time it starts a Checkout. Its
+/// subscriptions carry it, so one bought for a deleted workspace never applies to a new workspace
+/// at the same address.
+pub fn billing_id(db: &dyn Db) -> ApiResult<String> {
+    if let Some(id) = setting(db, "billing_id")? {
+        return Ok(id);
+    }
+    let id = crate::util::new_secret("");
+    put_setting(db, "billing_id", &id)?;
+    Ok(id)
+}
+
+/// Records what Stripe reported about a subscription. Returns `false` when it was ignored: it
+/// belongs to another workspace (by [`billing_id`]), or it's news about an older subscription
+/// that would undo a newer one in good standing.
 pub fn apply_subscription(db: &dyn Db, sub: &Subscription) -> ApiResult<bool> {
+    let ours = setting(db, "billing_id")?;
+    if ours.is_none() || sub.billing_id != ours {
+        return Ok(false);
+    }
     if let Some(cur) = current(db)?.subscription
         && cur.id != sub.id
         && cur.in_good_standing()
@@ -307,6 +330,8 @@ pub fn storage_full(plans: &Plans, plan: Plan, capacity: bool) -> ApiError {
 pub struct StripeCall {
     pub path: &'static str,
     pub form: Vec<(String, String)>,
+    /// Stripe's `Idempotency-Key`: the same key returns the same object instead of a new one.
+    pub idempotency_key: Option<String>,
 }
 
 /// Stands in for the Stripe page's URL until the host has it.
@@ -328,8 +353,18 @@ fn pairs(items: &[(&str, &str)]) -> Vec<(String, String)> {
 }
 
 /// A Checkout session for one Pro subscription. `client_reference_id` names the workspace (by its
-/// first address), so the webhook can link the new customer to it.
-pub fn checkout_call(price: &str, home: &str, base_url: &str, customer: Option<&str>, email: &str) -> StripeCall {
+/// first address), so the webhook can link the new customer to it, and the subscription carries
+/// the workspace's [`billing_id`]. Asking again within the hour returns the same session, so a
+/// double click or a second tab can't start a second subscription.
+pub fn checkout_call(
+    price: &str,
+    home: &str,
+    billing_id: &str,
+    base_url: &str,
+    customer: Option<&str>,
+    email: &str,
+    now: DateTime<Utc>,
+) -> StripeCall {
     let return_url = format!("{base_url}/settings/plan");
     let success_url = format!("{return_url}?checkout=done");
     let mut form = pairs(&[
@@ -340,6 +375,7 @@ pub fn checkout_call(price: &str, home: &str, base_url: &str, customer: Option<&
         ("success_url", &success_url),
         ("cancel_url", &return_url),
         ("subscription_data[metadata][workspace]", home),
+        ("subscription_data[metadata][billing_id]", billing_id),
         ("allow_promotion_codes", "true"),
         ("integration_identifier", INTEGRATION_ID),
     ]);
@@ -348,13 +384,19 @@ pub fn checkout_call(price: &str, home: &str, base_url: &str, customer: Option<&
         None if crate::util::is_valid_email(email) => form.push(("customer_email".into(), email.trim().into())),
         None => {}
     }
-    StripeCall { path: "checkout/sessions", form }
+    let request: Vec<String> = form.iter().map(|(k, v)| format!("{k}={v}")).collect();
+    let key = sha256_hex(&format!("{billing_id}|{}|{}", hour_of(now), request.join("&")));
+    StripeCall { path: "checkout/sessions", form, idempotency_key: Some(format!("dumbslab-checkout-{key}")) }
 }
 
 /// A customer portal session: change the card, see invoices, cancel.
-pub fn portal_call(customer: &str, base_url: &str) -> StripeCall {
+pub fn portal_call(customer: &str, base_url: &str, configuration: Option<&str>) -> StripeCall {
     let return_url = format!("{base_url}/settings/plan");
-    StripeCall { path: "billing_portal/sessions", form: pairs(&[("customer", customer), ("return_url", &return_url)]) }
+    let mut form = pairs(&[("customer", customer), ("return_url", &return_url)]);
+    if let Some(c) = configuration {
+        form.push(("configuration".into(), c.into()));
+    }
+    StripeCall { path: "billing_portal/sessions", form, idempotency_key: None }
 }
 
 /// Checks a webhook's `Stripe-Signature` header against the endpoint's signing secret and returns
@@ -466,9 +508,10 @@ mod tests {
     fn subscriptions_from_stripe() {
         let v = json!({
             "id": "sub_1", "customer": "cus_1", "status": "active", "cancel_at_period_end": false, "cancel_at": null,
-            "items": { "data": [{ "current_period_end": 1_796_056_472 }] }
+            "items": { "data": [{ "current_period_end": 1_796_056_472 }] }, "metadata": { "billing_id": "bid_1" }
         });
         let s = Subscription::from_stripe(&v).unwrap();
+        assert_eq!(s.billing_id.as_deref(), Some("bid_1"));
         assert_eq!((s.id.as_str(), s.customer.as_str(), s.period_end), ("sub_1", "cus_1", Some(1_796_056_472)));
         assert!(s.in_good_standing() && !s.cancel_at_period_end);
         // The portal cancels by setting cancel_at; Pro lasts until then.
@@ -552,7 +595,8 @@ mod tests {
 
     #[test]
     fn checkout_names_the_workspace() {
-        let call = checkout_call("price_1", "acme", "https://docs.dumbslab.com", None, "ada@acme.test");
+        let now = Utc::now();
+        let call = checkout_call("price_1", "acme", "bid_1", "https://docs.dumbslab.com", None, "ada@acme.test", now);
         let get = |k: &str| call.form.iter().find(|(key, _)| key == k).map(|(_, v)| v.as_str());
         assert_eq!(call.path, "checkout/sessions");
         assert_eq!(get("client_reference_id"), Some("acme"));
@@ -560,8 +604,17 @@ mod tests {
         assert_eq!(get("customer_email"), Some("ada@acme.test"));
         assert_eq!(get("customer"), None);
         assert!(get("payment_method_types").is_none());
-        let again = checkout_call("price_1", "acme", "https://acme.dumbslab.com", Some("cus_1"), "ada@acme.test");
+        assert_eq!(get("subscription_data[metadata][billing_id]"), Some("bid_1"));
+        let again = checkout_call("price_1", "acme", "bid_1", "https://acme.dumbslab.com", Some("cus_1"), "ada@acme.test", now);
         assert!(again.form.contains(&("customer".into(), "cus_1".into())));
         assert!(!again.form.iter().any(|(k, _)| k == "customer_email"), "an existing customer keeps its email");
+        // The same request within the hour gets the same session; another workspace's doesn't.
+        let same = checkout_call("price_1", "acme", "bid_1", "https://docs.dumbslab.com", None, "ada@acme.test", now);
+        assert_eq!(same.idempotency_key, call.idempotency_key);
+        let other = checkout_call("price_1", "acme", "bid_2", "https://docs.dumbslab.com", None, "ada@acme.test", now);
+        assert_ne!(other.idempotency_key, call.idempotency_key);
+        let portal = portal_call("cus_1", "https://acme.dumbslab.com", Some("bpc_1"));
+        assert!(portal.form.contains(&("configuration".into(), "bpc_1".into())));
+        assert!(!portal_call("cus_1", "https://acme.dumbslab.com", None).form.iter().any(|(k, _)| k == "configuration"));
     }
 }

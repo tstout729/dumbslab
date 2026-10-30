@@ -1821,6 +1821,7 @@ fn plans(price: Option<&str>) -> dumbslab_core::plan::Plans {
         pro: Allowance { storage_bytes: 5 << 30, writes_per_day: 100_000 },
         stripe_price: price.map(str::to_string),
         price_label: "$8 a month".into(),
+        portal_configuration: None,
     }
 }
 
@@ -1873,13 +1874,15 @@ fn stripe_call(r: &Res) -> dumbslab_core::plan::StripeCall {
         .expect("a Stripe call")
 }
 
-fn sub(id: &str, status: &str) -> dumbslab_core::plan::Subscription {
+/// A subscription bought through this workspace's Checkout (it carries the workspace's billing id).
+fn sub(h: &H, id: &str, status: &str) -> dumbslab_core::plan::Subscription {
     dumbslab_core::plan::Subscription {
         id: id.into(),
         customer: "cus_1".into(),
         status: status.into(),
         period_end: Some(1_800_000_000),
         cancel_at_period_end: false,
+        billing_id: Some(db_run(h, dumbslab_core::plan::billing_id)),
     }
 }
 
@@ -1974,8 +1977,18 @@ fn hosted_workspaces_meter_writes() {
     assert_eq!(form("customer_email").as_deref(), Some("ada@acme.test"));
     assert_eq!(h.call("POST", "/api/v1/plan/billing", None, &admin).status, 409, "nothing bought yet");
 
+    // A subscription some other workspace bought (or one made by hand in Stripe) doesn't apply.
+    let foreign = plan::Subscription { billing_id: Some("someone-else".into()), ..sub(&h, "sub_x", "active") };
+    assert!(!db_run(&h, |db| plan::apply_subscription(db, &foreign)));
+    assert!(!db_run(&h, |db| plan::apply_subscription(db, &plan::Subscription { billing_id: None, ..foreign.clone() })));
+    assert_eq!(h.ok("GET", "/api/v1/plan", None, &member)["plan"], "free");
+    assert_eq!(form("subscription_data[metadata][billing_id]"), sub(&h, "s", "active").billing_id);
+
     // Stripe reports the subscription: Pro, with its larger allowance.
-    assert!(db_run(&h, |db| plan::apply_subscription(db, &sub("sub_1", "active"))));
+    assert!({
+        let s = sub(&h, "sub_1", "active");
+        db_run(&h, |db| plan::apply_subscription(db, &s))
+    });
     let p = h.ok("GET", "/api/v1/plan", None, &member);
     assert_eq!(p["plan"], "pro");
     assert_eq!(p["subscription"]["status"], "active");
@@ -1990,14 +2003,26 @@ fn hosted_workspaces_meter_writes() {
     assert!(portal.form.contains(&("return_url".into(), "https://acme.kb.test/settings/plan".into())));
 
     // A failed renewal keeps Pro while Stripe retries; news about an older subscription is ignored.
-    db_run(&h, |db| plan::apply_subscription(db, &sub("sub_1", "past_due")));
+    {
+        let s = sub(&h, "sub_1", "past_due");
+        db_run(&h, |db| plan::apply_subscription(db, &s))
+    };
     assert_eq!(h.ok("GET", "/api/v1/plan", None, &member)["plan"], "pro");
-    db_run(&h, |db| plan::apply_subscription(db, &sub("sub_1", "active")));
-    assert!(!db_run(&h, |db| plan::apply_subscription(db, &sub("sub_0", "canceled"))));
+    {
+        let s = sub(&h, "sub_1", "active");
+        db_run(&h, |db| plan::apply_subscription(db, &s))
+    };
+    assert!(!{
+        let s = sub(&h, "sub_0", "canceled");
+        db_run(&h, |db| plan::apply_subscription(db, &s))
+    });
     assert_eq!(h.ok("GET", "/api/v1/plan", None, &member)["plan"], "pro");
 
     // Cancelled: back to free. Upgrading again reuses the Stripe customer.
-    db_run(&h, |db| plan::apply_subscription(db, &sub("sub_1", "canceled")));
+    {
+        let s = sub(&h, "sub_1", "canceled");
+        db_run(&h, |db| plan::apply_subscription(db, &s))
+    };
     assert_eq!(h.ok("GET", "/api/v1/plan", None, &member)["plan"], "free");
     assert_eq!(h.call("POST", "/api/v1/posts", Some(json!({ "title": "Over" })), &member).status, 429);
     let call = stripe_call(&h.call("POST", "/api/v1/plan/upgrade", None, &admin));

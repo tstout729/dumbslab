@@ -75,6 +75,8 @@ PRO_WRITES_PER_DAY = "200000"
 FREE_TOTAL_WRITES_PER_DAY = "1000000"
 FREE_TOTAL_STORAGE_MB = "4096"
 STRIPE_PRICE_ID = ""
+# Optional: the customer portal settings scripts/stripe-setup.sh made (bpc_…).
+STRIPE_PORTAL_CONFIG = ""
 PRO_PRICE_LABEL = "$8 a month"
 # Single-workspace mode only: public URL and Durable Object name.
 BASE_URL = ""

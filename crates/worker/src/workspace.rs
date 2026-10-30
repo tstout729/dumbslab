@@ -422,10 +422,18 @@ impl DurableObject for Workspace {
         }
 
         // Writes may not grow a full workspace. Reads and sign-in always work, and deletes free space.
+        // App registrations are exempt too: their table is capped, and refusing one would undo the
+        // count that limits them per hour.
         let exempt = matches!(method, Method::Get | Method::Head | Method::Options)
             || matches!(
                 path.as_str(),
-                "/api/v1/auth/login" | "/api/v1/auth/logout" | "/api/v1/auth/setup" | "/oauth/token" | "/oauth/revoke" | "/oauth/authorize"
+                "/api/v1/auth/login"
+                    | "/api/v1/auth/logout"
+                    | "/api/v1/auth/setup"
+                    | "/oauth/token"
+                    | "/oauth/revoke"
+                    | "/oauth/authorize"
+                    | "/oauth/register"
             );
 
         let headers: Vec<(String, String)> = req.headers().entries().map(|(k, v)| (k.to_lowercase(), v)).collect();

@@ -92,7 +92,7 @@ Pro goes on sale once three things are set. Until then, `upgrade_plan` answers `
    ```
 
 2. For the Worker, create a [restricted key](https://docs.stripe.com/keys#limit-access) that can only write Checkout Sessions and Customer portal, and read Subscriptions and Charges.
-3. Put the printed `STRIPE_PRICE_ID` in `wrangler.toml`, add the secrets and deploy:
+3. Put the printed `STRIPE_PRICE_ID` and `STRIPE_PORTAL_CONFIG` in `wrangler.toml`, add the secrets and deploy:
 
    ```sh
    cd crates/worker
@@ -105,6 +105,7 @@ How it works:
 
 - An admin chooses **Upgrade to Pro** under Settings › Plan (or an agent calls `upgrade_plan`). The workspace asks Stripe for a Checkout page and sends the person there. Agents get the link to hand to a person.
 - Stripe calls `POST /api/stripe/webhook` on the root domain. The Worker checks the signature, then reads the subscription from Stripe and records it on the workspace. Events that arrive late, twice or out of order change nothing. The checkout links the Stripe customer to the workspace's first address, so moving the workspace doesn't break billing.
+- Each subscription carries its workspace's billing id (made at its first checkout), and a workspace accepts only its own. A subscription made by hand in the Stripe Dashboard won't turn Pro on; use the operator API's `grant-pro` instead.
 - Pro stays on while a renewal is `past_due` and Stripe retries. Cancelling in the customer portal (**Manage billing**) keeps Pro until the paid period ends. After that the workspace is free again: nothing is deleted, but past the free limits it can only shrink.
 - Refunds, disputes and fraud warnings are noted on the workspace in the operator list (`billing_risk`) for you to look at.
 - Stripe Tax isn't on. If you need to collect sales tax or VAT, register with Stripe Tax first, then turn on `automatic_tax` in the Checkout call (`crates/core/src/plan.rs`).

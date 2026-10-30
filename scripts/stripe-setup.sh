@@ -68,7 +68,7 @@ if [[ -z "$portal_id" ]]; then
 fi
 
 echo "STRIPE_PRICE_ID=$price_id"
-echo "customer portal: $portal_id"
+echo "STRIPE_PORTAL_CONFIG=$portal_id"
 [[ "$BASE_URL" == local ]] && exit 0
 
 # Webhook endpoint, subscribed only to the events DumbSlab acts on (crates/worker/src/billing.rs).
