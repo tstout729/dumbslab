@@ -13,7 +13,7 @@ An open-source team knowledge base, written in Rust and built so AI agents can d
 | Area | What you get |
 | --- | --- |
 | Posts | Markdown posts with live preview, drafts, publish/archive, templates, duplicate, trash and restore |
-| Rich content | Embeds (paste a YouTube, Vimeo, Loom, Google Docs/Sheets/Slides/Forms/Drive, Figma, Airtable or Miro link on its own line), callouts (`> [!NOTE]`, `[!TIP]`, `[!IMPORTANT]`, `[!WARNING]`, `[!CAUTION]`), tables, checklists, toggles (`<details>`), linked URLs |
+| Rich content | Embeds (paste a link on its own line: YouTube, Vimeo, Loom, Wistia, Google Docs/Sheets/Slides/Forms/Drive, Word/Excel/PowerPoint embed links from OneDrive or SharePoint, Figma, Canva, Miro, Lucid, Draw.io, Gliffy, Airtable, Smartsheet, monday.com, Mode, Typeform, Jotform, CodePen, JSFiddle, iorad, Ludus, SlideShare, Dropbox images and videos; X posts show as a link card), callouts (`> [!NOTE]`, `[!TIP]`, `[!IMPORTANT]`, `[!WARNING]`, `[!CAUTION]`), tables, checklists, toggles (`<details>`), linked URLs |
 | Images and files | Paste, drop or upload screenshots and files into a post (10 MB each). Images show inline; other files download |
 | History | Every save is a version; diff any two versions and restore any of them |
 | Topics | Nested topics, private topics with members, pinned posts, follow topics |
