@@ -4,7 +4,7 @@
 // import_documents, with images and files through upload_file.
 
 import { api } from '/api.js';
-import { h, icon, button, toast, field, input, select, checkbox, plural, spinner } from '/ui.js';
+import { h, icon, button, toast, field, input, select, checkbox, plural, spinner, BLOCK_RECORDING } from '/ui.js';
 import { state, refreshTopics, myId } from '/state.js';
 import { FORMATS, openSource, detectFormat, convert } from '/importers/index.js';
 import { estimate } from '/importers/plan.js';
@@ -43,7 +43,8 @@ const warnLeaving = (e) => {
 };
 
 export async function importSection() {
-  const root = h('div', { class: 'stack import' });
+  // Never in session recordings: it shows the export's page titles and the zip's file name.
+  const root = h('div', { class: ['stack import', BLOCK_RECORDING] });
   if (!current) current = { step: 'choose' };
   host = root;
   paint(root);
@@ -74,7 +75,7 @@ function panel(title, description, ...body) {
 // 1. Choose a file
 
 function chooseView(c) {
-  const file = h('input', { type: 'file', accept: '.zip,application/zip', class: 'sr-only import-file', id: 'import-file' });
+  const file = h('input', { type: 'file', accept: '.zip,application/zip', class: ['sr-only import-file', BLOCK_RECORDING], id: 'import-file' });
   file.addEventListener('change', () => {
     if (file.files && file.files[0]) start(file.files[0]);
   });
