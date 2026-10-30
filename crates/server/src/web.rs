@@ -11,8 +11,18 @@ use rust_embed::RustEmbed;
 #[exclude = "_headers"]
 struct Assets;
 
-const CSP: &str = "default-src 'self'; img-src 'self' https: data:; style-src 'self' 'unsafe-inline'; script-src 'self'; \
-                   connect-src 'self'; font-src 'self' data:; frame-ancestors 'none'; base-uri 'self'; form-action 'self'";
+/// Matches `web/_headers`, which the Cloudflare host serves. Embeds may frame only the providers
+/// in [`dumbslab_core::embed::FRAME_ORIGINS`].
+fn csp() -> &'static str {
+    static CSP: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    CSP.get_or_init(|| {
+        format!(
+            "default-src 'self'; img-src 'self' https: data:; style-src 'self' 'unsafe-inline'; script-src 'self'; \
+             connect-src 'self'; font-src 'self' data:; {}; frame-ancestors 'none'; base-uri 'self'; form-action 'self'",
+            dumbslab_core::embed::frame_src_directive()
+        )
+    })
+}
 
 pub fn serve(path: &str, headers: &HeaderMap) -> Response {
     let wanted = path.trim_start_matches('/');
@@ -38,11 +48,22 @@ pub fn serve(path: &str, headers: &HeaderMap) -> Response {
         .header("x-content-type-options", "nosniff")
         .header("referrer-policy", "strict-origin-when-cross-origin");
     if name.ends_with(".html") {
-        b = b.header("content-security-policy", CSP).header("x-frame-options", "DENY");
+        b = b.header("content-security-policy", csp()).header("x-frame-options", "DENY");
     }
     b.body(Body::from(file.data.into_owned())).unwrap_or_default()
 }
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn both_hosts_allow_the_same_embed_frames() {
+        let headers = include_str!("../../../web/_headers");
+        let frame_src = dumbslab_core::embed::frame_src_directive();
+        assert!(super::csp().contains(&format!("; {frame_src};")), "{}", super::csp());
+        assert!(headers.contains(&format!("; {frame_src};")), "web/_headers must allow: {frame_src}");
+    }
 }

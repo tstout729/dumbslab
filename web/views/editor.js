@@ -157,6 +157,25 @@ function code(ta) {
   }
 }
 
+/** A provider link on a line of its own renders inline (see crates/core/src/embed.rs). */
+function embed(ta) {
+  const { selectionStart: s, selectionEnd: e, value } = ta;
+  const sel = value.slice(s, e).trim();
+  const url = /^https?:\/\/\S+$/.test(sel) ? sel : '';
+  const placeholder = 'Paste a YouTube, Vimeo, Loom, Google Docs or Figma link';
+  const after = value.slice(e);
+  const block = (url || placeholder) + (!after || after.startsWith('\n\n') ? '' : '\n');
+  insertBlock(ta, block, url ? block.length : 0, url ? 0 : placeholder.length);
+}
+
+function callout(ta) {
+  const { selectionStart: s, selectionEnd: e, value } = ta;
+  const sel = value.slice(s, e).trim();
+  const body = sel || 'Callout text';
+  const block = '> [!NOTE]\n' + body.split('\n').map((l) => '> ' + l).join('\n');
+  insertBlock(ta, block, sel ? block.length : 12, sel ? 0 : body.length);
+}
+
 const ACTIONS = [
   { id: 'bold', icon: 'bold', label: 'Bold', keys: `${modKey}+B`, run: (ta) => wrap(ta, '**', '**', 'bold text') },
   { id: 'italic', icon: 'italic', label: 'Italic', keys: `${modKey}+I`, run: (ta) => wrap(ta, '_', '_', 'italic text') },
@@ -165,11 +184,13 @@ const ACTIONS = [
   { id: 'link', icon: 'link', label: 'Link', run: link },
   { id: 'quote', icon: 'quote', label: 'Quote', run: (ta) => linePrefix(ta, 'quote') },
   { id: 'code', icon: 'code', label: 'Code', run: code },
+  { id: 'callout', icon: 'info', label: 'Callout', run: callout },
   'sep',
   { id: 'ul', icon: 'list', label: 'Bulleted list', run: (ta) => linePrefix(ta, 'ul') },
   { id: 'ol', icon: 'listOrdered', label: 'Numbered list', run: (ta) => linePrefix(ta, 'ol') },
   { id: 'task', icon: 'listChecks', label: 'Checklist', run: (ta) => linePrefix(ta, 'task') },
   'sep',
+  { id: 'embed', icon: 'video', label: 'Embed a video, doc or design', run: embed },
   { id: 'table', icon: 'table', label: 'Table', run: (ta) => insertBlock(ta, '| Column | Column |\n| --- | --- |\n| Cell | Cell |', 2, 6) },
   { id: 'hr', icon: 'minus', label: 'Divider', run: (ta) => insertBlock(ta, '---') },
 ];
@@ -666,7 +687,7 @@ function mountEditor(ctx, { post, initial, templates, startTemplate }) {
     h('div', { class: 'editor-head' }, titleEl, metaRow),
     tabs,
     panes,
-    h('div', { class: 'editor-foot' }, wordCount, h('span', { class: 'muted small' }, `${modKey}+S saves. Markdown with tables, task lists and footnotes.`)));
+    h('div', { class: 'editor-foot' }, wordCount, h('span', { class: 'muted small' }, `${modKey}+S saves. Markdown with tables, task lists, callouts and embeds.`)));
   ctx.main.replaceChildren(page);
   updateChrome();
   renderPreview.flush();

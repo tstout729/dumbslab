@@ -770,6 +770,28 @@ mark { background: var(--mark-bg); color: inherit; border-radius: 3px; padding: 
 .prose li > input[type="checkbox"] { margin: 0 .55em 0 0; vertical-align: -.1em; width: 15px; height: 15px; }
 .prose blockquote { margin-left: 0; padding: .1em 0 .1em 1.1em; border-left: 3px solid var(--accent-line); color: var(--ink-2); }
 .prose blockquote > :last-child { margin-bottom: 0; }
+/* Callouts: `> [!NOTE]`, `[!TIP]`, `[!IMPORTANT]`, `[!WARNING]`, `[!CAUTION]`. */
+.prose blockquote.md-callout { --c: #2563eb; padding: .7em 1em .8em; border: 1px solid color-mix(in srgb, var(--c) 30%, transparent); border-radius: 10px; background: color-mix(in srgb, var(--c) 7%, transparent); color: var(--ink); }
+.prose blockquote.md-callout-tip { --c: #16a34a; }
+.prose blockquote.md-callout-important { --c: #7c3aed; }
+.prose blockquote.md-callout-warning { --c: #d97706; }
+.prose blockquote.md-callout-caution { --c: #dc2626; }
+.prose .md-callout-title { margin: 0 0 .3em; font-size: .9em; font-weight: 650; letter-spacing: .01em; color: var(--c); }
+.prose .md-callout-title::before { margin-right: .45em; }
+.prose .md-callout-note .md-callout-title::before { content: "ℹ️"; }
+.prose .md-callout-tip .md-callout-title::before { content: "💡"; }
+.prose .md-callout-important .md-callout-title::before { content: "❗"; }
+.prose .md-callout-warning .md-callout-title::before { content: "⚠️"; }
+.prose .md-callout-caution .md-callout-title::before { content: "🛑"; }
+/* Embeds: a YouTube, Vimeo, Loom, Google, Figma, Airtable or Miro link on its own line. */
+.prose figure.embed { margin: 1.4em 0; border: 1px solid var(--line); border-radius: 12px; overflow: hidden; background: var(--bg-sunk); }
+.prose .embed-frame { position: relative; width: 100%; }
+.prose .embed-video .embed-frame { aspect-ratio: 16 / 9; }
+.prose .embed-document .embed-frame { height: min(72vh, 600px); }
+.prose .embed-frame iframe { position: absolute; inset: 0; width: 100%; height: 100%; border: 0; display: block; background: #fff; }
+.prose .embed figcaption { display: flex; align-items: center; gap: .6em; min-width: 0; padding: .5em .85em; border-top: 1px solid var(--line); font-size: .8em; line-height: 1.4; color: var(--ink-3); }
+.prose .embed-provider { flex: none; font-weight: 600; color: var(--ink-2); }
+.prose .embed figcaption a { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .prose code { font-size: .86em; padding: .15em .38em; border-radius: 5px; background: var(--bg-sunk); border: 1px solid var(--line); }
 .prose pre { padding: 14px 18px; border-radius: 10px; background: var(--bg-sunk); border: 1px solid var(--line); overflow-x: auto; font-size: 13.5px; line-height: 1.6; tab-size: 4; }
 .prose pre code { padding: 0; border: 0; background: none; font-size: inherit; }

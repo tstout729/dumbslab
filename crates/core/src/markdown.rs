@@ -4,10 +4,12 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
-use pulldown_cmark::{CowStr, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{BlockQuoteKind, CowStr, Event, HeadingLevel, LinkType, Options, Parser, Tag, TagEnd};
 use schemars::JsonSchema;
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 
+use crate::embed;
 use crate::util::{html_escape, slugify};
 
 fn options() -> Options {
@@ -16,6 +18,32 @@ fn options() -> Options {
         | Options::ENABLE_STRIKETHROUGH
         | Options::ENABLE_TASKLISTS
         | Options::ENABLE_HEADING_ATTRIBUTES
+        // `> [!NOTE]` style callouts.
+        | Options::ENABLE_GFM
+}
+
+/// Parses Markdown with adjacent text runs merged, so a URL or `@handle` is never split.
+fn parse(md: &str) -> Vec<Event<'_>> {
+    let mut out: Vec<Event> = vec![];
+    let mut text: Option<String> = None;
+    for ev in Parser::new_ext(md, options()) {
+        match ev {
+            Event::Text(t) => match text.as_mut() {
+                Some(buf) => buf.push_str(&t),
+                None => text = Some(t.into_string()),
+            },
+            other => {
+                if let Some(buf) = text.take() {
+                    out.push(Event::Text(CowStr::from(buf)));
+                }
+                out.push(other);
+            }
+        }
+    }
+    if let Some(buf) = text {
+        out.push(Event::Text(CowStr::from(buf)));
+    }
+    out
 }
 
 fn sanitizer() -> &'static ammonia::Builder<'static> {
@@ -109,17 +137,114 @@ fn split_mentions(text: &str) -> Vec<(bool, String)> {
     parts
 }
 
-/// Renders Markdown to safe HTML: heading anchors, linked `@mentions`, sanitized output.
+/// The link a paragraph consists of, when it holds nothing else: a bare URL, `<url>` or
+/// `[text](url)`. Returns the URL and the link text.
+fn lone_link(events: &[Event]) -> Option<(String, Option<String>)> {
+    let content: Vec<&Event> = events.iter().filter(|e| !matches!(e, Event::Text(t) if t.trim().is_empty())).collect();
+    match content.as_slice() {
+        [Event::Text(t)] => {
+            let t = t.trim();
+            let found = embed::find_urls(t);
+            (found.len() == 1 && found[0] == (0..t.len())).then(|| (t.to_string(), None))
+        }
+        [Event::Start(Tag::Link { dest_url, .. }), inner @ .., Event::End(TagEnd::Link)] => {
+            let mut label = String::new();
+            for e in inner {
+                match e {
+                    Event::Text(t) | Event::Code(t) => label.push_str(t),
+                    Event::SoftBreak => label.push(' '),
+                    _ => return None,
+                }
+            }
+            Some((dest_url.to_string(), Some(label)))
+        }
+        _ => None,
+    }
+}
+
+fn callout_title(kind: BlockQuoteKind) -> (&'static str, &'static str) {
+    match kind {
+        BlockQuoteKind::Note => ("note", "Note"),
+        BlockQuoteKind::Tip => ("tip", "Tip"),
+        BlockQuoteKind::Important => ("important", "Important"),
+        BlockQuoteKind::Warning => ("warning", "Warning"),
+        BlockQuoteKind::Caution => ("caution", "Caution"),
+    }
+}
+
+/// Splits plain text into runs, links for bare URLs, and `@mention` links.
+fn push_text<'a>(out: &mut Vec<Event<'a>>, text: &str) {
+    let push_plain = |out: &mut Vec<Event<'a>>, s: &str| {
+        if s.is_empty() {
+            return;
+        }
+        if !s.contains('@') {
+            out.push(Event::Text(CowStr::from(s.to_string())));
+            return;
+        }
+        for (is_mention, part) in split_mentions(s) {
+            if is_mention {
+                out.push(Event::InlineHtml(CowStr::from(format!("<a class=\"mention\" href=\"/u/{0}\">@{0}</a>", html_escape(&part)))));
+            } else {
+                out.push(Event::Text(CowStr::from(part)));
+            }
+        }
+    };
+    let mut last = 0;
+    for r in embed::find_urls(text) {
+        push_plain(out, &text[last..r.start]);
+        let url = text[r.clone()].to_string();
+        out.push(Event::Start(Tag::Link {
+            link_type: LinkType::Autolink,
+            dest_url: CowStr::from(url.clone()),
+            title: CowStr::from(""),
+            id: CowStr::from(""),
+        }));
+        out.push(Event::Text(CowStr::from(url)));
+        out.push(Event::End(TagEnd::Link));
+        last = r.end;
+    }
+    push_plain(out, &text[last..]);
+}
+
+/// Renders Markdown to safe HTML: heading anchors, linked `@mentions` and URLs, callouts, embeds
+/// (a provider link on its own line, see [`embed`]), sanitized output.
 pub fn render(md: &str) -> String {
     let mut seen: HashMap<String, usize> = HashMap::new();
-    let events: Vec<Event> = Parser::new_ext(md, options()).collect();
+    let events = parse(md);
 
-    // Give every heading an anchor id.
+    // Embeds are cut out before sanitizing and put back after, so the sanitizer never has to allow
+    // frames. Each one's placeholder carries a digest of the document, which the document itself
+    // can't contain.
+    let nonce = hex::encode(&Sha256::digest(md.as_bytes())[..8]);
+    let mut embeds: Vec<String> = vec![];
+
     let mut out_events: Vec<Event> = Vec::with_capacity(events.len());
     let mut i = 0;
     let mut in_code_or_link = 0usize;
     while i < events.len() {
         match &events[i] {
+            Event::Start(Tag::Paragraph) if in_code_or_link == 0 => {
+                let end = events[i..].iter().position(|e| matches!(e, Event::End(TagEnd::Paragraph))).map(|p| i + p);
+                let found = end.and_then(|end| {
+                    let (url, label) = lone_link(&events[i + 1..end])?;
+                    let e = embed::from_url(&url)?;
+                    Some((end, embed::html(&e, &url, label.as_deref())))
+                });
+                if let Some((end, html)) = found {
+                    out_events.push(Event::Html(CowStr::from(format!("<div id=\"ds-embed-{nonce}-{}\"></div>\n", embeds.len()))));
+                    embeds.push(html);
+                    i = end + 1;
+                    continue;
+                }
+                out_events.push(events[i].clone());
+            }
+            Event::Start(Tag::BlockQuote(Some(kind))) => {
+                let (class, title) = callout_title(*kind);
+                out_events.push(Event::Html(CowStr::from(format!(
+                    "<blockquote class=\"md-callout md-callout-{class}\">\n<p class=\"md-callout-title\">{title}</p>\n"
+                ))));
+            }
             Event::Start(Tag::Heading { level, id, classes, attrs }) => {
                 let mut text = String::new();
                 let mut j = i + 1;
@@ -142,26 +267,15 @@ pub fn render(md: &str) -> String {
                     attrs: attrs.clone(),
                 }));
             }
-            Event::Start(t @ (Tag::CodeBlock(_) | Tag::Link { .. })) => {
+            Event::Start(t @ (Tag::CodeBlock(_) | Tag::Link { .. } | Tag::Image { .. })) => {
                 in_code_or_link += 1;
                 out_events.push(Event::Start(t.clone()));
             }
-            Event::End(t @ (TagEnd::CodeBlock | TagEnd::Link)) => {
+            Event::End(t @ (TagEnd::CodeBlock | TagEnd::Link | TagEnd::Image)) => {
                 in_code_or_link = in_code_or_link.saturating_sub(1);
                 out_events.push(Event::End(*t));
             }
-            Event::Text(t) if in_code_or_link == 0 && t.contains('@') => {
-                for (is_mention, s) in split_mentions(t) {
-                    if is_mention {
-                        out_events.push(Event::InlineHtml(CowStr::from(format!(
-                            "<a class=\"mention\" href=\"/u/{0}\">@{0}</a>",
-                            html_escape(&s)
-                        ))));
-                    } else {
-                        out_events.push(Event::Text(CowStr::from(s)));
-                    }
-                }
-            }
+            Event::Text(t) if in_code_or_link == 0 => push_text(&mut out_events, t),
             other => out_events.push(other.clone()),
         }
         i += 1;
@@ -169,7 +283,32 @@ pub fn render(md: &str) -> String {
 
     let mut html = String::with_capacity(md.len() * 2);
     pulldown_cmark::html::push_html(&mut html, out_events.into_iter());
-    sanitizer().clean(&html).to_string()
+    let html = sanitizer().clean(&html).to_string();
+    if embeds.is_empty() {
+        return html;
+    }
+    // One pass, so many embeds don't make rendering quadratic.
+    let marker = format!("<div id=\"ds-embed-{nonce}-");
+    let mut out = String::with_capacity(html.len() + embeds.iter().map(String::len).sum::<usize>());
+    let mut rest = html.as_str();
+    while let Some(p) = rest.find(&marker) {
+        out.push_str(&rest[..p]);
+        let after = &rest[p + marker.len()..];
+        let digits = after.bytes().take_while(u8::is_ascii_digit).count();
+        let embed = after[..digits].parse::<usize>().ok().and_then(|n| embeds.get(n));
+        match (embed, after[digits..].strip_prefix("\"></div>")) {
+            (Some(embed), Some(tail)) => {
+                out.push_str(embed);
+                rest = tail;
+            }
+            _ => {
+                out.push_str(&marker);
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Plain text, for search and excerpts.
@@ -225,16 +364,27 @@ pub fn mentions(md: &str) -> Vec<String> {
     found
 }
 
-/// Ids of posts this document links to via `/p/{id}` URLs (relative or absolute).
+/// Ids of posts this document links to via `/p/{id}` URLs (relative or absolute), including bare
+/// URLs in the text.
 pub fn post_links(md: &str) -> Vec<String> {
     let mut ids = vec![];
     let mut seen = HashSet::new();
-    for ev in Parser::new_ext(md, options()) {
-        if let Event::Start(Tag::Link { dest_url, .. }) = ev
-            && let Some(id) = post_id_from_url(&dest_url)
-            && seen.insert(id.clone())
-        {
-            ids.push(id);
+    let mut depth = 0usize;
+    for ev in parse(md) {
+        let found: Vec<String> = match &ev {
+            Event::Start(Tag::Link { dest_url, .. }) => post_id_from_url(dest_url).into_iter().collect(),
+            Event::Text(t) if depth == 0 => embed::find_urls(t).into_iter().filter_map(|r| post_id_from_url(&t[r])).collect(),
+            _ => vec![],
+        };
+        match &ev {
+            Event::Start(Tag::CodeBlock(_) | Tag::Link { .. }) => depth += 1,
+            Event::End(TagEnd::CodeBlock | TagEnd::Link) => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+        for id in found {
+            if seen.insert(id.clone()) {
+                ids.push(id);
+            }
         }
     }
     ids
@@ -332,8 +482,51 @@ mod tests {
 
     #[test]
     fn finds_post_links() {
-        let links = post_links("[a](/p/abc123def0/hello) [b](https://x.com/p/zzz999yyy1) [c](/t/abc)");
-        assert_eq!(links, vec!["abc123def0", "zzz999yyy1"]);
+        let links = post_links("[a](/p/abc123def0/hello) [b](https://x.com/p/zzz999yyy1) [c](/t/abc) https://y.com/p/bare123456/x");
+        assert_eq!(links, vec!["abc123def0", "zzz999yyy1", "bare123456"]);
+    }
+
+    #[test]
+    fn links_bare_urls() {
+        let html = render("Open https://example.com/a?b=1&c=2. Email @trevor about `https://not.linked`.");
+        assert!(
+            html.contains(
+                "<a href=\"https://example.com/a?b=1&amp;c=2\" rel=\"noopener noreferrer\">https://example.com/a?b=1&amp;c=2</a>."
+            ),
+            "{html}"
+        );
+        assert!(html.contains("href=\"/u/trevor\""), "{html}");
+        assert!(html.contains("<code>https://not.linked</code>"), "{html}");
+        let html = render("[text](https://a.com) and ![alt https://b.com](https://c.com/i.png)");
+        assert_eq!(html.matches("<a ").count(), 1, "{html}");
+    }
+
+    #[test]
+    fn renders_callouts() {
+        let html = render("> [!WARNING]\n> Do not use the oven drawer. It gets hot.\n\n> plain quote");
+        assert!(html.contains("<blockquote class=\"md-callout md-callout-warning\">"), "{html}");
+        assert!(html.contains("<p class=\"md-callout-title\">Warning</p>"), "{html}");
+        assert!(html.contains("<blockquote>\n<p>plain quote</p>"), "{html}");
+    }
+
+    #[test]
+    fn embeds_provider_links_on_their_own_line() {
+        let md = "Watch this:\n\nhttps://youtu.be/9pasx0ghADM\n\n[Making a reservation](https://vimeo.com/896568706/b22f1f7053)\n\nInline https://youtu.be/9pasx0ghADM stays a link.";
+        let html = render(md);
+        assert_eq!(html.matches("<iframe ").count(), 2, "{html}");
+        assert!(html.contains("src=\"https://www.youtube-nocookie.com/embed/9pasx0ghADM\""), "{html}");
+        assert!(html.contains("src=\"https://player.vimeo.com/video/896568706?h=b22f1f7053\""), "{html}");
+        assert!(html.contains(">Making a reservation</a></figcaption>"), "{html}");
+        assert!(html.contains("Inline <a href=\"https://youtu.be/9pasx0ghADM\""), "{html}");
+        assert!(!html.contains("ds-embed-"), "{html}");
+        // An unknown site on its own line is just a link.
+        assert!(!render("https://example.com/watch").contains("<iframe"));
+    }
+
+    #[test]
+    fn raw_frames_are_stripped() {
+        let html = render("<iframe src=\"https://evil.example\"></iframe>\n\n<div id=\"ds-embed-0000000000000000-0\"></div>");
+        assert!(!html.contains("<iframe"), "{html}");
     }
 
     #[test]
