@@ -3,7 +3,7 @@
 import { api } from '/api.js';
 
 export const state = {
-  /** GET /auth/state: needs_setup, user, workspace_name, version, mcp_url, api_url. */
+  /** GET /auth/state: needs_setup, user, workspace_name, version, mcp_url, api_url, telemetry. */
   auth: null,
   /** GET /me: user, scopes, can_edit, can_admin, workspace_name. */
   me: null,

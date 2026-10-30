@@ -18,6 +18,7 @@ use std::rc::Rc;
 use chrono::Utc;
 use dumbslab_core::db::{Db, DbExt};
 use dumbslab_core::plan::{self, Capacity, Plan, Subscription};
+use dumbslab_core::telemetry::Telemetry;
 use dumbslab_core::{AddressMove, ApiError, ApiResult, Effect, HostConfig, Hosting, Outcome, params, tenancy};
 use serde_json::{Value, json};
 use wasm_bindgen::prelude::*;
@@ -298,9 +299,11 @@ impl Workspace {
 
     /// Runs a connected-apps job (see `dumbslab_core::connect::step`), each step in its own
     /// transaction, sending the requests it asks for in between.
-    /// Its writes count against the plan like the request's own.
+    /// Its writes count against the plan like the request's own. Sign-ins work even when the
+    /// workspace is full, like password sign-ins.
     async fn run_job(&self, mut job: dumbslab_core::connect::Job, cfg: &HostConfig) -> Result<dumbslab_core::connect::Finish> {
         use dumbslab_core::connect::{self, Finish, Step};
+        let signs_in = job.is_sign_in();
         let mut replies = vec![];
         let mut written = 0;
         let mut finish = Finish::Fail(ApiError::internal("connected apps took too many steps"));
@@ -313,8 +316,11 @@ impl Workspace {
                 let before = sql.database_size() as u64;
                 let mut job = job;
                 let mut step = connect::step(db, &cfg, &mut job, replies, Utc::now());
-                if let Some(e) =
-                    cfg.hosting.as_ref().filter(|_| step.is_ok()).and_then(|h| storage_refusal(db, h, before, sql.database_size() as u64))
+                if let Some(e) = cfg
+                    .hosting
+                    .as_ref()
+                    .filter(|_| step.is_ok() && !signs_in)
+                    .and_then(|h| storage_refusal(db, h, before, sql.database_size() as u64))
                 {
                     step = Err(e);
                 }
@@ -511,6 +517,13 @@ impl DurableObject for Workspace {
             workspace: workspace.clone(),
             hosting,
             connectors: crate::connect::connectors(&self.env, &origin, multi),
+            // Session recordings and browser error reports; off unless these are set.
+            telemetry: Telemetry::new(
+                var(&self.env, "QUILL_HOST").as_deref(),
+                var(&self.env, "QUILL_TOKEN").as_deref(),
+                var(&self.env, "SENTRY_DSN").as_deref(),
+            )
+            .0,
         };
         let move_cfg = cfg.clone();
 
@@ -574,19 +587,22 @@ impl DurableObject for Workspace {
         }
 
         let mut effects = outcome.effects;
-        // Connected apps: run the job, then answer with its result.
+        let mut response = outcome.response;
+        // Connected apps and single sign-on: run the job and answer with its result. The request's
+        // own webhooks (say, `sso.updated` from saving the settings) still go out below, as on the
+        // native server. Events recorded inside the job send none.
         if let Some(i) = effects.iter().position(|e| matches!(e, Effect::Connect(_))) {
             let Effect::Connect(job) = effects.remove(i) else { unreachable!() };
             let finish = self.run_job(job, &move_cfg).await?;
-            return to_response(dumbslab_core::connect::respond(outcome.response, finish));
+            response = dumbslab_core::connect::respond(response, finish);
         }
         // upgrade_plan and manage_billing: the answer holds a placeholder for the Stripe page's URL.
         if let Some(Effect::Stripe(call)) = effects.iter().find(|e| matches!(e, Effect::Stripe(_))) {
-            let filled = crate::billing::page(&self.env, call).await?.and_then(|url| plan::fill_stripe_url(&outcome.response.body, &url));
+            let filled = crate::billing::page(&self.env, call).await?.and_then(|url| plan::fill_stripe_url(&response.body, &url));
             let Some(body) = filled else {
                 return error_response(502, "billing_unavailable", "Stripe couldn't open that page just now. Try again in a minute.");
             };
-            return to_response(dumbslab_core::Response { body, ..outcome.response });
+            return to_response(dumbslab_core::Response { body, ..response });
         }
         if let Some(i) = effects.iter().position(|e| matches!(e, Effect::MoveAddress(_))) {
             let Effect::MoveAddress(mv) = effects.remove(i) else { unreachable!() };
@@ -620,7 +636,7 @@ impl DurableObject for Workspace {
             });
         }
 
-        to_response(outcome.response)
+        to_response(response)
     }
 }
 

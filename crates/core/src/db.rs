@@ -181,6 +181,7 @@ pub const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0005_files.sql"),
     include_str!("migrations/0006_usage.sql"),
     include_str!("migrations/0007_connections.sql"),
+    include_str!("migrations/0008_sso.sql"),
     include_str!("migrations/0010_sync.sql"),
 ];
 
