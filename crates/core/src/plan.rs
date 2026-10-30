@@ -266,15 +266,18 @@ pub fn check_write(db: &dyn Db, hosting: &Hosting, now: DateTime<Utc>) -> ApiRes
     Ok(())
 }
 
-/// Whether reads may do their bookkeeping writes (such as view counts).
+/// Whether reads may do their bookkeeping writes (such as view counts): not once the workspace
+/// can't change things, or can't grow.
 pub fn can_write(db: &dyn Db, hosting: Option<&Hosting>, now: DateTime<Utc>) -> ApiResult<bool> {
-    match hosting {
-        None => Ok(true),
-        Some(h) => match check_write(db, h, now) {
-            Ok(()) => Ok(true),
-            Err(e) if matches!(e.code, "write_limit" | "free_capacity") => Ok(false),
-            Err(e) => Err(e),
-        },
+    let Some(h) = hosting else { return Ok(true) };
+    let plan = current(db)?.plan();
+    if h.storage_bytes >= h.plans.allowance(plan).storage_bytes || (plan == Plan::Free && h.capacity.growth_paused) {
+        return Ok(false);
+    }
+    match check_write(db, h, now) {
+        Ok(()) => Ok(true),
+        Err(e) if matches!(e.code, "write_limit" | "free_capacity") => Ok(false),
+        Err(e) => Err(e),
     }
 }
 
@@ -297,12 +300,27 @@ pub fn storage_full(plans: &Plans, plan: Plan, capacity: bool) -> ApiError {
     ApiError::new(507, "storage_full", message)
 }
 
-/// A Stripe API call whose answer is the response. The host POSTs `form` to
-/// `https://api.stripe.com/v1/{path}` and replies `{"url": …}` with the page Stripe returns.
+/// A Stripe API call whose page is the answer. The host POSTs `form` to
+/// `https://api.stripe.com/v1/{path}` and puts the `url` Stripe returns in place of
+/// [`STRIPE_URL_PENDING`] in the response, whatever the transport (REST or MCP).
 #[derive(Clone, Debug)]
 pub struct StripeCall {
     pub path: &'static str,
     pub form: Vec<(String, String)>,
+}
+
+/// Stands in for the Stripe page's URL until the host has it.
+pub const STRIPE_URL_PENDING: &str = "dumbslab:stripe-url-pending";
+
+/// Puts Stripe's page URL into a response body in place of [`STRIPE_URL_PENDING`]. The URL goes
+/// in as is, so one that would need escaping in JSON (or JSON inside a JSON string, as in MCP's
+/// text content) is refused.
+pub fn fill_stripe_url(body: &[u8], url: &str) -> Option<Vec<u8>> {
+    if !url.starts_with("https://") || url.bytes().any(|b| b == b'"' || b == b'\\' || !(0x21..0x7f).contains(&b)) {
+        return None;
+    }
+    let text = std::str::from_utf8(body).ok()?;
+    text.contains(STRIPE_URL_PENDING).then(|| text.replace(STRIPE_URL_PENDING, url).into_bytes())
 }
 
 fn pairs(items: &[(&str, &str)]) -> Vec<(String, String)> {
@@ -509,6 +527,27 @@ mod tests {
             WebhookAction::Risk { kind: "charge.dispute.created".into(), customer: None, charge: Some("ch_1".into()) }
         );
         assert_eq!(webhook_action(&ev("customer.created", json!({ "id": "cus_1" }))), WebhookAction::Ignore);
+    }
+
+    #[test]
+    fn stripe_urls_fill_any_envelope() {
+        let url = "https://checkout.stripe.com/c/pay/cs_test_a1#fid%2Fx";
+        let rest = serde_json::to_vec(&json!({ "url": STRIPE_URL_PENDING })).unwrap();
+        let filled: Value = serde_json::from_slice(&fill_stripe_url(&rest, url).unwrap()).unwrap();
+        assert_eq!(filled["url"], url);
+        // MCP carries the result twice: as structured content and as JSON text inside a string.
+        let inner = serde_json::to_string(&json!({ "url": STRIPE_URL_PENDING })).unwrap();
+        let mcp = serde_json::to_vec(
+            &json!({ "result": { "structuredContent": { "url": STRIPE_URL_PENDING }, "content": [{ "type": "text", "text": inner }] } }),
+        )
+        .unwrap();
+        let filled: Value = serde_json::from_slice(&fill_stripe_url(&mcp, url).unwrap()).unwrap();
+        assert_eq!(filled["result"]["structuredContent"]["url"], url);
+        let text: Value = serde_json::from_str(filled["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(text["url"], url);
+        assert!(fill_stripe_url(&rest, "https://x.test/\"q").is_none(), "needs escaping");
+        assert!(fill_stripe_url(&rest, "javascript:alert(1)").is_none());
+        assert!(fill_stripe_url(b"{}", url).is_none(), "nothing to fill");
     }
 
     #[test]

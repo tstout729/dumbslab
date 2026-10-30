@@ -1903,6 +1903,12 @@ fn hosted_workspaces_meter_writes() {
     use dumbslab_core::plan;
     let (mut h, admin) = hosted(Some("price_pro"));
     let (_, member) = h.user(&admin, "mo@acme.test", "Mo", "member");
+    let admin_token = Auth::Bearer(
+        h.ok("POST", "/api/v1/tokens", Some(json!({ "name": "agent", "scopes": ["read", "write", "admin"] })), &admin)["token"]
+            .as_str()
+            .unwrap()
+            .to_string(),
+    );
     let post = h.ok("POST", "/api/v1/posts", Some(json!({ "title": "Runbook", "status": "published" })), &member);
     let post_id = post["id"].as_str().unwrap().to_string();
 
@@ -1939,11 +1945,27 @@ fn hosted_workspaces_meter_writes() {
     read_page(&h);
     assert_eq!(views(), 1, "reads stop counting views once writes are paused");
     h.ok("GET", "/api/v1/search?q=runbook", None, &member);
+    h.ok("GET", "/api/v1/export", None, &admin);
+    let reg = h.call(
+        "POST",
+        "/oauth/register",
+        Some(json!({ "client_name": "App", "redirect_uris": ["http://localhost:9999/cb"] })),
+        &Auth::None,
+    );
+    assert_eq!(reg.status, 429, "anonymous app registration is a change too: {}", reg.body);
 
     // Upgrading still works, for admins only, and hands the host a Checkout session for this workspace.
     assert_eq!(h.call("POST", "/api/v1/plan/upgrade", None, &member).status, 403);
     let r = h.call("POST", "/api/v1/plan/upgrade", None, &admin);
     assert_eq!(r.status, 200, "{}", r.body);
+    assert_eq!(r.body["url"], plan::STRIPE_URL_PENDING, "the host puts Stripe's URL here");
+    let via_mcp = h.mcp(
+        &admin_token,
+        "",
+        json!({ "jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": { "name": "upgrade_plan", "arguments": {} } }),
+    );
+    assert_eq!(via_mcp.body["result"]["structuredContent"]["url"], plan::STRIPE_URL_PENDING, "{}", via_mcp.body);
+    assert!(stripe_call(&via_mcp).path == "checkout/sessions");
     let call = stripe_call(&r);
     assert_eq!(call.path, "checkout/sessions");
     let form = |k: &str| call.form.iter().find(|(key, _)| key == k).map(|(_, v)| v.clone());
@@ -1993,6 +2015,33 @@ fn hosted_workspaces_meter_writes() {
     h.ok("POST", "/api/v1/posts", Some(json!({ "title": "Granted" })), &member);
     db_run(&h, |db| plan::set_grant(db, false));
     assert_eq!(h.call("POST", "/api/v1/posts", Some(json!({ "title": "Busy" })), &member).status, 503);
+}
+
+#[test]
+fn hosted_bookkeeping_stays_within_limits() {
+    let (mut h, admin) = hosted(Some("price_pro"));
+    let post = h.ok("POST", "/api/v1/posts", Some(json!({ "title": "Page", "status": "published" })), &admin);
+    let id = post["id"].as_str().unwrap().to_string();
+    let views = |h: &H| count(h, &format!("SELECT COUNT(*) FROM post_views WHERE post_id = '{id}'"));
+    // A full workspace stops recording views, which would grow it.
+    h.cfg.hosting.as_mut().unwrap().storage_bytes = 50 << 20;
+    h.ok("GET", &format!("/api/v1/posts/{id}?format=html"), None, &admin);
+    assert_eq!(views(&h), 0);
+    h.cfg.hosting.as_mut().unwrap().storage_bytes = 300_000;
+    h.ok("GET", &format!("/api/v1/posts/{id}?format=html"), None, &admin);
+    assert_eq!(views(&h), 1);
+
+    // Anonymous app registration is capped per hour.
+    for _ in 0..dumbslab_core::oauth::HOSTED_REGISTRATIONS_PER_HOUR {
+        register_app(&h);
+    }
+    let r = h.call(
+        "POST",
+        "/oauth/register",
+        Some(json!({ "client_name": "One more", "redirect_uris": ["http://localhost:9999/cb"] })),
+        &Auth::None,
+    );
+    assert_eq!(r.status, 429, "{}", r.body);
 }
 
 #[test]
@@ -2049,8 +2098,8 @@ fn directory_budgets_the_free_plan() {
     // Stripe customers map to their workspace; a paying workspace says so.
     assert!(!db_run(&h, |db| tenancy::paying(db, "beta")));
     db_run(&h, |db| tenancy::link_customer(db, "cus_9", "beta", t0));
-    assert_eq!(db_run(&h, |db| tenancy::customer_home(db, "cus_9")).as_deref(), Some("beta"));
-    assert_eq!(db_run(&h, |db| tenancy::customer_home(db, "cus_x")), None);
+    assert_eq!(db_run(&h, |db| tenancy::customer_home(db, "cus_9")), tenancy::Payer::Workspace("beta".into()));
+    assert_eq!(db_run(&h, |db| tenancy::customer_home(db, "cus_x")), tenancy::Payer::Unknown);
     db_run(&h, |db| tenancy::record_subscription(db, "cus_9", "sub_9", "active", t0));
     assert!(db_run(&h, |db| tenancy::paying(db, "beta")));
     db_run(&h, |db| tenancy::record_risk(db, "cus_9", "charge.dispute.created", t0));
@@ -2063,9 +2112,20 @@ fn directory_budgets_the_free_plan() {
     db_run(&h, |db| tenancy::record_subscription(db, "cus_9", "sub_9", "canceled", t0));
     assert!(!db_run(&h, |db| tenancy::paying(db, "beta")));
 
-    // Removing a workspace drops its usage, but not who paid for it.
+    // Removing a workspace drops its usage and detaches who paid for it, for good: someone else
+    // may claim the address, and the old customer's late events must not reach them.
     db_run(&h, |db| tenancy::remove(db, "acme"));
     assert_eq!(db_run(&h, |db| tenancy::free_usage(db, t0)).storage_bytes, 1_000);
+    db_run(&h, |db| tenancy::record_subscription(db, "cus_9", "sub_9", "active", t0));
     db_run(&h, |db| tenancy::remove(db, "beta"));
-    assert_eq!(db_run(&h, |db| tenancy::customer_home(db, "cus_9")).as_deref(), Some("beta"));
+    assert_eq!(db_run(&h, |db| tenancy::customer_home(db, "cus_9")), tenancy::Payer::Detached);
+    db_run(&h, |db| tenancy::reserve(db, "beta", "Name", "ip-new", t0 + Duration::days(2), limits).map(|_| ()));
+    db_run(&h, |db| tenancy::activate(db, "beta", t0 + Duration::days(2)));
+    assert!(!db_run(&h, |db| tenancy::paying(db, "beta")), "the new owner isn't the old payer");
+    db_run(&h, |db| tenancy::link_customer(db, "cus_9", "beta", t0));
+    assert_eq!(db_run(&h, |db| tenancy::customer_home(db, "cus_9")), tenancy::Payer::Detached, "stays detached");
+    db_run(&h, |db| tenancy::link_customer(db, "cus_new", "beta", t0));
+    assert_eq!(db_run(&h, |db| tenancy::customer_home(db, "cus_new")), tenancy::Payer::Workspace("beta".into()));
+    let entries = db_run(&h, tenancy::list);
+    assert_eq!(entries.iter().find(|e| e.slug == "beta").unwrap().billing_status, None);
 }

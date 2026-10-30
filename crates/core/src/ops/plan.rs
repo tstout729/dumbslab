@@ -120,9 +120,9 @@ fn upgrade_plan(ctx: &mut Ctx, _: NoInput) -> ApiResult<BillingLink> {
     }
     let customer = state.subscription.map(|s| s.customer);
     let call = plan::checkout_call(price, &h.home, &ctx.base_url, customer.as_deref(), &ctx.actor.email);
-    // The host asks Stripe for the page and answers with its URL.
+    // The host asks Stripe for the page and puts its URL in place of the placeholder.
     ctx.effects.push(Effect::Stripe(call));
-    Ok(BillingLink { url: String::new() })
+    Ok(BillingLink { url: plan::STRIPE_URL_PENDING.into() })
 }
 
 fn manage_billing(ctx: &mut Ctx, _: NoInput) -> ApiResult<BillingLink> {
@@ -131,5 +131,5 @@ fn manage_billing(ctx: &mut Ctx, _: NoInput) -> ApiResult<BillingLink> {
         return Err(ApiError::conflict("this workspace hasn't bought Pro, so there's no billing to manage; upgrade with upgrade_plan"));
     };
     ctx.effects.push(Effect::Stripe(plan::portal_call(&sub.customer, &ctx.base_url)));
-    Ok(BillingLink { url: String::new() })
+    Ok(BillingLink { url: plan::STRIPE_URL_PENDING.into() })
 }

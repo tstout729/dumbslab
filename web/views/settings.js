@@ -613,10 +613,14 @@ const day = (unix) => (unix ? dayFmt.format(new Date(unix * 1000)) : '');
 
 async function planSection() {
   const p = await api.get('/plan');
-  const justPaid = new URLSearchParams(location.search).get('checkout') === 'done';
-  if (justPaid && p.plan !== 'pro') {
-    // Stripe tells DumbSlab a moment after the payment; look again shortly.
-    setTimeout(() => { if (location.pathname === '/settings/plan') navigate('/settings/plan?checkout=done', { replace: true }); }, 3000);
+  const query = new URLSearchParams(location.search);
+  const justPaid = query.get('checkout') === 'done';
+  const look = Number(query.get('look') || 0);
+  if (justPaid && p.plan !== 'pro' && look < 10) {
+    // Stripe tells DumbSlab a moment after the payment; look again shortly (a new URL re-renders).
+    setTimeout(() => {
+      if (location.pathname === '/settings/plan') navigate(`/settings/plan?checkout=done&look=${look + 1}`, { replace: true });
+    }, 3000);
   }
   const sub = p.subscription;
   const pro = p.plan === 'pro';

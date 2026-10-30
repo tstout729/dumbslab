@@ -62,8 +62,8 @@ pub struct Op {
     pub access: Access,
     pub destructive: bool,
     pub idempotent: bool,
-    /// Hosted workspaces: whether the operation counts against the plan's write allowance. Ones
-    /// that don't (upgrading, managing billing) keep working once the allowance is used up.
+    /// Hosted workspaces: whether the operation, unless it's a GET, counts against the plan's write
+    /// allowance. Ones that don't (upgrading, managing billing) keep working once it's used up.
     pub metered: bool,
     pub input_schema: Value,
     pub output_schema: Value,
@@ -86,7 +86,7 @@ impl Op {
             _ => {}
         }
         if self.metered
-            && !self.read_only()
+            && self.method != "GET"
             && let Some(hosting) = ctx.cfg.hosting.as_ref()
         {
             crate::plan::check_write(ctx.db, hosting, ctx.now)?;

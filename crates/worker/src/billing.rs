@@ -72,14 +72,15 @@ async fn stripe(env: &Env, method: Method, path: &str, form: &[(String, String)]
     Ok((status, resp.json::<Value>().await.unwrap_or(Value::Null)))
 }
 
-/// Answers `upgrade_plan` and `manage_billing`: asks Stripe for the page and replies with its URL.
-pub async fn page(env: &Env, call: &StripeCall) -> Result<Response> {
+/// For `upgrade_plan` and `manage_billing`: asks Stripe for the page and returns its URL, or
+/// `None` when Stripe refused.
+pub async fn page(env: &Env, call: &StripeCall) -> Result<Option<String>> {
     let (status, body) = stripe(env, Method::Post, call.path, &call.form).await?;
     match body["url"].as_str() {
-        Some(url) if status == 200 => json_response(200, &json!({ "url": url })),
+        Some(url) if status == 200 => Ok(Some(url.to_string())),
         _ => {
             console_error!("stripe {} failed: {status} {}", call.path, body["error"]["message"]);
-            error_response(502, "billing_unavailable", "Stripe couldn't open that page just now. Try again in a minute.")
+            Ok(None)
         }
     }
 }
@@ -151,8 +152,13 @@ async fn sync(env: &Env, id: &str) -> Result<()> {
     }
     let sub = Subscription::from_stripe(&body).ok_or_else(|| Error::RustError(format!("subscription {id} has no customer or status")))?;
     // The customer was linked to its workspace when Checkout finished. The subscription's own
-    // metadata is the fallback, for an event that arrives before that one.
+    // metadata is the fallback, for an event that arrives before that one, but never for a
+    // customer whose workspace was deleted: someone else may have its address now.
     let (_, found) = directory(env, "/billing/lookup", json!({ "customer": sub.customer })).await?;
+    if found["detached"] == json!(true) {
+        console_warn!("subscription {id} is for a deleted workspace; ignored");
+        return Ok(());
+    }
     let home = match found["home"].as_str() {
         Some(h) => h.to_string(),
         None => match body["metadata"]["workspace"].as_str() {
@@ -166,8 +172,7 @@ async fn sync(env: &Env, id: &str) -> Result<()> {
             }
         },
     };
-    directory(env, "/billing/subscription", json!({ "customer": sub.customer, "subscription": sub.id, "status": sub.status })).await?;
-    let (status, _) = call_object(
+    let (status, reply) = call_object(
         env,
         "WORKSPACE",
         &format!("ws:{home}"),
@@ -177,8 +182,17 @@ async fn sync(env: &Env, id: &str) -> Result<()> {
     )
     .await?;
     match status {
+        // The directory follows what the workspace kept: news about an older subscription
+        // mustn't make a paying workspace look unpaid.
+        200 if reply["applied"] == json!(true) => {
+            let record = json!({ "customer": sub.customer, "subscription": sub.id, "status": sub.status });
+            let (status, _) = directory(env, "/billing/subscription", record).await?;
+            if status != 200 {
+                return Err(Error::RustError(format!("recording subscription {id} in the directory: answered {status}")));
+            }
+            Ok(())
+        }
         200 => Ok(()),
-        // The workspace was deleted; the directory still knows who pays.
         404 => {
             console_warn!("subscription {id} is for {home}, which no longer exists");
             Ok(())

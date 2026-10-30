@@ -484,15 +484,23 @@ impl DurableObject for Workspace {
             }
         })?;
         // Hosted workspaces count every row a request's statements wrote, even when it was rolled
-        // back, against their plan. A sign-up that failed left no table to count in.
-        if let Some(h) = move_cfg.hosting.as_ref()
-            && db.rows_written() > 0
-            && (self.migrated.get() || (creating && matches!(&result, Ok(Some(o)) if o.response.status == 200)))
-        {
-            if let Err(e) = plan::record_writes(&self.db(), Utc::now(), db.rows_written()) {
+        // back, against their plan. Signing in doesn't count: anyone can fail to sign in, and the
+        // sign-in limits bound those writes. A sign-up that failed left no table to count in.
+        if let Some(h) = move_cfg.hosting.as_ref() {
+            let metered = !path.starts_with("/api/v1/auth/")
+                && (self.migrated.get() || (creating && matches!(&result, Ok(Some(o)) if o.response.status == 200)));
+            if metered
+                && db.rows_written() > 0
+                && let Err(e) = plan::record_writes(&self.db(), Utc::now(), db.rows_written())
+            {
                 console_error!("recording usage failed: {}", e.message);
             }
-            self.report_usage(&h.home, false);
+            // A paused workspace writes nothing, so it also reports while paused to learn when
+            // the free plan has room again.
+            let capacity = self.capacity.get();
+            if self.migrated.get() && (db.rows_written() > 0 || capacity.writes_paused || capacity.growth_paused) {
+                self.report_usage(&h.home, false);
+            }
         }
         let outcome = match result {
             Ok(Some(o)) => o,
@@ -512,9 +520,13 @@ impl DurableObject for Workspace {
         }
 
         let mut effects = outcome.effects;
-        // upgrade_plan and manage_billing: the answer is the Stripe page's URL.
+        // upgrade_plan and manage_billing: the answer holds a placeholder for the Stripe page's URL.
         if let Some(Effect::Stripe(call)) = effects.iter().find(|e| matches!(e, Effect::Stripe(_))) {
-            return crate::billing::page(&self.env, call).await;
+            let filled = crate::billing::page(&self.env, call).await?.and_then(|url| plan::fill_stripe_url(&outcome.response.body, &url));
+            let Some(body) = filled else {
+                return error_response(502, "billing_unavailable", "Stripe couldn't open that page just now. Try again in a minute.");
+            };
+            return to_response(dumbslab_core::Response { body, ..outcome.response });
         }
         if let Some(i) = effects.iter().position(|e| matches!(e, Effect::MoveAddress(_))) {
             let Effect::MoveAddress(mv) = effects.remove(i) else { unreachable!() };

@@ -228,10 +228,12 @@ CREATE TABLE IF NOT EXISTS usage (
   storage_bytes INTEGER NOT NULL,
   reported_at TEXT NOT NULL
 );
--- Stripe customers and the workspace each one pays for. Kept after a workspace is deleted.
+-- Stripe customers and the workspace each one pays for. When the workspace is deleted its rows
+-- stay, detached, so Stripe's later events about them never reach a new workspace at that address.
 CREATE TABLE IF NOT EXISTS billing (
   customer TEXT PRIMARY KEY,
   home TEXT NOT NULL,
+  detached INTEGER NOT NULL DEFAULT 0,
   subscription TEXT,
   status TEXT,
   -- The last refund, dispute or fraud warning, e.g. `charge.dispute.created 2026-11-02T…`.
@@ -364,12 +366,14 @@ pub fn set_status(db: &dyn Db, slug: &str, status: &str) -> ApiResult<()> {
     Ok(())
 }
 
-/// Removes a workspace (by its first address) and every address it moved to. Its billing record
-/// stays, so Stripe's later events still find who paid.
+/// Removes a workspace (by its first address) and every address it moved to. Its billing records
+/// are detached: someone may claim the address again, and Stripe's later events about the old
+/// customers must not reach their workspace.
 pub fn remove(db: &dyn Db, home: &str) -> ApiResult<()> {
     db.execute("DELETE FROM workspaces WHERE slug = ?", &params![home])?;
     db.execute("DELETE FROM addresses WHERE home = ?", &params![home])?;
     db.execute("DELETE FROM usage WHERE home = ?", &params![home])?;
+    db.execute("UPDATE billing SET detached = 1 WHERE home = ?", &params![home])?;
     Ok(())
 }
 
@@ -462,19 +466,33 @@ pub fn free_capacity(db: &dyn Db, now: DateTime<Utc>, budget: FreeBudget) -> Api
     Ok(Capacity { writes_paused: used.writes_24h >= budget.writes_per_day, growth_paused: used.storage_bytes >= budget.storage_bytes })
 }
 
-/// Checkout finished: `customer` pays for the workspace whose first address is `home`.
+/// Checkout finished: `customer` pays for the workspace whose first address is `home`. A
+/// customer whose workspace was deleted stays detached.
 pub fn link_customer(db: &dyn Db, customer: &str, home: &str, now: DateTime<Utc>) -> ApiResult<()> {
     db.execute(
         "INSERT INTO billing (customer, home, updated_at) VALUES (?, ?, ?)
-         ON CONFLICT(customer) DO UPDATE SET home = excluded.home, updated_at = excluded.updated_at",
+         ON CONFLICT(customer) DO UPDATE SET home = excluded.home, updated_at = excluded.updated_at WHERE billing.detached = 0",
         &params![customer, home, ts(now)],
     )?;
     Ok(())
 }
 
-/// The workspace a Stripe customer pays for.
-pub fn customer_home(db: &dyn Db, customer: &str) -> ApiResult<Option<String>> {
-    Ok(db.one("SELECT home FROM billing WHERE customer = ?", &params![customer])?.map(|r| r.str("home")))
+/// Who a Stripe customer pays for, as far as the directory knows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Payer {
+    Unknown,
+    /// Pays for the workspace whose first address this is.
+    Workspace(String),
+    /// Paid for a workspace that was deleted.
+    Detached,
+}
+
+pub fn customer_home(db: &dyn Db, customer: &str) -> ApiResult<Payer> {
+    Ok(match db.one("SELECT home, detached FROM billing WHERE customer = ?", &params![customer])? {
+        None => Payer::Unknown,
+        Some(r) if r.i64("detached") != 0 => Payer::Detached,
+        Some(r) => Payer::Workspace(r.str("home")),
+    })
 }
 
 pub fn record_subscription(db: &dyn Db, customer: &str, subscription: &str, status: &str, now: DateTime<Utc>) -> ApiResult<()> {
@@ -496,8 +514,10 @@ pub fn record_risk(db: &dyn Db, customer: &str, kind: &str, now: DateTime<Utc>) 
 
 /// Whether someone still pays for the workspace. Deleting it would keep charging them.
 pub fn paying(db: &dyn Db, home: &str) -> ApiResult<bool> {
-    let n =
-        db.scalar_i64("SELECT COUNT(*) FROM billing WHERE home = ? AND status IN ('active', 'trialing', 'past_due')", &params![home])?;
+    let n = db.scalar_i64(
+        "SELECT COUNT(*) FROM billing WHERE home = ? AND detached = 0 AND status IN ('active', 'trialing', 'past_due')",
+        &params![home],
+    )?;
     Ok(n > 0)
 }
 
@@ -530,8 +550,8 @@ pub fn list(db: &dyn Db) -> ApiResult<Vec<DirectoryEntry>> {
     Ok(db
         .query(
             "SELECT w.slug, w.name, w.status, w.created_at, w.activated_at, u.plan, u.writes_24h, u.storage_bytes, u.reported_at,
-                    (SELECT b.status FROM billing b WHERE b.home = w.slug ORDER BY b.updated_at DESC LIMIT 1) AS billing_status,
-                    (SELECT b.risk FROM billing b WHERE b.home = w.slug AND b.risk IS NOT NULL ORDER BY b.updated_at DESC LIMIT 1) AS billing_risk
+                    (SELECT b.status FROM billing b WHERE b.home = w.slug AND b.detached = 0 ORDER BY b.updated_at DESC LIMIT 1) AS billing_status,
+                    (SELECT b.risk FROM billing b WHERE b.home = w.slug AND b.detached = 0 AND b.risk IS NOT NULL ORDER BY b.updated_at DESC LIMIT 1) AS billing_risk
              FROM workspaces w LEFT JOIN usage u ON u.home = w.slug ORDER BY w.created_at DESC",
             &[],
         )?

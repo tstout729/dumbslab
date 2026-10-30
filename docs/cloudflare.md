@@ -74,7 +74,7 @@ Every feature is on every plan: MCP, the API, webhooks, uploads, people and bots
 
 How the limits work:
 
-- **Writes** are counted as Cloudflare bills them: every row a request's statements write, index and search-index rows included, even when the request is rolled back. Each workspace keeps hourly totals and refuses changes once the last 24 hours reach its allowance. Measured costs: a new 2 KB post writes about 18 rows, an edit about 10, a comment about 10, an upload about 9, and an imported document about 19. Agents reading posts write nothing.
+- **Writes** are counted as Cloudflare bills them: every row a request's statements write, index and search-index rows included, even when the request is rolled back. Signing in doesn't count, since anyone can fail to sign in and the sign-in limits already bound those writes. Each workspace keeps hourly totals and refuses changes, including new app registrations, once the last 24 hours reach its allowance. Anonymous app registration (OAuth's `/oauth/register`) is also capped at 120 an hour per workspace. Measured costs: a new 2 KB post writes about 18 rows, an edit about 10, a comment about 10, an upload about 9, and an imported document about 19. Agents reading posts write nothing.
 - **Storage** is the workspace database's size. A change that would take it past the plan's allowance is refused with `507 storage_full`.
 - **The free plan's totals.** Each busy workspace reports its plan, recent writes and size to the `Directory` every five minutes at most. Once free workspaces together reach `FREE_TOTAL_WRITES_PER_DAY`, free workspaces stop accepting changes (`503 free_capacity`) until the total falls. Once they reach `FREE_TOTAL_STORAGE_MB`, they stop growing. In both cases sign-ups pause. Pro workspaces are never paused.
 - **Request floods.** The `REQUEST_LIMITER` binding lets each client network (an IPv4 address or IPv6 /64) make 1,200 API, MCP and file requests a minute, enough for a whole office behind one address. The Worker refuses the rest with `429` before they reach a workspace. Static files aren't counted.
@@ -122,7 +122,7 @@ curl -X POST -H "Authorization: Bearer $OPERATOR_TOKEN" https://your-domain/api/
 curl -X POST -H "Authorization: Bearer $OPERATOR_TOKEN" https://your-domain/api/operator/workspaces/acme/grant-pro  # Pro without paying; or revoke-pro
 ```
 
-Any of a workspace's addresses works in these URLs. The list shows each workspace's current `address`, its `previous_addresses`, its plan, writes in the last 24 hours, size and Stripe status, and the free plan's totals against their budget (`free_plan`). Deleting a workspace that someone still pays for is refused; cancel its subscription in the Stripe Dashboard first.
+Any of a workspace's addresses works in these URLs. The list shows each workspace's current `address`, its `previous_addresses`, its plan, writes in the last 24 hours, size and Stripe status, and the free plan's totals against their budget (`free_plan`). Deleting a workspace that someone still pays for is refused; cancel its subscription in the Stripe Dashboard first. Deleting one detaches its Stripe customers, so if someone claims the address later, the old customer's events never reach the new workspace.
 
 ## Single-workspace mode
 

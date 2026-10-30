@@ -200,7 +200,13 @@ impl DurableObject for Directory {
             }
             (Method::Post, "/billing/lookup") => {
                 let input: ApiResult<BillingInput> = parse(&body);
-                self.run(move |db| Ok(json!({ "home": tenancy::customer_home(db, &input?.customer)? })))?
+                self.run(move |db| {
+                    Ok(match tenancy::customer_home(db, &input?.customer)? {
+                        tenancy::Payer::Unknown => json!({ "home": null }),
+                        tenancy::Payer::Workspace(home) => json!({ "home": home }),
+                        tenancy::Payer::Detached => json!({ "home": null, "detached": true }),
+                    })
+                })?
             }
             (Method::Post, "/billing/subscription") => {
                 let input: ApiResult<BillingInput> = parse(&body);
