@@ -72,9 +72,10 @@ const SIGNING_SECRET: &str = "slack-signing-secret";
 const MAX_RESULTS: u32 = 5;
 /// Links previewed from one message.
 const MAX_LINKS: usize = 5;
-/// Messages one request may send to one channel: a bulk import publishes hundreds of posts.
+/// Messages one request may send to one Slack channel, across all the mappings that name it: a
+/// bulk import publishes hundreds of posts.
 const MAX_MESSAGES_PER_REQUEST: usize = 3;
-/// Marks which post a channel message is about, so one request sends one message per post.
+/// Marks which post a channel message is about, so one request sends a channel one message per post.
 const POST_HEADER: &str = "x-dumbslab-post";
 
 // ---------------------------------------------------------------------------
@@ -1068,7 +1069,10 @@ pub fn on_event(ctx: &mut Ctx, event: &str, post_id: Option<&str>) -> ApiResult<
             }
             Some(_) => continue,
         }
-        let queue = format!("slack:{}", c.str("id"));
+        // One queue per Slack channel, however many of its mappings match: a post is announced
+        // there once, and the per-request limit is the channel's (Slack's own limit is too).
+        let channel = c.str("channel");
+        let queue = format!("slack:{channel}");
         let queued: Vec<&WebhookDelivery> = ctx
             .effects
             .iter()
@@ -1087,7 +1091,7 @@ pub fn on_event(ctx: &mut Ctx, event: &str, post_id: Option<&str>) -> ApiResult<
             line.push_str(&format!(" · {}", escape(&topics.join(", "))));
         }
         let text = format!("{actor} {} “{}”", verb.to_lowercase(), escape(&card.title));
-        let body = message(&c.str("channel"), &text, card.blocks(&line));
+        let body = message(&channel, &text, card.blocks(&line));
         ctx.effects.push(Effect::Webhook(WebhookDelivery {
             webhook_id: queue,
             url: format!("{API}/chat.postMessage"),

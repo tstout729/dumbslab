@@ -4138,6 +4138,50 @@ mod slack {
         assert!(to(&r).is_empty());
     }
 
+    /// Several mappings can name one Slack channel: it hears about each post once, and the
+    /// per-request limit is the channel's.
+    #[test]
+    fn slack_channels_hear_about_each_post_once() {
+        let (h, admin) = connected();
+        let eng = h.ok("POST", "/api/v1/topics", Some(json!({ "name": "Engineering" })), &admin);
+        for mapping in [
+            json!({ "channel": "C0SAMECHAN" }),
+            json!({ "channel": "C0SAMECHAN", "topic_id": eng["id"], "updated_posts": true }),
+            json!({ "channel": "C0OTHERCHAN", "topic_id": eng["id"] }),
+        ] {
+            h.ok("POST", "/api/v1/slack/channels", Some(mapping), &admin);
+        }
+        let to =
+            |r: &Res| -> Vec<String> { slack_messages(&r.effects).iter().map(|m| m["channel"].as_str().unwrap().to_string()).collect() };
+
+        // A post both of a channel's mappings match: one message there.
+        let r = h.call("POST", "/api/v1/posts", Some(json!({ "title": "Once", "status": "published", "topic_ids": [eng["id"]] })), &admin);
+        assert_eq!(to(&r), vec!["C0SAMECHAN", "C0OTHERCHAN"]);
+        let queues: Vec<&str> = r
+            .effects
+            .iter()
+            .filter_map(|e| match e {
+                Effect::Webhook(d) => Some(d.webhook_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(queues, vec!["slack:C0SAMECHAN", "slack:C0OTHERCHAN"], "one delivery queue per channel");
+
+        // Four posts in one request, two mappings to one channel: three messages there, each about
+        // a different post.
+        let docs: Vec<Value> = (0..4).map(|i| json!({ "title": format!("Runbook {i}"), "content": "x", "topic": "Engineering" })).collect();
+        let r = h.call("POST", "/api/v1/import", Some(json!({ "documents": docs })), &admin);
+        assert_eq!(r.status, 200, "{}", r.body);
+        let messages = slack_messages(&r.effects);
+        for channel in ["C0SAMECHAN", "C0OTHERCHAN"] {
+            let mut posts: Vec<String> =
+                messages.iter().filter(|m| m["channel"] == channel).map(|m| m["text"].as_str().unwrap().to_string()).collect();
+            assert_eq!(posts.len(), 3, "{channel}: {posts:?}");
+            posts.dedup();
+            assert_eq!(posts.len(), 3, "{channel} heard about a post twice: {posts:?}");
+        }
+    }
+
     #[test]
     fn slack_secrets_are_never_returned() {
         let (h, admin) = connected();

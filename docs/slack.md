@@ -61,7 +61,7 @@ It subscribes to one event, `link_shared`, for the workspace's own domain.
 
 - Slack calls `POST /slack/commands` (the command) and `POST /slack/events` (link previews, and its URL check). These sit outside DumbSlab's sign-in: a request is accepted only with a valid `X-Slack-Signature` (HMAC-SHA256 of `v0:{timestamp}:{body}` with the signing secret, compared in constant time) made within five minutes. Each signature works once, so a copied request is refused, and an event Slack sends again after a slow answer is handled once. Requests are limited to 64 KB.
 - Slack expects an answer within three seconds. DumbSlab asks Slack's `users.info` who the person is, then searches its own index directly, so a reply needs one short call to Slack.
-- Channel messages are sent like webhooks, after the change is saved, to Slack's `chat.postMessage` with the bot token. One request sends at most three messages to a channel, so a bulk import doesn't flood it, and one message per post. Slack reports some problems (an app not invited to a private channel) in its answer rather than as an error, so use **Send a test message** to check a channel.
+- Channel messages are sent like webhooks, after the change is saved, to Slack's `chat.postMessage` with the bot token. A channel hears about a post once, however many of its settings match it, and one request sends a channel at most three messages, so a bulk import doesn't flood it. Slack reports some problems (an app not invited to a private channel) in its answer rather than as an error, so use **Send a test message** to check a channel.
 - The bot token and signing secret are never returned by any operation, and never written to logs.
 
 ## Troubleshooting
