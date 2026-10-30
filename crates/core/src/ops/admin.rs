@@ -39,7 +39,7 @@ pub fn ops() -> Vec<Op> {
             .build(),
         op("admin", "import_documents", "POST", "/import", Access::Write, import_documents)
             .title("Import Markdown documents")
-            .desc("Create many posts at once, e.g. when migrating from Confluence, Guru, a GitHub wiki, Notion or a docs folder. Each document can name a topic path like `Engineering/Runbooks`; missing topics are created. Imports don't notify topic followers or mentioned people. Pass `skip_existing: true` to skip documents whose title already exists in the same topic, so an interrupted import can be re-run without duplicates. A failing document rolls back the whole call, so send batches (25 is a good size) and retry a failed batch one document at a time. To migrate a whole export: convert each page to Markdown, upload its images with upload_file and use the returned `/files/...` paths, import the pages, then point links between pages at the new posts (`/p/<id>`) with edit_post; `results` lists the post for each document in order.")
+            .desc("Create many posts at once, e.g. when migrating from Confluence, Guru, a GitHub wiki, Notion or a docs folder. Each document can name a topic path like `Engineering/Runbooks`; missing topics are created, and those created under a private topic are private with the same members. Imports don't notify topic followers or mentioned people. Pass `skip_existing: true` to skip documents whose title already exists in the same topic, so an interrupted import can be re-run without duplicates. A failing document rolls back the whole call, so send batches (25 is a good size) and retry a failed batch one document at a time. To migrate a whole export: convert each page to Markdown, import the pages (`results` lists the post for each document in order), upload each page's images with upload_file and that page's `post_id`, then use edit_post to put the returned `/files/...` paths and links to the new posts (`/p/<id>`) in place.")
             .build(),
     ]
 }
@@ -506,7 +506,8 @@ pub struct ImportDocument {
     pub title: String,
     /// Markdown body.
     pub content: String,
-    /// Topic path such as `Engineering/Runbooks`. Missing topics are created.
+    /// Topic path such as `Engineering/Runbooks`. Missing topics are created; under a private
+    /// topic they are private, with its members.
     pub topic: Option<String>,
     /// `published` (default) or `draft`.
     pub status: Option<String>,
@@ -544,32 +545,60 @@ pub struct ImportResult {
     pub topics_created: i64,
 }
 
-/// Finds or creates each segment of a topic path; returns the leaf topic id.
+/// Finds or creates each segment of a topic path; returns the leaf topic id. A topic created
+/// under a private topic is private too, with the same members (and the importer), so importing
+/// into a private topic never makes part of the import visible to the whole workspace.
 fn ensure_topic_path(ctx: &mut Ctx, path: &str, created: &mut i64) -> ApiResult<Option<String>> {
-    let mut parent: Option<String> = None;
+    let mut parent: Option<(String, bool)> = None;
     for segment in path.split('/').map(str::trim).filter(|s| !s.is_empty()) {
-        let mut p = params![segment, parent.clone()];
+        let parent_id = parent.as_ref().map(|(id, _)| id.clone());
+        let mut p = params![segment, parent_id.clone()];
         let vis = topic_visible_sql(&ctx.actor, "t", &mut p);
-        let existing =
-            ctx.db.one(&format!("SELECT t.id FROM topics t WHERE t.name = ? COLLATE NOCASE AND t.parent_id IS ? AND {vis}"), &p)?;
-        let id = match existing {
-            Some(r) => r.str("id"),
+        let existing = ctx
+            .db
+            .one(&format!("SELECT t.id, t.visibility FROM topics t WHERE t.name = ? COLLATE NOCASE AND t.parent_id IS ? AND {vis}"), &p)?;
+        let next = match existing {
+            Some(r) => (r.str("id"), r.str("visibility") == "private"),
             None => {
+                let private = parent.as_ref().is_some_and(|(_, private)| *private);
                 let id = new_id();
                 let now = ctx.now_s();
                 ctx.db.execute(
-                    "INSERT INTO topics (id, parent_id, name, slug, visibility, position, created_by, created_at, updated_at) VALUES (?, ?, ?, ?, 'org', 0, ?, ?, ?)",
-                    &params![id.clone(), parent.clone(), segment, slugify(segment), ctx.actor.user_id.clone(), now.clone(), now],
+                    "INSERT INTO topics (id, parent_id, name, slug, visibility, position, created_by, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?)",
+                    &params![
+                        id.clone(),
+                        parent_id.clone(),
+                        segment,
+                        slugify(segment),
+                        if private { "private" } else { "org" },
+                        ctx.actor.user_id.clone(),
+                        now.clone(),
+                        now.clone()
+                    ],
                 )?;
+                if private {
+                    ctx.db.execute(
+                        "INSERT INTO topic_members (topic_id, user_id, added_at) SELECT ?, user_id, ? FROM topic_members WHERE topic_id = ? ON CONFLICT DO NOTHING",
+                        &params![id.clone(), now.clone(), parent_id.clone()],
+                    )?;
+                    ctx.db.execute(
+                        "INSERT INTO topic_members (topic_id, user_id, added_at) VALUES (?, ?, ?) ON CONFLICT DO NOTHING",
+                        &params![id.clone(), ctx.actor.user_id.clone(), now],
+                    )?;
+                }
                 crate::search::index_topic(ctx.db, &id)?;
-                emit(ctx, Event::new("topic.created", "topic", &id, format!("created topic “{segment}” during import")).topic(&id))?;
+                let mut event = Event::new("topic.created", "topic", &id, format!("created topic “{segment}” during import")).topic(&id);
+                if private {
+                    event = event.admin_only();
+                }
+                emit(ctx, event)?;
                 *created += 1;
-                id
+                (id, private)
             }
         };
-        parent = Some(id);
+        parent = Some(next);
     }
-    Ok(parent)
+    Ok(parent.map(|(id, _)| id))
 }
 
 /// A post the actor can see with exactly this title in the topic (or, without a topic, in no

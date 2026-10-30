@@ -1942,6 +1942,58 @@ fn imports_skip_what_exists_and_stay_quiet() {
     assert_ne!(dup["created"][0]["id"], home);
 }
 
+#[test]
+fn imports_into_a_private_topic_stay_private() {
+    let h = H::new();
+    let (_, admin) = h.setup();
+    let (mia_id, mia) = h.user(&admin, "mia@acme.test", "Mia Member", "member");
+    let (_, otto) = h.user(&admin, "otto@acme.test", "Otto Outsider", "member");
+    let (_, vic) = h.user(&admin, "vic@acme.test", "Vic Viewer", "viewer");
+    let leadership =
+        h.ok("POST", "/api/v1/topics", Some(json!({ "name": "Leadership", "visibility": "private", "members": [mia_id] })), &admin);
+    let lid = leadership["id"].as_str().unwrap().to_string();
+
+    // Mia imports under the private topic; the topics the import creates there are private too.
+    let r = h.ok(
+        "POST",
+        "/api/v1/import",
+        Some(json!({ "skip_existing": true, "documents": [
+            { "title": "Board minutes", "content": "zebracorn minutes", "topic": "Leadership/Board/2026" },
+            { "title": "Open notes", "content": "public", "topic": "Shared/Notes" },
+        ] })),
+        &mia,
+    );
+    assert_eq!(r["topics_created"], 4);
+    let minutes = r["results"][0]["id"].as_str().unwrap().to_string();
+    let topics = h.ok("GET", "/api/v1/topics", None, &mia)["items"].as_array().unwrap().clone();
+    let named = |n: &str| topics.iter().find(|t| t["name"] == n).unwrap().clone();
+    for name in ["Board", "2026"] {
+        assert_eq!(named(name)["visibility"], "private", "{name}");
+    }
+    assert_eq!(named("Shared")["visibility"], "org");
+    assert_eq!(named("Notes")["visibility"], "org");
+    assert_eq!(named("Board")["parent_id"], json!(lid));
+    let year = named("2026")["id"].as_str().unwrap().to_string();
+    let members = h.ok("GET", &format!("/api/v1/topics/{year}"), None, &admin)["members"].as_array().unwrap().len();
+    assert_eq!(members, 2, "the parent's members: its creator and Mia");
+
+    // People outside the private topic see neither the new topics nor the page.
+    for outsider in [&otto, &vic] {
+        let seen = h.ok("GET", "/api/v1/topics", None, outsider);
+        assert!(seen["items"].as_array().unwrap().iter().all(|t| t["name"] != "Board" && t["name"] != "2026"));
+        assert_eq!(h.call("GET", &format!("/api/v1/posts/{minutes}"), None, outsider).status, 404);
+        assert!(h.ok("GET", "/api/v1/search?q=zebracorn", None, outsider)["items"].as_array().unwrap().is_empty());
+        let feed = h.ok("GET", "/api/v1/activity?limit=200", None, outsider);
+        assert!(feed["items"].as_array().unwrap().iter().all(|a| a["summary"].as_str().is_none_or(|s| !s.contains("“Board”"))));
+    }
+    assert_eq!(h.call("GET", &format!("/api/v1/posts/{minutes}"), None, &admin).status, 200);
+
+    // Someone outside it importing to the same path gets their own org-wide topic instead.
+    let other =
+        h.ok("POST", "/api/v1/import", Some(json!({ "documents": [{ "title": "x", "content": "y", "topic": "Leadership" }] })), &otto);
+    assert_eq!(other["topics_created"], 1);
+}
+
 fn plans(price: Option<&str>) -> dumbslab_core::plan::Plans {
     use dumbslab_core::plan::{Allowance, Plans};
     Plans {
