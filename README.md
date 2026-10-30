@@ -121,6 +121,12 @@ cd crates/worker && npx wrangler dev --env dev   # the hosted Cloudflare build, 
 
 See [AGENTS.md](AGENTS.md) for conventions, which apply to people too.
 
+## Support
+
+[Report a bug](https://github.com/tstout729/dumbslab/issues/new?template=bug_report.yml) with steps to reproduce it and what you expected to happen. Public issues are visible to everyone; leave out passwords, tokens, workspace content and other private details.
+
+For account, billing or other private support, email [simplycoo+dumbslab@mail.grokbot.com](mailto:simplycoo+dumbslab@mail.grokbot.com).
+
 ## License
 
 Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.

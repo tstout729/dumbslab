@@ -401,6 +401,9 @@ a.chip:hover { background: var(--bg-hover); color: var(--ink); text-decoration: 
 .main-col { flex: 1; min-width: 0; display: flex; flex-direction: column; }
 .main { flex: 1; outline: none; }
 .main:focus-visible { box-shadow: none; }
+.app-footer { padding: 16px 24px; border-top: 1px solid var(--line); font-size: 13px; color: var(--ink-3); }
+.app-footer nav { display: flex; flex-wrap: wrap; gap: 12px 24px; }
+.app-footer a { color: var(--ink-2); }
 .topbar { display: none; }
 .backdrop { position: fixed; inset: 0; background: rgb(10 10 25 / 38%); z-index: 25; }
 
