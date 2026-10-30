@@ -4,7 +4,7 @@
 import { api, enc } from '/api.js';
 import {
   h, icon, button, busy, toast, toastError, modal, confirmDialog, openPopover, closeLayers, debounce,
-  checkbox, select, emptyState, relTime, modKey, topicIcon,
+  checkbox, select, emptyState, relTime, modKey, topicIcon, BLOCK_RECORDING,
 } from '/ui.js';
 import { state, navigate, topicById, flatTopicTree, canEdit, myId } from '/state.js';
 import { openTopicForm } from '/views/topic.js';
@@ -354,7 +354,8 @@ function mountEditor(ctx, { post, initial, templates, startTemplate }) {
   const topicIds = new Set(initial.topic_ids);
   const picker = topicPicker(topicIds, () => changed());
   const ta = h('textarea', {
-    class: 'editor-text',
+    // People's own writing: session recordings show an empty box here (web/telemetry.js).
+    class: ['editor-text', BLOCK_RECORDING],
     'aria-label': 'Post content in Markdown',
     placeholder: 'Write in Markdown. Link posts by pasting their URL, mention people with @handle.',
     spellcheck: 'true',
@@ -369,7 +370,8 @@ function mountEditor(ctx, { post, initial, templates, startTemplate }) {
   const wordCount = h('span', { class: 'muted small' });
 
   // --- Uploads ---------------------------------------------------------------------------
-  const fileInput = h('input', { type: 'file', multiple: true, hidden: true, tabindex: '-1' });
+  // Recordings mask inputs but still read a file picker's value (`C:\fakepath\<name>`): block it.
+  const fileInput = h('input', { type: 'file', multiple: true, hidden: true, tabindex: '-1', class: BLOCK_RECORDING });
   const placeholderTag = Date.now().toString(36);
   let placeholderSeq = 0;
 
@@ -462,7 +464,7 @@ function mountEditor(ctx, { post, initial, templates, startTemplate }) {
   });
 
   const previewTitle = h('h1', { class: 'post-title preview-title' });
-  const previewBody = h('div', { class: 'prose post-body' });
+  const previewBody = h('div', { class: ['prose post-body', BLOCK_RECORDING] });
   const previewPane = h('div', { class: 'pane pane-preview', id: 'pane-preview', role: 'tabpanel', 'aria-label': 'Preview' }, previewTitle, previewBody);
   const writePane = h('div', { class: 'pane pane-write', id: 'pane-write', role: 'tabpanel', 'aria-label': 'Write' }, toolbar, ta, fileInput);
 

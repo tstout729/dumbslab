@@ -17,6 +17,7 @@ import * as notifications from '/views/notifications.js';
 import * as activity from '/views/activity.js';
 import * as insights from '/views/insights.js';
 import * as settings from '/views/settings.js';
+import { startTelemetry, reportError, pageChanging, pageShown } from '/telemetry.js';
 
 const ROUTES = [
   ['/', home.render],
@@ -180,6 +181,8 @@ async function render({ keepScroll = false } = {}) {
   currentKey = path + location.search;
   currentUrl = currentKey + location.hash;
   updateActiveNav(path);
+  // Before anything renders: recordings stop on pages that must never be recorded.
+  pageChanging(path);
   const match = matchRoute(path);
   const ctx = {
     params: match ? match.params : {},
@@ -212,12 +215,14 @@ async function render({ keepScroll = false } = {}) {
     else if (e instanceof ApiError && e.status === 401) return;
     else {
       console.error(e);
+      reportError(e);
       errorView(e, () => render());
     }
   } finally {
     clearTimeout(loadingTimer);
   }
   if (token !== navToken) return;
+  pageShown(path);
   if (!keepScroll) {
     if (location.hash) requestAnimationFrame(scrollToHash);
     else window.scrollTo(0, 0);
@@ -313,6 +318,8 @@ async function boot() {
     if (e.status !== 401) bootError(root, e);
     return;
   }
+  // Session recordings and error reports, only when the host set them up. Runs in the background.
+  startTelemetry(authState.telemetry, state.me.user);
 
   main = buildShell(root);
   setNavigator(navigate);
