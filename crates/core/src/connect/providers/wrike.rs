@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 
 use crate::connect::{
     Account, Connector, Credential, Detail, Field, Hit, HttpCall, HttpReply, OAuthSpec, Preview, ProviderInfo, TokenSet, excerpt, host_of,
-    http_error, opt, path_of, s, standard_token,
+    html_text, http_error, opt, path_of, s, standard_token,
 };
 
 pub struct Wrike;
@@ -77,78 +77,6 @@ fn api(host: &str, path: &str, cred: &Credential) -> HttpCall {
 /// A query string's value for `key`.
 fn param(query: &str, key: &str) -> Option<String> {
     query.split('&').filter_map(|p| p.split_once('=')).find(|(k, _)| *k == key).map(|(_, v)| v.to_string())
-}
-
-/// The text in an HTML description: tags dropped (with what's inside scripts and styles), block
-/// boundaries kept as spaces, and entities decoded. The result is only ever shown as text.
-fn html_text(html: &str) -> String {
-    const BLOCKS: &[&str] =
-        &["br", "p", "div", "li", "ul", "ol", "tr", "td", "th", "table", "h1", "h2", "h3", "h4", "h5", "h6", "blockquote", "pre", "hr"];
-    let mut out = String::with_capacity(html.len());
-    let mut rest = html;
-    while let Some(start) = rest.find('<') {
-        out.push_str(&rest[..start]);
-        rest = &rest[start..];
-        if let Some(after) = rest.strip_prefix("<!--") {
-            rest = after.find("-->").map_or("", |i| &after[i + 3..]);
-            continue;
-        }
-        let end = rest.find('>').map_or(rest.len(), |i| i + 1);
-        let inner = &rest[1..end];
-        let closing = inner.starts_with('/');
-        let name =
-            inner.trim_start_matches('/').split(|c: char| !c.is_ascii_alphanumeric()).next().unwrap_or_default().to_ascii_lowercase();
-        rest = &rest[end..];
-        if !closing && (name == "script" || name == "style") {
-            // ASCII lowercasing keeps byte offsets.
-            rest = rest.to_ascii_lowercase().find(&format!("</{name}")).map_or("", |i| &rest[i..]);
-        } else if BLOCKS.contains(&name.as_str()) {
-            out.push(' ');
-        }
-    }
-    out.push_str(rest);
-    decode_entities(&out)
-}
-
-fn decode_entities(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(i) = rest.find('&') {
-        out.push_str(&rest[..i]);
-        rest = &rest[i..];
-        let decoded = rest.find(';').filter(|&j| j <= 10).and_then(|j| entity(&rest[1..j]).map(|c| (c, j + 1)));
-        match decoded {
-            Some((c, len)) => {
-                out.push(c);
-                rest = &rest[len..];
-            }
-            None => {
-                out.push('&');
-                rest = &rest[1..];
-            }
-        }
-    }
-    out.push_str(rest);
-    out
-}
-
-fn entity(name: &str) -> Option<char> {
-    match name {
-        "amp" => Some('&'),
-        "lt" => Some('<'),
-        "gt" => Some('>'),
-        "quot" => Some('"'),
-        "apos" => Some('\''),
-        "nbsp" => Some(' '),
-        _ => {
-            let n = name.strip_prefix('#')?;
-            let code = match n.strip_prefix(['x', 'X']) {
-                Some(hex) => u32::from_str_radix(hex, 16).ok()?,
-                None => n.parse().ok()?,
-            };
-            char::from_u32(code)
-        }
-    }
 }
 
 impl Connector for Wrike {
@@ -420,11 +348,13 @@ mod tests {
 
     #[test]
     fn html_becomes_plain_text() {
-        assert_eq!(excerpt(&html_text("a<br>b<i>c</i>d"), 50), "a bcd");
-        assert_eq!(html_text("<STYLE>p{}</style>ok"), "ok");
-        assert_eq!(html_text("&unknown; &amp &#xZZ; &#128512;"), "&unknown; &amp &#xZZ; 😀");
-        assert_eq!(html_text("1 < 2"), "1 ", "a stray < swallows up to the next >, or the rest");
-        assert_eq!(html_text("x<a href='y'"), "x");
-        assert_eq!(html_text("<!-- never closed"), "");
+        // Descriptions go through `excerpt`, which collapses the spaces tags leave.
+        let text = |html: &str| excerpt(&html_text(html), 50);
+        assert_eq!(text("a<br>b<i>c</i>d"), "a bcd");
+        assert_eq!(text("<STYLE>p{}</style>ok"), "ok");
+        assert_eq!(text("&unknown; &amp &#xZZ; &#128512;"), "&unknown; &amp &#xZZ; 😀");
+        assert_eq!(text("1 < 2"), "1", "a stray < swallows up to the next >, or the rest");
+        assert_eq!(text("x<a href='y'"), "x");
+        assert_eq!(text("<!-- never closed"), "");
     }
 }

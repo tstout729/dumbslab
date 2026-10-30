@@ -112,6 +112,10 @@ How it works:
 
 To try it locally, create a Stripe sandbox, run `scripts/stripe-setup.sh local` against it, and put its `STRIPE_SECRET_KEY`, `STRIPE_PRICE_ID` and the secret `stripe listen --forward-to http://localhost:8787/api/stripe/webhook` prints in `crates/worker/.dev.vars`.
 
+### Connected apps
+
+Set the `CONNECTOR_KEY` secret to let people connect GitHub, Google Drive, Jira and other apps; register OAuth apps to let them sign in instead of pasting tokens. The redirect URL is `https://<root domain>/connect/callback` for every workspace. See [connected-apps.md](connected-apps.md).
+
 ### Operator API
 
 Manage workspaces with `Authorization: Bearer $OPERATOR_TOKEN` on the root domain:

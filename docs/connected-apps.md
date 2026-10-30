@@ -42,3 +42,35 @@ The redirect (callback) URL to register is:
 - self-hosted or a single workspace: `<your public URL>/connect/callback`.
 
 The person who started signing in must be the one who comes back, signed in to the workspace, within 15 minutes; each sign-in link works once.
+
+## The apps
+
+| App | `<APP>` | Search | Link previews | Connect with a token | Sign in |
+| --- | --- | --- | --- | --- | --- |
+| GitHub | `GITHUB` | issues, pull requests, repositories | issues, pull requests | personal access token (fine-grained read-only works) | OAuth app |
+| Google Drive | `GOOGLE_DRIVE` | files in My Drive and shared drives | | | OAuth client (see below) |
+| Slack | `SLACK` | messages | | | Slack app with a user token (`search:read`) |
+| Jira | `JIRA` | issues | issues | site, email and API token | Atlassian OAuth 2.0 (3LO) app |
+| Confluence | `CONFLUENCE` | pages and blog posts | | site, email and API token | Atlassian OAuth 2.0 (3LO) app |
+| Zendesk | `ZENDESK` | tickets, Help Center articles | tickets | subdomain, email and API token | |
+| Asana | `ASANA` | tasks, projects | tasks | personal access token | OAuth app |
+| Box | `BOX` | files and folders | | | OAuth app |
+| Dropbox | `DROPBOX` | files and folders | | | app with PKCE |
+| Guru | `GURU` | cards | cards | email and user token | |
+| GitLab | `GITLAB` | | issues, merge requests | personal access token (and the server's URL for self-managed GitLab) | gitlab.com OAuth app |
+| Linear | `LINEAR` | | issues | personal API key | OAuth app |
+| Freshdesk | `FRESHDESK` | | tickets | domain and API key | |
+| Shortcut | `SHORTCUT` | | stories | API token | |
+| Todoist | `TODOIST` | | tasks | API token | OAuth app |
+| Trello | `TRELLO` | | cards | API key and token | Atlassian OAuth 2.0 app for Trello |
+| ClickUp | `CLICKUP` | | tasks | personal token | OAuth app |
+| monday.com | `MONDAY` | | items | API token | OAuth app with the new OAuth flow turned on |
+| Wrike | `WRIKE` | | tasks | permanent access token | OAuth app |
+
+Things worth knowing before you register apps:
+
+- **Google Drive** needs the `drive.readonly` scope, which Google calls restricted: a public app must pass Google's verification before more than 100 people can connect. Until then, add testers to the OAuth consent screen.
+- **Slack**'s terms allow distributing an app commercially only through the Slack Marketplace, so hosted DumbSlab's shared Slack app needs a listing. A self-hosted server's own Slack app counts as internal. Message search uses `search.messages`, which works for any app.
+- **Zendesk** is retiring API tokens: no new ones since October 27, 2026, and existing ones stop working on April 30, 2027. Zendesk's own OAuth clients belong to one Zendesk account, so a shared app needs a global OAuth client that Zendesk approves; until then, Zendesk works only with existing tokens.
+- **Atlassian** (Jira, Confluence, Trello) uses one developer console. Add the "User identity API" so DumbSlab can show whose account it is.
+- **Asana**'s OAuth app should ask only for `users:read`, `workspaces:read`, `workspaces.typeahead:read`, `tasks:read` and `projects:read`.

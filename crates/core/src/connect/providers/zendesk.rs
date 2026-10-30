@@ -26,8 +26,8 @@ use std::collections::BTreeMap;
 use serde_json::{Value, json};
 
 use crate::connect::{
-    Account, Connector, Credential, Detail, Field, Hit, HttpCall, HttpReply, Preview, ProviderInfo, excerpt, host_of, http_error, opt,
-    path_of, s,
+    Account, Connector, Credential, Detail, Field, Hit, HttpCall, HttpReply, Preview, ProviderInfo, excerpt, host_of, html_text,
+    http_error, opt, path_of, s,
 };
 
 pub struct Zendesk;
@@ -113,77 +113,6 @@ fn names(users: &Value) -> BTreeMap<i64, String> {
 /// Zendesk's status as people read it: `hold` is shown as "on hold".
 fn status(v: &Value) -> Option<String> {
     opt(v).map(|st| if st == "hold" { "on hold".into() } else { st })
-}
-
-/// Help Center HTML as text: tags dropped (all but inline ones leave a space), scripts and
-/// styles skipped, entities decoded.
-fn html_text(html: &str) -> String {
-    const INLINE: &[&str] = &["a", "abbr", "b", "code", "em", "i", "mark", "s", "small", "span", "strong", "sub", "sup", "u"];
-    let mut out = String::with_capacity(html.len());
-    let mut rest = html;
-    while let Some(start) = rest.find('<') {
-        out.push_str(&rest[..start]);
-        let tag_text = &rest[start..];
-        let end = tag_text.find('>').map_or(tag_text.len(), |e| e + 1);
-        let closing = tag_text[1..].starts_with('/');
-        let name: String = tag_text[1..end]
-            .trim_start_matches('/')
-            .chars()
-            .take_while(char::is_ascii_alphanumeric)
-            .collect::<String>()
-            .to_ascii_lowercase();
-        rest = &tag_text[end..];
-        if !closing && matches!(name.as_str(), "script" | "style") {
-            let close = format!("</{name}");
-            rest = match rest.to_ascii_lowercase().find(&close) {
-                Some(i) => {
-                    let tail = &rest[i..];
-                    &tail[tail.find('>').map_or(tail.len(), |e| e + 1)..]
-                }
-                None => "",
-            };
-        }
-        if !INLINE.contains(&name.as_str()) {
-            out.push(' ');
-        }
-    }
-    out.push_str(rest);
-    decode_entities(&out)
-}
-
-fn decode_entities(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(i) = rest.find('&') {
-        out.push_str(&rest[..i]);
-        let from = &rest[i..];
-        let entity = from.find(';').filter(|&e| e <= 10).map(|e| &from[1..e]);
-        let ch = entity.and_then(|e| match e {
-            "amp" => Some('&'),
-            "lt" => Some('<'),
-            "gt" => Some('>'),
-            "quot" => Some('"'),
-            "apos" => Some('\''),
-            "nbsp" => Some(' '),
-            _ => match e.strip_prefix("#x").or_else(|| e.strip_prefix("#X")) {
-                Some(hex) => u32::from_str_radix(hex, 16).ok(),
-                None => e.strip_prefix('#').and_then(|d| d.parse().ok()),
-            }
-            .and_then(char::from_u32),
-        });
-        match (ch, entity) {
-            (Some(c), Some(e)) => {
-                out.push(c);
-                rest = &from[e.len() + 2..];
-            }
-            _ => {
-                out.push('&');
-                rest = &from[1..];
-            }
-        }
-    }
-    out.push_str(rest);
-    out
 }
 
 fn ticket_hit(host: &str, t: &Value, users: &BTreeMap<i64, String>) -> Hit {

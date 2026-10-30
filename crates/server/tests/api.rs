@@ -2413,7 +2413,7 @@ mod connected {
             .with_tx(|db| {
                 (db.execute(
                     "INSERT INTO connections (user_id, provider, account, settings, secret, expires_at, created_at, updated_at) VALUES (?, 'google-drive', 'ada@acme.test', '{}', ?, ?, ?, ?)",
-                    &dumbslab_core::params![user_id.clone(), sealed, past.clone(), past.clone(), past],
+                    &dumbslab_core::params![user_id.clone(), sealed, past.clone(), past.clone(), past.clone()],
                 ), true)
             })
             .unwrap()
@@ -2444,5 +2444,45 @@ mod connected {
             .unwrap();
         assert_eq!(connect::open("connector-key", &user_id, "google-drive", &secret).unwrap().token, "new");
         assert!(expires > dumbslab_core::util::ts(chrono::Utc::now()));
+
+        // Two searches refresh at once: the second's refresh token was already spent by the first,
+        // which saved new tokens, so the second uses those instead of asking to reconnect.
+        let stale = connect::seal(
+            "connector-key",
+            &user_id,
+            "google-drive",
+            &connect::Credential { token: "new".into(), refresh_token: Some("refresh-2".into()), ..Default::default() },
+        )
+        .unwrap();
+        h.store
+            .with_tx(|db| {
+                (db.execute("UPDATE connections SET secret = ?, expires_at = ?", &dumbslab_core::params![stale, past.clone()]), true)
+            })
+            .unwrap()
+            .unwrap();
+        let first = job_of(&h.call("GET", "/api/v1/search/connected?q=budget", None, &admin));
+        let second = job_of(&h.call("GET", "/api/v1/search/connected?q=budget", None, &admin));
+        let answer = |c: &HttpCall| {
+            if c.url.contains("oauth2.googleapis.com/token") {
+                ok(json!({ "access_token": "newer", "refresh_token": "refresh-3", "expires_in": 3600 }))
+            } else {
+                ok(json!({ "files": [] }))
+            }
+        };
+        // The first refresh is answered; it saves "newer".
+        drive(&h, first, &answer);
+        let (finish, sent) = drive(&h, second, &|c: &HttpCall| {
+            if c.url.contains("oauth2.googleapis.com/token") {
+                HttpReply { status: 400, body: json!({ "error": "invalid_grant" }).to_string() }
+            } else {
+                ok(json!({ "files": [] }))
+            }
+        });
+        assert!(sent.last().unwrap().headers.contains(&("authorization".into(), "Bearer newer".into())), "{sent:?}");
+        let v = match finish {
+            Finish::Fill(v) => v,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(v["apps"][0]["ok"], true, "{v}");
     }
 }

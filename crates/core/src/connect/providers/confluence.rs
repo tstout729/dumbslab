@@ -47,44 +47,7 @@ fn plain(text: &str) -> String {
             _ => {}
         }
     }
-    let mut out = String::with_capacity(untagged.len());
-    let mut rest = untagged.as_str();
-    while let Some(at) = rest.find('&') {
-        out.push_str(&rest[..at]);
-        let tail = &rest[at..];
-        match tail.find(';').filter(|&end| end <= 10).and_then(|end| Some((entity(&tail[1..end])?, end))) {
-            Some((c, end)) => {
-                out.push(c);
-                rest = &tail[end + 1..];
-            }
-            None => {
-                out.push('&');
-                rest = &tail[1..];
-            }
-        }
-    }
-    out.push_str(rest);
-    out
-}
-
-fn entity(name: &str) -> Option<char> {
-    match name {
-        "amp" => Some('&'),
-        "lt" => Some('<'),
-        "gt" => Some('>'),
-        "quot" => Some('"'),
-        "apos" => Some('\''),
-        "nbsp" => Some(' '),
-        "hellip" => Some('…'),
-        _ => {
-            let number = name.strip_prefix('#')?;
-            let code = match number.strip_prefix(['x', 'X']) {
-                Some(hex) => u32::from_str_radix(hex, 16).ok()?,
-                None => number.parse().ok()?,
-            };
-            char::from_u32(code)
-        }
-    }
+    crate::connect::decode_entities(&untagged)
 }
 
 /// A page's address on the site, from the link Confluence gives (relative to `/wiki`).

@@ -388,6 +388,93 @@ pub fn excerpt(text: &str, max: usize) -> String {
     format!("{cut}…")
 }
 
+/// HTML as plain text, in time linear in its length: tags dropped (all but inline ones leave a
+/// space), scripts and styles skipped with their content, entities decoded. Reads at most 64 KB;
+/// previews and snippets need far less.
+pub fn html_text(html: &str) -> String {
+    const INLINE: &[&str] = &["a", "abbr", "b", "code", "em", "i", "mark", "s", "small", "span", "strong", "sub", "sup", "u"];
+    let html = head(html, 64 * 1024);
+    // ASCII lowercasing keeps every byte offset, so `lower` and `html` index alike.
+    let lower = html.to_ascii_lowercase();
+    let mut out = String::with_capacity(html.len());
+    let mut at = 0;
+    while let Some(found) = html[at..].find('<') {
+        let start = at + found;
+        out.push_str(&html[at..start]);
+        let end = html[start..].find('>').map_or(html.len(), |e| start + e + 1);
+        let tag = &lower[start + 1..end];
+        let closing = tag.starts_with('/');
+        let name: String = tag.trim_start_matches('/').chars().take_while(char::is_ascii_alphanumeric).collect();
+        at = end;
+        if !closing && matches!(name.as_str(), "script" | "style") {
+            // Searching on from here only: each byte is looked at a bounded number of times.
+            at = match lower[at..].find(&format!("</{name}")) {
+                Some(i) => html[at + i..].find('>').map_or(html.len(), |e| at + i + e + 1),
+                None => html.len(),
+            };
+        }
+        if !INLINE.contains(&name.as_str()) {
+            out.push(' ');
+        }
+    }
+    out.push_str(&html[at..]);
+    decode_entities(&out)
+}
+
+/// `&amp;`, `&lt;`, `&#39;`, `&#x27;` and the like decoded; anything else left as it is. Linear:
+/// an entity's `;` is looked for only in the next few bytes.
+pub fn decode_entities(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(i) = rest.find('&') {
+        out.push_str(&rest[..i]);
+        let from = &rest[i..];
+        let semi = from.bytes().take(12).position(|b| b == b';');
+        let decoded = semi.and_then(|e| {
+            let name = &from[1..e];
+            let ch = match name {
+                "amp" => Some('&'),
+                "lt" => Some('<'),
+                "gt" => Some('>'),
+                "quot" => Some('"'),
+                "apos" => Some('\''),
+                "nbsp" => Some(' '),
+                "hellip" => Some('…'),
+                _ => match name.strip_prefix("#x").or_else(|| name.strip_prefix("#X")) {
+                    Some(hex) => u32::from_str_radix(hex, 16).ok(),
+                    None => name.strip_prefix('#').and_then(|d| d.parse().ok()),
+                }
+                .and_then(char::from_u32),
+            };
+            ch.map(|c| (c, e))
+        });
+        match decoded {
+            Some((c, e)) => {
+                out.push(c);
+                rest = &from[e + 1..];
+            }
+            None => {
+                out.push('&');
+                rest = &from[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// At most `max` bytes of `s`, cut at a character boundary.
+fn head(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 /// A JSON string field, or "".
 pub fn s(v: &Value) -> String {
     v.as_str().unwrap_or_default().to_string()
@@ -897,7 +984,16 @@ fn apply_refresh(
     now: DateTime<Utc>,
 ) -> ApiResult<bool> {
     let p = providers::get(conn.provider).expect("known provider");
-    let Ok(tokens) = p.read_token(reply) else { return Ok(false) };
+    let Ok(tokens) = p.read_token(reply) else {
+        // Apps that hand out a new refresh token each time (Box, Atlassian, monday) refuse the old
+        // one once another request used it first. That request saved fresh tokens: use them.
+        let saved = connections(db, cfg, user_id)?.into_iter().find(|c| c.provider == conn.provider);
+        if let Some(saved) = saved.filter(|s| s.cred.token != conn.cred.token && !needs_refresh(cfg, s, now)) {
+            *conn = saved;
+            return Ok(true);
+        }
+        return Ok(false);
+    };
     conn.cred.token = tokens.access_token.clone();
     if let Some(r) = tokens.refresh_token.clone() {
         conn.cred.refresh_token = Some(r);
@@ -1157,6 +1253,24 @@ mod tests {
         for bad in ["javascript:alert(1)", "data:text/html,x", "//x.test", "JaVaScRiPt:x"] {
             assert_eq!(web_link(bad), "", "{bad}");
         }
+    }
+
+    #[test]
+    fn html_becomes_text_in_linear_time() {
+        assert_eq!(html_text("<p>One</p><p>Two <b>bold</b>er</p>"), " One  Two bolder ");
+        assert_eq!(html_text("a<script>alert('<p>')</script>b<STYLE>p{}</STYLE>c"), "a b c");
+        assert_eq!(html_text("&lt;tag&gt; &amp;amp; &#39;x&#x27; &nbsp;&bogus; & done"), "<tag> &amp; 'x'  &bogus; & done");
+        assert_eq!(html_text("unclosed <a href"), "unclosed ");
+        assert_eq!(html_text("<!-- never closed"), " ");
+        assert_eq!(html_text("é<b>ü</b>"), "éü");
+        // Inputs built to make naive versions quadratic finish quickly.
+        let started = std::time::Instant::now();
+        html_text(&"<script>".repeat(200_000));
+        html_text(&"<style>x".repeat(200_000));
+        decode_entities(&"&".repeat(2_000_000));
+        decode_entities(&"&amp".repeat(500_000));
+        assert!(started.elapsed() < std::time::Duration::from_secs(2), "took {:?}", started.elapsed());
+        assert_eq!(html_text(&"a".repeat(100_000)).len(), 64 * 1024, "capped");
     }
 
     #[test]
