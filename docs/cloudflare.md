@@ -25,7 +25,7 @@ There are two modes:
 
 The checked-in `crates/worker/wrangler.toml` deploys dumbslab.com in this mode. For your own domain:
 
-1. Set `ROOT_DOMAIN` and the three `routes` to your domain.
+1. Set `ROOT_DOMAIN` and the three `routes` to your domain. Also replace `https://dumbslab.com` in `web/welcome.html`: the sign-up page's canonical link, social tags and structured data name it.
 2. Add a proxied wildcard DNS record so workspace subdomains reach the Worker: type `AAAA`, name `*`, content `100::`, proxied. Cloudflare's free Universal SSL covers one level of subdomains.
 3. Add the secrets and deploy:
 
@@ -42,7 +42,9 @@ How sign-up works:
 2. The `Directory` object reserves the address for an hour. It enforces the limits below.
 3. The browser goes to `https://address.your-domain/setup` with a signed link, and the person creates the admin account.
 
-An address nobody has signed up for answers "no workspace here" and creates no storage.
+An address nobody has signed up for answers "no workspace here" and creates no storage. While someone types, the form asks `GET /api/signup/check?address=…` whether the address is free.
+
+For search engines and agents, the root domain serves `/robots.txt`, `/sitemap.xml` and `/llms.txt`, built from `ROOT_DOMAIN`. The `llms.txt` explains how an agent can start a sign-up for a person. Every workspace subdomain answers `/robots.txt` with `Disallow: /`, so its sign-in pages stay out of search results.
 
 ### Changing a workspace's address
 

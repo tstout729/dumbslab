@@ -133,6 +133,55 @@ pub fn hsts(multi_tenant: bool) -> &'static str {
     if multi_tenant { "max-age=31536000; includeSubDomains" } else { "max-age=31536000" }
 }
 
+/// The sign-up site's `/robots.txt`. Workspaces answer with their own, which keeps crawlers out.
+pub fn root_robots_txt(root: &str) -> String {
+    format!("User-agent: *\nAllow: /\nDisallow: /api/\n\nSitemap: https://{root}/sitemap.xml\n")
+}
+
+/// The sign-up site's `/sitemap.xml`: it has one public page.
+pub fn root_sitemap_xml(root: &str) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">\n  <url><loc>https://{root}/</loc></url>\n</urlset>\n"
+    )
+}
+
+/// The sign-up site's `/llms.txt`: what DumbSlab is, and how an agent signs a person up and
+/// connects to a workspace. Each workspace serves its own detailed guide.
+pub fn root_llms_txt(root: &str) -> String {
+    format!(
+        "# DumbSlab
+
+> DumbSlab is a free, open-source team wiki and knowledge base, in the spirit of Slab, built so AI agents can do everything people can. Every workspace has its own MCP server and REST API.
+
+Hosted workspaces are free at https://{root}/ with no credit card. Each workspace has its own address, such as https://acme.{root}. The same software runs self-hosted as one Rust binary with one SQLite file, or on Cloudflare Workers.
+
+## Create a workspace
+
+- A person signs up at https://{root}/: they pick a workspace name and an address, then create the admin account.
+- An agent can start sign-up for a person: `POST https://{root}/api/signup` with the header `x-dumbslab-client: agent` and a JSON body such as `{{\"workspace_name\": \"Acme\", \"address\": \"acme\"}}`. The reply's `setup_url` is a one-hour link; give it to the person to create their admin account.
+- `GET https://{root}/api/signup/check?address=acme` answers `{{\"available\": true}}` or `{{\"available\": false, \"message\": \"…\"}}`.
+- Addresses are 3 to 32 lowercase letters, digits and single hyphens.
+
+## Connect an agent to a workspace
+
+- MCP server: `https://<address>.{root}/mcp` (Streamable HTTP). Clients that support OAuth, such as Claude, ChatGPT and Cursor, need only the URL; the person approves access in the browser. Other clients send `Authorization: Bearer <token>` with a token from Settings › API tokens.
+- `?toolset=core` lists about 15 everyday tools plus `call_operation`, which reaches everything else. `?toolset=read` lists only read-only tools.
+- REST API: `https://<address>.{root}/api/v1`, described by OpenAPI 3.1 at `/api/v1/openapi.json`.
+- Every workspace serves a full agent guide at `https://<address>.{root}/llms.txt`.
+- Edits are precise: find and replace, or change one section by its heading. Pass `base_version` to get a 409 conflict instead of overwriting a teammate's change.
+
+## Self-host
+
+- [Source code](https://github.com/tstout729/dumbslab): Rust, dual-licensed MIT or Apache-2.0.
+- [README](https://github.com/tstout729/dumbslab/blob/main/README.md): features, quick start, MCP, REST and the CLI.
+- [Deploying to Cloudflare](https://github.com/tstout729/dumbslab/blob/main/docs/cloudflare.md)
+
+DumbSlab is an independent project, not affiliated with Slab, Inc.
+"
+    )
+}
+
 /// A sign-up link token: `{expiry}.{HMAC(secret, "setup|{workspace}|{expiry}")}`.
 pub fn signup_token(secret: &str, workspace: &str, expires_unix: i64) -> String {
     format!("{expires_unix}.{}", hmac_sha256_hex(secret, &format!("setup|{workspace}|{expires_unix}")))
@@ -194,13 +243,8 @@ pub fn reserve(db: &dyn Db, slug: &str, name: &str, ip_hash: &str, now: DateTime
         return Err(ApiError::bad_request("the workspace name must be 1 to 80 characters"));
     }
     let now_s = ts(now);
-    if let Some(row) = db.one("SELECT status, reserved_until FROM workspaces WHERE slug = ?", &params![slug])?
-        && (row.str("status") != "reserved" || row.str("reserved_until") > now_s)
-    {
-        return Err(ApiError::conflict(format!("{slug} is taken; pick another address")));
-    }
-    if db.one("SELECT home FROM addresses WHERE slug = ?", &params![slug])?.is_some() {
-        return Err(ApiError::conflict(format!("{slug} is taken; pick another address")));
+    if is_taken(db, slug, &now_s)? {
+        return Err(ApiError::conflict(taken_message(slug)));
     }
     let day_ago = ts(now - Duration::days(1));
     let from_ip =
@@ -226,6 +270,29 @@ pub fn reserve(db: &dyn Db, slug: &str, name: &str, ip_hash: &str, now: DateTime
         &params![slug, name, ip_hash, now_s, ts(until)],
     )?;
     Ok(until)
+}
+
+/// Whether a workspace, a live reservation or a moved workspace's old address holds `slug`.
+fn is_taken(db: &dyn Db, slug: &str, now_s: &str) -> ApiResult<bool> {
+    if let Some(row) = db.one("SELECT status, reserved_until FROM workspaces WHERE slug = ?", &params![slug])?
+        && (row.str("status") != "reserved" || row.str("reserved_until").as_str() > now_s)
+    {
+        return Ok(true);
+    }
+    Ok(db.one("SELECT home FROM addresses WHERE slug = ?", &params![slug])?.is_some())
+}
+
+fn taken_message(slug: &str) -> String {
+    format!("{slug} is taken; pick another address")
+}
+
+/// Why an address can't be claimed, or `None` when it's free. The sign-up form asks while
+/// someone types; `reserve` checks again, along with the sign-up limits.
+pub fn address_unavailable(db: &dyn Db, slug: &str, now: DateTime<Utc>) -> ApiResult<Option<String>> {
+    if let Err(message) = validate_slug(slug) {
+        return Ok(Some(message));
+    }
+    Ok(is_taken(db, slug, &ts(now))?.then(|| taken_message(slug)))
 }
 
 /// Whether a sign-up link (by its expiry) matches the address's current, live reservation.
@@ -434,6 +501,19 @@ mod tests {
             assert_eq!(https_upgrade(local), None, "{local}");
         }
         assert!(hsts(true).contains("includeSubDomains") && !hsts(false).contains("includeSubDomains"));
+    }
+
+    #[test]
+    fn root_site_files_name_the_root_domain() {
+        let robots = root_robots_txt("kb.test");
+        assert!(robots.contains("Allow: /\n") && robots.contains("Disallow: /api/\n"), "{robots}");
+        assert!(robots.ends_with("Sitemap: https://kb.test/sitemap.xml\n"), "{robots}");
+        assert!(root_sitemap_xml("kb.test").contains("<loc>https://kb.test/</loc>"));
+        let llms = root_llms_txt("kb.test");
+        assert!(llms.starts_with("# DumbSlab\n\n> "), "llms.txt opens with a title and summary");
+        for want in ["POST https://kb.test/api/signup", "https://<address>.kb.test/mcp", "{\"workspace_name\": \"Acme\""] {
+            assert!(llms.contains(want), "missing {want}");
+        }
     }
 
     #[test]

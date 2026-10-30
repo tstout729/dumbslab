@@ -17,7 +17,7 @@ pub use directory::Directory;
 pub use workspace::Workspace;
 
 use chrono::Utc;
-use dumbslab_core::http::is_core_path;
+use dumbslab_core::http::{WORKSPACE_ROBOTS_TXT, is_core_path};
 use dumbslab_core::tenancy::{self, HostKind};
 use dumbslab_core::util::{secure_eq, sha256_hex};
 use serde::Deserialize;
@@ -71,6 +71,10 @@ async fn route(req: Request, env: Env, url: &Url) -> Result<Response> {
     match tenancy::host_kind(&host, &root) {
         HostKind::Root => root_site(req, &env, &root, &path).await,
         HostKind::Workspace(slug) if tenancy::validate_slug(&slug).is_ok() => {
+            // The same answer for every address, claimed or not, without waking a workspace.
+            if path == "/robots.txt" {
+                return text_response(WORKSPACE_ROBOTS_TXT.into(), "text/plain; charset=utf-8");
+            }
             if !is_core_path(&path) {
                 return env.assets("ASSETS")?.fetch_request(req).await;
             }
@@ -140,7 +144,10 @@ async fn root_site(req: Request, env: &Env, root: &str, path: &str) -> Result<Re
             env.assets("ASSETS")?.fetch_request(Request::new(url.as_str(), Method::Get)?).await
         }
         (Method::Get, "/healthz") => json_response(200, &json!({ "ok": true, "version": dumbslab_core::VERSION })),
-        (Method::Get, "/llms.txt") => Response::ok(root_guide(root)),
+        (Method::Get | Method::Head, "/llms.txt") => text_response(tenancy::root_llms_txt(root), "text/plain; charset=utf-8"),
+        (Method::Get | Method::Head, "/robots.txt") => text_response(tenancy::root_robots_txt(root), "text/plain; charset=utf-8"),
+        (Method::Get | Method::Head, "/sitemap.xml") => text_response(tenancy::root_sitemap_xml(root), "application/xml; charset=utf-8"),
+        (Method::Get, "/api/signup/check") => check_address(&req, env).await,
         (Method::Post, "/api/signup") => signup(req, env, root).await,
         (_, p) if p.starts_with("/api/operator/") => operator(req, env, p).await,
         // Static files the sign-up page uses.
@@ -163,15 +170,25 @@ async fn root_site(req: Request, env: &Env, root: &str, path: &str) -> Result<Re
     }
 }
 
-fn root_guide(root: &str) -> String {
-    format!(
-        "# DumbSlab\n\n\
-         > A free, open-source team knowledge base (in the spirit of Slab) built so AI agents can do anything people can.\n\n\
-         - Create a free workspace at https://{root}/ — each workspace gets its own address, e.g. https://acme.{root}.\n\
-         - Every workspace has a REST API (https://acme.{root}/api/v1), an MCP server (https://acme.{root}/mcp, OAuth or bearer token)\n\
-           and its own agent guide at https://acme.{root}/llms.txt.\n\
-         - Self-host it instead: one Rust binary and one SQLite file.\n"
-    )
+/// A plain-text file for crawlers and agents. It changes only when the Worker deploys.
+fn text_response(body: String, content_type: &str) -> Result<Response> {
+    let headers = Headers::new();
+    headers.set("content-type", content_type)?;
+    headers.set("cache-control", "public, max-age=3600")?;
+    Ok(Response::ok(body)?.with_headers(headers))
+}
+
+/// Whether an address is free, so the sign-up form can say so while someone types. `/api/signup`
+/// checks again when they submit.
+async fn check_address(req: &Request, env: &Env) -> Result<Response> {
+    let url = req.url()?;
+    let slug = url.query_pairs().find(|(k, _)| k == "address").map(|(_, v)| v.trim().to_ascii_lowercase()).unwrap_or_default();
+    // Malformed and reserved addresses never reach the directory.
+    if let Err(message) = tenancy::validate_slug(&slug) {
+        return json_response(200, &json!({ "available": false, "message": message }));
+    }
+    let (status, reply) = call_object(env, "DIRECTORY", "directory", Method::Post, "/available", Some(&json!({ "slug": slug }))).await?;
+    json_response(status, &reply)
 }
 
 #[derive(Deserialize)]

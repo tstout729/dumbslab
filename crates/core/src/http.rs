@@ -30,10 +30,14 @@ pub fn body_limit(path: &str) -> usize {
     }
 }
 
+/// A workspace's `/robots.txt`. Workspaces are private, so crawlers stay out of their sign-in pages.
+pub const WORKSPACE_ROBOTS_TXT: &str = "User-agent: *\nDisallow: /\n";
+
 /// Whether the core handles this path (everything else is the web app's static files).
 pub fn is_core_path(path: &str) -> bool {
     path == "/healthz"
         || path == "/llms.txt"
+        || path == "/robots.txt"
         || path == "/mcp"
         || path.starts_with("/oauth/")
         || path.starts_with("/.well-known/oauth")
@@ -49,6 +53,8 @@ pub fn handle(db: &dyn Db, cfg: &HostConfig, req: &Request) -> Option<Outcome> {
         done(Response::json(200, &json!({ "ok": true, "version": crate::VERSION })))
     } else if path == "/llms.txt" {
         done(Response::text(200, "text/plain; charset=utf-8", crate::openapi::llms_txt(&base_url(cfg, req))))
+    } else if path == "/robots.txt" {
+        done(Response::text(200, "text/plain; charset=utf-8", WORKSPACE_ROBOTS_TXT))
     } else if path == "/mcp" {
         crate::mcp::handle_http(db, cfg, req)
     } else if path.starts_with("/oauth/") || path.starts_with("/.well-known/oauth") {

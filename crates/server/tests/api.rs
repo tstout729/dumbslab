@@ -898,6 +898,8 @@ fn rest_routing_and_docs() {
     assert!(spec["paths"]["/api/v1/posts/{id}"]["patch"]["requestBody"].is_object());
     let llms = h.call("GET", "/llms.txt", None, &Auth::None);
     assert!(llms.text().contains("https://kb.test/mcp"));
+    let robots = h.call("GET", "/robots.txt", None, &Auth::None);
+    assert_eq!((robots.status, robots.text().as_str()), (200, "User-agent: *\nDisallow: /\n"), "workspaces keep crawlers out");
 }
 
 #[test]
@@ -948,9 +950,12 @@ fn directory_reserves_addresses_within_limits() {
     let reserve = |slug: &'static str, ip: &'static str, at| run(&move |db| tenancy::reserve(db, slug, "Name", ip, at, limits).map(|_| ()));
     let status = |r: dumbslab_core::ApiResult<()>| r.err().map(|e| e.status);
     run(&|db| tenancy::directory_migrate(db)).unwrap();
+    let unavailable = |slug: &'static str, at| h.store.with_tx(|db| (tenancy::address_unavailable(db, slug, at), true)).unwrap().unwrap();
 
     // Taken while reserved, and once active. A sign-up link names exactly one live reservation.
+    assert_eq!(unavailable("acme", t0), None);
     assert_eq!(status(reserve("acme", "ip1", t0)), None);
+    assert_eq!(unavailable("acme", t0).as_deref(), Some("acme is taken; pick another address"));
     let matches = |slug: &'static str, expires: i64, at| {
         h.store.with_tx(|db| (tenancy::reservation_matches(db, slug, expires, at), true)).unwrap().unwrap()
     };
@@ -971,6 +976,10 @@ fn directory_reserves_addresses_within_limits() {
     run(&|db| tenancy::activate(db, "eps", t0)).unwrap();
     assert_eq!(status(reserve("zeta", "ip11", t0)), Some(429));
     // Two days later: beta's abandoned reservation is free again, then the total cap applies.
+    assert!(unavailable("beta", t0).is_some());
+    assert_eq!(unavailable("beta", t1), None);
+    assert!(unavailable("acme", t1).is_some(), "active workspaces stay taken");
+    assert!(unavailable("www", t1).unwrap().contains("reserved"));
     assert_eq!(status(reserve("beta", "ip3", t1)), None);
     assert_eq!(status(reserve("eta", "ip4", t1)), None);
     assert_eq!(status(reserve("theta", "ip5", t1)), Some(503));
@@ -1105,6 +1114,8 @@ fn directory_moves_addresses() {
     assert_eq!(status(mv("acme", "www", t0)), Some(400));
     assert_eq!(status(mv("acme", "wiki", t0)), None);
     // Both addresses now belong to acme, for good.
+    let unavailable = |slug: &'static str| h.store.with_tx(|db| (tenancy::address_unavailable(db, slug, t0), true)).unwrap().unwrap();
+    assert!(unavailable("wiki").is_some(), "the sign-up form calls a moved-to address taken");
     assert_eq!(status(reserve("wiki", t0)), Some(409));
     assert_eq!(status(reserve("acme", t0 + Duration::days(3))), Some(409));
     assert_eq!(status(mv("beta", "wiki", t0)), Some(409));

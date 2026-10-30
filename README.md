@@ -86,6 +86,8 @@ dumbslab call search '{"q":"onboarding"}' --as you@example.com
 dumbslab openapi > openapi.json
 ```
 
+An agent can also start a hosted workspace for a person: [dumbslab.com/llms.txt](https://dumbslab.com/llms.txt) explains how.
+
 Give each agent its own bot account (Settings → People → Add bot) and token. Its edits then show up under its own name in history and activity, with a badge showing whether they came in via `api`, `mcp` or `cli`.
 
 ## Permissions
