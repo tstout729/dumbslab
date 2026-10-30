@@ -369,6 +369,12 @@ pub fn http_error(name: &str, reply: &HttpReply) -> String {
     }
 }
 
+/// Only web links leave the core: an app's answer could hold a `javascript:` URL.
+fn web_link(url: &str) -> String {
+    let lower = url.trim().to_ascii_lowercase();
+    if lower.starts_with("https://") || lower.starts_with("http://") { url.trim().to_string() } else { String::new() }
+}
+
 /// Plain text, whitespace collapsed, at most `max` characters.
 pub fn excerpt(text: &str, max: usize) -> String {
     let collapsed: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -698,6 +704,25 @@ pub fn fill_pending(body: &[u8], value: &Value) -> Option<Vec<u8>> {
     Some(text.replace(&format!("\\\"{PENDING}\\\""), escaped).replace(&format!("\"{PENDING}\""), &raw).into_bytes())
 }
 
+/// The answer to send once a job finished: `response` with the result filled in, a redirect, or
+/// an error.
+pub fn respond(mut response: crate::Response, finish: Finish) -> crate::Response {
+    match finish {
+        Finish::Fill(value) => match fill_pending(&response.body, &value) {
+            Some(body) => {
+                response.body = body;
+                response
+            }
+            None => crate::Response::error(&ApiError::internal("the result had nowhere to go")),
+        },
+        Finish::Redirect(url) => crate::Response::redirect(&url).with_header("cache-control", "no-store"),
+        Finish::Fail(e) => crate::Response::error(&e),
+    }
+}
+
+/// Response bodies read from an app, at most. Larger answers are cut off (and won't parse).
+pub const MAX_REPLY_BYTES: usize = 4 * 1024 * 1024;
+
 /// What a job does next.
 #[derive(Debug)]
 pub enum Step {
@@ -906,7 +931,10 @@ fn preview_step(db: &dyn Db, cfg: &HostConfig, j: &mut PreviewJob, replies: Vec<
     let p = providers::get(j.conn.provider).expect("known provider");
     let done = |preview: Result<Preview, String>| -> ApiResult<Step> {
         let (preview, error) = match preview {
-            Ok(v) => (Some(v), None),
+            Ok(mut v) => {
+                v.url = web_link(&v.url);
+                (Some(v), None)
+            }
             Err(e) => (None, Some(e)),
         };
         let value = LinkPreview { app: Some(p.info().id.into()), connected: true, preview, error };
@@ -984,6 +1012,9 @@ fn search_step(db: &dyn Db, cfg: &HostConfig, j: &mut SearchJob, replies: Vec<Ht
                 match p.read_search(&c.account, &these, j.limit) {
                     Ok(mut hits) => {
                         hits.truncate(j.limit);
+                        for hit in &mut hits {
+                            hit.url = web_link(&hit.url);
+                        }
                         apps.push(AppResult {
                             provider: c.provider.into(),
                             name: p.info().name.into(),
@@ -1117,6 +1148,15 @@ mod tests {
         let inner: Value = serde_json::from_str(filled["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
         assert_eq!(inner, value);
         assert!(fill_pending(b"{}", &value).is_none());
+    }
+
+    #[test]
+    fn only_web_links_leave() {
+        assert_eq!(web_link(" https://x.test/a "), "https://x.test/a");
+        assert_eq!(web_link("HTTP://x.test"), "HTTP://x.test");
+        for bad in ["javascript:alert(1)", "data:text/html,x", "//x.test", "JaVaScRiPt:x"] {
+            assert_eq!(web_link(bad), "", "{bad}");
+        }
     }
 
     #[test]

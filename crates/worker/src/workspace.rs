@@ -296,6 +296,30 @@ impl Workspace {
         }
     }
 
+    /// Runs a connected-apps job (see `dumbslab_core::connect::step`), each step in its own
+    /// transaction, sending the requests it asks for in between.
+    async fn run_job(&self, mut job: dumbslab_core::connect::Job, cfg: &HostConfig) -> Result<dumbslab_core::connect::Finish> {
+        use dumbslab_core::connect::{self, Finish, Step};
+        let mut replies = vec![];
+        for _ in 0..connect::MAX_STEPS {
+            let storage = self.state.storage();
+            let cfg = cfg.clone();
+            let (step, next) = transaction(&storage, self.db(), move |db| {
+                let mut job = job;
+                let step = connect::step(db, &cfg, &mut job, replies, Utc::now());
+                let ok = step.is_ok();
+                ((step, job), ok)
+            })?;
+            job = next;
+            match step {
+                Err(e) => return Ok(Finish::Fail(e)),
+                Ok(Step::Done(finish)) => return Ok(finish),
+                Ok(Step::Fetch(calls)) => replies = futures_util::future::join_all(calls.iter().map(crate::connect::send)).await,
+            }
+        }
+        Ok(Finish::Fail(ApiError::internal("connected apps took too many steps")))
+    }
+
     /// Answers for an address nobody has set up yet, without creating storage.
     fn unclaimed(&self, method: &Method, path: &str, url: &Url, origin: &str, slug: &str) -> Result<Response> {
         let root = var(&self.env, "ROOT_DOMAIN").unwrap_or_default();
@@ -461,6 +485,7 @@ impl DurableObject for Workspace {
             signup_secret: if multi { signup_secret } else { None },
             workspace: workspace.clone(),
             hosting,
+            connectors: crate::connect::connectors(&self.env, &origin, multi),
         };
         let move_cfg = cfg.clone();
 
@@ -530,6 +555,12 @@ impl DurableObject for Workspace {
         }
 
         let mut effects = outcome.effects;
+        // Connected apps: run the job, then answer with its result.
+        if let Some(i) = effects.iter().position(|e| matches!(e, Effect::Connect(_))) {
+            let Effect::Connect(job) = effects.remove(i) else { unreachable!() };
+            let finish = self.run_job(job, &move_cfg).await?;
+            return to_response(dumbslab_core::connect::respond(outcome.response, finish));
+        }
         // upgrade_plan and manage_billing: the answer holds a placeholder for the Stripe page's URL.
         if let Some(Effect::Stripe(call)) = effects.iter().find(|e| matches!(e, Effect::Stripe(_))) {
             let filled = crate::billing::page(&self.env, call).await?.and_then(|url| plan::fill_stripe_url(&outcome.response.body, &url));

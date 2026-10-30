@@ -1,6 +1,6 @@
 //! `dumbslab`: the self-hosted server and CLI. One binary, one SQLite file.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -13,6 +13,7 @@ use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderName, HeaderValue, StatusCode};
 use clap::{Parser, Subcommand};
 use dumbslab_core::auth::{Actor, Role, Scopes, Via};
+use dumbslab_core::connect::{self, Connectors, HttpCall, HttpReply, OAuthApp};
 use dumbslab_core::db::DbExt;
 use dumbslab_core::mcp::Toolset;
 use dumbslab_core::registry::registry;
@@ -23,6 +24,24 @@ use tracing::{info, warn};
 
 use dumbslab::store::Store;
 use dumbslab::web;
+
+/// Connected apps' settings from the environment: `DUMBSLAB_CONNECTOR_KEY` encrypts people's
+/// credentials, and `DUMBSLAB_<APP>_CLIENT_ID` / `_CLIENT_SECRET` (e.g. `DUMBSLAB_GITHUB_CLIENT_ID`,
+/// `DUMBSLAB_GOOGLE_DRIVE_CLIENT_SECRET`) let people sign in to that app.
+fn connectors_from_env() -> Connectors {
+    let var = |k: &str| std::env::var(k).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+    let mut apps = BTreeMap::new();
+    for c in connect::providers::ALL {
+        let id = c.info().id;
+        let env = id.to_ascii_uppercase().replace('-', "_");
+        if let (Some(client_id), Some(client_secret)) =
+            (var(&format!("DUMBSLAB_{env}_CLIENT_ID")), var(&format!("DUMBSLAB_{env}_CLIENT_SECRET")))
+        {
+            apps.insert(id.to_string(), OAuthApp { client_id, client_secret });
+        }
+    }
+    Connectors { key: var("DUMBSLAB_CONNECTOR_KEY"), apps, callback_url: None }
+}
 
 #[derive(Parser)]
 #[command(name = "dumbslab", version, about = "An open-source team knowledge base for people and AI agents")]
@@ -171,7 +190,7 @@ async fn call(
     input: Option<String>,
     user: Option<String>,
 ) -> anyhow::Result<()> {
-    let app = App::new(open(&db)?, HostConfig::default(), allow_private_webhooks);
+    let app = App::new(open(&db)?, HostConfig { connectors: connectors_from_env(), ..Default::default() }, allow_private_webhooks);
     let actor = local_actor(&app.store, user.as_deref(), Via::Cli)?;
     let op = registry().get(&operation).ok_or_else(|| anyhow!("unknown operation `{operation}`; run `dumbslab ops`"))?;
     let input: serde_json::Value = serde_json::from_str(input.as_deref().unwrap_or("{}")).context("input must be JSON")?;
@@ -187,7 +206,15 @@ async fn call(
         }
     })?;
     match result {
-        Ok((v, effects)) => {
+        Ok((v, mut effects)) => {
+            let v = match take_job(&mut effects) {
+                Some(job) => match run_job(&app, job).await {
+                    connect::Finish::Fill(filled) => filled,
+                    connect::Finish::Redirect(url) => serde_json::json!({ "url": url }),
+                    connect::Finish::Fail(e) => return Err(anyhow!("{} ({})", e.message, e.code)),
+                },
+                None => v,
+            };
             println!("{}", serde_json::to_string_pretty(&v)?);
             for delivered in deliver(app, effects) {
                 let _ = delivered.await;
@@ -199,7 +226,7 @@ async fn call(
 }
 
 async fn stdio_mcp(db: PathBuf, allow_private_webhooks: bool, user: Option<String>, toolset: Toolset) -> anyhow::Result<()> {
-    let app = App::new(open(&db)?, HostConfig::default(), allow_private_webhooks);
+    let app = App::new(open(&db)?, HostConfig { connectors: connectors_from_env(), ..Default::default() }, allow_private_webhooks);
     let mut pending = vec![];
     let actor = local_actor(&app.store, user.as_deref(), Via::Mcp)?;
     info!(user = %actor.email, "serving MCP over stdio");
@@ -217,6 +244,16 @@ async fn stdio_mcp(db: PathBuf, allow_private_webhooks: bool, user: Option<Strin
             })
         })
         .await??;
+        let mut effects = effects;
+        let reply = match (take_job(&mut effects), reply) {
+            (Some(job), Some(reply)) => match run_job(&app, job).await {
+                connect::Finish::Fill(v) => {
+                    connect::fill_pending(reply.to_string().as_bytes(), &v).and_then(|b| serde_json::from_slice(&b).ok()).or(Some(reply))
+                }
+                _ => Some(reply),
+            },
+            (_, reply) => reply,
+        };
         pending.extend(deliver(app.clone(), effects));
         pending.retain_mut(|d: &mut oneshot::Receiver<()>| d.try_recv().is_err_and(|e| e == oneshot::error::TryRecvError::Empty));
         if let Some(reply) = reply {
@@ -251,7 +288,13 @@ async fn serve(
             _ => info!("first run: create the admin account at {shown_url}/setup"),
         }
     }
-    let cfg = HostConfig { base_url: base_url.map(|u| u.trim_end_matches('/').to_string()), setup_token, open_setup, ..Default::default() };
+    let cfg = HostConfig {
+        base_url: base_url.map(|u| u.trim_end_matches('/').to_string()),
+        setup_token,
+        open_setup,
+        connectors: connectors_from_env(),
+        ..Default::default()
+    };
     let app = App::new(store, cfg, allow_private_webhooks);
     let router = Router::new()
         .fallback(handle)
@@ -320,7 +363,10 @@ async fn handle(
     })
     .await;
     match result {
-        Ok(Ok(Some(outcome))) => respond(app, outcome),
+        Ok(Ok(Some(outcome))) => {
+            let outcome = finish_jobs(&app, outcome).await;
+            respond(app, outcome)
+        }
         Ok(Ok(None)) => plain(StatusCode::NOT_FOUND, "not found"),
         Ok(Err(e)) => {
             warn!("request failed: {e:#}");
@@ -359,6 +405,7 @@ fn deliver(app: Arc<App>, effects: Vec<Effect>) -> Vec<oneshot::Receiver<()>> {
     // Address moves and Stripe calls only exist for hosted workspaces, which this server never is.
     for d in effects.into_iter().filter_map(|effect| match effect {
         Effect::Webhook(d) => Some(d),
+        // Jobs for connected apps ran before the response was sent.
         Effect::MoveAddress(_) | Effect::Stripe(_) | Effect::Connect(_) => None,
     }) {
         let mut queues = app.webhooks.lock().unwrap_or_else(|e| e.into_inner());
@@ -409,6 +456,119 @@ fn webhook_queue(app: &Arc<App>) -> mpsc::Sender<QueuedDelivery> {
 /// A webhook URL's host, for logs. Its path, query and user info can hold credentials.
 fn url_host(url: &str) -> String {
     reqwest::Url::parse(url).ok().and_then(|u| u.host_str().map(str::to_string)).unwrap_or_else(|| "(invalid URL)".into())
+}
+
+/// Removes the request's connected-apps job, if it has one.
+fn take_job(effects: &mut Vec<Effect>) -> Option<connect::Job> {
+    let i = effects.iter().position(|e| matches!(e, Effect::Connect(_)))?;
+    match effects.remove(i) {
+        Effect::Connect(job) => Some(job),
+        _ => None,
+    }
+}
+
+/// Runs a connected-apps job (see `connect::step`), each step in its own transaction.
+async fn run_job(app: &Arc<App>, mut job: connect::Job) -> connect::Finish {
+    let mut replies = vec![];
+    for _ in 0..connect::MAX_STEPS {
+        let app2 = app.clone();
+        let ran = tokio::task::spawn_blocking(move || {
+            app2.store.with_tx(|db| {
+                let step = connect::step(db, &app2.cfg, &mut job, replies, chrono::Utc::now());
+                let ok = step.is_ok();
+                ((step, job), ok)
+            })
+        })
+        .await;
+        let (step, next) = match ran {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => {
+                warn!("connected-apps job failed: {e:#}");
+                return connect::Finish::Fail(dumbslab_core::ApiError::internal("connected apps failed"));
+            }
+            Err(e) => {
+                warn!("connected-apps task failed: {e}");
+                return connect::Finish::Fail(dumbslab_core::ApiError::internal("connected apps failed"));
+            }
+        };
+        job = next;
+        match step {
+            Err(e) => return connect::Finish::Fail(e),
+            Ok(connect::Step::Done(finish)) => return finish,
+            Ok(connect::Step::Fetch(calls)) => {
+                // All at once; answers keep the requests' order.
+                let allow = app.allow_private_webhooks;
+                let sent: Vec<_> = calls.into_iter().map(|c| tokio::spawn(async move { send_app_call(&c, allow).await })).collect();
+                replies = Vec::with_capacity(sent.len());
+                for s in sent {
+                    replies.push(s.await.unwrap_or_default());
+                }
+            }
+        }
+    }
+    connect::Finish::Fail(dumbslab_core::ApiError::internal("connected apps took too many steps"))
+}
+
+/// Answers with a connected-apps job's result, when the request started one.
+async fn finish_jobs(app: &Arc<App>, mut outcome: Outcome) -> Outcome {
+    if let Some(job) = take_job(&mut outcome.effects) {
+        let finish = run_job(app, job).await;
+        outcome.response = connect::respond(outcome.response, finish);
+    }
+    outcome
+}
+
+/// Sends one request to a connected app, like a webhook: https only, the host resolved once and
+/// pinned, private addresses refused (unless allowed), no redirects. Reads at most
+/// `connect::MAX_REPLY_BYTES`. Failures answer status 0.
+async fn send_app_call(call: &HttpCall, allow_private: bool) -> HttpReply {
+    let attempt = async {
+        let url = reqwest::Url::parse(&call.url)?;
+        if url.scheme() != "https" {
+            anyhow::bail!("apps are reached over https only");
+        }
+        let port = url.port_or_known_default().unwrap_or(443);
+        let host = url.host_str().unwrap_or_default().trim_start_matches('[').trim_end_matches(']').to_string();
+        let addrs: Vec<SocketAddr> = match host.parse::<IpAddr>() {
+            Ok(ip) => vec![SocketAddr::new(ip, port)],
+            Err(_) => tokio::net::lookup_host((host.as_str(), port)).await?.collect(),
+        };
+        if addrs.is_empty() {
+            anyhow::bail!("the app's host did not resolve");
+        }
+        if !allow_private && addrs.iter().any(|a| !is_public(a.ip())) {
+            anyhow::bail!("the app's address is private (start the server with --allow-private-webhooks to permit this)");
+        }
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(connect::FETCH_TIMEOUT_SECS))
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .resolve_to_addrs(&host, &addrs)
+            .build()?;
+        let mut req = client.request(reqwest::Method::from_bytes(call.method.as_bytes())?, url);
+        for (k, v) in &call.headers {
+            req = req.header(k, v);
+        }
+        if let Some(body) = &call.body {
+            req = req.body(body.clone());
+        }
+        // Errors name the URL, which may hold a credential.
+        let mut resp = req.send().await.map_err(reqwest::Error::without_url)?;
+        let status = resp.status().as_u16();
+        let mut body = Vec::new();
+        while let Some(chunk) = resp.chunk().await.map_err(reqwest::Error::without_url)? {
+            body.extend_from_slice(&chunk);
+            if body.len() > connect::MAX_REPLY_BYTES {
+                body.truncate(connect::MAX_REPLY_BYTES);
+                break;
+            }
+        }
+        Ok::<_, anyhow::Error>(HttpReply { status, body: String::from_utf8_lossy(&body).into_owned() })
+    };
+    attempt.await.unwrap_or_else(|e| {
+        warn!(host = %url_host(&call.url), error = %e, "request to a connected app failed");
+        HttpReply::default()
+    })
 }
 
 /// Whether an address is on the public internet (not loopback, private, link-local, CGNAT, …).
