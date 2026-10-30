@@ -89,7 +89,7 @@ DumbSlab uses the issuer `https://login.microsoftonline.com/<tenant ID>/v2.0` an
 1. At [api.slack.com/apps](https://api.slack.com/apps), create an app.
 2. Under **OAuth & Permissions**, add the redirect URI, and add the user token scopes `openid`, `email` and `profile`.
 3. Under **Basic Information › App Credentials**, copy the client ID and client secret.
-4. In DumbSlab, choose **Slack**. To let in only your Slack workspace's members, enter its team ID, which starts with `T`. It's in the address when you open Slack in a browser (`app.slack.com/client/T…`). Without it, anyone whose verified Slack email is at an allowed domain can sign in.
+4. In DumbSlab, choose **Slack** and enter your Slack workspace's team ID, which starts with `T`. It's in the address when you open Slack in a browser (`app.slack.com/client/T…`). It's required: only members of that Slack workspace can sign in, like Microsoft's tenant and Google's domains.
 
 ### Other OpenID Connect providers
 
