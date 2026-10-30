@@ -1,0 +1,19 @@
+name: Question
+description: Ask a public usage or self-hosting question.
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Issues are public. Do not include credentials, workspace content or personal details.
+        Use the billing and private support email in the issue chooser for account-specific help.
+  - type: textarea
+    id: question
+    attributes:
+      label: What do you need help with?
+    validations:
+      required: true
+  - type: textarea
+    id: tried
+    attributes:
+      label: What have you tried?
+      description: Include relevant documentation and sanitized errors, if any.
