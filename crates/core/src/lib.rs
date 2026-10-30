@@ -40,6 +40,8 @@ pub use error::{ApiError, ApiResult};
 pub use http::handle;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// Full source commit embedded at build time, or `unknown` outside a Git checkout.
+pub const GIT_SHA: &str = env!("DUMBSLAB_BUILD_GIT_SHA");
 pub const PRODUCT: &str = "DumbSlab";
 
 /// Host-provided configuration.

@@ -4795,6 +4795,23 @@ mod slack {
     }
 }
 
+#[test]
+fn healthz_reports_build_identity_without_auth() {
+    let h = H::new();
+    let r = h.call("GET", "/healthz", None, &Auth::None);
+    assert_eq!(r.status, 200);
+    assert_eq!(
+        r.body,
+        json!({
+            "ok": true,
+            "version": dumbslab_core::VERSION,
+            "git_sha": dumbslab_core::GIT_SHA,
+        })
+    );
+    let sha = dumbslab_core::GIT_SHA;
+    assert!(sha == "unknown" || ((sha.len() == 40 || sha.len() == 64) && sha.bytes().all(|b| b.is_ascii_hexdigit())));
+}
+
 // ---------------------------------------------------------------------------
 // People sync (BambooHR) and docs sync (GitHub, GitLab). The tests play the host and the apps:
 // they run each sync's steps with canned answers.
