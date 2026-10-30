@@ -110,7 +110,7 @@ pub fn llms_txt(base_url: &str) -> String {
     }
     format!(
         "# DumbSlab\n\n\
-         > An open-source team knowledge base (in the spirit of Slab). Posts are Markdown, organized into topics.\n\
+         > An open-source team knowledge base. Posts are Markdown, organized into topics.\n\
          > Everything a person can do in the web app, an agent can do through MCP or the REST API.\n\n\
          ## Connect\n\n\
          - MCP (Streamable HTTP): `{base_url}/mcp` — sign in with OAuth, or send `Authorization: Bearer <token>`.\n\

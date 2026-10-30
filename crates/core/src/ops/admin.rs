@@ -39,7 +39,7 @@ pub fn ops() -> Vec<Op> {
             .build(),
         op("admin", "import_documents", "POST", "/import", Access::Write, import_documents)
             .title("Import Markdown documents")
-            .desc("Create many posts at once, e.g. when migrating from Slab, Notion or a docs folder. Each document can name a topic path like `Engineering/Runbooks`; missing topics are created.")
+            .desc("Create many posts at once, e.g. when migrating from another wiki, Notion or a docs folder. Each document can name a topic path like `Engineering/Runbooks`; missing topics are created.")
             .build(),
     ]
 }

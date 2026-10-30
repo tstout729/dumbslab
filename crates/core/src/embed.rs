@@ -1,4 +1,4 @@
-//! Embeds: a link to a known provider on a line of its own renders inline, the way Slab and Notion
+//! Embeds: a link to a known provider on a line of its own renders inline, the way most wikis
 //! show videos, Google Docs and design files. The frame URL is always rebuilt from the parsed link,
 //! so a post can never point a frame anywhere outside [`FRAME_ORIGINS`].
 

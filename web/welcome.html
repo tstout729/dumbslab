@@ -82,8 +82,7 @@
         { "@type": "Question", "name": "Who can see my workspace?", "acceptedAnswer": { "@type": "Answer", "text": "Only the people you add. Admins add people and choose each person's role: admin, member or viewer. Private topics are visible only to their members, and drafts only to their author. Search engines are told to stay out of workspaces." } },
         { "@type": "Question", "name": "Can I change my address later?", "acceptedAnswer": { "@type": "Answer", "text": "Yes. Admins can move the workspace to a new address in Settings. Anyone who opens the old address in a browser is sent to the new one; AI tools need the new MCP URL." } },
         { "@type": "Question", "name": "Can I get my data out?", "acceptedAnswer": { "@type": "Answer", "text": "Yes. Posts are Markdown, and an admin can download the whole workspace as JSON at any time from Settings. You can bring Markdown files in, too." } },
-        { "@type": "Question", "name": "Can I self-host DumbSlab?", "acceptedAnswer": { "@type": "Answer", "text": "Yes. It's one Rust binary and one SQLite file, or a Cloudflare Worker with a separate database for each workspace. The source is on GitHub under the MIT or Apache-2.0 license." } },
-        { "@type": "Question", "name": "Is DumbSlab related to Slab?", "acceptedAnswer": { "@type": "Answer", "text": "No. DumbSlab is an independent open-source project inspired by Slab's team wiki. It isn't affiliated with or endorsed by Slab, Inc." } }
+        { "@type": "Question", "name": "Can I self-host DumbSlab?", "acceptedAnswer": { "@type": "Answer", "text": "Yes. It's one Rust binary and one SQLite file, or a Cloudflare Worker with a separate database for each workspace. The source is on GitHub under the MIT or Apache-2.0 license." } }
       ]
     }
   ]
@@ -312,10 +311,6 @@ cargo run --release -p dumbslab -- serve</code></pre>
         <summary>Can I self-host DumbSlab?</summary>
         <p>Yes. It's one Rust binary and one SQLite file, or a Cloudflare Worker with a separate database for each workspace. The source is on GitHub under the MIT or Apache-2.0 license.</p>
       </details>
-      <details>
-        <summary>Is DumbSlab related to Slab?</summary>
-        <p>No. DumbSlab is an independent open-source project inspired by Slab's team wiki. It isn't affiliated with or endorsed by Slab, Inc.</p>
-      </details>
     </div>
   </section>
 
@@ -333,7 +328,7 @@ cargo run --release -p dumbslab -- serve</code></pre>
 </main>
 
 <footer class="w-foot w-wrap">
-  <p>DumbSlab is open source under MIT or Apache-2.0. Not affiliated with Slab, Inc.</p>
+  <p>DumbSlab is open source under MIT or Apache-2.0.</p>
   <nav aria-label="Footer">
     <a href="https://github.com/tstout729/dumbslab">GitHub</a>
     <a href="https://github.com/tstout729/dumbslab/blob/main/docs/cloudflare.md">Self-hosting</a>
