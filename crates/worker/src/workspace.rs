@@ -656,9 +656,10 @@ async fn drive_job(state: &State, mut job: Job, cfg: &HostConfig) -> Result<(Fin
         match step {
             Err(e) => {
                 // The step rolled back (a full workspace, a failed operation); whoever is waiting
-                // elsewhere (a Slack command) hears so.
+                // elsewhere (a Slack command) hears so. Earlier steps committed, and their webhooks
+                // still go (see `Job::settle`).
                 notify_failure(notice).await;
-                return Ok((Finish::Fail(e), vec![], written));
+                return Ok((Finish::Fail(e), job.take_effects(), written));
             }
             Ok(Step::Done(done)) => return Ok((done, job.take_effects(), written)),
             Ok(Step::Fetch(calls)) => replies = futures_util::future::join_all(calls.iter().map(crate::connect::send)).await,

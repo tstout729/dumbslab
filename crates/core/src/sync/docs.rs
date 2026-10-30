@@ -256,13 +256,23 @@ pub struct DocsJob {
     phase: Phase,
     result: DocsSyncResult,
     /// Webhooks for the posts this sync created, changed or archived, from steps that committed,
-    /// for the host to send once it finishes (see [`crate::connect::Job::take_effects`]).
+    /// for the host to send once it finishes, however it finishes (see
+    /// [`crate::connect::Job::take_effects`]).
     effects: Vec<crate::Effect>,
+    /// The current step's, until the host says whether it committed ([`crate::connect::Job::settle`]).
+    staged: Vec<crate::Effect>,
 }
 
 impl DocsJob {
     pub(crate) fn take_effects(&mut self) -> Vec<crate::Effect> {
         std::mem::take(&mut self.effects)
+    }
+
+    pub(crate) fn settle(&mut self, committed: bool) {
+        let staged = std::mem::take(&mut self.staged);
+        if committed {
+            self.effects.extend(staged);
+        }
     }
 }
 
@@ -332,6 +342,7 @@ pub(crate) fn start(db: &dyn Db, source: Source, base_url: &str, now: DateTime<U
         phase: Phase::Start,
         result: DocsSyncResult::default(),
         effects: vec![],
+        staged: vec![],
     }))))
 }
 
@@ -443,8 +454,8 @@ fn guard(db: &dyn Db, j: &DocsJob, plan: &mut Plan, now: DateTime<Utc>) -> ApiRe
     let writer = super::actor(db, &j.source.owner_id)?.user_id;
     let lapsed = "SELECT id FROM users WHERE role != 'admin' OR deactivated_at IS NOT NULL";
     // Someone who wrote for this source while an admin, and isn't one now, keeps nothing through
-    // it: its posts and images pass to the admin it writes as now (authors and uploaders always
-    // see their own)...
+    // its authorship: its posts and images pass to the admin it writes as now (authors and
+    // uploaders always see their own).
     db.execute(
         &format!(
             "UPDATE posts SET author_id = ? WHERE author_id IN ({lapsed})
@@ -460,14 +471,23 @@ fn guard(db: &dyn Db, j: &DocsJob, plan: &mut Plan, now: DateTime<Utc>) -> ApiRe
         &params![writer, source_id.clone()],
     )?;
     for (folder, topic_id) in &plan.folders {
-        // ...and loses the membership it got by creating a private folder topic, unless it's in
-        // the source's topic too.
+        // Memberships the sync gave when it made this topic go once their person has left the
+        // source's topic. Any other membership is someone's choice and stays; if it lets more
+        // people in than the source's topic, the check below keeps the source's posts out.
+        let target_members = "SELECT user_id FROM topic_members WHERE topic_id = ?";
         db.execute(
             &format!(
-                "DELETE FROM topic_members WHERE topic_id = ? AND user_id = (SELECT created_by FROM topics WHERE id = ?)
-                   AND user_id IN ({lapsed}) AND user_id NOT IN (SELECT user_id FROM topic_members WHERE topic_id = ?)"
+                "DELETE FROM topic_members WHERE topic_id = ? AND user_id NOT IN ({target_members})
+                   AND EXISTS (SELECT 1 FROM docs_memberships g WHERE g.topic_id = topic_members.topic_id
+                     AND g.user_id = topic_members.user_id AND g.added_at = topic_members.added_at)"
             ),
-            &params![topic_id.clone(), topic_id.clone(), j.source.topic_id.clone()],
+            &params![topic_id.clone(), j.source.topic_id.clone()],
+        )?;
+        // Forget grants that are gone, or that someone made again (theirs now).
+        db.execute(
+            "DELETE FROM docs_memberships WHERE topic_id = ? AND NOT EXISTS (SELECT 1 FROM topic_members m
+               WHERE m.topic_id = docs_memberships.topic_id AND m.user_id = docs_memberships.user_id AND m.added_at = docs_memberships.added_at)",
+            &params![topic_id.clone()],
         )?;
         let Some(a) = Audience::of(db, topic_id)? else { continue };
         if !target.exceeded_by(&a) {
@@ -557,6 +577,13 @@ fn listing(db: &dyn Db, cfg: &HostConfig, j: &mut DocsJob, replies: &[HttpReply]
     }
     let mut ctx = super::ctx(db, cfg, &j.source.owner_id, &j.base_url, now)?;
     j.result.files = tree_docs.len();
+    // Topics first: posts leave folder topics that got wider before anything here records an
+    // event about them.
+    let folders = items(db, &source_id, "folder")?.into_iter().map(|(p, i)| (p, i.target_id)).collect();
+    let mut plan = Plan { folders, ..Plan::default() };
+    if let Some(message) = guard(db, j, &mut plan, now)? {
+        return fail(db, j, &message, now);
+    }
     // Paths that files appeared at (new, back or moved there) and images that changed: files that
     // link to them are synced again.
     let mut changed: BTreeSet<String> = BTreeSet::new();
@@ -610,7 +637,6 @@ fn listing(db: &dyn Db, cfg: &HostConfig, j: &mut DocsJob, replies: &[HttpReply]
     docs.retain(|p, _| tree_docs.contains_key(p));
 
     // New files get their post's id now, so links to them work before they're synced.
-    let mut plan = Plan::default();
     let mut revive: BTreeSet<String> = BTreeSet::new();
     for path in tree_docs.keys() {
         match docs.get_mut(path) {
@@ -667,12 +693,6 @@ fn listing(db: &dyn Db, cfg: &HostConfig, j: &mut DocsJob, replies: &[HttpReply]
     // try again.
     changed.extend(tree_images.keys().filter(|p| !uploaded.contains_key(*p)).cloned());
     plan.images = tree_images;
-    plan.folders = items(db, &source_id, "folder")?.into_iter().map(|(p, i)| (p, i.target_id)).collect();
-
-    if let Some(message) = guard(db, j, &mut plan, now)? {
-        j.effects.append(&mut ctx.effects);
-        return fail(db, j, &message, now);
-    }
     let blocked = |path: &str| blocked_by(&plan, path);
     for (_, d) in docs.iter_mut().filter(|(p, _)| blocked(p).is_some()) {
         d.sha = None;
@@ -731,7 +751,7 @@ fn listing(db: &dyn Db, cfg: &HostConfig, j: &mut DocsJob, replies: &[HttpReply]
     let calls = todo.iter().map(|w| j.source.repo.blob_call(&w.sha, j.source.token())).collect();
     plan.batch = todo;
     j.phase = Phase::Reading(plan);
-    j.effects.append(&mut ctx.effects);
+    j.staged.append(&mut ctx.effects);
     Ok(Step::Fetch(calls))
 }
 
@@ -907,6 +927,13 @@ fn folder_topic(ctx: &mut Ctx, j: &DocsJob, plan: &mut Plan, dir: &str) -> ApiRe
            AND NOT EXISTS (SELECT 1 FROM topic_members t WHERE t.topic_id = ? AND t.user_id = ?)",
         &params![topic.topic.id.clone(), ctx.actor.user_id.clone(), j.source.topic_id.clone(), ctx.actor.user_id.clone()],
     )?;
+    // Every membership it has now, the sync gave (see `docs_memberships`).
+    ctx.db.execute(
+        "INSERT INTO docs_memberships (source_id, topic_id, user_id, added_at)
+         SELECT ?, topic_id, user_id, added_at FROM topic_members WHERE topic_id = ?
+         ON CONFLICT(topic_id, user_id) DO UPDATE SET added_at = excluded.added_at",
+        &params![j.source.id.clone(), topic.topic.id.clone()],
+    )?;
     ctx.db.execute(
         "INSERT INTO docs_items (source_id, kind, path, target_id) VALUES (?, 'folder', ?, ?)
          ON CONFLICT(source_id, kind, path) DO UPDATE SET target_id = excluded.target_id",
@@ -993,7 +1020,7 @@ fn write(ctx: &mut Ctx, j: &mut DocsJob, mut plan: Plan, texts: Vec<Text>, ready
     }
     // Topics may have changed while the files were fetched.
     if let Some(message) = guard(db, j, &mut plan, now)? {
-        j.effects.append(&mut ctx.effects);
+        j.staged.append(&mut ctx.effects);
         return fail(db, j, &message, now);
     }
     for r in &ready {
@@ -1032,10 +1059,13 @@ fn write(ctx: &mut Ctx, j: &mut DocsJob, mut plan: Plan, texts: Vec<Text>, ready
                 continue;
             }
         }
+        // Events only once the post is in its topics (and published again, if it came back): what
+        // hears of them decides who may see the post from where it is.
         place(ctx, j, &plan, &t.work.post_id, &folder)?;
         if t.work.revive && set_status(ctx, &t.work.post_id, "published")? {
             j.result.restored += 1;
         }
+        posts::synced_event(ctx, &t.work.post_id, synced)?;
         // Images this sync stored earlier that belong to no post yet (the file showing them waited
         // for a later run) join this one. Only the sync's own records count: text naming some
         // other upload never attaches it (see `posts::Writer::Sync`).
@@ -1084,7 +1114,7 @@ fn write(ctx: &mut Ctx, j: &mut DocsJob, mut plan: Plan, texts: Vec<Text>, ready
                 .admin_only(),
         )?;
     }
-    j.effects.append(&mut ctx.effects);
+    j.staged.append(&mut ctx.effects);
     Ok(Step::Done(Finish::Fill(value)))
 }
 

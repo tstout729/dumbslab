@@ -566,6 +566,8 @@ async fn run_job(app: &Arc<App>, mut job: connect::Job) -> connect::Finish {
         match step {
             Err(e) => {
                 // The step rolled back; whoever is waiting elsewhere (a Slack command) hears so.
+                // Earlier steps committed, and their webhooks still go (see `Job::settle`).
+                deliver(app.clone(), job.take_effects());
                 notify_failure(app, notice).await;
                 return connect::Finish::Fail(e);
             }

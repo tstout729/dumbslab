@@ -953,13 +953,26 @@ impl Job {
 
     /// What the job's operations left for the host to deliver once it finishes: a draft started
     /// from Slack, and posts a docs sync wrote, have webhooks to send. Events a sign-in records send
-    /// no webhooks, and connected apps' jobs record none.
+    /// no webhooks, and connected apps' jobs record none. Hosts deliver them when the job ends,
+    /// also when a step failed: a sync's committed steps keep theirs (see [`Job::settle`]).
     pub fn take_effects(&mut self) -> Vec<crate::Effect> {
         match self {
             Job::Slack(j) => j.take_effects(),
             Job::Docs(j) => j.take_effects(),
             Job::People(j) => j.take_effects(),
             _ => vec![],
+        }
+    }
+
+    /// After each step, whether it was kept. A sync's committed steps keep their effects for the
+    /// host to deliver when the job ends, however it ends; a rolled-back step's go with it. A
+    /// Slack job keeps its effects only if it finishes, as it always has. [`guarded_step`] calls this.
+    pub fn settle(&mut self, committed: bool) {
+        match self {
+            Job::Docs(j) => j.settle(committed),
+            Job::People(j) => j.settle(committed),
+            Job::Slack(j) if !committed => drop(j.take_effects()),
+            _ => {}
         }
     }
 
@@ -1247,7 +1260,9 @@ pub fn step(db: &dyn Db, cfg: &HostConfig, job: &mut Job, replies: Vec<HttpReply
 /// step back. Then the second value is the notice to send (see [`Job::failure_notice`]), decided
 /// from the job as it was before the step: a step that prepared a Slack command's answer and was
 /// rolled back sent nothing, so the person must still hear something. A job that really sent its
-/// answer in an earlier step has none. Hosts run this inside the step's transaction.
+/// answer in an earlier step has none. Hosts run this inside the step's transaction. It settles the
+/// step's effects (see [`Job::settle`]): hosts deliver [`Job::take_effects`] when the job ends,
+/// failed or not.
 pub fn guarded_step(
     db: &dyn Db,
     cfg: &HostConfig,
@@ -1268,6 +1283,7 @@ pub fn guarded_step(
         Err(e) => before.and_then(|b| b.failure_notice(e)),
         Ok(_) => None,
     };
+    job.settle(result.is_ok());
     (result, notice)
 }
 

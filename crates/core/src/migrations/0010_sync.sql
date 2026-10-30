@@ -101,3 +101,15 @@ CREATE TABLE IF NOT EXISTS docs_items (
   PRIMARY KEY (source_id, kind, path)
 );
 CREATE INDEX IF NOT EXISTS docs_items_target ON docs_items(target_id);
+
+-- Memberships of private folder topics that the sync itself gave: the source's topic's members
+-- when it made the folder's topic. Only these does it ever take back (when the person is no longer
+-- in the source's topic), and only while unchanged: `added_at` is the membership's own, so one
+-- someone removed and gave again counts as theirs, not the sync's.
+CREATE TABLE IF NOT EXISTS docs_memberships (
+  source_id TEXT NOT NULL REFERENCES docs_sources(id) ON DELETE CASCADE,
+  topic_id TEXT NOT NULL REFERENCES topics(id) ON DELETE CASCADE,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  added_at TEXT NOT NULL,
+  PRIMARY KEY (topic_id, user_id)
+);

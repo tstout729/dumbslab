@@ -118,11 +118,20 @@ pub struct PeopleJob {
     phase: Phase,
     /// The webhooks of the event the sync records, for the host to send once it finishes.
     effects: Vec<crate::Effect>,
+    /// The current step's, until the host says whether it committed ([`crate::connect::Job::settle`]).
+    staged: Vec<crate::Effect>,
 }
 
 impl PeopleJob {
     pub(crate) fn take_effects(&mut self) -> Vec<crate::Effect> {
         std::mem::take(&mut self.effects)
+    }
+
+    pub(crate) fn settle(&mut self, committed: bool) {
+        let staged = std::mem::take(&mut self.staged);
+        if committed {
+            self.effects.extend(staged);
+        }
     }
 }
 
@@ -141,6 +150,7 @@ pub(crate) fn start(db: &dyn Db, cfg: &HostConfig, base_url: &str, now: DateTime
         pages: 0,
         phase: Phase::Start,
         effects: vec![],
+        staged: vec![],
     }))))
 }
 
@@ -340,7 +350,7 @@ fn apply(db: &dyn Db, cfg: &HostConfig, j: &mut PeopleJob, truncated: bool, now:
             .data(json!({ "matched": result.matched, "updated": result.updated, "not_found": result.not_found_count }))
             .admin_only(),
     )?;
-    j.effects.append(&mut ctx.effects);
+    j.staged.append(&mut ctx.effects);
     Ok(Step::Done(Finish::Fill(value)))
 }
 

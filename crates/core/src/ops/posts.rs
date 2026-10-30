@@ -576,7 +576,8 @@ pub(crate) enum Synced {
 
 /// Docs sync: sets a post's title and content, creating it (published) with this id when there's
 /// no such post. Changes take the same path as edits ([`write_revision`]), so each one is a version
-/// in the history; but they notify nobody and attach no uploads ([`Writer::Sync`]).
+/// in the history; but they notify nobody and attach no uploads ([`Writer::Sync`]). Their events
+/// come later, from [`synced_event`], once the post is in its topics.
 pub(crate) fn sync_post(ctx: &mut Ctx, id: &str, title: &str, content: &str, note: &str) -> ApiResult<Synced> {
     let title = required(title, "title", 300)?;
     if let Some(post) = ctx.db.one(&format!("SELECT {POST_COLS}, p.content FROM posts p WHERE p.id = ?"), &params![id])? {
@@ -586,12 +587,6 @@ pub(crate) fn sync_post(ctx: &mut Ctx, id: &str, title: &str, content: &str, not
         if !write_revision(ctx, &post, &title, content, note, Writer::Sync)? {
             return Ok(Synced::Unchanged);
         }
-        emit(
-            ctx,
-            Event::new("post.updated", "post", id, format!("synced “{title}”"))
-                .post(id)
-                .data(json!({ "fields": ["content"], "version": post.i64("version") + 1, "synced": true })),
-        )?;
         return Ok(Synced::Updated);
     }
     check_content(content)?;
@@ -620,11 +615,22 @@ pub(crate) fn sync_post(ctx: &mut Ctx, id: &str, title: &str, content: &str, not
     // No upload joins the post because its text mentions one (see `Writer::Sync`).
     update_links(ctx, id, content)?;
     search::index_post(ctx.db, id)?;
-    emit(
-        ctx,
-        Event::new("post.created", "post", id, format!("synced “{title}”")).post(id).data(json!({ "status": "published", "synced": true })),
-    )?;
     Ok(Synced::Created)
+}
+
+/// Docs sync: records what [`sync_post`] did. Called once the post is in its topics, so whatever
+/// hears of it (webhooks, Slack channels) judges who may see it by where it ended up.
+pub(crate) fn synced_event(ctx: &mut Ctx, id: &str, synced: Synced) -> ApiResult<()> {
+    let Some(post) = ctx.db.one("SELECT title, version FROM posts WHERE id = ?", &params![id])? else { return Ok(()) };
+    let summary = format!("synced “{}”", post.str("title"));
+    let event = match synced {
+        Synced::Created => Event::new("post.created", "post", id, summary).data(json!({ "status": "published", "synced": true })),
+        Synced::Updated => Event::new("post.updated", "post", id, summary)
+            .data(json!({ "fields": ["content"], "version": post.i64("version"), "synced": true })),
+        Synced::Unchanged | Synced::Trashed => return Ok(()),
+    };
+    emit(ctx, event.post(id))?;
+    Ok(())
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]

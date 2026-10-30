@@ -4045,7 +4045,7 @@ mod slack {
     }
 
     /// A workspace with Slack connected, and its admin Ada.
-    fn connected() -> (H, Auth) {
+    pub(super) fn connected() -> (H, Auth) {
         let mut h = H::new();
         let (admin, _) = h.setup();
         h.cfg.connectors.key = Some("connector-key".into());
@@ -4135,7 +4135,7 @@ mod slack {
         reply.to_string()
     }
 
-    fn slack_messages(effects: &[Effect]) -> Vec<Value> {
+    pub(super) fn slack_messages(effects: &[Effect]) -> Vec<Value> {
         effects
             .iter()
             .filter_map(|e| match e {
@@ -4829,7 +4829,7 @@ mod syncs {
             let (step, next) = h
                 .store
                 .with_tx(|db| {
-                    let step = connect::step(db, &h.cfg, &mut job, replies.clone(), chrono::Utc::now());
+                    let (step, _) = connect::guarded_step(db, &h.cfg, &mut job, replies.clone(), chrono::Utc::now(), |_| None);
                     let ok = step.is_ok();
                     ((step, job.clone()), ok)
                 })
@@ -5412,7 +5412,7 @@ mod syncs {
     fn step_once(h: &H, job: &mut Job, replies: Vec<HttpReply>) -> Step {
         h.store
             .with_tx(|db| {
-                let step = connect::step(db, &h.cfg, job, replies, chrono::Utc::now());
+                let (step, _) = connect::guarded_step(db, &h.cfg, job, replies, chrono::Utc::now(), |_| None);
                 let ok = step.is_ok();
                 (step, ok)
             })
@@ -5674,6 +5674,168 @@ mod syncs {
         events.sort();
         assert_eq!(events, vec!["post.archived", "post.updated"]);
         assert!(run().is_empty(), "nothing changed, nothing sent");
+    }
+
+    /// Runs a job to the end like a host (each step through `guarded_step`), and returns its result
+    /// and what it left to deliver.
+    fn run_to_end(h: &H, mut job: Job, answer: &dyn Fn(&HttpCall) -> HttpReply) -> (Value, Vec<Effect>) {
+        let mut replies = vec![];
+        loop {
+            match step_once(h, &mut job, replies) {
+                Step::Fetch(calls) => replies = calls.iter().map(answer).collect(),
+                Step::Done(f) => return (filled(f), job.take_effects()),
+            }
+        }
+    }
+
+    /// The workspace webhook events among a job's effects.
+    fn events(effects: &[Effect]) -> Vec<String> {
+        effects
+            .iter()
+            .filter_map(|e| match e {
+                Effect::Webhook(d) if !d.webhook_id.starts_with("slack:") => {
+                    d.headers.iter().find(|(k, _)| k == "x-dumbslab-event").map(|(_, v)| v.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn docs_sync_announces_posts_by_their_final_topics() {
+        let (h, admin) = super::slack::connected();
+        h.ok("POST", "/api/v1/slack/channels", Some(json!({ "channel": "C0ALLPOSTS", "updated_posts": true })), &admin);
+        let ops = h.ok("POST", "/api/v1/topics", Some(json!({ "name": "Ops", "visibility": "private" })), &admin)["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let handbook = h.ok("POST", "/api/v1/topics", Some(json!({ "name": "Handbook" })), &admin)["id"].as_str().unwrap().to_string();
+        let lab = Lab::new(&[("rota.md", b"# Confidential rota\n\nWho is on call.\n"), ("deploys/rollback.md", b"# Secret rollback\n")]);
+        let answer = |c: &HttpCall| lab.answer(c);
+        // A private topic's synced posts go to no channel for every post: they're in the private
+        // topic by the time anything hears of them.
+        let (private_source, _) = gitlab_source(&h, &admin, &ops);
+        let r = h.call("POST", &format!("/api/v1/docs-sources/{private_source}/sync"), None, &admin);
+        let (v, effects) = run_to_end(&h, job_of(&r), &answer);
+        assert_eq!(v["created"], 2, "{v}");
+        let messages = super::slack::slack_messages(&effects);
+        assert!(messages.is_empty(), "{messages:?}");
+        // The same files in an org-wide topic are announced.
+        let (public_source, _) = gitlab_source(&h, &admin, &handbook);
+        let r = h.call("POST", &format!("/api/v1/docs-sources/{public_source}/sync"), None, &admin);
+        let (_, effects) = run_to_end(&h, job_of(&r), &answer);
+        let messages = super::slack::slack_messages(&effects);
+        assert_eq!(messages.len(), 2, "one per post: {messages:?}");
+        assert!(messages.iter().all(|m| m["channel"] == "C0ALLPOSTS"));
+        assert!(messages.iter().any(|m| m.to_string().contains("Confidential rota")));
+        // Updates too: a change to the private copy stays out of the channel.
+        lab.put("rota.md", b"# Confidential rota\n\nWho is on call now.\n");
+        let r = h.call("POST", &format!("/api/v1/docs-sources/{private_source}/sync"), None, &admin);
+        let (v, effects) = run_to_end(&h, job_of(&r), &answer);
+        assert_eq!(v["updated"], 1, "{v}");
+        assert!(super::slack::slack_messages(&effects).is_empty());
+        assert_eq!(events(&effects), Vec::<String>::new(), "no workspace webhooks are set up");
+    }
+
+    #[test]
+    fn docs_sync_takes_back_only_its_own_grants() {
+        let mut h = H::new();
+        let (admin, _) = h.setup();
+        with_key(&mut h);
+        let (mo_id, mo) = h.user(&admin, "mo@acme.test", "Mo", "member");
+        let (ann_id, _) = h.user(&admin, "ann@acme.test", "Ann", "admin");
+        let ann_admin =
+            h.ok("POST", "/api/v1/tokens", Some(json!({ "name": "ann", "user": ann_id, "scopes": ["read", "write", "admin"] })), &admin);
+        let ann_admin = Auth::Bearer(ann_admin["token"].as_str().unwrap().to_string());
+        let ann = sign_in(&h, "ann@acme.test", "password123");
+        let ops = h.ok("POST", "/api/v1/topics", Some(json!({ "name": "Ops", "visibility": "private", "members": [mo_id] })), &admin)["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let (source, _) = gitlab_source(&h, &ann_admin, &ops);
+        let lab = Lab::new(&[("deploys/rollback.md", b"# Rollback\n")]);
+        let answer = |c: &HttpCall| lab.answer(c);
+        let sync = || {
+            let r = h.call("POST", &format!("/api/v1/docs-sources/{source}/sync"), None, &admin);
+            filled(drive(&h, job_of(&r), &answer).0)
+        };
+        sync();
+        let deploys = db_run(&h, |db| db.one("SELECT target_id FROM docs_items WHERE kind = 'folder' AND path = 'deploys'", &[]))
+            .unwrap()
+            .str("target_id");
+        let rollback = doc_ids(&h)["deploys/rollback.md"].clone();
+        let members = |h: &H| -> Vec<String> {
+            let t = h.ok("GET", &format!("/api/v1/topics/{deploys}"), None, &admin);
+            t["members"].as_array().unwrap().iter().map(|m| m["id"].as_str().unwrap().to_string()).collect()
+        };
+        assert!(!members(&h).contains(&ann_id), "Ann made the topic but isn't in Ops");
+        assert!(members(&h).contains(&mo_id));
+
+        // An admin gives Ann a place in the folder's topic on purpose, with a post that has
+        // nothing to do with the sync. Then Ann is demoted, and the sync runs.
+        h.ok("POST", &format!("/api/v1/topics/{deploys}/members"), Some(json!({ "user": ann_id })), &admin);
+        let notes =
+            h.ok("POST", "/api/v1/posts", Some(json!({ "title": "Ann's notes", "status": "published", "topic_ids": [deploys] })), &admin);
+        let notes = notes["id"].as_str().unwrap().to_string();
+        h.ok("PATCH", &format!("/api/v1/users/{ann_id}"), Some(json!({ "role": "member" })), &admin);
+        let v = sync();
+        // That membership was someone's choice: it stays, and so does Ann's access to the post.
+        assert!(members(&h).contains(&ann_id), "an explicit membership stays");
+        assert_eq!(h.call("GET", &format!("/api/v1/posts/{notes}"), None, &ann).status, 200);
+        // But it lets in someone Ops doesn't, so the synced post leaves the topic.
+        assert_eq!(v["skipped"][0]["path"], "deploys/rollback.md", "{v}");
+        assert_eq!(h.call("GET", &format!("/api/v1/posts/{rollback}"), None, &ann).status, 404);
+        assert_eq!(h.call("GET", &format!("/api/v1/posts/{rollback}"), None, &mo).status, 200);
+
+        // A membership the sync gave goes once its person leaves the source's topic.
+        h.ok("DELETE", &format!("/api/v1/topics/{ops}/members/{mo_id}"), None, &admin);
+        sync();
+        assert!(!members(&h).contains(&mo_id), "the sync's own grant is taken back");
+        assert!(members(&h).contains(&ann_id));
+    }
+
+    #[test]
+    fn docs_sync_delivers_committed_webhooks_when_a_later_step_fails() {
+        let mut h = H::new();
+        let (admin, _) = h.setup();
+        with_key(&mut h);
+        h.ok("POST", "/api/v1/webhooks", Some(json!({ "url": "https://hooks.example.com/dumbslab", "events": ["post.*"] })), &admin);
+        let topic = h.ok("POST", "/api/v1/topics", Some(json!({ "name": "Runbooks" })), &admin)["id"].as_str().unwrap().to_string();
+        let (source, _) = gitlab_source(&h, &admin, &topic);
+        let lab = Lab::new(&[("a.md", b"# A\n"), ("b.md", b"# B\n")]);
+        let answer = |c: &HttpCall| lab.answer(c);
+        let r = h.call("POST", &format!("/api/v1/docs-sources/{source}/sync"), None, &admin);
+        run_to_end(&h, job_of(&r), &answer);
+        let ids = doc_ids(&h);
+
+        // b.md goes (the listing step archives its post and commits), a.md changes, and then the
+        // step that writes a.md is refused (a full workspace) and rolled back.
+        lab.files.borrow_mut().remove("b.md");
+        lab.put("a.md", b"# A\n\nChanged.\n");
+        let r = h.call("POST", &format!("/api/v1/docs-sources/{source}/sync"), None, &admin);
+        let mut job = job_of(&r);
+        let tree: Vec<HttpReply> = match step_once(&h, &mut job, vec![]) {
+            Step::Fetch(calls) => calls.iter().map(&answer).collect(),
+            other => panic!("{other:?}"),
+        };
+        let blobs: Vec<HttpReply> = match step_once(&h, &mut job, tree) {
+            Step::Fetch(calls) => calls.iter().map(&answer).collect(),
+            other => panic!("{other:?}"),
+        };
+        let refused = h
+            .store
+            .with_tx(|db| {
+                let full = |_: &dyn dumbslab_core::Db| Some(dumbslab_core::ApiError::new(507, "storage_full", "This workspace is full."));
+                let (step, _) = connect::guarded_step(db, &h.cfg, &mut job, blobs, chrono::Utc::now(), full);
+                let ok = step.is_ok();
+                (step, ok)
+            })
+            .unwrap();
+        assert!(refused.is_err());
+        // The archive committed and is announced; the refused change isn't.
+        assert_eq!(events(&job.take_effects()), vec!["post.archived"]);
+        assert_eq!(post(&h, &ids["b.md"], &admin)["status"], "archived");
+        assert!(!post(&h, &ids["a.md"], &admin)["content"].as_str().unwrap().contains("Changed"), "rolled back");
     }
 
     #[test]
