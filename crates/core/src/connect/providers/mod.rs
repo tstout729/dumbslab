@@ -2,11 +2,13 @@
 
 use super::Connector;
 
+pub mod confluence;
 pub mod github;
 pub mod google_drive;
+pub mod jira;
 
 /// Every app this build can connect to, in the order Settings shows them.
-pub static ALL: &[&dyn Connector] = &[&github::GitHub, &google_drive::GoogleDrive];
+pub static ALL: &[&dyn Connector] = &[&github::GitHub, &google_drive::GoogleDrive, &jira::Jira, &confluence::Confluence];
 
 pub fn get(id: &str) -> Option<&'static dyn Connector> {
     ALL.iter().copied().find(|c| c.info().id == id)
