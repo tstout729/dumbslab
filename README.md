@@ -13,6 +13,7 @@ An open-source team knowledge base in the spirit of [Slab](https://slab.com), wr
 | Area | What you get |
 | --- | --- |
 | Posts | Markdown posts with live preview, drafts, publish/archive, templates, duplicate, trash and restore |
+| Rich content | Embeds (paste a YouTube, Vimeo, Loom, Google Docs/Sheets/Slides/Forms/Drive, Figma, Airtable, Miro or CodePen link on its own line), callouts (`> [!NOTE]`, `[!TIP]`, `[!IMPORTANT]`, `[!WARNING]`, `[!CAUTION]`), tables, checklists, toggles (`<details>`), linked URLs |
 | History | Every save is a version; diff any two versions and restore any of them |
 | Topics | Nested topics, private topics with members, pinned posts, follow topics |
 | Verification | Mark posts verified for N days; expired and stale docs surface in Insights |

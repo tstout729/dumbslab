@@ -1520,3 +1520,40 @@ fn database_files_are_private() {
     let _ = Store::open(&old).unwrap();
     assert_eq!(mode(&old), 0o600);
 }
+
+#[test]
+fn rich_content_embeds_callouts_and_bare_links() {
+    let h = H::new();
+    let (_, admin) = h.setup();
+    let (_, viewer) = h.user(&admin, "vic@acme.test", "Vic", "viewer");
+    let target = h.ok("POST", "/api/v1/posts", Some(json!({ "title": "Target", "content": "Hi", "status": "published" })), &admin);
+    let tid = target["id"].as_str().unwrap();
+    let content = format!(
+        "> [!WARNING]\n> Turn the water off first.\n\n\
+         [How to unlock the thermostat](https://www.youtube.com/watch?v=9pasx0ghADM)\n\n\
+         https://docs.google.com/spreadsheets/d/1Sescq7Qe50UoB9UNhjthBSN1YmSV7FkBn3uTv6yd0ak/edit#gid=0\n\n\
+         <iframe src=\"https://evil.example/\"></iframe>\n\n\
+         Related: https://kb.acme.test/p/{tid}/target"
+    );
+    let post = h.ok("POST", "/api/v1/posts", Some(json!({ "title": "Thermostat", "content": content, "status": "published" })), &admin);
+    let pid = post["id"].as_str().unwrap();
+
+    let got = h.ok("GET", &format!("/api/v1/posts/{pid}?format=html"), None, &viewer);
+    let html = got["html"].as_str().unwrap();
+    assert!(html.contains("<blockquote class=\"md-callout md-callout-warning\">"), "{html}");
+    assert!(html.contains("<iframe src=\"https://www.youtube-nocookie.com/embed/9pasx0ghADM\""), "{html}");
+    assert!(
+        html.contains("<iframe src=\"https://docs.google.com/spreadsheets/d/1Sescq7Qe50UoB9UNhjthBSN1YmSV7FkBn3uTv6yd0ak/preview#gid=0\""),
+        "{html}"
+    );
+    assert!(!html.contains("evil.example"), "{html}");
+    assert_eq!(html.matches("<iframe ").count(), 2, "{html}");
+
+    // A bare /p/ URL counts as a backlink, like a Markdown link.
+    let t = h.ok("GET", &format!("/api/v1/posts/{tid}"), None, &viewer);
+    assert_eq!(t["backlinks"][0]["id"], post["id"]);
+
+    // The preview operation renders the same way.
+    let preview = h.ok("POST", "/api/v1/render", Some(json!({ "markdown": "https://vimeo.com/925549059/56f7392e1c" })), &viewer);
+    assert!(preview["html"].as_str().unwrap().contains("https://player.vimeo.com/video/925549059?h=56f7392e1c"));
+}
