@@ -2473,6 +2473,60 @@ mod connected {
     }
 
     #[test]
+    fn previews_follow_the_connection_as_it_is_now() {
+        let mut h = H::new();
+        let (admin, _) = h.setup();
+        with_key(&mut h);
+        h.cfg.connectors.apps.insert("gitlab".into(), OAuthApp { client_id: "gl".into(), client_secret: "glsecret".into() });
+        let user_id = h.ok("GET", "/api/v1/me", None, &admin)["user"]["id"].as_str().unwrap().to_string();
+        let gitlab_com = |expires: chrono::DateTime<chrono::Utc>| {
+            let cred = connect::Credential { token: "com-old".into(), refresh_token: Some("com-refresh".into()), ..Default::default() };
+            let sealed = connect::seal("connector-key", &user_id, "gitlab", &cred).unwrap();
+            let (expires, now) = (dumbslab_core::util::ts(expires), dumbslab_core::util::ts(chrono::Utc::now()));
+            let settings = json!({ "host": "gitlab.com", "username": "ada" }).to_string();
+            h.store
+                .with_tx(|db| {
+                    db.execute("DELETE FROM connections", &[]).unwrap();
+                    (db.execute(
+                        "INSERT INTO connections (user_id, provider, account, settings, secret, expires_at, created_at, updated_at) VALUES (?, 'gitlab', '@ada', ?, ?, ?, ?, ?)",
+                        &dumbslab_core::params![user_id.clone(), settings, sealed, expires, now.clone(), now],
+                    ), true)
+                })
+                .unwrap()
+                .unwrap();
+        };
+        let own_server = || {
+            let fields = json!({ "app": "gitlab", "fields": { "token": "self-token", "base_url": "https://gitlab.example.com" } });
+            drive(&h, job_of(&h.call("POST", "/api/v1/connections", Some(fields), &admin)), &|_: &HttpCall| {
+                ok(json!({ "username": "ada" }))
+            });
+        };
+        let link = format!("/api/v1/connections/preview?url={}", urlencoding::encode("https://gitlab.com/acme/api/-/issues/3"));
+        let preview = || job_of(&h.call("GET", &link, None, &admin));
+        let error = |step: Step| result(step)["error"].as_str().unwrap_or_default().to_string();
+        let (past, later) = (chrono::Utc::now() - chrono::Duration::hours(1), chrono::Utc::now() + chrono::Duration::hours(1));
+
+        // The refresh is refused because the person connected their own server meanwhile: the
+        // gitlab.com link isn't on that server, so nothing is fetched from it.
+        gitlab_com(past);
+        let mut job = preview();
+        fetches(step(&h, &mut job, vec![]));
+        own_server();
+        let refused = HttpReply { status: 400, body: json!({ "error": "invalid_grant" }).to_string() };
+        assert!(error(step(&h, &mut job, vec![refused])).contains("connected again"));
+        // The same when the change comes before the preview starts.
+        gitlab_com(later);
+        let mut job = preview();
+        own_server();
+        assert!(error(step(&h, &mut job, vec![])).contains("connected again"));
+        // A disconnected app's token isn't used at all.
+        gitlab_com(later);
+        let mut job = preview();
+        h.ok("DELETE", "/api/v1/connections/gitlab", None, &admin);
+        assert!(error(step(&h, &mut job, vec![])).contains("isn't connected any more"));
+    }
+
+    #[test]
     fn expired_tokens_are_refreshed_first() {
         let mut h = H::new();
         let (admin, _) = h.setup();

@@ -223,8 +223,8 @@ fn preview_link(ctx: &mut Ctx, input: PreviewInput) -> ApiResult<Deferred<LinkPr
             if !p.info().preview {
                 continue;
             }
-            if let Some(target) = p.preview_target(&conn.account, url) {
-                ctx.effects.push(Effect::Connect(Job::Preview(PreviewJob::new(&ctx.actor.user_id, conn, target))));
+            if let Some(job) = PreviewJob::new(&ctx.actor.user_id, conn, url) {
+                ctx.effects.push(Effect::Connect(Job::Preview(job)));
                 return Ok(Deferred::Pending);
             }
         }

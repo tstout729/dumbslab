@@ -921,6 +921,8 @@ impl SearchJob {
 pub struct PreviewJob {
     pub user_id: String,
     conn: Connection,
+    /// The link, to find its target again if the connection changes meanwhile.
+    url: String,
     target: String,
     phase: PreviewPhase,
 }
@@ -933,9 +935,24 @@ enum PreviewPhase {
 }
 
 impl PreviewJob {
-    /// Previews `target` (from [`Connector::preview_target`]) with the person's connection.
-    pub fn new(user_id: &str, conn: Connection, target: String) -> PreviewJob {
-        PreviewJob { user_id: user_id.into(), conn, target, phase: PreviewPhase::Start }
+    /// Previews `url` with the person's connection, when its app recognizes the link as one of
+    /// that account's items (see [`Connector::preview_target`]).
+    pub fn new(user_id: &str, conn: Connection, url: &str) -> Option<PreviewJob> {
+        let target = providers::get(conn.provider)?.preview_target(&conn.account, url)?;
+        Some(PreviewJob { user_id: user_id.into(), conn, url: url.into(), target, phase: PreviewPhase::Start })
+    }
+
+    /// Finds the link's target again on the connection as it is now. `false` when that's another
+    /// account now, one the link isn't on.
+    fn retarget(&mut self) -> bool {
+        let p = providers::get(self.conn.provider).expect("known provider");
+        match p.preview_target(&self.conn.account, &self.url) {
+            Some(target) => {
+                self.target = target;
+                true
+            }
+            None => false,
+        }
     }
 }
 
@@ -1064,6 +1081,10 @@ fn renewal(db: &dyn Db, user_id: &str, conn: &mut Connection, now: DateTime<Utc>
     })
 }
 
+fn reconnected_message(name: &str) -> String {
+    format!("{name} was connected again while this was loading. Try again.")
+}
+
 fn busy_message(name: &str) -> String {
     format!("{name} is renewing its sign-in. Try again in a moment.")
 }
@@ -1103,7 +1124,7 @@ fn apply_refresh(
     conn.cred.fields.extend(tokens.fields.clone());
     conn.expires_at = expiry(now, &tokens);
     if !save_token(db, cfg, user_id, conn, now)? {
-        return Ok(Err(format!("{} was connected again while this was loading. Try again.", p.info().name)));
+        return Ok(Err(reconnected_message(p.info().name)));
     }
     Ok(Ok(()))
 }
@@ -1147,9 +1168,14 @@ fn preview_step(db: &dyn Db, cfg: &HostConfig, j: &mut PreviewJob, replies: Vec<
     };
     match j.phase {
         PreviewPhase::Start => {
-            // Another request may have refreshed the token since the preview was asked for.
-            if let Some(saved) = connections(db, cfg, &j.user_id)?.into_iter().find(|c| c.provider == j.conn.provider) {
-                j.conn = saved;
+            // Another request may have refreshed the token since the preview was asked for, or the
+            // person may have connected another account, or none.
+            let Some(saved) = connections(db, cfg, &j.user_id)?.into_iter().find(|c| c.provider == j.conn.provider) else {
+                return done(Err(format!("{} isn't connected any more.", p.info().name)));
+            };
+            j.conn = saved;
+            if !j.retarget() {
+                return done(Err(reconnected_message(p.info().name)));
             }
             if needs_refresh(cfg, &j.conn, now) {
                 match renewal(db, &j.user_id, &mut j.conn, now)? {
@@ -1166,6 +1192,8 @@ fn preview_step(db: &dyn Db, cfg: &HostConfig, j: &mut PreviewJob, replies: Vec<
         }
         PreviewPhase::Refreshing => {
             match apply_refresh(db, cfg, &j.user_id, &mut j.conn, &replies.first().cloned().unwrap_or_default(), now)? {
+                // A refused refresh may have loaded what's stored now instead.
+                Ok(()) if !j.retarget() => done(Err(reconnected_message(p.info().name))),
                 Ok(()) => {
                     j.phase = PreviewPhase::Fetching;
                     Ok(Step::Fetch(p.preview(&j.conn.cred, &j.conn.account, &j.target)))
