@@ -114,7 +114,7 @@ pub fn llms_txt(base_url: &str) -> String {
          > Everything a person can do in the web app, an agent can do through MCP or the REST API.\n\n\
          ## Connect\n\n\
          - MCP (Streamable HTTP): `{base_url}/mcp` — sign in with OAuth, or send `Authorization: Bearer <token>`.\n\
-           Add `?toolset=core` for a smaller tool list (the rest stay reachable through `call_operation`), or `?toolset=read` for read-only tools.\n\
+           Add `?toolset=core` for a smaller tool list (the rest stay reachable through `call_operation`), or `?toolset=read` for read-only tools (OAuth through it grants read access only).\n\
          - Claude Code: `claude mcp add --transport http dumbslab {base_url}/mcp`\n\
          - REST: `{base_url}/api/v1` with `Authorization: Bearer <token>`. OpenAPI: `{base_url}/api/v1/openapi.json`.\n\
          - Any operation: `POST {base_url}/api/v1/operations/<name>` with the input as JSON.\n\

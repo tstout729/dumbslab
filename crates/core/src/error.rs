@@ -9,13 +9,16 @@ pub struct ApiError {
     pub code: &'static str,
     pub message: String,
     pub details: Option<Value>,
+    /// Commit the request's writes although it fails, e.g. so a wrong password still counts
+    /// toward the sign-in limits. Errors normally roll everything back.
+    pub keep_writes: bool,
 }
 
 pub type ApiResult<T> = Result<T, ApiError>;
 
 impl ApiError {
     pub fn new(status: u16, code: &'static str, message: impl Into<String>) -> Self {
-        ApiError { status, code, message: message.into(), details: None }
+        ApiError { status, code, message: message.into(), details: None, keep_writes: false }
     }
 
     pub fn bad_request(message: impl Into<String>) -> Self {
@@ -38,6 +41,11 @@ impl ApiError {
     }
     pub fn internal(message: impl Into<String>) -> Self {
         Self::new(500, "internal", message)
+    }
+
+    pub fn keep_writes(mut self) -> Self {
+        self.keep_writes = true;
+        self
     }
 
     pub fn with_details(mut self, details: impl Serialize) -> Self {

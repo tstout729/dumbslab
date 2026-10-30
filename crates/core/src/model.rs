@@ -6,7 +6,8 @@
 //! - A post with no topics, or in at least one org-wide topic, is visible to everyone.
 //! - A post whose topics are all private is visible to members of any of those topics.
 //! - Authors always see their own posts.
-//! - Trashed posts (`deleted_at` set) are excluded unless a query asks for the trash.
+//! - Trashed posts (`deleted_at` set) are excluded unless a query asks for the trash, and even then
+//!   only their author (who alone, besides admins, may delete and restore them) sees them.
 
 use std::collections::HashMap;
 
@@ -27,9 +28,9 @@ pub fn post_visible_sql(actor: &Actor, a: &str, params: &mut Vec<SqlValue>) -> S
         return "1=1".into();
     }
     let uid = actor.user_id.clone();
-    params.extend([uid.clone().into(), uid.clone().into(), uid.into()]);
+    params.extend([uid.clone().into(), uid.clone().into(), uid.clone().into(), uid.into()]);
     format!(
-        "(({a}.status != 'draft' OR {a}.author_id = ?) AND ({a}.author_id = ?
+        "(({a}.deleted_at IS NULL OR {a}.author_id = ?) AND ({a}.status != 'draft' OR {a}.author_id = ?) AND ({a}.author_id = ?
           OR NOT EXISTS (SELECT 1 FROM post_topics vpt WHERE vpt.post_id = {a}.id)
           OR EXISTS (SELECT 1 FROM post_topics vpt JOIN topics vt ON vt.id = vpt.topic_id
                      WHERE vpt.post_id = {a}.id AND (vt.visibility = 'org'

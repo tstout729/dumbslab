@@ -68,11 +68,39 @@ pub struct Store {
     conn: Mutex<Connection>,
 }
 
+/// Makes the database owner-only: it holds password hashes, token hashes and every private post.
+/// SQLite gives its `-wal` and `-shm` files the database file's permissions.
+#[cfg(unix)]
+fn restrict_permissions(path: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    // Created owner-only from the start (an empty file is an empty database), never truncated.
+    std::fs::OpenOptions::new().write(true).create(true).truncate(false).mode(0o600).open(path)?;
+    let side_files = ["-wal", "-shm"].map(|suffix| {
+        let mut p = path.as_os_str().to_owned();
+        p.push(suffix);
+        std::path::PathBuf::from(p)
+    });
+    for file in std::iter::once(path.to_path_buf()).chain(side_files.into_iter().filter(|p| p.exists())) {
+        let mode = std::fs::metadata(&file)?.permissions().mode();
+        if mode & 0o077 != 0 {
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600))?;
+            tracing::warn!(file = %file.display(), "made the database readable by its owner only (it was {:o})", mode & 0o777);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn restrict_permissions(_: &Path) -> anyhow::Result<()> {
+    Ok(())
+}
+
 impl Store {
     pub fn open(path: &Path) -> anyhow::Result<Store> {
         if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
             std::fs::create_dir_all(dir)?;
         }
+        restrict_permissions(path)?;
         let conn = Connection::open(path)?;
         conn.execute_batch(
             "PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;",

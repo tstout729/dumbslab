@@ -314,13 +314,23 @@ fn set_topics(ctx: &Ctx, post_id: &str, topic_ids: &[String]) -> ApiResult<(Vec<
     let vis = topic_visible_sql(&ctx.actor, "t", &mut p);
     p.push(post_id.into());
     let current = ctx.db.query(
-        &format!("SELECT pt.topic_id, {vis} AS visible FROM post_topics pt JOIN topics t ON t.id = pt.topic_id WHERE pt.post_id = ?"),
+        &format!(
+            "SELECT pt.topic_id, t.visibility, {vis} AS visible FROM post_topics pt JOIN topics t ON t.id = pt.topic_id WHERE pt.post_id = ?"
+        ),
         &p,
     )?;
     let current_ids: Vec<String> = current.iter().map(|r| r.str("topic_id")).collect();
     let added: Vec<String> = wanted.iter().filter(|t| !current_ids.contains(t)).cloned().collect();
     let removed: Vec<String> =
         current.iter().filter(|r| r.bool("visible") && !wanted.contains(&r.str("topic_id"))).map(|r| r.str("topic_id")).collect();
+    // A post without topics is visible to everyone, so dropping the last private topic would
+    // publish a restricted post to the whole workspace. Sharing it takes an org-wide topic.
+    let only_private = !current.is_empty() && current.iter().all(|r| r.str("visibility") == "private");
+    if only_private && current.len() - removed.len() + added.len() == 0 {
+        return Err(ApiError::conflict(
+            "this post is only in private topics; removing them all would make it visible to everyone. Add an org-wide topic first if you mean to share it",
+        ));
+    }
     for t in &removed {
         ctx.db.execute("DELETE FROM post_topics WHERE post_id = ? AND topic_id = ?", &params![post_id, t.clone()])?;
     }

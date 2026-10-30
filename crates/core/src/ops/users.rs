@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use super::{DONE, Done, NoInput, clean, required};
-use crate::auth::{self, Role, Scopes};
+use crate::auth::{self, Role, Scopes, Via};
 use crate::db::{DbExt, Row, SqlValue};
 use crate::error::{ApiError, ApiResult};
 use crate::events::{Event, emit};
@@ -35,7 +35,7 @@ pub fn ops() -> Vec<Op> {
             .build(),
         op("users", "change_password", "POST", "/me/password", Access::Write, change_password)
             .title("Change your password")
-            .desc("Changes your password and signs out your other browser sessions.")
+            .desc("Changes your password and signs out your other browser sessions. Only from a signed-in browser or the local CLI, never with a token.")
             .build(),
         op("users", "list_api_tokens", "GET", "/tokens", Access::Read, list_tokens)
             .title("List API tokens")
@@ -47,6 +47,7 @@ pub fn ops() -> Vec<Op> {
             .build(),
         op("users", "revoke_api_token", "DELETE", "/tokens/{id}", Access::Write, revoke_token)
             .title("Revoke an API token")
+            .desc("Revoke one of your tokens (admins: anyone's). A connected app can only disconnect itself unless it was granted the admin scope.")
             .destructive()
             .build(),
     ]
@@ -360,14 +361,25 @@ pub struct ChangePasswordInput {
 }
 
 fn change_password(ctx: &mut Ctx, input: ChangePasswordInput) -> ApiResult<Done> {
+    // A token (a connected app's or a script's) must not be a way to guess, or replace, the
+    // password that signs in with the account's full role.
+    if ctx.actor.session_hash.is_none() && ctx.actor.via != Via::Cli {
+        return Err(ApiError::forbidden("change your password in the web app, under Settings → Profile"));
+    }
     let row = ctx
         .db
-        .one("SELECT password_hash FROM users WHERE id = ?", &params![ctx.actor.user_id.clone()])?
+        .one("SELECT email, password_hash FROM users WHERE id = ?", &params![ctx.actor.user_id.clone()])?
         .ok_or_else(|| ApiError::not_found("user"))?;
+    // Guesses at the current password count against the same limits as sign-ins.
+    let keys = auth::password_keys(&row.str("email"), None);
+    auth::check_throttle(ctx.db, &keys, ctx.now)?;
     let ok = row.opt_str("password_hash").is_some_and(|h| auth::verify_password(&input.current_password, &h));
     if !ok {
-        return Err(ApiError::forbidden("current password is incorrect"));
+        auth::record_failures(ctx.db, &keys, ctx.now)?;
+        // Keep the failure count although the request fails.
+        return Err(ApiError::forbidden("current password is incorrect").keep_writes());
     }
+    auth::clear_failures(ctx.db, &keys[0].0)?;
     let hash = auth::hash_password(&input.new_password)?;
     ctx.db.execute(
         "UPDATE users SET password_hash = ?, updated_at = ? WHERE id = ?",
@@ -477,22 +489,22 @@ pub struct CreatedToken {
     pub info: TokenInfo,
 }
 
-/// Creates a token row and returns (id, secret).
+/// Creates a token row and returns (id, secret). `app` is a connected app's (client id, resource);
+/// without one it's a personal token.
 pub fn mint_token(
     ctx: &Ctx,
     user_id: &str,
     name: &str,
     scopes: Scopes,
-    kind: &str,
-    client_id: Option<&str>,
+    app: Option<(&str, &str)>,
     expires_at: Option<String>,
 ) -> ApiResult<(String, String)> {
-    let prefix = if kind == "oauth" { "ds_oat_" } else { "ds_pat_" };
+    let (kind, prefix) = if app.is_some() { ("oauth", "ds_oat_") } else { ("personal", "ds_pat_") };
     let secret = new_secret(prefix);
     let id = new_id();
     ctx.db.execute(
-        "INSERT INTO api_tokens (id, user_id, name, token_hash, prefix, scopes, kind, client_id, created_at, expires_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO api_tokens (id, user_id, name, token_hash, prefix, scopes, kind, client_id, resource, created_at, expires_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         &params![
             id.clone(),
             user_id,
@@ -501,12 +513,20 @@ pub fn mint_token(
             secret.chars().take(11).collect::<String>(),
             scopes.to_str(),
             kind,
-            client_id,
+            app.map(|(client, _)| client),
+            app.map(|(_, resource)| resource),
             ctx.now_s(),
             expires_at
         ],
     )?;
     Ok((id, secret))
+}
+
+/// The connected app (its client id) whose token the caller is using, if any.
+fn connected_app(ctx: &Ctx) -> ApiResult<Option<String>> {
+    let Some(tid) = &ctx.actor.token_id else { return Ok(None) };
+    let row = ctx.db.one("SELECT kind, client_id FROM api_tokens WHERE id = ?", &params![tid.clone()])?;
+    Ok(row.filter(|r| r.str("kind") == "oauth").and_then(|r| r.opt_str("client_id")))
 }
 
 fn create_token(ctx: &mut Ctx, input: CreateTokenInput) -> ApiResult<CreatedToken> {
@@ -531,11 +551,11 @@ fn create_token(ctx: &mut Ctx, input: CreateTokenInput) -> ApiResult<CreatedToke
         return Err(ApiError::forbidden("you can't create a token with more scopes than the credential you're using"));
     }
     let mut expires = input.expires_in_days.filter(|d| *d > 0).map(|d| ts(ctx.now + Duration::days(d as i64)));
+    if connected_app(ctx)?.is_some() {
+        return Err(ApiError::forbidden("connected apps can't create API tokens; create one in Settings → API tokens"));
+    }
     if let Some(tid) = &ctx.actor.token_id {
-        let caller = ctx.db.one("SELECT kind, expires_at FROM api_tokens WHERE id = ?", &params![tid.clone()])?;
-        if caller.as_ref().is_some_and(|c| c.str("kind") == "oauth") {
-            return Err(ApiError::forbidden("connected apps can't create API tokens; create one in Settings → API tokens"));
-        }
+        let caller = ctx.db.one("SELECT expires_at FROM api_tokens WHERE id = ?", &params![tid.clone()])?;
         if let Some(limit) = caller.and_then(|c| c.opt_str("expires_at")) {
             expires = Some(match expires {
                 Some(e) if e < limit => e,
@@ -543,7 +563,7 @@ fn create_token(ctx: &mut Ctx, input: CreateTokenInput) -> ApiResult<CreatedToke
             });
         }
     }
-    let (id, token) = mint_token(ctx, &owner.str("id"), &name, requested, "personal", None, expires)?;
+    let (id, token) = mint_token(ctx, &owner.str("id"), &name, requested, None, expires)?;
     emit(
         ctx,
         Event::new("token.created", "token", &id, format!("created API token “{name}” for {}", owner.str("name")))
@@ -566,6 +586,14 @@ fn revoke_token(ctx: &mut Ctx, input: TokenIdInput) -> ApiResult<Done> {
         ctx.db.one("SELECT * FROM api_tokens WHERE id = ?", &params![input.id.clone()])?.ok_or_else(|| ApiError::not_found("token"))?;
     if row.str("user_id") != ctx.actor.user_id {
         ctx.actor.require_admin()?;
+    }
+    // Consent to a connected app covers content, not the person's other credentials: without the
+    // admin scope it may only disconnect itself.
+    if let Some(client) = connected_app(ctx)?
+        && !ctx.actor.can_admin()
+        && !(row.str("kind") == "oauth" && row.opt_str("client_id").as_deref() == Some(client.as_str()))
+    {
+        return Err(ApiError::forbidden("connected apps can only disconnect themselves; manage other tokens in Settings → API tokens"));
     }
     ctx.db.execute("UPDATE api_tokens SET revoked_at = COALESCE(revoked_at, ?) WHERE id = ?", &params![ctx.now_s(), input.id.clone()])?;
     ctx.db.execute(

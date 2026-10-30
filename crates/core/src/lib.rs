@@ -62,16 +62,14 @@ pub struct Request {
     pub body: Vec<u8>,
     /// `scheme://host[:port]` as seen by the client.
     pub origin: String,
+    /// The caller's address, when the host can vouch for it (not a proxy's address, and not a
+    /// header anyone could set). Sign-in limits count failures per address.
     pub client_ip: Option<String>,
 }
 
 impl Request {
     pub fn header(&self, name: &str) -> Option<&str> {
         self.headers.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str())
-    }
-
-    pub fn is_https(&self) -> bool {
-        self.origin.starts_with("https://")
     }
 }
 

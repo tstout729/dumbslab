@@ -65,10 +65,15 @@ impl H {
             origin: "https://kb.test".into(),
             client_ip: None,
         };
+        self.send(&req)
+    }
+
+    /// Runs a request built by the test (for a custom origin or client address).
+    fn send(&self, req: &Request) -> Res {
         let out = self
             .store
             .with_tx(|db| {
-                let o = dumbslab_core::handle(db, &self.cfg, &req).expect("core route");
+                let o = dumbslab_core::handle(db, &self.cfg, req).expect("core route");
                 let c = o.commit;
                 (o, c)
             })
@@ -209,7 +214,7 @@ fn setup_login_and_csrf() {
     h.store.with_tx(|db| (db.execute("UPDATE login_attempts SET window_start = '2000-01-01T00:00:00.000Z'", &[]), true)).unwrap().unwrap();
     h.call("POST", "/api/v1/auth/login", Some(json!({ "email": "someone-else@acme.test", "password": "nopenope" })), &Auth::None);
     let kept = h.store.with_tx(|db| (db.scalar_i64("SELECT COUNT(*) FROM login_attempts", &[]), true)).unwrap().unwrap();
-    assert_eq!(kept, 1, "only the current window's record remains");
+    assert_eq!(kept, 2, "only the current window's records remain: that email's and the workspace's");
 
     // Logout ends the session.
     let session = session_from(&right);
@@ -1125,4 +1130,393 @@ fn directory_moves_addresses() {
     run(&|db| tenancy::remove(db, "acme")).unwrap();
     assert_eq!(resolve("wiki"), None);
     assert_eq!(status(reserve("wiki", t0)), None);
+}
+
+// ---------------------------------------------------------------------------
+// Security review regressions (October 2026).
+
+fn count(h: &H, sql: &str) -> i64 {
+    h.store.with_tx(|db| (db.scalar_i64(sql, &[]), true)).unwrap().unwrap()
+}
+
+fn register_app(h: &H) -> String {
+    let reg = h.call(
+        "POST",
+        "/oauth/register",
+        Some(json!({ "client_name": "Some App", "redirect_uris": ["http://localhost:9999/cb"] })),
+        &Auth::None,
+    );
+    assert_eq!(reg.status, 201, "{}", reg.body);
+    reg.body["client_id"].as_str().unwrap().to_string()
+}
+
+/// The authorization request for `client_id`, plus `extra` query parameters (`&scope=…`, `&resource=…`).
+fn authorize_query(client_id: &str, extra: &str) -> String {
+    let (_, challenge) = pkce_pair();
+    format!(
+        "response_type=code&client_id={client_id}&redirect_uri={}&code_challenge={challenge}&code_challenge_method=S256&state=s{extra}",
+        urlencoding::encode("http://localhost:9999/cb")
+    )
+}
+
+/// Approves the consent page as `cookie` and returns the authorization code.
+fn approve(h: &H, cookie: &Auth, q: &str) -> String {
+    let page = h.call("GET", &format!("/oauth/authorize?{q}"), None, cookie);
+    assert_eq!(page.status, 200, "consent page: {}", page.text());
+    let csrf = page.text().split("name=\"csrf\" value=\"").nth(1).unwrap().split('"').next().unwrap().to_string();
+    let approved = h.raw(
+        "POST",
+        "/oauth/authorize",
+        format!("{q}&decision=approve&csrf={csrf}").into_bytes(),
+        "application/x-www-form-urlencoded",
+        cookie,
+    );
+    assert_eq!(approved.status, 302);
+    query_of(approved.header("location").unwrap())["code"].clone()
+}
+
+fn exchange(h: &H, client_id: &str, code: &str, extra: &str) -> Res {
+    let (verifier, _) = pkce_pair();
+    let form = format!(
+        "grant_type=authorization_code&code={code}&client_id={client_id}&redirect_uri={}&code_verifier={verifier}{extra}",
+        urlencoding::encode("http://localhost:9999/cb")
+    );
+    h.raw("POST", "/oauth/token", form.into_bytes(), "application/x-www-form-urlencoded", &Auth::None)
+}
+
+/// Connects a new app for the person signed in with `cookie` and returns the token response.
+fn connect_app(h: &H, cookie: &Auth, extra: &str) -> Res {
+    let client_id = register_app(h);
+    let code = approve(h, cookie, &authorize_query(&client_id, extra));
+    let tok = exchange(h, &client_id, &code, "");
+    assert_eq!(tok.status, 200, "{}", tok.body);
+    tok
+}
+
+fn sign_in(h: &H, email: &str, password: &str) -> Auth {
+    let r = h.call("POST", "/api/v1/auth/login", Some(json!({ "email": email, "password": password })), &Auth::None);
+    assert_eq!(r.status, 200, "{}", r.body);
+    session_from(&r)
+}
+
+#[test]
+fn trashed_posts_are_private_to_their_author_and_admins() {
+    let h = H::new();
+    let (_, admin) = h.setup();
+    let (_, author) = h.user(&admin, "ana@acme.test", "Ana Author", "member");
+    let (_, member) = h.user(&admin, "mo@acme.test", "Mo Member", "member");
+    let (_, viewer) = h.user(&admin, "vic@acme.test", "Vic Viewer", "viewer");
+    let post = h.ok(
+        "POST",
+        "/api/v1/posts",
+        Some(json!({ "title": "Retired runbook", "content": "the old root password was hunter2", "status": "published" })),
+        &author,
+    );
+    let id = post["id"].as_str().unwrap().to_string();
+    h.ok("DELETE", &format!("/api/v1/posts/{id}"), None, &admin);
+
+    // Everyone else loses the post: reads, the trash list, its history, activity and restore.
+    for who in [&viewer, &member] {
+        assert_eq!(h.call("GET", &format!("/api/v1/posts/{id}"), None, who).status, 404, "a trashed post is readable");
+        assert!(!ids(&h.ok("GET", "/api/v1/posts?status=trash", None, who)).contains(&id));
+        assert_eq!(h.call("GET", &format!("/api/v1/posts/{id}/versions/1"), None, who).status, 404);
+        let feed = h.ok("GET", "/api/v1/activity?limit=200", None, who);
+        assert!(feed["items"].as_array().unwrap().iter().all(|a| a["post_id"] != json!(id)), "trashed post in activity");
+    }
+    assert_eq!(h.call("POST", &format!("/api/v1/posts/{id}/restore"), None, &member).status, 404, "an unrelated member restored it");
+
+    // Its author and admins still see it and can restore it.
+    assert!(h.ok("GET", &format!("/api/v1/posts/{id}"), None, &admin)["deleted_at"].is_string());
+    assert!(ids(&h.ok("GET", "/api/v1/posts?status=trash", None, &author)).contains(&id));
+    h.ok("POST", &format!("/api/v1/posts/{id}/restore"), None, &author);
+    assert_eq!(h.call("GET", &format!("/api/v1/posts/{id}"), None, &viewer).status, 200);
+}
+
+#[test]
+fn topic_changes_never_widen_a_private_post() {
+    let h = H::new();
+    let (_, admin) = h.setup();
+    let (_, member) = h.user(&admin, "mia@acme.test", "Mia Member", "member");
+    let (_, viewer) = h.user(&admin, "vic@acme.test", "Vic Viewer", "viewer");
+    let private =
+        h.ok("POST", "/api/v1/topics", Some(json!({ "name": "HR", "visibility": "private", "members": ["mia@acme.test"] })), &admin);
+    let tid = private["id"].as_str().unwrap().to_string();
+    let post = h.ok(
+        "POST",
+        "/api/v1/posts",
+        Some(json!({ "title": "Layoff plan", "content": "confidential", "topic_ids": [tid], "status": "published" })),
+        &admin,
+    );
+    let id = post["id"].as_str().unwrap().to_string();
+    assert_eq!(h.call("GET", &format!("/api/v1/posts/{id}"), None, &viewer).status, 404);
+
+    // Removing its last private topic would publish it to everyone, however it's asked for.
+    for change in [json!({ "topic_ids": [] }), json!({ "remove_topic_ids": [tid] })] {
+        let r = h.call("PATCH", &format!("/api/v1/posts/{id}"), Some(change), &member);
+        assert_eq!(r.status, 409, "{}", r.body);
+        assert_eq!(h.call("GET", &format!("/api/v1/posts/{id}"), None, &viewer).status, 404, "the private post was exposed");
+    }
+
+    // Sharing it is an explicit step: add an org-wide topic. Then the private one can go.
+    let everyone = h.ok("POST", "/api/v1/topics", Some(json!({ "name": "Everyone" })), &admin)["id"].as_str().unwrap().to_string();
+    h.ok("PATCH", &format!("/api/v1/posts/{id}"), Some(json!({ "add_topic_ids": [everyone] })), &member);
+    h.ok("PATCH", &format!("/api/v1/posts/{id}"), Some(json!({ "remove_topic_ids": [tid] })), &member);
+    assert_eq!(h.call("GET", &format!("/api/v1/posts/{id}"), None, &viewer).status, 200);
+}
+
+#[test]
+fn deleted_comments_leave_no_body_behind() {
+    let h = H::new();
+    let (_, admin) = h.setup();
+    let (_, viewer) = h.user(&admin, "vic@acme.test", "Vic Viewer", "viewer");
+    h.ok("POST", "/api/v1/webhooks", Some(json!({ "url": "https://hooks.test/in", "events": ["comment.*"] })), &admin);
+    let post = h.ok("POST", "/api/v1/posts", Some(json!({ "title": "Office", "status": "published" })), &admin);
+    let pid = post["id"].as_str().unwrap().to_string();
+
+    let created = h.call("POST", &format!("/api/v1/posts/{pid}/comments"), Some(json!({ "body": "the door code is 4512" })), &viewer);
+    assert_eq!(created.status, 200);
+    let cid = created.body["id"].as_str().unwrap().to_string();
+    let feed = |who: &Auth| h.ok("GET", &format!("/api/v1/activity?post_id={pid}&limit=200"), None, who).to_string();
+    assert!(!feed(&viewer).contains("4512"), "the comment body is stored in activity");
+    // Webhooks still receive the body when the comment is written.
+    let Effect::Webhook(d) = &created.effects[0] else { panic!("expected a webhook delivery") };
+    assert!(d.body.contains("4512"));
+
+    h.ok("PATCH", &format!("/api/v1/comments/{cid}"), Some(json!({ "body": "the door code is 7788" })), &viewer);
+    assert!(!feed(&viewer).contains("7788"));
+    h.ok("DELETE", &format!("/api/v1/comments/{cid}"), None, &viewer);
+    let kept = h
+        .store
+        .with_tx(|db| (db.one("SELECT body, quote FROM comments WHERE id = ?", &[cid.clone().into()]), true))
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(kept.str("body"), "", "a deleted comment keeps its body");
+
+    // Bodies recorded before this fix are scrubbed by a migration, even after the post is purged.
+    h.store
+        .with_tx(|db| {
+            let r = db.execute(
+                "INSERT INTO activity (event, actor_id, via, target_type, target_id, post_id, summary, data, created_at)
+                 VALUES ('comment.created', NULL, 'web', 'comment', 'old', ?, 'commented', '{\"body\":\"legacy 9999\"}', '2026-10-01T00:00:00.000Z')",
+                &[pid.clone().into()],
+            );
+            (r, true)
+        })
+        .unwrap()
+        .unwrap();
+    h.ok("DELETE", &format!("/api/v1/posts/{pid}?permanent=true"), None, &admin);
+    let last = dumbslab_core::db::MIGRATIONS.len() as i64;
+    h.store
+        .with_tx(|db| (db.execute("UPDATE meta SET value = ? WHERE key = 'schema_version'", &[(last - 1).to_string().into()]), true))
+        .unwrap()
+        .unwrap();
+    let _reopened = Store::open(&h._dir.path().join("t.db")).unwrap();
+    assert!(!h.ok("GET", "/api/v1/activity?limit=200", None, &admin).to_string().contains("9999"));
+}
+
+#[test]
+fn connected_apps_cannot_manage_credentials() {
+    let h = H::new();
+    let (_, admin) = h.setup();
+    let (_, pat) = h.user(&admin, "mia@acme.test", "Mia", "member");
+    let mia = sign_in(&h, "mia@acme.test", "password123");
+    let app = connect_app(&h, &mia, "&scope=read%20write");
+    let app_token = Auth::Bearer(app.body["access_token"].as_str().unwrap().to_string());
+    let tokens = h.ok("GET", "/api/v1/tokens", None, &mia);
+    let id_of =
+        |kind: &str| tokens["items"].as_array().unwrap().iter().find(|t| t["kind"] == kind).unwrap()["id"].as_str().unwrap().to_string();
+
+    // A write grant can't revoke the person's other credentials.
+    assert_eq!(h.call("DELETE", &format!("/api/v1/tokens/{}", id_of("personal")), None, &app_token).status, 403);
+    assert_eq!(h.call("GET", "/api/v1/me", None, &pat).status, 200);
+
+    // Tokens can't guess (or change) the password; the browser can, within sign-in limits.
+    let change = |pw: &str, who: &Auth| {
+        h.call("POST", "/api/v1/me/password", Some(json!({ "current_password": pw, "new_password": "brand-new-pass" })), who).status
+    };
+    assert_eq!(change("guess-number-1", &app_token), 403);
+    assert_eq!(change("password123", &pat), 403);
+    for i in 0..10 {
+        assert_eq!(change(&format!("wrong-guess-{i}"), &mia), 403);
+    }
+    assert_eq!(change("password123", &mia), 429, "current-password guesses aren't throttled");
+
+    // An app can still disconnect itself.
+    h.ok("DELETE", &format!("/api/v1/tokens/{}", id_of("oauth")), None, &app_token);
+    assert_eq!(h.call("GET", "/api/v1/me", None, &app_token).status, 401);
+}
+
+#[test]
+fn sign_in_limits_cover_every_email() {
+    let mut h = H::new();
+    h.setup();
+    let login = |h: &H, email: &str, ip: &str, origin: &str| {
+        h.send(&Request {
+            method: "POST".into(),
+            path: "/api/v1/auth/login".into(),
+            headers: vec![("content-type".into(), "application/json".into()), ("x-dumbslab-client".into(), "web".into())],
+            body: serde_json::to_vec(&json!({ "email": email, "password": "not-the-password" })).unwrap(),
+            origin: origin.into(),
+            client_ip: Some(ip.into()),
+            ..Default::default()
+        })
+    };
+    // A failure counts against the email, the client's address and the whole workspace.
+    assert_eq!(login(&h, "first@acme.test", "203.0.113.7", "https://kb.test").status, 401);
+    assert_eq!(count(&h, "SELECT COUNT(*) FROM login_attempts"), 3, "only the email is throttled");
+
+    // An address that failed many times with other emails is stopped before any password check.
+    h.store.with_tx(|db| (db.execute("UPDATE login_attempts SET failures = 1000 WHERE key LIKE 'ip:%'", &[]), true)).unwrap().unwrap();
+    assert_eq!(login(&h, "fresh@acme.test", "203.0.113.7", "https://kb.test").status, 429);
+    assert_eq!(login(&h, "fresh@acme.test", "198.51.100.9", "https://kb.test").status, 401);
+    // So is everyone, once the workspace as a whole has failed too often (addresses are cheap).
+    h.store.with_tx(|db| (db.execute("UPDATE login_attempts SET failures = 1000 WHERE key = 'workspace'", &[]), true)).unwrap().unwrap();
+    assert_eq!(login(&h, "other@acme.test", "192.0.2.1", "https://kb.test").status, 429);
+    h.store.with_tx(|db| (db.execute("DELETE FROM login_attempts", &[]), true)).unwrap().unwrap();
+
+    // Behind a proxy that doesn't forward the scheme, an HTTPS public URL still gets Secure cookies.
+    h.cfg.base_url = Some("https://kb.test".into());
+    let ok = h.send(&Request {
+        method: "POST".into(),
+        path: "/api/v1/auth/login".into(),
+        headers: vec![("content-type".into(), "application/json".into()), ("x-dumbslab-client".into(), "web".into())],
+        body: serde_json::to_vec(&json!({ "email": "ada@acme.test", "password": "correct horse" })).unwrap(),
+        origin: "http://kb.test".into(),
+        ..Default::default()
+    });
+    assert_eq!(ok.status, 200, "{}", ok.body);
+    assert!(ok.header("set-cookie").unwrap().contains("Secure"), "{:?}", ok.header("set-cookie"));
+}
+
+#[test]
+fn oauth_tokens_are_bound_to_this_server() {
+    let mut h = H::new();
+    let (cookie, admin_pat) = h.setup();
+    let client_id = register_app(&h);
+    let enc = |s: &str| urlencoding::encode(s).into_owned();
+
+    // The authorization server only issues tokens for itself.
+    let foreign = h.call(
+        "GET",
+        &format!("/oauth/authorize?{}", authorize_query(&client_id, &format!("&resource={}", enc("https://evil.test/mcp")))),
+        None,
+        &cookie,
+    );
+    assert_eq!(foreign.status, 302, "a token for another resource was offered: {}", foreign.status);
+    assert_eq!(query_of(foreign.header("location").unwrap())["error"], "invalid_target");
+
+    // A token for this server can't be redirected elsewhere at the token endpoint either.
+    let q = authorize_query(&client_id, &format!("&resource={}", enc("https://kb.test/mcp")));
+    let code = approve(&h, &cookie, &q);
+    assert_eq!(exchange(&h, &client_id, &code, &format!("&resource={}", enc("https://evil.test/mcp"))).body["error"], "invalid_target");
+    let code = approve(&h, &cookie, &q);
+    let tok = exchange(&h, &client_id, &code, &format!("&resource={}", enc("https://kb.test/mcp")));
+    assert_eq!(tok.status, 200, "{}", tok.body);
+    let access = Auth::Bearer(tok.body["access_token"].as_str().unwrap().to_string());
+    assert_eq!(h.call("GET", "/api/v1/me", None, &access).status, 200);
+
+    // Presented anywhere else, it's refused. Personal tokens aren't bound to an address.
+    h.cfg.base_url = Some("https://other.test".into());
+    assert_eq!(h.call("GET", "/api/v1/me", None, &access).status, 401);
+    assert_eq!(h.call("GET", "/api/v1/me", None, &admin_pat).status, 200);
+}
+
+#[test]
+fn read_only_mcp_url_grants_read_only_access() {
+    let h = H::new();
+    let (cookie, _) = h.setup();
+    let list = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" });
+    let anon = h.mcp(&Auth::None, "read", list.clone());
+    assert_eq!(anon.status, 401);
+    let challenge = anon.header("www-authenticate").unwrap().to_string();
+    assert!(challenge.contains("toolset=read") && challenge.contains("scope=\"read\""), "{challenge}");
+    let prm = h.ok("GET", "/.well-known/oauth-protected-resource/mcp?toolset=read", None, &Auth::None);
+    assert_eq!(prm["resource"], "https://kb.test/mcp?toolset=read");
+    assert_eq!(prm["scopes_supported"], json!(["read"]));
+
+    // Even when the app asks for more, a grant for the read-only URL can only read, wherever it's used.
+    let tok =
+        connect_app(&h, &cookie, &format!("&scope=read%20write&resource={}", urlencoding::encode("https://kb.test/mcp?toolset=read")));
+    assert_eq!(tok.body["scope"], "read");
+    let access = Auth::Bearer(tok.body["access_token"].as_str().unwrap().to_string());
+    let write = h.mcp(
+        &access,
+        "",
+        json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": { "name": "create_post", "arguments": { "title": "Sneaky" } } }),
+    );
+    assert_eq!(write.body["result"]["isError"], true, "{}", write.body);
+    assert_eq!(h.call("POST", "/api/v1/posts", Some(json!({ "title": "Sneaky" })), &access).status, 403);
+}
+
+#[test]
+fn token_writes_stay_bounded() {
+    let h = H::new();
+    let (cookie, _) = h.setup();
+    let client_id = register_app(&h);
+    let tok = exchange(&h, &client_id, &approve(&h, &cookie, &authorize_query(&client_id, "")), "");
+    let rows = |h: &H| (count(h, "SELECT COUNT(*) FROM api_tokens"), count(h, "SELECT COUNT(*) FROM oauth_refresh_tokens"));
+    let before = rows(&h);
+    let mut refresh = tok.body["refresh_token"].as_str().unwrap().to_string();
+    for _ in 0..5 {
+        let r = h.raw(
+            "POST",
+            "/oauth/token",
+            format!("grant_type=refresh_token&refresh_token={refresh}").into_bytes(),
+            "application/x-www-form-urlencoded",
+            &Auth::None,
+        );
+        assert_eq!(r.status, 200, "{}", r.body);
+        refresh = r.body["refresh_token"].as_str().unwrap().to_string();
+    }
+    assert_eq!(rows(&h), before, "refreshing grows storage");
+
+    // Reconnecting the same app replaces its older grants beyond a few.
+    for _ in 0..8 {
+        let r = exchange(&h, &client_id, &approve(&h, &cookie, &authorize_query(&client_id, "")), "");
+        assert_eq!(r.status, 200);
+    }
+    assert!(count(&h, "SELECT COUNT(*) FROM oauth_refresh_tokens") <= 5);
+    assert!(count(&h, "SELECT COUNT(*) FROM api_tokens WHERE kind = 'oauth'") <= 5);
+
+    // Pending authorization codes and sessions per person are capped too.
+    let q = authorize_query(&client_id, "");
+    for _ in 0..30 {
+        approve(&h, &cookie, &q);
+    }
+    assert!(count(&h, "SELECT COUNT(*) FROM oauth_codes") <= 10);
+    let uid = h.ok("GET", "/api/v1/me", None, &cookie)["user"]["id"].as_str().unwrap().to_string();
+    h.store
+        .with_tx(|db| {
+            let mut r = Ok(String::new());
+            for _ in 0..80 {
+                r = dumbslab_core::auth::create_session(db, &uid, None, chrono::Utc::now());
+            }
+            (r, true)
+        })
+        .unwrap()
+        .unwrap();
+    assert!(count(&h, "SELECT COUNT(*) FROM sessions") <= 50);
+}
+
+#[cfg(unix)]
+#[test]
+fn database_files_are_private() {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    let dir = tempfile::tempdir().unwrap();
+    let fresh = dir.path().join("fresh.db");
+    let store = Store::open(&fresh).unwrap();
+    store.with_tx(|db| (db.execute("INSERT INTO meta (key, value) VALUES ('probe', '1')", &[]), true)).unwrap().unwrap();
+    assert_eq!(mode(&fresh), 0o600, "a new database is readable by others");
+    let wal = dir.path().join("fresh.db-wal");
+    if wal.exists() {
+        assert_eq!(mode(&wal), 0o600);
+    }
+    // Existing installations are tightened.
+    let old = dir.path().join("old.db");
+    std::fs::write(&old, b"").unwrap();
+    std::fs::set_permissions(&old, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let _ = Store::open(&old).unwrap();
+    assert_eq!(mode(&old), 0o600);
 }

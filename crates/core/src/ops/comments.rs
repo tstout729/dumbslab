@@ -269,7 +269,7 @@ fn create_comment(ctx: &mut Ctx, input: CreateCommentInput) -> ApiResult<Comment
     notify::follow(ctx, &uid, "post", &post_id)?;
     emit(
         ctx,
-        Event::new("comment.created", "comment", &id, format!("commented on “{title}”")).post(&post_id).data(json!({ "body": body })),
+        Event::new("comment.created", "comment", &id, format!("commented on “{title}”")).post(&post_id).content(json!({ "body": body })),
     )?;
     one_comment(ctx, &id)
 }
@@ -305,7 +305,7 @@ fn update_comment(ctx: &mut Ctx, input: UpdateCommentInput) -> ApiResult<Comment
             ctx,
             Event::new("comment.updated", "comment", &id, format!("edited a comment on “{}”", post.str("title")))
                 .post(&post_id)
-                .data(json!({ "body": body })),
+                .content(json!({ "body": body })),
         )?;
     }
     if let Some(resolved) = input.resolved {
@@ -341,7 +341,8 @@ fn delete_comment(ctx: &mut Ctx, input: CommentIdInput) -> ApiResult<Done> {
     if c.str("author_id") != ctx.actor.user_id && ctx.actor.role != Role::Admin {
         return Err(ApiError::forbidden("only the comment's author or an admin can delete it"));
     }
-    ctx.db.execute("UPDATE comments SET deleted_at = ? WHERE id = ?", &params![ctx.now_s(), id.clone()])?;
+    // Nothing can bring a deleted comment back, so its text goes too.
+    ctx.db.execute("UPDATE comments SET deleted_at = ?, body = '', quote = NULL WHERE id = ?", &params![ctx.now_s(), id.clone()])?;
     search::index_comment(ctx.db, &id)?;
     emit(
         ctx,

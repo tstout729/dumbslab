@@ -10,10 +10,10 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::auth::{self, Actor, Role, Scopes, Via};
-use crate::db::{Db, DbExt};
+use crate::db::{Db, DbExt, Row};
 use crate::error::ApiError;
 use crate::http::{base_url, done, new_ctx};
-use crate::mcp::cors;
+use crate::mcp::{Toolset, cors, requested_toolset};
 use crate::ops::users::mint_token;
 use crate::util::{html_escape, new_id, new_secret, parse_ts, secure_eq, sha256_hex, ts};
 use crate::{HostConfig, Outcome, Request, Response, params};
@@ -25,6 +25,12 @@ const CODE_MINUTES: i64 = 10;
 pub const MAX_CLIENTS: i64 = 1000;
 /// How long opening a client's consent page protects it from eviction.
 pub const CONSENT_PROTECTION_MINUTES: i64 = 15;
+/// Grants and codes are written even in a full workspace, so each is capped: an app keeps a
+/// person's newest grants (reconnecting replaces the oldest), and a person their newest codes.
+pub const MAX_GRANTS_PER_APP: i64 = 5;
+pub const MAX_CODES_PER_PERSON: i64 = 10;
+/// The read-only MCP URL's resource suffix. Grants for it can only read.
+const READ_ONLY: &str = "?toolset=read";
 
 pub fn handle(db: &dyn Db, cfg: &HostConfig, req: &Request) -> Outcome {
     let base = base_url(cfg, req);
@@ -32,17 +38,26 @@ pub fn handle(db: &dyn Db, cfg: &HostConfig, req: &Request) -> Outcome {
         return cors(done(Response::empty(204)));
     }
     let out = match (req.method.as_str(), req.path.as_str()) {
-        ("GET", p) if p.starts_with("/.well-known/oauth-protected-resource") => done(Response::json(
-            200,
-            &json!({
-                "resource": format!("{base}/mcp"),
-                "authorization_servers": [base],
-                "scopes_supported": ["read", "write", "admin"],
-                "bearer_methods_supported": ["header"],
-                "resource_name": "DumbSlab",
-                "resource_documentation": format!("{base}/llms.txt"),
-            }),
-        )),
+        ("GET", p) if p.starts_with("/.well-known/oauth-protected-resource") => {
+            // The read-only MCP URL is its own resource, and it only offers read access.
+            let read_only = requested_toolset(&req.query) == Toolset::Read;
+            let (resource, scopes) = if read_only {
+                (format!("{base}/mcp{READ_ONLY}"), json!(["read"]))
+            } else {
+                (format!("{base}/mcp"), json!(["read", "write", "admin"]))
+            };
+            done(Response::json(
+                200,
+                &json!({
+                    "resource": resource,
+                    "authorization_servers": [base],
+                    "scopes_supported": scopes,
+                    "bearer_methods_supported": ["header"],
+                    "resource_name": "DumbSlab",
+                    "resource_documentation": format!("{base}/llms.txt"),
+                }),
+            ))
+        }
         ("GET", p) if p.starts_with("/.well-known/oauth-authorization-server") => done(Response::json(
             200,
             &json!({
@@ -188,6 +203,38 @@ fn register(db: &dyn Db, req: &Request) -> Outcome {
     ))
 }
 
+/// The resource (RFC 8707) a connected app's token is for, from the one it asked for. This server
+/// issues tokens only for itself, so a resource anywhere else is `None`; that way a token approved
+/// here can't be meant for (and replayed by) another server. `?toolset=read` asks for the read-only
+/// MCP URL. No resource means this server's MCP endpoint.
+pub fn canonical_resource(base: &str, requested: Option<&str>) -> Option<String> {
+    let mcp = format!("{base}/mcp");
+    let Some(requested) = requested.map(str::trim).filter(|r| !r.is_empty()) else { return Some(mcp) };
+    if requested.contains('#') {
+        return None;
+    }
+    let (address, query) = requested.split_once('?').unwrap_or((requested, ""));
+    let address = without_default_port(&address.to_ascii_lowercase());
+    let rest = address.strip_prefix(&without_default_port(&base.to_ascii_lowercase()))?;
+    if !(rest.is_empty() || rest.starts_with('/')) {
+        return None;
+    }
+    Some(if requested_toolset(query) == Toolset::Read { format!("{mcp}{READ_ONLY}") } else { mcp })
+}
+
+/// `https://host:443/x` → `https://host/x`, so a default port written out still names this server.
+fn without_default_port(url: &str) -> String {
+    for (scheme, port) in [("https://", ":443"), ("http://", ":80")] {
+        if let Some(rest) = url.strip_prefix(scheme) {
+            let (host, path) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
+            if let Some(host) = host.strip_suffix(port) {
+                return format!("{scheme}{host}{path}");
+            }
+        }
+    }
+    url.to_string()
+}
+
 struct AuthRequest {
     client_id: String,
     client_name: String,
@@ -195,6 +242,7 @@ struct AuthRequest {
     state: String,
     code_challenge: String,
     scopes: Scopes,
+    resource: String,
 }
 
 /// Validates client and redirect URI. Errors here are shown to the user, never redirected.
@@ -218,7 +266,7 @@ fn redirect_with(redirect_uri: &str, params: &[(&str, &str)]) -> Outcome {
     done(Response::redirect(&format!("{redirect_uri}{sep}{q}")))
 }
 
-fn parse_auth_request(db: &dyn Db, p: &HashMap<String, String>) -> Result<Result<AuthRequest, Outcome>, String> {
+fn parse_auth_request(db: &dyn Db, base: &str, p: &HashMap<String, String>) -> Result<Result<AuthRequest, Outcome>, String> {
     let (client_name, redirect_uri) = load_client(db, p)?;
     let state = p.get("state").cloned().unwrap_or_default();
     let fail =
@@ -230,6 +278,9 @@ fn parse_auth_request(db: &dyn Db, p: &HashMap<String, String>) -> Result<Result
     if challenge.len() < 43 || p.get("code_challenge_method").map(String::as_str) != Some("S256") {
         return fail("invalid_request", "PKCE with code_challenge_method=S256 is required");
     }
+    let Some(resource) = canonical_resource(base, p.get("resource").map(String::as_str)) else {
+        return fail("invalid_target", &format!("this server only issues tokens for itself ({base}/mcp)"));
+    };
     let scopes = match p.get("scope").map(|s| s.trim()).filter(|s| !s.is_empty()) {
         Some(s) => match Scopes::parse(&s.split(' ').filter(|w| matches!(*w, "read" | "write" | "admin")).collect::<Vec<_>>().join(" ")) {
             Ok(sc) if sc.read => sc,
@@ -237,7 +288,9 @@ fn parse_auth_request(db: &dyn Db, p: &HashMap<String, String>) -> Result<Result
         },
         None => Scopes::parse("read write").expect("valid"),
     };
-    Ok(Ok(AuthRequest { client_id: p["client_id"].clone(), client_name, redirect_uri, state, code_challenge: challenge, scopes }))
+    // The read-only MCP URL grants read access, whatever the app asks for.
+    let scopes = if resource.ends_with(READ_ONLY) { Scopes { read: true, write: false, admin: false } } else { scopes };
+    Ok(Ok(AuthRequest { client_id: p["client_id"].clone(), client_name, redirect_uri, state, code_challenge: challenge, scopes, resource }))
 }
 
 fn html_page(status: u16, title: &str, body: &str) -> Outcome {
@@ -267,8 +320,8 @@ fn error_page(message: &str) -> Outcome {
     html_page(400, "Can't connect", &format!("<h1>Can't connect this app</h1><p>{}</p>", html_escape(message)))
 }
 
-fn session_actor(db: &dyn Db, req: &Request) -> Option<Actor> {
-    match auth::authenticate(db, req, Utc::now()) {
+fn session_actor(db: &dyn Db, cfg: &HostConfig, req: &Request) -> Option<Actor> {
+    match auth::authenticate(db, cfg, req, Utc::now()) {
         Ok(Some(a)) if a.via == Via::Web => Some(a),
         _ => None,
     }
@@ -276,12 +329,12 @@ fn session_actor(db: &dyn Db, req: &Request) -> Option<Actor> {
 
 fn authorize_page(db: &dyn Db, cfg: &HostConfig, req: &Request) -> Outcome {
     let p = parse_form(&req.query);
-    let ar = match parse_auth_request(db, &p) {
+    let ar = match parse_auth_request(db, &base_url(cfg, req), &p) {
         Err(msg) => return error_page(&msg),
         Ok(Err(redirect)) => return redirect,
         Ok(Ok(ar)) => ar,
     };
-    let Some(actor) = session_actor(db, req) else {
+    let Some(actor) = session_actor(db, cfg, req) else {
         let next = format!("/oauth/authorize?{}", req.query);
         return done(Response::redirect(&format!("/login?next={}", urlencoding::encode(&next))));
     };
@@ -303,7 +356,6 @@ fn authorize_page(db: &dyn Db, cfg: &HostConfig, req: &Request) -> Outcome {
         abilities.push("Manage people, tokens, webhooks and settings");
     }
     let list: String = abilities.iter().map(|a| format!("<li>{a}</li>")).collect();
-    let _ = cfg;
     html_page(
         200,
         "Connect an app",
@@ -327,12 +379,12 @@ fn effective_scopes(actor: &Actor, requested: Scopes) -> Scopes {
 
 fn authorize_decision(db: &dyn Db, cfg: &HostConfig, req: &Request) -> Outcome {
     let p = parse_form(&String::from_utf8_lossy(&req.body));
-    let ar = match parse_auth_request(db, &p) {
+    let ar = match parse_auth_request(db, &base_url(cfg, req), &p) {
         Err(msg) => return error_page(&msg),
         Ok(Err(redirect)) => return redirect,
         Ok(Ok(ar)) => ar,
     };
-    let Some(actor) = session_actor(db, req) else {
+    let Some(actor) = session_actor(db, cfg, req) else {
         return error_page("Your session expired. Start connecting again.");
     };
     let expected = auth::form_csrf(actor.session_hash.as_deref().unwrap_or_default());
@@ -345,13 +397,33 @@ fn authorize_decision(db: &dyn Db, cfg: &HostConfig, req: &Request) -> Outcome {
     let scopes = effective_scopes(&actor, ar.scopes);
     let code = new_secret("ds_code_");
     let now = Utc::now();
-    if let Err(e) = db.execute(
-        "INSERT INTO oauth_codes (code_hash, client_id, user_id, redirect_uri, code_challenge, scopes, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        &params![sha256_hex(&code), ar.client_id, actor.user_id.clone(), ar.redirect_uri.clone(), ar.code_challenge, scopes.to_str(), ts(now + Duration::minutes(CODE_MINUTES))],
-    ) {
+    let uid = actor.user_id.clone();
+    let written = db
+        .execute(
+            "INSERT INTO oauth_codes (code_hash, client_id, user_id, redirect_uri, code_challenge, scopes, expires_at, resource)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            &params![
+                sha256_hex(&code),
+                ar.client_id,
+                uid.clone(),
+                ar.redirect_uri.clone(),
+                ar.code_challenge,
+                scopes.to_str(),
+                ts(now + Duration::minutes(CODE_MINUTES)),
+                ar.resource
+            ],
+        )
+        .and_then(|_| db.execute("DELETE FROM oauth_codes WHERE expires_at < ?", &params![ts(now)]))
+        .and_then(|_| {
+            db.execute(
+                "DELETE FROM oauth_codes WHERE user_id = ? AND code_hash != ? AND code_hash NOT IN
+                   (SELECT code_hash FROM oauth_codes WHERE user_id = ? ORDER BY expires_at DESC LIMIT ?)",
+                &params![uid.clone(), sha256_hex(&code), uid, MAX_CODES_PER_PERSON],
+            )
+        });
+    if let Err(e) = written {
         return crate::http::failed(&e);
     }
-    let _ = db.execute("DELETE FROM oauth_codes WHERE expires_at < ?", &params![ts(now)]);
     redirect_with(&ar.redirect_uri, &[("code", &code), ("state", &ar.state), ("iss", &base_url(cfg, req))])
 }
 
@@ -368,42 +440,136 @@ fn user_actor(db: &dyn Db, user_id: &str) -> Option<Actor> {
     crate::model::actor_for_user(db, user_id).ok().flatten()
 }
 
-fn issue_tokens(db: &dyn Db, cfg: &HostConfig, req: &Request, user_id: &str, client_id: &str, scopes: Scopes) -> Result<Value, ApiError> {
+fn app_token_name(db: &dyn Db, client_id: &str) -> Result<String, ApiError> {
+    let name = db.one("SELECT client_name FROM oauth_clients WHERE client_id = ?", &params![client_id])?.map(|r| r.str("client_name"));
+    Ok(format!("{} (connected app)", name.unwrap_or_else(|| "MCP client".into())))
+}
+
+fn token_response(access: &str, refresh: &str, scopes: Scopes) -> Value {
+    json!({
+        "access_token": access,
+        "token_type": "Bearer",
+        "expires_in": ACCESS_TOKEN_SECONDS,
+        "refresh_token": refresh,
+        "scope": scopes.to_str(),
+    })
+}
+
+/// Starts a grant for a person and app: an access token and a refresh token, both for `resource`.
+fn new_grant(
+    db: &dyn Db,
+    cfg: &HostConfig,
+    req: &Request,
+    user_id: &str,
+    client_id: &str,
+    scopes: Scopes,
+    resource: &str,
+) -> Result<Value, ApiError> {
     let actor = user_actor(db, user_id).ok_or_else(|| ApiError::bad_request("account is deactivated"))?;
     let scopes = effective_scopes(&actor, scopes);
-    let client_name = db
-        .one("SELECT client_name FROM oauth_clients WHERE client_id = ?", &params![client_id])?
-        .map(|r| r.str("client_name"))
-        .unwrap_or_else(|| "MCP client".into());
+    let name = app_token_name(db, client_id)?;
     let ctx = new_ctx(db, cfg, req, actor);
     let expires = ts(ctx.now + Duration::seconds(ACCESS_TOKEN_SECONDS));
-    let (token_id, access) =
-        mint_token(&ctx, user_id, &format!("{client_name} (connected app)"), scopes, "oauth", Some(client_id), Some(expires))?;
+    let (token_id, access) = mint_token(&ctx, user_id, &name, scopes, Some((client_id, resource)), Some(expires))?;
     let refresh = new_secret("ds_ort_");
     db.execute(
-        "INSERT INTO oauth_refresh_tokens (token_hash, client_id, user_id, scopes, access_token_id, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        &params![sha256_hex(&refresh), client_id, user_id, scopes.to_str(), token_id, ctx.now_s(), ts(ctx.now + Duration::days(REFRESH_TOKEN_DAYS))],
+        "INSERT INTO oauth_refresh_tokens (token_hash, client_id, user_id, scopes, access_token_id, created_at, expires_at, resource)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        &params![
+            sha256_hex(&refresh),
+            client_id,
+            user_id,
+            scopes.to_str(),
+            token_id,
+            ctx.now_s(),
+            ts(ctx.now + Duration::days(REFRESH_TOKEN_DAYS)),
+            resource
+        ],
     )?;
-    // Housekeeping: drop long-expired connected-app tokens whose grant has also ended.
+    // Reconnecting an app replaces the person's oldest grants for it beyond a few.
+    let older = db.query(
+        "SELECT token_hash, access_token_id FROM oauth_refresh_tokens WHERE user_id = ? AND client_id = ? AND token_hash != ?
+         ORDER BY created_at DESC LIMIT -1 OFFSET ?",
+        &params![user_id, client_id, sha256_hex(&refresh), MAX_GRANTS_PER_APP - 1],
+    )?;
+    for r in older {
+        db.execute("DELETE FROM api_tokens WHERE id = ? AND kind = 'oauth'", &params![r.opt_str("access_token_id")])?;
+        db.execute("DELETE FROM oauth_refresh_tokens WHERE token_hash = ?", &params![r.str("token_hash")])?;
+    }
+    // Housekeeping: ended grants, and long-expired connected-app tokens whose grant has also ended.
+    db.execute("DELETE FROM oauth_refresh_tokens WHERE revoked_at IS NOT NULL OR expires_at < ?", &params![ctx.now_s()])?;
     db.execute(
         "DELETE FROM api_tokens WHERE kind = 'oauth' AND expires_at < ?
            AND id NOT IN (SELECT access_token_id FROM oauth_refresh_tokens
                           WHERE access_token_id IS NOT NULL AND revoked_at IS NULL AND expires_at > ?)",
         &params![ts(ctx.now - Duration::days(7)), ctx.now_s()],
     )?;
-    Ok(json!({
-        "access_token": access,
-        "token_type": "Bearer",
-        "expires_in": ACCESS_TOKEN_SECONDS,
-        "refresh_token": refresh,
-        "scope": scopes.to_str(),
-    }))
+    Ok(token_response(&access, &refresh, scopes))
+}
+
+/// Refreshes a grant in place: new secrets in the same rows, so the old ones stop working,
+/// refreshing never grows storage, and the grant keeps the id people see (and revoke) in Settings.
+fn rotate_grant(db: &dyn Db, cfg: &HostConfig, req: &Request, grant: &Row, resource: &str) -> Result<Value, ApiError> {
+    let (user_id, client_id) = (grant.str("user_id"), grant.str("client_id"));
+    let actor = user_actor(db, &user_id).ok_or_else(|| ApiError::bad_request("account is deactivated"))?;
+    let scopes = effective_scopes(&actor, Scopes::parse(&grant.str("scopes")).unwrap_or(Scopes { read: true, write: false, admin: false }));
+    let ctx = new_ctx(db, cfg, req, actor);
+    let expires = ts(ctx.now + Duration::seconds(ACCESS_TOKEN_SECONDS));
+    let access = new_secret("ds_oat_");
+    let rotated = match grant.opt_str("access_token_id") {
+        Some(id) => {
+            let n = db.execute(
+                "UPDATE api_tokens SET token_hash = ?, prefix = ?, scopes = ?, resource = ?, expires_at = ?, revoked_at = NULL
+                 WHERE id = ? AND kind = 'oauth'",
+                &params![
+                    sha256_hex(&access),
+                    access.chars().take(11).collect::<String>(),
+                    scopes.to_str(),
+                    resource,
+                    expires.clone(),
+                    id.clone()
+                ],
+            )?;
+            (n > 0).then_some((id, access))
+        }
+        None => None,
+    };
+    // The access token's row is gone (cleaned up long after it expired): start a new one.
+    let (token_id, access) = match rotated {
+        Some(t) => t,
+        None => mint_token(&ctx, &user_id, &app_token_name(db, &client_id)?, scopes, Some((&client_id, resource)), Some(expires))?,
+    };
+    let refresh = new_secret("ds_ort_");
+    db.execute(
+        "UPDATE oauth_refresh_tokens SET token_hash = ?, scopes = ?, access_token_id = ?, resource = ?, created_at = ?, expires_at = ?
+         WHERE token_hash = ?",
+        &params![
+            sha256_hex(&refresh),
+            scopes.to_str(),
+            token_id,
+            resource,
+            ctx.now_s(),
+            ts(ctx.now + Duration::days(REFRESH_TOKEN_DAYS)),
+            grant.str("token_hash")
+        ],
+    )?;
+    Ok(token_response(&access, &refresh, scopes))
 }
 
 fn token(db: &dyn Db, cfg: &HostConfig, req: &Request) -> Outcome {
+    let base = base_url(cfg, req);
     let p = body_params(req);
     let now = Utc::now();
     let client_id = p.get("client_id").cloned().unwrap_or_default();
+    // A `resource` here must name what the grant is for (RFC 8707), so a token can't be retargeted.
+    let target = |granted: Option<String>| -> Option<String> {
+        let granted = granted.unwrap_or_else(|| format!("{base}/mcp"));
+        match p.get("resource") {
+            Some(r) if canonical_resource(&base, Some(r)).as_deref() != Some(granted.as_str()) => None,
+            _ => Some(granted),
+        }
+    };
+    let wrong_target = || oauth_error(400, "invalid_target", "the resource isn't the one this grant is for");
     let result = match p.get("grant_type").map(String::as_str) {
         Some("authorization_code") => {
             let code = p.get("code").cloned().unwrap_or_default();
@@ -424,8 +590,11 @@ fn token(db: &dyn Db, cfg: &HostConfig, req: &Request) -> Outcome {
             if !pkce_ok(p.get("code_verifier").map(String::as_str).unwrap_or_default(), &row.str("code_challenge")) {
                 return Outcome { commit: true, ..oauth_error(400, "invalid_grant", "PKCE verification failed") };
             }
+            let Some(resource) = target(row.opt_str("resource")) else {
+                return Outcome { commit: true, ..wrong_target() };
+            };
             let scopes = Scopes::parse(&row.str("scopes")).unwrap_or(Scopes { read: true, write: false, admin: false });
-            issue_tokens(db, cfg, req, &row.str("user_id"), &client_id, scopes)
+            new_grant(db, cfg, req, &row.str("user_id"), &client_id, scopes, &resource)
         }
         Some("refresh_token") => {
             let rt = p.get("refresh_token").cloned().unwrap_or_default();
@@ -440,15 +609,10 @@ fn token(db: &dyn Db, cfg: &HostConfig, req: &Request) -> Outcome {
             if !client_id.is_empty() && row.str("client_id") != client_id {
                 return oauth_error(400, "invalid_grant", "refresh token was issued to another client");
             }
-            // Rotate: the old refresh token and its access token stop working.
-            let _ =
-                db.execute("UPDATE oauth_refresh_tokens SET revoked_at = ? WHERE token_hash = ?", &params![ts(now), row.str("token_hash")]);
-            let _ = db.execute(
-                "UPDATE api_tokens SET revoked_at = COALESCE(revoked_at, ?) WHERE id = ?",
-                &params![ts(now), row.opt_str("access_token_id")],
-            );
-            let scopes = Scopes::parse(&row.str("scopes")).unwrap_or(Scopes { read: true, write: false, admin: false });
-            issue_tokens(db, cfg, req, &row.str("user_id"), &row.str("client_id"), scopes)
+            let Some(resource) = target(row.opt_str("resource")) else {
+                return wrong_target();
+            };
+            rotate_grant(db, cfg, req, &row, &resource)
         }
         _ => return oauth_error(400, "unsupported_grant_type", "use authorization_code or refresh_token"),
     };

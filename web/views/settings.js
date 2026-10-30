@@ -165,7 +165,7 @@ async function agentsSection() {
       snippet('mcp.json', jsonConfig)),
     panel('Smaller tool lists', 'Agents with limited context can load fewer tools. Add a toolset to the URL.',
       snippet('Core tools only', () => `${mcp}?toolset=core`, 'Search, read, write and comment.'),
-      snippet('Read-only', () => `${mcp}?toolset=read`, 'Search and read. Nothing can be changed.')),
+      snippet('Read-only', () => `${mcp}?toolset=read`, 'Search and read. Apps that sign in through this URL get read-only access; with a token, use a read-only one.')),
     panel('REST API', 'Every operation is also a REST endpoint. Send a token as a Bearer header.',
       snippet('Search with curl', () => `curl -H "Authorization: Bearer ${token}" "${apiUrl}/search?q=onboarding"`),
       h('ul', { class: 'link-list' },

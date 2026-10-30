@@ -30,6 +30,23 @@ use crate::workspace::{ALIAS_HEADER, HOME_HEADER, WORKSPACE_HEADER};
 #[event(fetch)]
 async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     let url = req.url()?;
+    // Passwords, sign-up links and session cookies never travel over plain HTTP.
+    if let Some(target) = tenancy::https_upgrade(url.as_str()) {
+        let status = if matches!(req.method(), Method::Get | Method::Head) { 301 } else { 308 };
+        return Response::redirect_with_status(Url::parse(&target)?, status);
+    }
+    let hsts = tenancy::hsts(flag(&env, "MULTI_TENANT"));
+    let resp = route(req, env, &url).await?;
+    if url.scheme() != "https" || tenancy::is_local_host(url.host_str().unwrap_or_default()) {
+        return Ok(resp);
+    }
+    // Fetched responses have immutable headers; a copy can be changed.
+    let headers = resp.headers().clone();
+    headers.set("strict-transport-security", hsts)?;
+    Ok(resp.with_headers(headers))
+}
+
+async fn route(req: Request, env: Env, url: &Url) -> Result<Response> {
     let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
     // Serve one canonical host: www.example.com → example.com.
     if let Some(apex) = host.strip_prefix("www.") {
@@ -238,11 +255,21 @@ async fn operator(req: Request, env: &Env, path: &str) -> Result<Response> {
     // The workspace's answer decides the directory change: 404 means the address was reserved
     // but never set up.
     let directory: (&str, Value) = match action.as_str() {
-        "disable" => match internal_call(env, &home, "/_internal/disable").await? {
-            // Disabling a reservation also kills its sign-up link.
-            200 | 404 => ("/status", json!({ "slug": home, "status": "disabled" })),
-            status => return error_response(status, "failed", "the workspace couldn't be disabled"),
-        },
+        "disable" => {
+            // The directory first, so no sign-up link passes its check from now on (disabling a
+            // reservation kills its link). Then the object, which also stops a sign-up already past
+            // that check: 404 means nobody had finished setting it up.
+            let (status, body) =
+                call_object(env, "DIRECTORY", "directory", Method::Post, "/status", Some(&json!({ "slug": home, "status": "disabled" })))
+                    .await?;
+            if status != 200 {
+                return json_response(status, &body);
+            }
+            return match internal_call(env, &home, "/_internal/disable").await? {
+                200 | 404 => json_response(200, &json!({ "ok": true })),
+                status => error_response(status, "failed", "the workspace couldn't be disabled; try again"),
+            };
+        }
         "enable" => match internal_call(env, &home, "/_internal/enable").await? {
             200 => ("/status", json!({ "slug": home, "status": "active" })),
             404 => ("/status", json!({ "slug": home, "status": "reserved" })),
