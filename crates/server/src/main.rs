@@ -359,7 +359,7 @@ fn deliver(app: Arc<App>, effects: Vec<Effect>) -> Vec<oneshot::Receiver<()>> {
     // Address moves and Stripe calls only exist for hosted workspaces, which this server never is.
     for d in effects.into_iter().filter_map(|effect| match effect {
         Effect::Webhook(d) => Some(d),
-        Effect::MoveAddress(_) | Effect::Stripe(_) => None,
+        Effect::MoveAddress(_) | Effect::Stripe(_) | Effect::Connect(_) => None,
     }) {
         let mut queues = app.webhooks.lock().unwrap_or_else(|e| e.into_inner());
         let queue = queues.entry(d.webhook_id.clone()).or_insert_with(|| webhook_queue(&app));
