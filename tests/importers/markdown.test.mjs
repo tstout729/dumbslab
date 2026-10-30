@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { rewriteMarkdown, splitFrontMatter, leadingTitle } from '../../web/importers/markdown.js';
 import { parseYaml } from '../../web/importers/yaml.js';
 import { fillTokens, pendingLink } from '../../web/importers/plan.js';
+import { localTarget } from '../../web/importers/paths.js';
 
 test('links, images, wiki links and definitions are rewritten outside code', () => {
   const seen = [];
@@ -49,4 +50,10 @@ test('tokens fill in, and links to what is gone keep their text', () => {
   const out = fillTokens(md, { page: (n) => (n === 0 ? '/p/abc' : null), file: (n) => (n === 0 ? '/files/f1/c.png' : null) });
   assert.equal(out, '[A](/p/abc) B ![C](/files/f1/c.png)  D\n[r]: #');
   assert.match(pendingLink({ title: 'Deploy (v2)', key: 'a.html' }), /^\/search\?q=Deploy%20%28v2%29&import=[0-9a-f]{8}$/);
+});
+
+test('a + in a link path is itself, not a space', () => {
+  assert.deepEqual(localTarget('C++.md'), { path: 'C++.md', query: '' });
+  assert.deepEqual(localTarget('images/a+b.png?raw=1'), { path: 'images/a+b.png', query: '?raw=1' });
+  assert.deepEqual(localTarget('My%20Page.md#top'), { path: 'My Page.md', query: '#top' });
 });

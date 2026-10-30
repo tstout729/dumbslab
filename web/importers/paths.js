@@ -36,7 +36,8 @@ export function localTarget(href) {
   const pathPart = cut < 0 ? t : t.slice(0, cut);
   let path = pathPart;
   try {
-    path = decodeURIComponent(pathPart.replace(/\+/g, '%20'));
+    // `+` is a space only in form-encoded queries; in a path it's itself (`C++.md`).
+    path = decodeURIComponent(pathPart);
   } catch {
     /* keep it as written */
   }
