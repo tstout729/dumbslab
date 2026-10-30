@@ -12,6 +12,7 @@ pub mod comments;
 pub mod files;
 pub mod meta;
 pub mod notifications;
+pub mod plan;
 pub mod posts;
 pub mod search;
 pub mod topics;
@@ -27,6 +28,7 @@ pub fn all() -> Vec<Op> {
     ops.extend(search::ops());
     ops.extend(notifications::ops());
     ops.extend(admin::ops());
+    ops.extend(plan::ops());
     ops.extend(meta::ops());
     ops
 }

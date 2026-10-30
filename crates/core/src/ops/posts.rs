@@ -237,6 +237,10 @@ fn get_post(ctx: &mut Ctx, input: GetPostInput) -> ApiResult<Post> {
 }
 
 fn record_view(ctx: &Ctx, post_id: &str) -> ApiResult<()> {
+    // A hosted workspace that has used its write allowance stops counting views too.
+    if !crate::plan::can_write(ctx.db, ctx.cfg.hosting.as_ref(), ctx.now)? {
+        return Ok(());
+    }
     let recent = ctx.db.one(
         "SELECT viewed_at FROM post_views WHERE post_id = ? AND user_id = ? AND viewed_at > ?",
         &params![post_id, ctx.actor.user_id.clone(), crate::util::ts(ctx.now - Duration::hours(1))],

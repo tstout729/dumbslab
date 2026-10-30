@@ -215,3 +215,19 @@ gotoInput.addEventListener('input', () => {
   cleanAddressInput(gotoInput);
   gotoInput.removeAttribute('aria-invalid');
 });
+
+// Pricing shows the server's own limits.
+function size(bytes) {
+  const gb = bytes / (1024 * 1024 * 1024);
+  return gb >= 1 ? `${Number.isInteger(gb) ? gb : gb.toFixed(1)} GB` : `${Math.round(bytes / (1024 * 1024))} MB`;
+}
+const fill = (attr, text) => { for (const el of document.querySelectorAll(`[${attr}]`)) el.textContent = text; };
+fetch('/api/plans').then((r) => (r.ok ? r.json() : null)).then((p) => {
+  if (!p) return;
+  fill('data-free-storage', size(p.free.storage_bytes));
+  fill('data-free-writes', p.free.writes_per_day.toLocaleString('en-US'));
+  fill('data-pro-storage', size(p.pro.allowance.storage_bytes));
+  fill('data-pro-writes', p.pro.allowance.writes_per_day.toLocaleString('en-US'));
+  fill('data-pro-price', p.pro.price);
+  document.querySelector('[data-pro-soon]').hidden = p.pro.available;
+}).catch(() => {});

@@ -340,9 +340,9 @@ pub fn password_keys(email: &str, client_ip: Option<&str>) -> Vec<(String, i64)>
     keys
 }
 
-/// The network a client address belongs to for sign-in limits. One IPv6 subscriber usually holds a
-/// whole /64, so its addresses count together; IPv4 addresses count one by one.
-fn client_network(ip: &str) -> String {
+/// The network a client address belongs to, for sign-in and request limits. One IPv6 subscriber
+/// usually holds a whole /64, so its addresses count together; IPv4 addresses count one by one.
+pub fn client_network(ip: &str) -> String {
     match ip.trim().parse::<std::net::IpAddr>() {
         Ok(std::net::IpAddr::V6(v6)) if v6.to_ipv4_mapped().is_none() => {
             let s = v6.segments();

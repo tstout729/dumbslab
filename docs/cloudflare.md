@@ -55,28 +55,74 @@ Admins can move a workspace to another address under **Settings › Workspace**,
 - **Old addresses:** they stay reserved for the workspace. Browsers opening one are sent to the new address. API and MCP calls get a `410 workspace_moved` error that names it.
 - **Limit:** a workspace can use 5 addresses in total, counting its first. Moving back to an earlier address is always allowed.
 
-### Limits that keep it free
+### Plans and the limits that keep it free
+
+Every feature is on every plan: MCP, the API, webhooks, uploads, people and bots. Plans differ only in what costs money to run, which is storage and database writes. Past either limit, changes are refused; reading, signing in, exporting and upgrading keep working.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `SIGNUPS_PER_IP_PER_DAY` | `3` | New workspaces per visitor IP per day |
 | `SIGNUPS_PER_DAY` | `200` | New workspaces per day overall |
 | `MAX_WORKSPACES` | `1000` | Total workspaces; sign-up pauses at the cap |
-| `WORKSPACE_STORAGE_MB` | `50` | A workspace past this size stops accepting new content, uploaded images and files included. Reading, deleting and signing in keep working. |
+| `FREE_STORAGE_MB` | `50` | A free workspace's storage, uploads included |
+| `FREE_WRITES_PER_DAY` | `50000` | Database rows a free workspace may write in any 24 hours |
+| `PRO_STORAGE_MB` | `5120` | A Pro workspace's storage (a Durable Object holds at most 10 GB) |
+| `PRO_WRITES_PER_DAY` | `200000` | Database rows a Pro workspace may write in any 24 hours |
+| `FREE_TOTAL_WRITES_PER_DAY` | `1000000` | Rows all free workspaces together may write in 24 hours |
+| `FREE_TOTAL_STORAGE_MB` | `4096` | What all free workspaces together may store |
+| `PRO_PRICE_LABEL` | `$8 a month` | How Pro's price reads in the app and on the sign-up page |
 
-What workspaces cost: a new workspace with its starter posts is about 0.3 MB. A busy one, with 100 documents each edited a few times, is about 6 MB. Workers Paid includes 5 GB of Durable Object storage and 1M Durable Object requests a month. So roughly a thousand active small-team workspaces, or many thousands of idle ones, fit in the included usage. Past that, storage is $0.20 per GB-month and requests are $0.15 per million.
+How the limits work:
+
+- **Writes** are counted as Cloudflare bills them: every row a request's statements write, index and search-index rows included, even when the request is rolled back. Each workspace keeps hourly totals and refuses changes once the last 24 hours reach its allowance. Measured costs: a new 2 KB post writes about 18 rows, an edit about 10, a comment about 10, an upload about 9, and an imported document about 19. Agents reading posts write nothing.
+- **Storage** is the workspace database's size. A change that would take it past the plan's allowance is refused with `507 storage_full`.
+- **The free plan's totals.** Each busy workspace reports its plan, recent writes and size to the `Directory` every five minutes at most. Once free workspaces together reach `FREE_TOTAL_WRITES_PER_DAY`, free workspaces stop accepting changes (`503 free_capacity`) until the total falls. Once they reach `FREE_TOTAL_STORAGE_MB`, they stop growing. In both cases sign-ups pause. Pro workspaces are never paused.
+- **Request floods.** The `REQUEST_LIMITER` binding lets each client network (an IPv4 address or IPv6 /64) make 1,200 API, MCP and file requests a minute, enough for a whole office behind one address. The Worker refuses the rest with `429` before they reach a workspace. Static files aren't counted.
+
+What this costs. Workers Paid ($5 a month) includes 50 million rows written and 5 GB stored a month; past that, rows are $1.00 per million and storage $0.20 per GB-month. The free plan's totals keep free use inside the included amounts: 1 million rows a day is about 30 million a month, and 4 GB stays under 5 GB. A Pro workspace at its limits for a whole month writes about 6 million rows and stores 5 GB, roughly $7 if nothing else were included, which is less than its $8 price after Stripe's fee. Requests cost little (Workers $0.30 and Durable Objects $0.15 per million past what's included); the request limit stops any one network from running them up, and Cloudflare's DDoS protection handles floods from many.
+
+### Selling Pro with Stripe
+
+Pro goes on sale once three things are set. Until then, `upgrade_plan` answers `503 unavailable`, and the app and sign-up page say Pro is coming soon.
+
+1. In the Stripe account that should be paid, create the product, the monthly price, the customer portal settings and the webhook endpoint. Use the account's secret key, or a restricted key that can write Products, Prices, Customer portal and Webhook Endpoints:
+
+   ```sh
+   STRIPE_API_KEY=sk_live_... scripts/stripe-setup.sh https://your-domain 800   # price in cents
+   ```
+
+2. For the Worker, create a [restricted key](https://docs.stripe.com/keys#limit-access) that can only write Checkout Sessions and Customer portal, and read Subscriptions and Charges.
+3. Put the printed `STRIPE_PRICE_ID` in `wrangler.toml`, add the secrets and deploy:
+
+   ```sh
+   cd crates/worker
+   npx wrangler secret put STRIPE_SECRET_KEY       # the Worker's restricted key
+   npx wrangler secret put STRIPE_WEBHOOK_SECRET   # whsec_… printed by the script
+   npx wrangler deploy
+   ```
+
+How it works:
+
+- An admin chooses **Upgrade to Pro** under Settings › Plan (or an agent calls `upgrade_plan`). The workspace asks Stripe for a Checkout page and sends the person there. Agents get the link to hand to a person.
+- Stripe calls `POST /api/stripe/webhook` on the root domain. The Worker checks the signature, then reads the subscription from Stripe and records it on the workspace. Events that arrive late, twice or out of order change nothing. The checkout links the Stripe customer to the workspace's first address, so moving the workspace doesn't break billing.
+- Pro stays on while a renewal is `past_due` and Stripe retries. Cancelling in the customer portal (**Manage billing**) keeps Pro until the paid period ends. After that the workspace is free again: nothing is deleted, but past the free limits it can only shrink.
+- Refunds, disputes and fraud warnings are noted on the workspace in the operator list (`billing_risk`) for you to look at.
+- Stripe Tax isn't on. If you need to collect sales tax or VAT, register with Stripe Tax first, then turn on `automatic_tax` in the Checkout call (`crates/core/src/plan.rs`).
+
+To try it locally, create a Stripe sandbox, run `scripts/stripe-setup.sh local` against it, and put its `STRIPE_SECRET_KEY`, `STRIPE_PRICE_ID` and the secret `stripe listen --forward-to http://localhost:8787/api/stripe/webhook` prints in `crates/worker/.dev.vars`.
 
 ### Operator API
 
-Remove abuse with `Authorization: Bearer $OPERATOR_TOKEN` on the root domain:
+Manage workspaces with `Authorization: Bearer $OPERATOR_TOKEN` on the root domain:
 
 ```sh
 curl -H "Authorization: Bearer $OPERATOR_TOKEN" https://your-domain/api/operator/workspaces
-curl -X POST -H "Authorization: Bearer $OPERATOR_TOKEN" https://your-domain/api/operator/workspaces/acme/disable   # or enable
-curl -X POST -H "Authorization: Bearer $OPERATOR_TOKEN" https://your-domain/api/operator/workspaces/acme/delete    # erases it; its addresses become free
+curl -X POST -H "Authorization: Bearer $OPERATOR_TOKEN" https://your-domain/api/operator/workspaces/acme/disable    # or enable
+curl -X POST -H "Authorization: Bearer $OPERATOR_TOKEN" https://your-domain/api/operator/workspaces/acme/delete     # erases it; its addresses become free
+curl -X POST -H "Authorization: Bearer $OPERATOR_TOKEN" https://your-domain/api/operator/workspaces/acme/grant-pro  # Pro without paying; or revoke-pro
 ```
 
-Any of a workspace's addresses works in these URLs. The list shows each workspace's current `address` and its `previous_addresses`.
+Any of a workspace's addresses works in these URLs. The list shows each workspace's current `address`, its `previous_addresses`, its plan, writes in the last 24 hours, size and Stripe status, and the free plan's totals against their budget (`free_plan`). Deleting a workspace that someone still pays for is refused; cancel its subscription in the Stripe Dashboard first.
 
 ## Single-workspace mode
 

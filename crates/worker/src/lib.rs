@@ -8,7 +8,11 @@
 //!
 //! Each workspace object runs the same core as the native server; every request is one
 //! `transactionSync` call, so a failed operation rolls back exactly like it does on SQLite.
+//!
+//! Requests to a workspace are limited per client network before they reach its object (the
+//! `REQUEST_LIMITER` binding), so a flood costs no Durable Object time.
 
+mod billing;
 mod directory;
 mod sql;
 mod workspace;
@@ -63,6 +67,9 @@ async fn route(req: Request, env: Env, url: &Url) -> Result<Response> {
         if !is_core_path(&path) {
             return env.assets("ASSETS")?.fetch_request(req).await;
         }
+        if let Some(limited) = rate_limited(&req, &env).await? {
+            return Ok(limited);
+        }
         let name = var(&env, "WORKSPACE_NAME").unwrap_or_else(|| "main".into());
         return forward(&env, &name, req, None).await;
     }
@@ -78,9 +85,31 @@ async fn route(req: Request, env: Env, url: &Url) -> Result<Response> {
             if !is_core_path(&path) {
                 return env.assets("ASSETS")?.fetch_request(req).await;
             }
+            if let Some(limited) = rate_limited(&req, &env).await? {
+                return Ok(limited);
+            }
             forward(&env, &format!("ws:{slug}"), req, Some(&slug)).await
         }
         _ => error_response(404, "no_workspace", &format!("There's no workspace at this address. Create one at https://{root}/")),
+    }
+}
+
+/// Refuses a request once its client network has sent too many this minute. Each request that
+/// gets through costs a Durable Object request, and writes cost more; the plans meter those.
+async fn rate_limited(req: &Request, env: &Env) -> Result<Option<Response>> {
+    let Ok(limiter) = env.rate_limiter("REQUEST_LIMITER") else {
+        return Ok(None);
+    };
+    let Some(ip) = req.headers().get("cf-connecting-ip")? else {
+        return Ok(None);
+    };
+    match limiter.limit(dumbslab_core::auth::client_network(&ip)).await {
+        Ok(outcome) if !outcome.success => {
+            let mut resp = error_response(429, "rate_limited", "Too many requests from your network. Wait a minute and try again.")?;
+            resp.headers_mut().set("retry-after", "60")?;
+            Ok(Some(resp))
+        }
+        _ => Ok(None),
     }
 }
 
@@ -149,6 +178,8 @@ async fn root_site(req: Request, env: &Env, root: &str, path: &str) -> Result<Re
         (Method::Get | Method::Head, "/sitemap.xml") => text_response(tenancy::root_sitemap_xml(root), "application/xml; charset=utf-8"),
         (Method::Get, "/api/signup/check") => check_address(&req, env).await,
         (Method::Post, "/api/signup") => signup(req, env, root).await,
+        (Method::Get, "/api/plans") => billing::offer(env),
+        (Method::Post, "/api/stripe/webhook") => billing::webhook(req, env).await,
         (_, p) if p.starts_with("/api/operator/") => operator(req, env, p).await,
         // Static files the sign-up page uses.
         (Method::Get | Method::Head, p) if p.rsplit('/').next().is_some_and(|f| f.contains('.')) => {
@@ -241,11 +272,12 @@ async fn signup(mut req: Request, env: &Env, root: &str) -> Result<Response> {
     json_response(200, &json!({ "address": format!("{slug}.{root}"), "setup_url": setup_url }))
 }
 
-/// Operator API for removing abuse: `Authorization: Bearer $OPERATOR_TOKEN`.
+/// Operator API: `Authorization: Bearer $OPERATOR_TOKEN`.
 ///
-/// - `GET  /api/operator/workspaces`
+/// - `GET  /api/operator/workspaces`: every workspace with its plan and usage, and the free plan's totals.
 /// - `POST /api/operator/workspaces/{address}/disable` (or `enable`, `delete`). Any of a
-///   workspace's addresses works; `delete` frees all of them.
+///   workspace's addresses works; `delete` frees all of them, and refuses while someone pays.
+/// - `POST /api/operator/workspaces/{address}/grant-pro` (or `revoke-pro`): Pro without paying.
 async fn operator(req: Request, env: &Env, path: &str) -> Result<Response> {
     let Some(expected) = var(env, "OPERATOR_TOKEN") else {
         return error_response(404, "not_found", "not found");
@@ -272,6 +304,19 @@ async fn operator(req: Request, env: &Env, path: &str) -> Result<Response> {
     // The workspace's answer decides the directory change: 404 means the address was reserved
     // but never set up.
     let directory: (&str, Value) = match action.as_str() {
+        "grant-pro" | "revoke-pro" => {
+            let body = json!({ "home": home, "granted": action == "grant-pro" });
+            let (status, reply) =
+                call_object(env, "WORKSPACE", &format!("ws:{home}"), Method::Post, "/_internal/grant", Some(&body)).await?;
+            return json_response(status, &reply);
+        }
+        "delete" if found["paying"] == json!(true) => {
+            return error_response(
+                409,
+                "paying",
+                &format!("{home} has a paid Pro subscription. Cancel it in the Stripe Dashboard first, or it keeps charging."),
+            );
+        }
         "disable" => {
             // The directory first, so no sign-up link passes its check from now on (disabling a
             // reservation kills its link). Then the object, which also stops a sign-up already past

@@ -1,4 +1,5 @@
-// Settings: profile, connecting agents, API tokens, and (for admins) people, webhooks and workspace.
+// Settings: profile, connecting agents, API tokens, and (for admins) people, webhooks, workspace
+// and, on hosted DumbSlab, the plan.
 
 import { api, enc } from '/api.js';
 import {
@@ -14,11 +15,14 @@ const SECTIONS = [
   { id: 'people', label: 'People', icon: 'users', admin: true },
   { id: 'webhooks', label: 'Webhooks', icon: 'zap', admin: true },
   { id: 'workspace', label: 'Workspace', icon: 'settings', admin: true },
+  { id: 'plan', label: 'Plan', icon: 'layers', admin: true, hosted: true },
 ];
 
 export async function render(ctx) {
   const id = ctx.params.section || 'profile';
-  const sections = SECTIONS.filter((s) => !s.admin || canAdmin());
+  // Only hosted workspaces have an address, and a plan.
+  const hosted = Boolean(state.settings && state.settings.address);
+  const sections = SECTIONS.filter((s) => (!s.admin || canAdmin()) && (!s.hosted || hosted));
   const current = sections.find((s) => s.id === id);
   if (!current) {
     navigate('/settings', { replace: true });
@@ -576,6 +580,93 @@ function addressPanel(current) {
   return panel('Address', 'Your workspace’s web address. Posts, people and API tokens all move with it. Everyone signs in again at the new address, and the old one keeps sending people there.', f);
 }
 
+// ---------------------------------------------------------------------------
+// Plan (hosted workspaces)
+
+function formatBytes(n) {
+  if (n < 1024 * 1024) return `${Math.max(1, Math.round(n / 1024))} KB`;
+  if (n < 1024 * 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(n < 10 * 1024 * 1024 ? 1 : 0)} MB`;
+  return `${(n / (1024 * 1024 * 1024)).toFixed(1).replace(/\.0$/, '')} GB`;
+}
+
+const count = (n) => n.toLocaleString('en-US');
+
+function usageRow(label, used, limit, text, hint) {
+  const share = limit > 0 ? used / limit : 0;
+  const level = share >= 1 ? 'full' : share >= 0.8 ? 'high' : 'ok';
+  return h('div', { class: 'usage' },
+    h('div', { class: 'usage-head' }, h('span', { class: 'usage-label' }, label), h('span', { class: 'usage-value' }, text)),
+    h('div', { class: ['usage-bar', `usage-${level}`], role: 'meter', 'aria-label': label, 'aria-valuemin': '0', 'aria-valuemax': String(limit), 'aria-valuenow': String(Math.min(used, limit)), 'aria-valuetext': text },
+      h('span', { class: 'usage-fill', style: `width: ${Math.min(100, share * 100).toFixed(1)}%` })),
+    hint ? h('p', { class: 'field-hint' }, hint) : null);
+}
+
+function allowanceList(a) {
+  return h('ul', { class: 'plan-list' },
+    h('li', null, `${formatBytes(a.storage_bytes)} of storage, uploads included`),
+    h('li', null, `${count(a.writes_per_day)} database writes a day`),
+    h('li', null, 'Everything else: MCP, the API, webhooks, people and bots'));
+}
+
+const dayFmt = new Intl.DateTimeFormat(undefined, { month: 'long', day: 'numeric', year: 'numeric' });
+const day = (unix) => (unix ? dayFmt.format(new Date(unix * 1000)) : '');
+
+async function planSection() {
+  const p = await api.get('/plan');
+  const justPaid = new URLSearchParams(location.search).get('checkout') === 'done';
+  if (justPaid && p.plan !== 'pro') {
+    // Stripe tells DumbSlab a moment after the payment; look again shortly.
+    setTimeout(() => { if (location.pathname === '/settings/plan') navigate('/settings/plan?checkout=done', { replace: true }); }, 3000);
+  }
+  const sub = p.subscription;
+  const pro = p.plan === 'pro';
+  const a = p.allowance;
+  const u = p.usage;
+
+  const usage = panel('Usage',
+    `This workspace is on the ${pro ? 'Pro' : 'Free'} plan. Every feature is on every plan; plans differ only in how much a workspace stores and how much it writes in a day, the two things that cost money to run.`,
+    h('div', { class: 'stack' },
+      usageRow('Storage', u.storage_bytes, a.storage_bytes, `${formatBytes(u.storage_bytes)} of ${formatBytes(a.storage_bytes)}`,
+        'Past this, new posts, edits and uploads that need more room are refused. Deleting old files or posts frees space.'),
+      usageRow('Writes in the last 24 hours', u.writes_24h, a.writes_per_day, `${count(u.writes_24h)} of ${count(a.writes_per_day)}`,
+        'Every database row a change writes counts: an edit writes about 10, a new post about 20. Past the allowance, changes pause until it refills, hour by hour. Reading always works.')));
+
+  const parts = [];
+  if (justPaid) {
+    parts.push(h('p', { class: 'callout', role: 'status' }, icon('check'),
+      h('span', null, pro ? 'Thanks! This workspace is on Pro.' : 'Thanks! Pro turns on as soon as Stripe confirms the payment, usually within a minute.')));
+  }
+  if (sub && sub.status === 'past_due') {
+    parts.push(h('p', { class: 'callout callout-warn', role: 'alert' }, icon('alert'),
+      h('span', null, 'The last payment didn’t go through. Stripe will try again; update the card under Manage billing to keep Pro.')));
+  }
+  parts.push(usage);
+
+  const manage = button('Manage billing', { icon: 'external', variant: 'subtle' });
+  manage.addEventListener('click', () => busy(manage, async () => {
+    const r = await api.post('/plan/billing');
+    location.assign(r.url);
+  }).catch(toastError));
+
+  if (pro && p.granted) {
+    parts.push(panel('Pro, on the house', 'DumbSlab gave this workspace Pro. There’s nothing to pay.', allowanceList(a)));
+  } else if (pro) {
+    const when = sub && sub.period_end ? (sub.cancel_at_period_end ? `Pro ends on ${day(sub.period_end)}; it won’t renew.` : `Renews on ${day(sub.period_end)}.`) : '';
+    parts.push(panel(`Pro, ${p.pro.price}`, when, allowanceList(a), h('div', null, manage)));
+  } else {
+    const upgrade = button('Upgrade to Pro', { icon: 'zap', variant: 'primary' });
+    upgrade.addEventListener('click', () => busy(upgrade, async () => {
+      const r = await api.post('/plan/upgrade');
+      location.assign(r.url);
+    }).catch(toastError));
+    const actions = p.pro.available
+      ? h('div', { class: 'plan-actions' }, upgrade, sub ? manage : null)
+      : h('p', { class: 'muted small' }, 'Pro isn’t on sale yet. Until then, delete old files to make room, or export the workspace and self-host DumbSlab, which has no limits.');
+    parts.push(panel(`Pro, ${p.pro.price}`, 'For workspaces that need more room. Payments go through Stripe; cancel any time and Pro lasts until the end of the paid month.', allowanceList(p.pro.allowance), actions));
+  }
+  return frag(...parts);
+}
+
 const RENDER = {
   profile: profileSection,
   agents: agentsSection,
@@ -583,4 +674,5 @@ const RENDER = {
   people: peopleSection,
   webhooks: webhooksSection,
   workspace: workspaceSection,
+  plan: planSection,
 };

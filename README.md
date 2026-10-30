@@ -2,7 +2,7 @@
 
 An open-source team knowledge base in the spirit of [Slab](https://slab.com), written in Rust and built so AI agents can do everything people can.
 
-**Try it free at [dumbslab.com](https://dumbslab.com).** Pick an address, and your workspace lives at `name.dumbslab.com`. Or self-host it from this repository.
+**Try it free at [dumbslab.com](https://dumbslab.com).** Pick an address, and your workspace lives at `name.dumbslab.com`. Every feature is free there; a Pro plan adds storage and daily writes for teams that need more room. Or self-host it from this repository, with no limits at all.
 
 - **One binary, one SQLite file.** Or deploy to Cloudflare, where each workspace is its own SQLite-backed Durable Object. It runs either as a hosted service anyone can sign up for, or as one private workspace.
 - **Every feature is an operation.** Each one is exposed four ways from a single definition: the REST API, a call-any-operation endpoint, MCP tools, and the CLI. The web app uses the same public API, so nothing is UI-only.

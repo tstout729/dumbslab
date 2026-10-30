@@ -7,17 +7,26 @@
 //! A workspace keeps its data in the object named after its first address (its "home"). When it
 //! moves, the object for the new address only stores a pointer home; the front Worker follows it.
 //! The home object sends requests for any address but the current one on to the current one.
+//!
+//! Hosted workspaces have a plan (see `dumbslab_core::plan`). This object measures the database,
+//! refuses changes past the storage allowance, counts the rows each request writes, and reports
+//! its usage to the directory, which answers whether the free plan is at capacity.
 
 use std::cell::{Cell, RefCell};
+use std::rc::Rc;
 
 use chrono::Utc;
 use dumbslab_core::db::{Db, DbExt};
-use dumbslab_core::{AddressMove, ApiError, ApiResult, Effect, HostConfig, Outcome, params, tenancy};
+use dumbslab_core::plan::{self, Capacity, Plan, Subscription};
+use dumbslab_core::{AddressMove, ApiError, ApiResult, Effect, HostConfig, Hosting, Outcome, params, tenancy};
 use serde_json::{Value, json};
 use wasm_bindgen::prelude::*;
 use worker::*;
 
-use crate::sql::{DoDb, api_error_response, call_object, error_response, flag, json_response, read_body, transaction, var, var_i64};
+use crate::sql::{DoDb, api_error_response, call_object, error_response, flag, json_response, read_body, transaction, var};
+
+/// How often, at most, a busy workspace reports its usage to the directory.
+const REPORT_EVERY_SECS: i64 = 300;
 
 /// The header the front Worker uses to tell a workspace object its address.
 pub const WORKSPACE_HEADER: &str = "x-dumbslab-workspace";
@@ -45,6 +54,10 @@ pub struct Workspace {
     /// Set when an operator disables this address before anyone set it up. A sign-up that passed
     /// its directory check just before then is still in flight here, and must not finish.
     setup_blocked: Cell<bool>,
+    /// The free plan's capacity, from the directory's answer to this workspace's last report.
+    capacity: Rc<Cell<Capacity>>,
+    /// When this workspace last reported its usage (Unix seconds).
+    reported_at: Cell<i64>,
 }
 
 fn rust_err(e: ApiError) -> worker::Error {
@@ -68,7 +81,28 @@ fn to_response(r: dumbslab_core::Response) -> Result<Response> {
 
 impl Workspace {
     fn db(&self) -> DoDb {
-        DoDb { sql: self.state.storage().sql() }
+        DoDb::new(self.state.storage().sql())
+    }
+
+    /// Tells the directory this workspace's plan, recent writes and size, at most every few
+    /// minutes unless `now` is asked for. Its answer says whether the free plan is at capacity.
+    fn report_usage(&self, home: &str, now: bool) {
+        let at = Utc::now();
+        if !now && at.timestamp() - self.reported_at.get() < REPORT_EVERY_SECS {
+            return;
+        }
+        self.reported_at.set(at.timestamp());
+        let db = self.db();
+        let (Ok(state), Ok(writes)) = (plan::current(&db), plan::writes_24h(&db, at)) else { return };
+        let body = json!({ "home": home, "plan": state.plan().as_str(), "writes_24h": writes, "storage_bytes": db.sql.database_size() });
+        let (env, capacity) = (self.env.clone(), self.capacity.clone());
+        self.state.wait_until(async move {
+            if let Ok((200, reply)) = call_object(&env, "DIRECTORY", "directory", Method::Post, "/usage", Some(&body)).await
+                && let Ok(c) = serde_json::from_value::<Capacity>(reply)
+            {
+                capacity.set(c);
+            }
+        });
     }
 
     /// What this object stores. Reading `sqlite_master` writes nothing.
@@ -156,6 +190,43 @@ impl Workspace {
                 };
                 self.db().execute(sql, &[]).map_err(|e| worker::Error::RustError(e.message))?;
                 json_response(200, &json!({ "ok": true }))
+            }
+            // From the front Worker: Stripe reported a subscription, or the operator granted Pro.
+            "/_internal/subscription" | "/_internal/grant" => {
+                if !matches!(self.stored()?, Stored::Workspace) {
+                    return error_response(404, "no_workspace", "no workspace here");
+                }
+                self.migrate()?;
+                let body = req.json::<Value>().await.unwrap_or_default();
+                let home = body["home"].as_str().unwrap_or_default().to_string();
+                if home.is_empty() {
+                    return error_response(400, "bad_request", "send the workspace's home");
+                }
+                let grant = path.ends_with("grant").then(|| body["granted"].as_bool().unwrap_or(false));
+                let sub = match grant {
+                    Some(_) => None,
+                    None => match serde_json::from_value::<Subscription>(body["subscription"].clone()) {
+                        Ok(s) => Some(s),
+                        Err(e) => return error_response(400, "bad_request", &format!("invalid subscription: {e}")),
+                    },
+                };
+                let storage = self.state.storage();
+                let saved = transaction(&storage, self.db(), move |db| {
+                    let r = match (grant, &sub) {
+                        (Some(g), _) => plan::set_grant(db, g).map(|_| true),
+                        (None, Some(s)) => plan::apply_subscription(db, s),
+                        (None, None) => Ok(false),
+                    };
+                    let ok = r.is_ok();
+                    (r, ok)
+                })?;
+                match saved {
+                    Ok(applied) => {
+                        self.report_usage(&home, true);
+                        json_response(200, &json!({ "ok": true, "applied": applied }))
+                    }
+                    Err(e) => api_error_response(&e),
+                }
             }
             "/_internal/delete" => {
                 // The operator deletes the home object first and then reads the final address
@@ -259,6 +330,8 @@ impl DurableObject for Workspace {
             alias: RefCell::new(None),
             moving: Cell::new(false),
             setup_blocked: Cell::new(false),
+            capacity: Rc::new(Cell::new(Capacity::default())),
+            reported_at: Cell::new(0),
         }
     }
 
@@ -354,7 +427,6 @@ impl DurableObject for Workspace {
                 path.as_str(),
                 "/api/v1/auth/login" | "/api/v1/auth/logout" | "/api/v1/auth/setup" | "/oauth/token" | "/oauth/revoke" | "/oauth/authorize"
             );
-        let quota = (workspace.is_some() && !exempt).then(|| var_i64(&self.env, "WORKSPACE_STORAGE_MB", 50).max(1) as usize * 1024 * 1024);
 
         let headers: Vec<(String, String)> = req.headers().entries().map(|(k, v)| (k.to_lowercase(), v)).collect();
         let core_req = dumbslab_core::Request {
@@ -366,43 +438,62 @@ impl DurableObject for Workspace {
             body,
             origin: origin.clone(),
         };
+        let db = self.db();
         let multi = workspace.is_some();
+        let hosting = home.clone().filter(|_| multi).map(|home| Hosting {
+            plans: crate::billing::plans(&self.env),
+            home,
+            storage_bytes: db.sql.database_size() as u64,
+            capacity: self.capacity.get(),
+        });
         let cfg = HostConfig {
             base_url: if multi { Some(origin.clone()) } else { var(&self.env, "BASE_URL") },
             setup_token: if multi { None } else { var(&self.env, "SETUP_TOKEN") },
             open_setup: flag(&self.env, "OPEN_SETUP"),
             signup_secret: if multi { signup_secret } else { None },
             workspace: workspace.clone(),
+            hosting,
         };
         let move_cfg = cfg.clone();
 
         let storage = self.state.storage();
-        let sql = self.db().sql;
-        let result: ApiResult<Option<Outcome>> = transaction(&storage, self.db(), move |db| {
+        let sql = db.sql.clone();
+        let result: ApiResult<Option<Outcome>> = transaction(&storage, db.clone(), move |db| {
             if creating && let Err(e) = dumbslab_core::migrate(db) {
                 return (Err(e), false);
             }
-            let before = sql.database_size();
+            let before = sql.database_size() as u64;
             match dumbslab_core::handle(db, &cfg, &core_req) {
                 None => (Ok(None), true),
                 Some(o) => {
                     // A failed setup leaves no schema behind.
                     let commit = o.commit && (!creating || o.response.status == 200);
-                    if let Some(limit) = quota {
-                        let after = sql.database_size();
-                        if commit && after > before && after > limit {
-                            let full = ApiError::new(
-                                507,
-                                "storage_full",
-                                "This workspace has reached its storage limit. Delete old posts or uploaded files, or export it and self-host DumbSlab for unlimited space.",
-                            );
-                            return (Err(full), false);
+                    if let Some(h) = cfg.hosting.as_ref().filter(|_| !exempt) {
+                        let after = sql.database_size() as u64;
+                        if commit && after > before {
+                            let plan = plan::current(db).map(|s| s.plan()).unwrap_or(Plan::Free);
+                            let shared_full = plan == Plan::Free && h.capacity.growth_paused;
+                            let own_full = after > h.plans.allowance(plan).storage_bytes;
+                            if own_full || shared_full {
+                                return (Err(plan::storage_full(&h.plans, plan, !own_full)), false);
+                            }
                         }
                     }
                     (Ok(Some(o)), commit)
                 }
             }
         })?;
+        // Hosted workspaces count every row a request's statements wrote, even when it was rolled
+        // back, against their plan. A sign-up that failed left no table to count in.
+        if let Some(h) = move_cfg.hosting.as_ref()
+            && db.rows_written() > 0
+            && (self.migrated.get() || (creating && matches!(&result, Ok(Some(o)) if o.response.status == 200)))
+        {
+            if let Err(e) = plan::record_writes(&self.db(), Utc::now(), db.rows_written()) {
+                console_error!("recording usage failed: {}", e.message);
+            }
+            self.report_usage(&h.home, false);
+        }
         let outcome = match result {
             Ok(Some(o)) => o,
             Ok(None) => return error_response(404, "not_found", "not found"),
@@ -421,6 +512,10 @@ impl DurableObject for Workspace {
         }
 
         let mut effects = outcome.effects;
+        // upgrade_plan and manage_billing: the answer is the Stripe page's URL.
+        if let Some(Effect::Stripe(call)) = effects.iter().find(|e| matches!(e, Effect::Stripe(_))) {
+            return crate::billing::page(&self.env, call).await;
+        }
         if let Some(i) = effects.iter().position(|e| matches!(e, Effect::MoveAddress(_))) {
             let Effect::MoveAddress(mv) = effects.remove(i) else { unreachable!() };
             let home = home.clone().unwrap_or_else(|| mv.from.clone());

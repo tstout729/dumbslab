@@ -1,6 +1,6 @@
 //! Durable Object SQL access, transactions and small HTTP helpers shared by both objects.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use dumbslab_core::db::{Db, Row, SqlValue};
@@ -11,10 +11,12 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
 use worker::*;
 
-/// SQL access through the Durable Object's synchronous SQL API.
+/// SQL access through the Durable Object's synchronous SQL API. Counts the rows its statements
+/// write, as Cloudflare bills them (index entries and search-index rows included).
 #[derive(Clone)]
 pub struct DoDb {
     pub sql: SqlStorage,
+    pub written: Rc<Cell<u64>>,
 }
 
 fn to_binding(v: &SqlValue) -> SqlStorageValue {
@@ -48,6 +50,19 @@ fn sql_err(e: worker::Error) -> ApiError {
 }
 
 impl DoDb {
+    pub fn new(sql: SqlStorage) -> DoDb {
+        DoDb { sql, written: Rc::new(Cell::new(0)) }
+    }
+
+    /// Rows written through this handle (and its clones) so far.
+    pub fn rows_written(&self) -> u64 {
+        self.written.get()
+    }
+
+    fn count(&self, cursor: &SqlCursor) {
+        self.written.set(self.written.get() + cursor.rows_written() as u64);
+    }
+
     fn run(&self, sql: &str, params: &[SqlValue]) -> ApiResult<SqlCursor> {
         let bindings: Vec<SqlStorageValue> = params.iter().map(to_binding).collect();
         self.sql.exec(sql, if bindings.is_empty() { None } else { Some(bindings) }).map_err(sql_err)
@@ -63,22 +78,27 @@ impl Db for DoDb {
             let values = row.map_err(sql_err)?.into_iter().map(from_storage).collect();
             out.push(Row::new(columns.clone(), values));
         }
+        self.count(&cursor);
         Ok(out)
     }
 
     fn execute(&self, sql: &str, params: &[SqlValue]) -> ApiResult<u64> {
         // Drain the cursor so the statement has fully run before reading changes().
-        for row in self.run(sql, params)?.raw() {
+        let cursor = self.run(sql, params)?;
+        for row in cursor.raw() {
             row.map_err(sql_err)?;
         }
+        self.count(&cursor);
         let changes = self.query("SELECT changes() AS n", &[])?;
         Ok(changes.first().map(|r| r.i64("n")).unwrap_or(0).max(0) as u64)
     }
 
     fn execute_batch(&self, sql: &str) -> ApiResult<()> {
-        for row in self.run(sql, &[])?.raw() {
+        let cursor = self.run(sql, &[])?;
+        for row in cursor.raw() {
             row.map_err(sql_err)?;
         }
+        self.count(&cursor);
         Ok(())
     }
 }
