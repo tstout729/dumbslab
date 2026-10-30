@@ -39,7 +39,7 @@ pub fn ops() -> Vec<Op> {
             .build(),
         op("admin", "import_documents", "POST", "/import", Access::Write, import_documents)
             .title("Import Markdown documents")
-            .desc("Create many posts at once, e.g. when migrating from another wiki, Notion or a docs folder. Each document can name a topic path like `Engineering/Runbooks`; missing topics are created.")
+            .desc("Create many posts at once, e.g. when migrating from Confluence, Guru, a GitHub wiki, Notion or a docs folder. Each document can name a topic path like `Engineering/Runbooks` (inside `topic_id` when given); missing topics are created. Inside a private topic, new topics are private with the same members, and a path through a topic more people can see is refused. Imports don't notify topic followers or mentioned people. Pass `skip_existing: true` to skip documents whose title is already one of your posts in the same topic, so an interrupted import can be re-run without duplicates; a title someone else's post has there is reported in `taken` and not imported. A failing document rolls back the whole call, so send batches (25 is a good size) and retry a failed batch one document at a time. To migrate a whole export: convert each page to Markdown, import the pages (`results` lists the post for each document in order), upload each page's images with upload_file and that page's `post_id`, then use edit_post to put the returned `/files/...` paths and links to the new posts (`/p/<id>`) in place.")
             .build(),
     ]
 }
@@ -506,7 +506,9 @@ pub struct ImportDocument {
     pub title: String,
     /// Markdown body.
     pub content: String,
-    /// Topic path such as `Engineering/Runbooks`. Missing topics are created.
+    /// Topic path such as `Engineering/Runbooks`, inside `topic_id` when that is given. Missing
+    /// topics are created; inside a private topic they are private, with its members, and a path
+    /// through a topic more people can see than its private parent is refused.
     pub topic: Option<String>,
     /// `published` (default) or `draft`.
     pub status: Option<String>,
@@ -517,40 +519,152 @@ pub struct ImportDocument {
 pub struct ImportInput {
     /// Up to 500 documents per call.
     pub documents: Vec<ImportDocument>,
+    /// An existing topic to import into, by id: each document's `topic` path is created inside it,
+    /// and a document without one goes in this topic. Without it, paths start at the top level.
+    pub topic_id: Option<String>,
+    /// Skip a document when a post with exactly the same title is already in its topic (for a
+    /// document without a topic: among posts with no topic), and report that post instead. Only
+    /// your own posts count as already imported: when the post is someone else's, nothing is
+    /// created and the document is reported in `taken`. Trashed posts and templates don't count.
+    /// Default false.
+    pub skip_existing: Option<bool>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct ImportedDocument {
+    /// The post created for the document, or the existing post it matched.
+    pub id: String,
+    pub title: String,
+    pub url: String,
+    /// True when `skip_existing` matched an existing post and nothing was created.
+    pub skipped: bool,
+    /// With `skipped`: the matching post is someone else's, so the document wasn't imported.
+    /// Leave that post alone; rename the document or import it into another topic.
+    pub taken: bool,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct ImportResult {
+    /// Posts this call created.
     pub created: Vec<PostLink>,
+    /// Your existing posts that `skip_existing` matched, so their documents weren't imported again.
+    pub skipped: Vec<PostLink>,
+    /// Someone else's posts that already have a document's title in its topic, so with
+    /// `skip_existing` those documents weren't imported.
+    pub taken: Vec<PostLink>,
+    /// One entry per document, in the order sent.
+    pub results: Vec<ImportedDocument>,
     pub topics_created: i64,
 }
 
-/// Finds or creates each segment of a topic path; returns the leaf topic id.
-fn ensure_topic_path(ctx: &mut Ctx, path: &str, created: &mut i64) -> ApiResult<Option<String>> {
-    let mut parent: Option<String> = None;
+/// A topic on an import's path.
+#[derive(Clone)]
+struct PathTopic {
+    id: String,
+    name: String,
+    private: bool,
+}
+
+/// Finds or creates each segment of a topic path below `base` (or at the top); returns the leaf
+/// topic id. Inside a private topic, nothing an import does is visible to more people than that
+/// topic: topics it creates there are private with the same members (and the importer), and an
+/// existing topic more people can see is refused rather than used. Visibility doesn't inherit,
+/// so a public topic under a private one would otherwise show the import to everyone.
+fn ensure_topic_path(ctx: &mut Ctx, base: Option<PathTopic>, path: &str, created: &mut i64) -> ApiResult<Option<String>> {
+    let mut parent = base;
     for segment in path.split('/').map(str::trim).filter(|s| !s.is_empty()) {
-        let mut p = params![segment, parent.clone()];
+        let parent_id = parent.as_ref().map(|t| t.id.clone());
+        let mut p = params![segment, parent_id.clone()];
         let vis = topic_visible_sql(&ctx.actor, "t", &mut p);
-        let existing =
-            ctx.db.one(&format!("SELECT t.id FROM topics t WHERE t.name = ? COLLATE NOCASE AND t.parent_id IS ? AND {vis}"), &p)?;
-        let id = match existing {
-            Some(r) => r.str("id"),
+        let existing = ctx.db.one(
+            &format!("SELECT t.id, t.name, t.visibility FROM topics t WHERE t.name = ? COLLATE NOCASE AND t.parent_id IS ? AND {vis}"),
+            &p,
+        )?;
+        let next = match existing {
+            Some(r) => {
+                let topic = PathTopic { id: r.str("id"), name: r.str("name"), private: r.str("visibility") == "private" };
+                if let Some(up) = parent.as_ref().filter(|up| up.private) {
+                    // Compare who can read, not member lists: admins read every private topic, so an
+                    // admin among the members (such as an admin importer this import added) widens
+                    // nothing. Anyone else must be a member of the parent too.
+                    let wider = !topic.private
+                        || ctx.db.scalar_i64(
+                            "SELECT COUNT(*) FROM topic_members c JOIN users cu ON cu.id = c.user_id
+                             WHERE c.topic_id = ? AND cu.role != 'admin'
+                               AND NOT EXISTS (SELECT 1 FROM topic_members u WHERE u.topic_id = ? AND u.user_id = c.user_id)",
+                            &params![topic.id.clone(), up.id.clone()],
+                        )? > 0;
+                    if wider {
+                        return Err(ApiError::conflict(format!(
+                            "“{}” is inside the private topic “{}”, but more people can see it, so the import won't put pages in it or add topics under it. Make it private with the same members as “{}”, or import somewhere else.",
+                            topic.name, up.name, up.name
+                        )));
+                    }
+                }
+                topic
+            }
             None => {
+                let private = parent.as_ref().is_some_and(|t| t.private);
                 let id = new_id();
                 let now = ctx.now_s();
                 ctx.db.execute(
-                    "INSERT INTO topics (id, parent_id, name, slug, visibility, position, created_by, created_at, updated_at) VALUES (?, ?, ?, ?, 'org', 0, ?, ?, ?)",
-                    &params![id.clone(), parent.clone(), segment, slugify(segment), ctx.actor.user_id.clone(), now.clone(), now],
+                    "INSERT INTO topics (id, parent_id, name, slug, visibility, position, created_by, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?)",
+                    &params![
+                        id.clone(),
+                        parent_id.clone(),
+                        segment,
+                        slugify(segment),
+                        if private { "private" } else { "org" },
+                        ctx.actor.user_id.clone(),
+                        now.clone(),
+                        now.clone()
+                    ],
                 )?;
+                if private {
+                    ctx.db.execute(
+                        "INSERT INTO topic_members (topic_id, user_id, added_at) SELECT ?, user_id, ? FROM topic_members WHERE topic_id = ? ON CONFLICT DO NOTHING",
+                        &params![id.clone(), now.clone(), parent_id.clone()],
+                    )?;
+                    ctx.db.execute(
+                        "INSERT INTO topic_members (topic_id, user_id, added_at) VALUES (?, ?, ?) ON CONFLICT DO NOTHING",
+                        &params![id.clone(), ctx.actor.user_id.clone(), now],
+                    )?;
+                }
                 crate::search::index_topic(ctx.db, &id)?;
-                emit(ctx, Event::new("topic.created", "topic", &id, format!("created topic “{segment}” during import")).topic(&id))?;
+                let mut event = Event::new("topic.created", "topic", &id, format!("created topic “{segment}” during import")).topic(&id);
+                if private {
+                    event = event.admin_only();
+                }
+                emit(ctx, event)?;
                 *created += 1;
-                id
+                PathTopic { id, name: segment.to_string(), private }
             }
         };
-        parent = Some(id);
+        parent = Some(next);
     }
-    Ok(parent)
+    Ok(parent.map(|t| t.id))
+}
+
+/// A post the actor can see with exactly this title in the topic (or, without a topic, in no
+/// topic), the actor's own first, and whether it is the actor's. Trashed posts and templates
+/// don't count.
+fn existing_post(ctx: &Ctx, title: &str, topic_id: Option<&str>) -> ApiResult<Option<(PostLink, bool)>> {
+    let mut p = params![ctx.actor.user_id.clone(), title];
+    let place = match topic_id {
+        Some(tid) => {
+            p.push(tid.into());
+            "EXISTS (SELECT 1 FROM post_topics ipt WHERE ipt.post_id = p.id AND ipt.topic_id = ?)"
+        }
+        None => "NOT EXISTS (SELECT 1 FROM post_topics ipt WHERE ipt.post_id = p.id)",
+    };
+    let vis = post_visible_sql(&ctx.actor, "p", &mut p);
+    let row = ctx.db.one(
+        &format!(
+            "SELECT p.id, p.title, p.slug, p.author_id = ? AS own FROM posts p WHERE p.title = ? AND {place} AND p.deleted_at IS NULL AND p.is_template = 0 AND {vis} ORDER BY own DESC, p.created_at LIMIT 1"
+        ),
+        &p,
+    )?;
+    Ok(row.map(|r| (PostLink { url: post_url(ctx, &r.str("id"), &r.str("slug")), id: r.str("id"), title: r.str("title") }, r.bool("own"))))
 }
 
 fn import_documents(ctx: &mut Ctx, input: ImportInput) -> ApiResult<ImportResult> {
@@ -558,30 +672,63 @@ fn import_documents(ctx: &mut Ctx, input: ImportInput) -> ApiResult<ImportResult
     if input.documents.len() > 500 {
         return Err(ApiError::bad_request("import at most 500 documents per call"));
     }
-    let mut created = vec![];
+    let skip_existing = input.skip_existing.unwrap_or(false);
+    let (mut created, mut skipped, mut taken, mut results) = (vec![], vec![], vec![], vec![]);
+    let base = match clean(input.topic_id) {
+        Some(id) => {
+            let t = load_topic(ctx, &id)?;
+            Some(PathTopic { id: t.str("id"), name: t.str("name"), private: t.str("visibility") == "private" })
+        }
+        None => None,
+    };
     let mut topics_created = 0;
     for doc in input.documents {
-        let topic_ids = match clean(doc.topic) {
-            Some(path) => ensure_topic_path(ctx, &path, &mut topics_created)?.into_iter().collect(),
-            None => vec![],
-        };
-        let post = crate::ops::posts::create_post(
+        let topic_id = ensure_topic_path(ctx, base.clone(), doc.topic.as_deref().unwrap_or_default(), &mut topics_created)?;
+        // Only the caller's own post counts as this document already imported. Someone else's post
+        // with the title is neither adopted (a retry would then change it) nor duplicated.
+        if skip_existing && let Some((post, own)) = existing_post(ctx, doc.title.trim(), topic_id.as_deref())? {
+            results.push(ImportedDocument {
+                id: post.id.clone(),
+                title: post.title.clone(),
+                url: post.url.clone(),
+                skipped: true,
+                taken: !own,
+            });
+            if own {
+                skipped.push(post)
+            } else {
+                taken.push(post)
+            }
+            continue;
+        }
+        // Imported text was written elsewhere: its @handles aren't meant for people here, and
+        // followers of a topic shouldn't get a notification per imported page.
+        let post = crate::ops::posts::insert_post(
             ctx,
             CreatePostInput {
                 title: doc.title,
                 content: Some(doc.content),
-                topic_ids: Some(topic_ids),
+                topic_ids: Some(topic_id.into_iter().collect()),
                 status: Some(doc.status.unwrap_or_else(|| "published".into())),
                 is_template: None,
                 template_id: None,
             },
+            false,
         )?;
-        created.push(PostLink { id: post.summary.id, title: post.summary.title, url: post.summary.url });
+        let link = PostLink { id: post.summary.id, title: post.summary.title, url: post.summary.url };
+        results.push(ImportedDocument {
+            id: link.id.clone(),
+            title: link.title.clone(),
+            url: link.url.clone(),
+            skipped: false,
+            taken: false,
+        });
+        created.push(link);
     }
     emit(
         ctx,
         Event::new("import.completed", "workspace", "import", format!("imported {} documents", created.len()))
-            .data(json!({ "count": created.len() })),
+            .data(json!({ "count": created.len(), "skipped": skipped.len(), "taken": taken.len() })),
     )?;
-    Ok(ImportResult { created, topics_created })
+    Ok(ImportResult { created, skipped, taken, results, topics_created })
 }

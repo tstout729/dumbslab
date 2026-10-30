@@ -1,0 +1,14 @@
+Title: Billing
+Description: |
+  How we bill customers,
+  and how refunds work.
+Items:
+- ID: "card-invoices"
+  Type: "card"
+- Type: "section"
+  Title: "Refunds"
+  Items:
+  - ID: "card-refunds"
+    Type: "card"
+- ID: "disputes"
+  Type: "folder"

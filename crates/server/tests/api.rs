@@ -1862,6 +1862,277 @@ fn file_access_follows_posts() {
 // ---------------------------------------------------------------------------
 // Plans for hosted workspaces.
 
+#[test]
+fn imports_skip_what_exists_and_stay_quiet() {
+    let h = H::new();
+    let (_, admin) = h.setup();
+    let (_, member) = h.user(&admin, "mia@acme.test", "Mia Member", "member");
+    let (_, other) = h.user(&admin, "otto@acme.test", "Otto Other", "member");
+    let (_, viewer) = h.user(&admin, "vic@acme.test", "Vic Viewer", "viewer");
+    let docs = h.ok("POST", "/api/v1/topics", Some(json!({ "name": "Docs" })), &admin)["id"].as_str().unwrap().to_string();
+    h.ok("POST", "/api/v1/follows", Some(json!({ "target_type": "topic", "target_id": docs })), &viewer);
+
+    // Viewers can't import.
+    let one = json!({ "documents": [{ "title": "x", "content": "y" }] });
+    assert_eq!(h.call("POST", "/api/v1/import", Some(one), &viewer).status, 403);
+
+    // An image uploaded before the import joins the post that uses it.
+    let png = b"\x89PNG\r\n\x1a\nimported";
+    let file = upload(&h, &member, "diagram.png", None, png, None).body;
+    let batch = json!({ "skip_existing": true, "documents": [
+        { "title": "Home", "content": format!("Welcome @vic\n\n{}", file["markdown"].as_str().unwrap()), "topic": "Docs" },
+        { "title": "Runbook", "content": "Steps", "topic": "Docs/Ops" },
+        { "title": "Loose page", "content": "No topic" },
+    ] });
+    let first = h.ok("POST", "/api/v1/import", Some(batch.clone()), &member);
+    assert_eq!(first["created"].as_array().unwrap().len(), 3);
+    assert_eq!(first["topics_created"], 1);
+    let first_ids: Vec<&str> = first["results"].as_array().unwrap().iter().map(|r| r["id"].as_str().unwrap()).collect();
+    assert!(first["results"].as_array().unwrap().iter().all(|r| r["skipped"] == false));
+    assert_eq!(first["results"][1]["title"], "Runbook");
+    let home = first_ids[0];
+    let fid = file["id"].as_str().unwrap();
+    assert_eq!(h.ok("GET", &format!("/api/v1/files/{fid}"), None, &member)["post_id"], home);
+
+    // Imported pages don't notify topic followers or the people their text mentions.
+    let n = h.ok("GET", "/api/v1/notifications", None, &viewer);
+    assert!(n["items"].as_array().unwrap().iter().all(|x| !first_ids.contains(&x["post"]["id"].as_str().unwrap_or_default())), "{n}");
+    // The activity feed still records each new post.
+    let feed = h.ok("GET", &format!("/api/v1/activity?post_id={home}"), None, &viewer);
+    assert_eq!(feed["items"][0]["event"], "post.created");
+
+    // Running the same import again creates nothing and reports the posts it matched, in order.
+    let again = h.ok("POST", "/api/v1/import", Some(batch.clone()), &member);
+    assert!(again["created"].as_array().unwrap().is_empty(), "{again}");
+    assert_eq!(again["skipped"].as_array().unwrap().len(), 3);
+    assert_eq!(again["topics_created"], 0);
+    let again_ids: Vec<&str> = again["results"].as_array().unwrap().iter().map(|r| r["id"].as_str().unwrap()).collect();
+    assert_eq!(again_ids, first_ids);
+    assert!(again["results"].as_array().unwrap().iter().all(|r| r["skipped"] == true));
+
+    // The match is exact title in the same topic: other topics, other titles and trashed posts don't count.
+    h.ok("DELETE", &format!("/api/v1/posts/{}", first_ids[2]), None, &member);
+    let mixed = h.ok(
+        "POST",
+        "/api/v1/import",
+        Some(json!({ "skip_existing": true, "documents": [
+            { "title": "Runbook", "content": "Elsewhere", "topic": "Docs" },
+            { "title": "runbook", "content": "Case differs", "topic": "Docs/Ops" },
+            { "title": "Loose page", "content": "Back from the trash" },
+            { "title": "New page", "content": "a", "topic": "Docs" },
+            { "title": "New page", "content": "b", "topic": "Docs" },
+        ] })),
+        &member,
+    );
+    let skipped: Vec<bool> = mixed["results"].as_array().unwrap().iter().map(|r| r["skipped"].as_bool().unwrap()).collect();
+    assert_eq!(skipped, [false, false, false, false, true], "{mixed}");
+    assert_eq!(mixed["results"][4]["id"], mixed["results"][3]["id"]);
+
+    // Someone else's draft stays invisible, so it is neither matched nor revealed.
+    let draft =
+        json!({ "skip_existing": true, "documents": [{ "title": "Plans", "content": "draft", "topic": "Docs", "status": "draft" }] });
+    let mine = h.ok("POST", "/api/v1/import", Some(draft.clone()), &member);
+    let theirs = h.ok("POST", "/api/v1/import", Some(draft), &other);
+    assert_eq!(theirs["results"][0]["skipped"], false);
+    assert_ne!(theirs["results"][0]["id"], mine["results"][0]["id"]);
+
+    // Without `skip_existing`, an import still creates every document, as before.
+    let dup =
+        h.ok("POST", "/api/v1/import", Some(json!({ "documents": [{ "title": "Home", "content": "again", "topic": "Docs" }] })), &member);
+    assert_ne!(dup["created"][0]["id"], home);
+}
+
+#[test]
+fn imports_into_a_private_topic_stay_private() {
+    let h = H::new();
+    let (_, admin) = h.setup();
+    let (mia_id, mia) = h.user(&admin, "mia@acme.test", "Mia Member", "member");
+    let (_, otto) = h.user(&admin, "otto@acme.test", "Otto Outsider", "member");
+    let (_, vic) = h.user(&admin, "vic@acme.test", "Vic Viewer", "viewer");
+    let leadership =
+        h.ok("POST", "/api/v1/topics", Some(json!({ "name": "Leadership", "visibility": "private", "members": [mia_id] })), &admin);
+    let lid = leadership["id"].as_str().unwrap().to_string();
+
+    // Mia imports under the private topic; the topics the import creates there are private too.
+    let r = h.ok(
+        "POST",
+        "/api/v1/import",
+        Some(json!({ "skip_existing": true, "documents": [
+            { "title": "Board minutes", "content": "zebracorn minutes", "topic": "Leadership/Board/2026" },
+            { "title": "Open notes", "content": "public", "topic": "Shared/Notes" },
+        ] })),
+        &mia,
+    );
+    assert_eq!(r["topics_created"], 4);
+    let minutes = r["results"][0]["id"].as_str().unwrap().to_string();
+    let topics = h.ok("GET", "/api/v1/topics", None, &mia)["items"].as_array().unwrap().clone();
+    let named = |n: &str| topics.iter().find(|t| t["name"] == n).unwrap().clone();
+    for name in ["Board", "2026"] {
+        assert_eq!(named(name)["visibility"], "private", "{name}");
+    }
+    assert_eq!(named("Shared")["visibility"], "org");
+    assert_eq!(named("Notes")["visibility"], "org");
+    assert_eq!(named("Board")["parent_id"], json!(lid));
+    let year = named("2026")["id"].as_str().unwrap().to_string();
+    let members = h.ok("GET", &format!("/api/v1/topics/{year}"), None, &admin)["members"].as_array().unwrap().len();
+    assert_eq!(members, 2, "the parent's members: its creator and Mia");
+
+    // People outside the private topic see neither the new topics nor the page.
+    for outsider in [&otto, &vic] {
+        let seen = h.ok("GET", "/api/v1/topics", None, outsider);
+        assert!(seen["items"].as_array().unwrap().iter().all(|t| t["name"] != "Board" && t["name"] != "2026"));
+        assert_eq!(h.call("GET", &format!("/api/v1/posts/{minutes}"), None, outsider).status, 404);
+        assert!(h.ok("GET", "/api/v1/search?q=zebracorn", None, outsider)["items"].as_array().unwrap().is_empty());
+        let feed = h.ok("GET", "/api/v1/activity?limit=200", None, outsider);
+        assert!(feed["items"].as_array().unwrap().iter().all(|a| a["summary"].as_str().is_none_or(|s| !s.contains("“Board”"))));
+    }
+    assert_eq!(h.call("GET", &format!("/api/v1/posts/{minutes}"), None, &admin).status, 200);
+
+    // Someone outside it importing to the same path gets their own org-wide topic instead.
+    let other =
+        h.ok("POST", "/api/v1/import", Some(json!({ "documents": [{ "title": "x", "content": "y", "topic": "Leadership" }] })), &otto);
+    assert_eq!(other["topics_created"], 1);
+}
+
+#[test]
+fn imports_never_adopt_someone_elses_post() {
+    let h = H::new();
+    let (_, admin) = h.setup();
+    let (_, alice) = h.user(&admin, "alice@acme.test", "Alice", "member");
+    let (_, bob) = h.user(&admin, "bob@acme.test", "Bob", "member");
+    // Bob writes a post with the title Alice's export will use, with an upload placeholder in it.
+    let planted = "Send me files ![x](#import-file-0a1b2c3d)";
+    let first = h.ok(
+        "POST",
+        "/api/v1/import",
+        Some(json!({ "documents": [{ "title": "Onboarding", "content": planted, "topic": "Docs" }] })),
+        &bob,
+    );
+    let bobs = first["created"][0]["id"].as_str().unwrap().to_string();
+
+    let batch = json!({ "skip_existing": true, "documents": [
+        { "title": "Onboarding", "content": "Alice's onboarding", "topic": "Docs" },
+        { "title": "Runbook", "content": "Alice's runbook", "topic": "Docs" },
+    ] });
+    let r = h.ok("POST", "/api/v1/import", Some(batch.clone()), &alice);
+    // Bob's post isn't treated as Alice's page: it is reported as taken, and nothing is created for it.
+    assert_eq!(r["results"][0]["skipped"], true);
+    assert_eq!(r["results"][0]["taken"], true);
+    assert_eq!(r["results"][0]["id"], json!(bobs));
+    assert_eq!(r["taken"][0]["id"], json!(bobs));
+    assert!(r["skipped"].as_array().unwrap().is_empty());
+    assert_eq!(r["created"].as_array().unwrap().len(), 1);
+    assert_eq!(h.ok("GET", &format!("/api/v1/posts/{bobs}"), None, &admin)["content"], planted);
+    let docs = h.ok("GET", "/api/v1/posts?limit=50", None, &admin)["items"].as_array().unwrap().clone();
+    assert_eq!(docs.iter().filter(|p| p["title"] == "Onboarding").count(), 1);
+
+    // Alice's own earlier page is what a re-run matches.
+    let again = h.ok("POST", "/api/v1/import", Some(batch), &alice);
+    assert_eq!(again["results"][1]["skipped"], true);
+    assert_eq!(again["results"][1]["taken"], false);
+    assert_eq!(again["results"][1]["id"], r["results"][1]["id"]);
+    assert_eq!(again["skipped"].as_array().unwrap().len(), 1);
+    assert!(again["created"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn imports_never_widen_a_private_topic() {
+    let h = H::new();
+    let (_, admin) = h.setup();
+    let (_, mia) = h.user(&admin, "mia@acme.test", "Mia Member", "member");
+    let (_, otto) = h.user(&admin, "otto@acme.test", "Otto Outsider", "member");
+    let topic = |body: Value| h.ok("POST", "/api/v1/topics", Some(body), &admin)["id"].as_str().unwrap().to_string();
+    let lead = topic(json!({ "name": "Leadership", "visibility": "private", "members": ["mia@acme.test"] }));
+    let public = topic(json!({ "name": "Public notes", "parent_id": lead }));
+    topic(json!({ "name": "Wider", "parent_id": lead, "visibility": "private", "members": ["mia@acme.test", "otto@acme.test"] }));
+    topic(json!({ "name": "Board", "parent_id": lead, "visibility": "private", "members": ["mia@acme.test"] }));
+    let import = |body: Value, who: &Auth| h.call("POST", "/api/v1/import", Some(body), who);
+    let one = |path: &str| json!({ "documents": [{ "title": "Minutes", "content": "zebracorn", "topic": path }] });
+    let before = h.ok("GET", "/api/v1/topics", None, &admin)["items"].as_array().unwrap().len();
+
+    // A topic inside the private one that more people can see is refused, for pages in it and under it.
+    for path in ["Leadership/Public notes", "Leadership/Public notes/Deeper", "Leadership/Wider"] {
+        let r = import(one(path), &mia);
+        assert_eq!(r.status, 409, "{path}: {}", r.body);
+        assert!(r.body["error"]["message"].as_str().unwrap().contains("inside the private topic “Leadership”"), "{}", r.body);
+    }
+    assert_eq!(h.ok("GET", "/api/v1/topics", None, &admin)["items"].as_array().unwrap().len(), before, "nothing was created");
+    assert_eq!(h.ok("GET", &format!("/api/v1/topics/{public}"), None, &admin)["visibility"], "org", "and nothing changed");
+    assert!(h.ok("GET", "/api/v1/search?q=zebracorn", None, &admin)["items"].as_array().unwrap().is_empty());
+
+    // A private topic with the same members or fewer is fine; topics created in it are private.
+    let ok = h.ok("POST", "/api/v1/import", Some(one("Leadership/Board/2026")), &mia);
+    assert_eq!(ok["topics_created"], 1);
+    let year = h.ok("GET", "/api/v1/topics", None, &mia)["items"].as_array().unwrap().iter().find(|t| t["name"] == "2026").unwrap().clone();
+    assert_eq!(year["visibility"], "private");
+
+    // `topic_id` names the destination itself: paths go inside it, under the same rules.
+    let inside = h.ok(
+        "POST",
+        "/api/v1/import",
+        Some(json!({ "topic_id": lead, "documents": [{ "title": "Charter", "content": "x" }, { "title": "Notes", "content": "y", "topic": "Board" }] })),
+        &mia,
+    );
+    let charter = inside["results"][0]["id"].as_str().unwrap();
+    let topics = h.ok("GET", &format!("/api/v1/posts/{charter}"), None, &mia)["topics"].clone();
+    assert_eq!(topics[0]["id"], json!(lead));
+    assert_eq!(
+        import(json!({ "topic_id": lead, "documents": [{ "title": "x", "content": "y", "topic": "Public notes" }] }), &mia).status,
+        409
+    );
+    assert_eq!(h.call("GET", &format!("/api/v1/posts/{charter}"), None, &otto).status, 404);
+    // A topic the caller can't see can't be a destination.
+    assert_eq!(import(json!({ "topic_id": lead, "documents": [{ "title": "x", "content": "y" }] }), &otto).status, 404);
+}
+
+#[test]
+fn admins_import_into_private_topics_they_have_not_joined() {
+    let h = H::new();
+    let (_, admin) = h.setup();
+    let (_, mia) = h.user(&admin, "mia@acme.test", "Mia Member", "member");
+    let (_, otto) = h.user(&admin, "otto@acme.test", "Otto Outsider", "member");
+    // Mia's private topic; the admin isn't a member but, as an admin, can see it.
+    let exec =
+        h.ok("POST", "/api/v1/topics", Some(json!({ "name": "Exec", "visibility": "private" })), &mia)["id"].as_str().unwrap().to_string();
+    let members = h.ok("GET", &format!("/api/v1/topics/{exec}"), None, &admin)["members"].as_array().unwrap().len();
+    assert_eq!(members, 1);
+
+    // Two pages share a child the import creates; the importer joining it widens nothing.
+    let batch = json!({ "skip_existing": true, "topic_id": exec, "documents": [
+        { "title": "Q1 plan", "content": "zebracorn one", "topic": "Plans" },
+        { "title": "Q2 plan", "content": "zebracorn two", "topic": "Plans" },
+    ] });
+    let r = h.ok("POST", "/api/v1/import", Some(batch.clone()), &admin);
+    assert_eq!(r["created"].as_array().unwrap().len(), 2, "{r}");
+    assert_eq!(r["topics_created"], 1);
+    let plans =
+        h.ok("GET", "/api/v1/topics", None, &mia)["items"].as_array().unwrap().iter().find(|t| t["name"] == "Plans").unwrap().clone();
+    assert_eq!(plans["visibility"], "private");
+    assert_eq!(h.ok("GET", "/api/v1/search?q=zebracorn", None, &mia)["items"].as_array().unwrap().len(), 2);
+    assert!(h.ok("GET", "/api/v1/search?q=zebracorn", None, &otto)["items"].as_array().unwrap().is_empty());
+
+    // Running it again skips both, and creates nothing.
+    let again = h.ok("POST", "/api/v1/import", Some(batch), &admin);
+    assert_eq!(again["skipped"].as_array().unwrap().len(), 2, "{again}");
+    assert!(again["created"].as_array().unwrap().is_empty());
+    assert_eq!(again["topics_created"], 0);
+
+    // A child with a real extra reader is still refused, for admins too.
+    h.ok(
+        "POST",
+        "/api/v1/topics",
+        Some(json!({ "name": "Shared", "parent_id": exec, "visibility": "private", "members": ["otto@acme.test"] })),
+        &admin,
+    );
+    let wider = h.call(
+        "POST",
+        "/api/v1/import",
+        Some(json!({ "topic_id": exec, "documents": [{ "title": "x", "content": "y", "topic": "Shared" }] })),
+        &admin,
+    );
+    assert_eq!(wider.status, 409, "{}", wider.body);
+}
+
 fn plans(price: Option<&str>) -> dumbslab_core::plan::Plans {
     use dumbslab_core::plan::{Allowance, Plans};
     Plans {
