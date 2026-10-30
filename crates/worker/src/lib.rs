@@ -191,7 +191,9 @@ async fn root_site(req: Request, env: &Env, root: &str, path: &str) -> Result<Re
             url.set_path("/welcome");
             env.assets("ASSETS")?.fetch_request(Request::new(url.as_str(), Method::Get)?).await
         }
-        (Method::Get, "/healthz") => json_response(200, &json!({ "ok": true, "version": dumbslab_core::VERSION })),
+        (Method::Get, "/healthz") => {
+            json_response(200, &json!({ "ok": true, "version": dumbslab_core::VERSION, "git_sha": dumbslab_core::GIT_SHA }))
+        }
         (Method::Get | Method::Head, "/llms.txt") => text_response(tenancy::root_llms_txt(root), "text/plain; charset=utf-8"),
         (Method::Get | Method::Head, "/robots.txt") => text_response(tenancy::root_robots_txt(root), "text/plain; charset=utf-8"),
         (Method::Get | Method::Head, "/sitemap.xml") => text_response(tenancy::root_sitemap_xml(root), "application/xml; charset=utf-8"),

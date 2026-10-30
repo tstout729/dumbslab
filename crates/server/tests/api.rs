@@ -4794,3 +4794,20 @@ mod slack {
         assert_eq!(r.status, 404);
     }
 }
+
+#[test]
+fn healthz_reports_build_identity_without_auth() {
+    let h = H::new();
+    let r = h.call("GET", "/healthz", None, &Auth::None);
+    assert_eq!(r.status, 200);
+    assert_eq!(
+        r.body,
+        json!({
+            "ok": true,
+            "version": dumbslab_core::VERSION,
+            "git_sha": dumbslab_core::GIT_SHA,
+        })
+    );
+    let sha = dumbslab_core::GIT_SHA;
+    assert!(sha == "unknown" || ((sha.len() == 40 || sha.len() == 64) && sha.bytes().all(|b| b.is_ascii_hexdigit())));
+}
