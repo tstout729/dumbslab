@@ -14,7 +14,6 @@ pub const FRAME_ORIGINS: &[&str] = &[
     "https://www.figma.com",
     "https://airtable.com",
     "https://miro.com",
-    "https://codepen.io",
 ];
 
 /// The `frame-src` directive for the web app's Content-Security-Policy.
@@ -23,7 +22,7 @@ pub fn frame_src_directive() -> String {
 }
 
 /// Providers, for documentation: shown to agents in the MCP instructions and tool descriptions.
-pub const PROVIDERS: &str = "YouTube, Vimeo, Loom, Google Docs, Sheets, Slides, Forms and Drive, Figma, Airtable, Miro and CodePen";
+pub const PROVIDERS: &str = "YouTube, Vimeo, Loom, Google Docs, Sheets, Slides, Forms and Drive, Figma, Airtable and Miro";
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Embed {
@@ -33,6 +32,8 @@ pub struct Embed {
     pub src: String,
     /// `video` frames keep a 16:9 shape; `document` frames are tall.
     pub shape: Shape,
+    /// The frame's `sandbox` flags: only what the provider needs.
+    pub sandbox: &'static str,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -103,12 +104,22 @@ fn seconds(t: &str) -> Option<u64> {
     n.is_empty().then_some(total)
 }
 
+/// Video players: scripts, fullscreen, and popups that stay sandboxed.
+const PLAYER: &str = "allow-scripts allow-same-origin allow-popups allow-presentation";
+/// Design tools: may also ask for their own cookies after a click, to show the viewer's access.
+const APP: &str = "allow-scripts allow-same-origin allow-popups allow-presentation allow-storage-access-by-user-activation";
+/// Google: signing in to see a private file needs forms and an unsandboxed sign-in popup.
+const GOOGLE: &str = "allow-scripts allow-same-origin allow-popups allow-popups-to-escape-sandbox allow-forms allow-presentation \
+                      allow-storage-access-by-user-activation";
+
 fn video(provider: &'static str, src: String) -> Option<Embed> {
-    Some(Embed { provider, src, shape: Shape::Video })
+    let sandbox = if provider.starts_with("Google") { GOOGLE } else { PLAYER };
+    Some(Embed { provider, src, shape: Shape::Video, sandbox })
 }
 
 fn document(provider: &'static str, src: String) -> Option<Embed> {
-    Some(Embed { provider, src, shape: Shape::Document })
+    let sandbox = if provider.starts_with("Google") { GOOGLE } else { APP };
+    Some(Embed { provider, src, shape: Shape::Document, sandbox })
 }
 
 /// The embed for a link, when it points at a provider that can be embedded.
@@ -191,11 +202,6 @@ pub fn from_url(url: &str) -> Option<Embed> {
             let suffix = if seg(2).ends_with('=') { "=" } else { "" };
             document("Miro", format!("https://miro.com/app/live-embed/{board}{suffix}/"))
         }
-        "codepen.io" if matches!(seg(1), "pen" | "embed") => {
-            let user = id(seg(0), 1, 40)?;
-            let pen = id(seg(2), 3, 20)?;
-            document("CodePen", format!("https://codepen.io/{user}/embed/{pen}?default-tab=result"))
-        }
         _ => None,
     }
 }
@@ -268,10 +274,11 @@ pub fn html(embed: &Embed, href: &str, label: Option<&str>) -> String {
         "<figure class=\"embed {shape}\"><div class=\"embed-frame\"><iframe src=\"{src}\" title=\"{title}\" loading=\"lazy\" \
          allow=\"autoplay; clipboard-write; encrypted-media; fullscreen; picture-in-picture\" allowfullscreen \
          referrerpolicy=\"strict-origin-when-cross-origin\" \
-         sandbox=\"allow-scripts allow-same-origin allow-popups allow-popups-to-escape-sandbox allow-forms allow-presentation allow-storage-access-by-user-activation\">\
+         sandbox=\"{sandbox}\">\
          </iframe></div><figcaption><span class=\"embed-provider\">{provider}</span>\
          <a href=\"{href}\" target=\"_blank\" rel=\"noopener noreferrer\">{caption}</a></figcaption></figure>",
         src = html_escape(&embed.src),
+        sandbox = embed.sandbox,
         title = html_escape(&format!("{}: {caption}", embed.provider)),
         provider = html_escape(embed.provider),
         href = html_escape(href),
@@ -286,41 +293,53 @@ fn display_url(url: &str) -> &str {
 
 /// Finds `http(s)://` URLs in plain text, as byte ranges. A URL ends at whitespace or `<`, and
 /// trailing punctuation that usually ends a sentence (or an unbalanced closing bracket) is left out.
+/// Runs in linear time: every byte is scanned a bounded number of times.
 pub fn find_urls(text: &str) -> Vec<std::ops::Range<usize>> {
     let mut out = vec![];
     let bytes = text.as_bytes();
     let mut i = 0;
-    while i < text.len() {
-        let rest = &text[i..];
+    while let Some(off) = text[i..].find("http") {
+        let start = i + off;
+        let rest = &text[start..];
         let scheme = if rest.starts_with("https://") {
             8
         } else if rest.starts_with("http://") {
             7
         } else {
-            i += rest.chars().next().map_or(1, char::len_utf8);
+            i = start + 4;
             continue;
         };
-        let boundary = i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || matches!(bytes[i - 1], b'/' | b'@' | b'.'));
-        let mut end = i + rest.find(|c: char| c.is_whitespace() || c == '<').unwrap_or(rest.len());
-        loop {
-            let tail = &text[i..end];
-            let Some(last) = tail.chars().last() else { break };
-            let unbalanced = match last {
-                ')' => tail.matches(')').count() > tail.matches('(').count(),
-                ']' => tail.matches(']').count() > tail.matches('[').count(),
-                '.' | ',' | ':' | ';' | '!' | '?' | '\'' | '"' | '*' | '_' | '~' => true,
+        let scan_end = start + rest.find(|c: char| c.is_whitespace() || c == '<').unwrap_or(rest.len());
+        i = scan_end.max(start + scheme);
+        let boundary = start == 0 || !(bytes[start - 1].is_ascii_alphanumeric() || matches!(bytes[start - 1], b'/' | b'@' | b'.'));
+        if !boundary {
+            continue;
+        }
+        let candidate = &bytes[start..scan_end];
+        let count = |b: u8| candidate.iter().filter(|&&c| c == b).count();
+        let (open_paren, open_bracket) = (count(b'('), count(b'['));
+        let (mut close_paren, mut close_bracket) = (count(b')'), count(b']'));
+        let mut end = scan_end;
+        while end > start + scheme {
+            let last = bytes[end - 1];
+            let trim = match last {
+                b')' => close_paren > open_paren,
+                b']' => close_bracket > open_bracket,
+                b'.' | b',' | b':' | b';' | b'!' | b'?' | b'\'' | b'"' | b'*' | b'_' | b'~' => true,
                 _ => false,
             };
-            if !unbalanced {
+            if !trim {
                 break;
             }
-            end -= last.len_utf8();
+            match last {
+                b')' => close_paren -= 1,
+                b']' => close_bracket -= 1,
+                _ => {}
+            }
+            end -= 1;
         }
-        if boundary && end > i + scheme && text[i + scheme..end].contains(|c: char| c.is_alphanumeric()) {
-            out.push(i..end);
-            i = end;
-        } else {
-            i += scheme;
+        if text[start + scheme..end].contains(|c: char| c.is_alphanumeric()) {
+            out.push(start..end);
         }
     }
     out
@@ -398,7 +417,7 @@ mod tests {
         );
         assert_eq!(src("https://airtable.com/appABCDEFGHIJ1234/tblABCDEFGHIJ1234"), None, "only shared views embed");
         assert_eq!(src("https://miro.com/app/board/uXjVabc123=/").unwrap(), "https://miro.com/app/live-embed/uXjVabc123=/");
-        assert_eq!(src("https://codepen.io/someone/pen/abcXYZ").unwrap(), "https://codepen.io/someone/embed/abcXYZ?default-tab=result");
+        assert_eq!(src("https://codepen.io/someone/pen/abcXYZ"), None, "CodePen runs arbitrary code; not embedded");
         assert!(
             src("https://www.figma.com/design/AbCdEfGhIjKlMn/Name?node-id=1-2")
                 .unwrap()
@@ -424,10 +443,26 @@ mod tests {
     }
 
     #[test]
+    fn frames_get_only_the_permissions_they_need() {
+        let yt = from_url("https://youtu.be/9pasx0ghADM").unwrap().sandbox;
+        assert!(!yt.contains("allow-forms") && !yt.contains("escape-sandbox"), "{yt}");
+        let figma = from_url("https://www.figma.com/design/AbCdEfGhIjKlMn/Name").unwrap().sandbox;
+        assert!(!figma.contains("allow-forms") && !figma.contains("escape-sandbox"), "{figma}");
+        let sheet = from_url("https://docs.google.com/spreadsheets/d/1Sescq7Qe50UoB9UNhjthBSN1YmSV7FkBn3uTv6yd0ak/edit").unwrap();
+        assert!(sheet.sandbox.contains("allow-forms"), "Google sign-in needs forms");
+        assert!(html(&sheet, "https://docs.google.com/x", None).contains(&format!("sandbox=\"{}\"", sheet.sandbox)));
+    }
+
+    #[test]
     fn finds_urls_in_text() {
         let t = "See https://example.com/a_(b), then (https://x.io/y). Not foo://bar or ahttps://no.";
         let found: Vec<&str> = find_urls(t).into_iter().map(|r| &t[r]).collect();
         assert_eq!(found, vec!["https://example.com/a_(b)", "https://x.io/y"]);
         assert!(find_urls("https:// alone").is_empty());
+        // Long runs that are not URLs, or that only look like the start of one, stay fast.
+        let long = format!("x{}", "https://(".repeat(50_000));
+        let t = std::time::Instant::now();
+        let _ = find_urls(&long);
+        assert!(t.elapsed().as_secs() < 2);
     }
 }

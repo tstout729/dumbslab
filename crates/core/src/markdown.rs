@@ -25,12 +25,23 @@ fn options() -> Options {
 /// Parses Markdown with adjacent text runs merged, so a URL or `@handle` is never split.
 fn parse(md: &str) -> Vec<Event<'_>> {
     let mut out: Vec<Event> = vec![];
+    let mut text: Option<String> = None;
     for ev in Parser::new_ext(md, options()) {
-        if let (Event::Text(t), Some(Event::Text(prev))) = (&ev, out.last_mut()) {
-            *prev = CowStr::from(format!("{prev}{t}"));
-            continue;
+        match ev {
+            Event::Text(t) => match text.as_mut() {
+                Some(buf) => buf.push_str(&t),
+                None => text = Some(t.into_string()),
+            },
+            other => {
+                if let Some(buf) = text.take() {
+                    out.push(Event::Text(CowStr::from(buf)));
+                }
+                out.push(other);
+            }
         }
-        out.push(ev);
+    }
+    if let Some(buf) = text {
+        out.push(Event::Text(CowStr::from(buf)));
     }
     out
 }
@@ -272,11 +283,32 @@ pub fn render(md: &str) -> String {
 
     let mut html = String::with_capacity(md.len() * 2);
     pulldown_cmark::html::push_html(&mut html, out_events.into_iter());
-    let mut html = sanitizer().clean(&html).to_string();
-    for (n, embed) in embeds.iter().enumerate() {
-        html = html.replacen(&format!("<div id=\"ds-embed-{nonce}-{n}\"></div>"), embed, 1);
+    let html = sanitizer().clean(&html).to_string();
+    if embeds.is_empty() {
+        return html;
     }
-    html
+    // One pass, so many embeds don't make rendering quadratic.
+    let marker = format!("<div id=\"ds-embed-{nonce}-");
+    let mut out = String::with_capacity(html.len() + embeds.iter().map(String::len).sum::<usize>());
+    let mut rest = html.as_str();
+    while let Some(p) = rest.find(&marker) {
+        out.push_str(&rest[..p]);
+        let after = &rest[p + marker.len()..];
+        let digits = after.bytes().take_while(u8::is_ascii_digit).count();
+        let embed = after[..digits].parse::<usize>().ok().and_then(|n| embeds.get(n));
+        match (embed, after[digits..].strip_prefix("\"></div>")) {
+            (Some(embed), Some(tail)) => {
+                out.push_str(embed);
+                rest = tail;
+            }
+            _ => {
+                out.push_str(&marker);
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Plain text, for search and excerpts.

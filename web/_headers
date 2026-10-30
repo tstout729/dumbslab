@@ -2,4 +2,4 @@
   X-Content-Type-Options: nosniff
   Referrer-Policy: strict-origin-when-cross-origin
   X-Frame-Options: DENY
-  Content-Security-Policy: default-src 'self'; img-src 'self' https: data:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'; font-src 'self' data:; frame-src https://www.youtube-nocookie.com https://player.vimeo.com https://www.loom.com https://docs.google.com https://drive.google.com https://www.figma.com https://airtable.com https://miro.com https://codepen.io; frame-ancestors 'none'; base-uri 'self'; form-action 'self'
+  Content-Security-Policy: default-src 'self'; img-src 'self' https: data:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'; font-src 'self' data:; frame-src https://www.youtube-nocookie.com https://player.vimeo.com https://www.loom.com https://docs.google.com https://drive.google.com https://www.figma.com https://airtable.com https://miro.com; frame-ancestors 'none'; base-uri 'self'; form-action 'self'

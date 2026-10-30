@@ -783,7 +783,7 @@ mark { background: var(--mark-bg); color: inherit; border-radius: 3px; padding: 
 .prose .md-callout-important .md-callout-title::before { content: "❗"; }
 .prose .md-callout-warning .md-callout-title::before { content: "⚠️"; }
 .prose .md-callout-caution .md-callout-title::before { content: "🛑"; }
-/* Embeds: a YouTube, Vimeo, Loom, Google, Figma, Airtable, Miro or CodePen link on its own line. */
+/* Embeds: a YouTube, Vimeo, Loom, Google, Figma, Airtable or Miro link on its own line. */
 .prose figure.embed { margin: 1.4em 0; border: 1px solid var(--line); border-radius: 12px; overflow: hidden; background: var(--bg-sunk); }
 .prose .embed-frame { position: relative; width: 100%; }
 .prose .embed-video .embed-frame { aspect-ratio: 16 / 9; }
