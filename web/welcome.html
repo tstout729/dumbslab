@@ -4,91 +4,315 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="light dark">
-<title>DumbSlab — the free team wiki your AI agents can use too</title>
-<meta name="description" content="A free, open-source team knowledge base. Every workspace includes an MCP server and REST API so AI agents can search, write and edit alongside your team.">
+<title>DumbSlab: the free team wiki your AI agents can use too</title>
+<meta name="description" content="A free, open-source team wiki and knowledge base with a built-in MCP server and REST API, so Claude, ChatGPT and Cursor can search and edit docs alongside your team.">
+<!-- Hosting the sign-up site on another domain? Replace https://dumbslab.com in this file's links, social tags and structured data. -->
+<link rel="canonical" href="https://dumbslab.com/">
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<link rel="alternate" type="text/plain" href="/llms.txt" title="DumbSlab for AI agents (llms.txt)">
+<meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#15161c" media="(prefers-color-scheme: dark)">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="DumbSlab">
+<meta property="og:url" content="https://dumbslab.com/">
+<meta property="og:title" content="DumbSlab: the free team wiki your AI agents can use too">
+<meta property="og:description" content="Free, open-source team wiki. Every workspace has its own MCP server and REST API, so Claude, ChatGPT and Cursor can search and edit docs with your team.">
+<meta property="og:image" content="https://dumbslab.com/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="DumbSlab: the free team wiki your AI agents can use too">
+<meta name="twitter:card" content="summary_large_image">
 <link rel="stylesheet" href="/styles.css">
 <link rel="stylesheet" href="/welcome.css">
 <script src="/theme-init.js"></script>
 <script type="module" src="/welcome.js"></script>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@graph": [
+    {
+      "@type": "WebSite",
+      "@id": "https://dumbslab.com/#website",
+      "url": "https://dumbslab.com/",
+      "name": "DumbSlab",
+      "inLanguage": "en"
+    },
+    {
+      "@type": "SoftwareApplication",
+      "@id": "https://dumbslab.com/#app",
+      "name": "DumbSlab",
+      "url": "https://dumbslab.com/",
+      "image": "https://dumbslab.com/og.png",
+      "description": "A free, open-source team wiki and knowledge base. Every workspace has its own MCP server and REST API, so AI agents such as Claude, ChatGPT and Cursor can search, write and edit docs alongside the team.",
+      "applicationCategory": "BusinessApplication",
+      "applicationSubCategory": "Team wiki and knowledge base",
+      "operatingSystem": "Web",
+      "isAccessibleForFree": true,
+      "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" },
+      "featureList": [
+        "Markdown posts organized into nested and private topics",
+        "Full-text search across posts, comments and topics",
+        "Version history with diffs and restore",
+        "Doc verification with stale-doc reports",
+        "Inline comments, mentions and reactions",
+        "Built-in MCP server with OAuth for Claude, ChatGPT and Cursor",
+        "REST API with an OpenAPI 3.1 spec",
+        "Bot accounts and an activity feed for agent edits",
+        "Signed webhooks, Markdown import and JSON export"
+      ],
+      "sameAs": ["https://github.com/tstout729/dumbslab"]
+    },
+    {
+      "@type": "SoftwareSourceCode",
+      "@id": "https://dumbslab.com/#code",
+      "name": "DumbSlab",
+      "codeRepository": "https://github.com/tstout729/dumbslab",
+      "programmingLanguage": "Rust",
+      "license": ["https://opensource.org/license/mit", "https://www.apache.org/licenses/LICENSE-2.0"],
+      "targetProduct": { "@id": "https://dumbslab.com/#app" }
+    },
+    {
+      "@type": "FAQPage",
+      "@id": "https://dumbslab.com/#faq",
+      "mainEntity": [
+        { "@type": "Question", "name": "Is DumbSlab free?", "acceptedAnswer": { "@type": "Answer", "text": "Yes. Hosted workspaces at dumbslab.com are free, with no credit card and no trial. The code is open source, so you can also run your own copy." } },
+        { "@type": "Question", "name": "Which AI tools work with DumbSlab?", "acceptedAnswer": { "@type": "Answer", "text": "Any MCP client. Claude, ChatGPT, Cursor and other clients that support OAuth need only your workspace's MCP URL, such as https://acme.dumbslab.com/mcp, and you approve access in the browser. Other tools can use a personal access token with the MCP server or the REST API." } },
+        { "@type": "Question", "name": "Can an agent overwrite my team's work?", "acceptedAnswer": { "@type": "Answer", "text": "Not by accident. Agents change one section or one passage at a time instead of rewriting the whole doc, and they send the version they last read. If a teammate saved since then, the edit is refused with a conflict instead of erasing their change. Every save is a version you can compare and restore." } },
+        { "@type": "Question", "name": "Who can see my workspace?", "acceptedAnswer": { "@type": "Answer", "text": "Only the people you add. Admins add people and choose each person's role: admin, member or viewer. Private topics are visible only to their members, and drafts only to their author. Search engines are told to stay out of workspaces." } },
+        { "@type": "Question", "name": "Can I change my address later?", "acceptedAnswer": { "@type": "Answer", "text": "Yes. Admins can move the workspace to a new address in Settings. Anyone who opens the old address in a browser is sent to the new one; AI tools need the new MCP URL." } },
+        { "@type": "Question", "name": "Can I get my data out?", "acceptedAnswer": { "@type": "Answer", "text": "Yes. Posts are Markdown, and an admin can download the whole workspace as JSON at any time from Settings. You can bring Markdown files in, too." } },
+        { "@type": "Question", "name": "Can I self-host DumbSlab?", "acceptedAnswer": { "@type": "Answer", "text": "Yes. It's one Rust binary and one SQLite file, or a Cloudflare Worker with a separate database for each workspace. The source is on GitHub under the MIT or Apache-2.0 license." } },
+        { "@type": "Question", "name": "Is DumbSlab related to Slab?", "acceptedAnswer": { "@type": "Answer", "text": "No. DumbSlab is an independent open-source project inspired by Slab's team wiki. It isn't affiliated with or endorsed by Slab, Inc." } }
+      ]
+    }
+  ]
+}
+</script>
 </head>
 <body class="w-page">
+<a class="skip-link" href="#signup">Skip to sign-up</a>
 <header class="w-top">
-  <a class="w-brand" href="/"><img src="/favicon.svg" alt="" width="28" height="28"><span>DumbSlab</span></a>
-  <nav class="w-nav">
-    <a href="#features">Features</a>
+  <a class="w-brand" href="/" aria-label="DumbSlab home"><img src="/favicon.svg" alt="" width="28" height="28"><span>DumbSlab</span></a>
+  <nav class="w-nav" aria-label="Page">
+    <a href="#how">How it works</a>
     <a href="#agents">For agents</a>
+    <a href="#features">Features</a>
+    <a href="#faq">FAQ</a>
     <a href="https://github.com/tstout729/dumbslab">GitHub</a>
   </nav>
+  <details class="w-signin">
+    <summary class="btn btn-sm">Sign in</summary>
+    <form id="goto" class="w-signin-pop" novalidate>
+      <label class="field-label" for="goto-address">Your workspace's address</label>
+      <div class="w-url w-url-sm">
+        <input id="goto-address" required maxlength="32" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="acme" aria-describedby="goto-suffix">
+        <span class="w-url-fix" id="goto-suffix">.<span data-root>dumbslab.com</span></span>
+      </div>
+      <button class="btn btn-primary btn-sm btn-block" type="submit">Go to sign-in</button>
+    </form>
+  </details>
 </header>
 
-<main id="main" class="w-main">
-  <section class="w-hero">
+<main id="main">
+  <section class="w-hero w-wrap" aria-labelledby="hero-title">
     <div class="w-pitch">
-      <h1>The free team wiki your AI agents can use too.</h1>
-      <p class="w-lede">Write things down once, find them later, keep them current. Every workspace comes with an MCP server and a REST API, so Claude, ChatGPT and your own agents can search, write and edit alongside your team.</p>
-      <ul class="w-points">
-        <li>Free, with your own address like <strong>acme.<span data-root>dumbslab.com</span></strong></li>
-        <li>Open source: fork it or self-host it</li>
-        <li>No credit card, no trial</li>
+      <h1 id="hero-title">The free team wiki your AI agents can use too.</h1>
+      <p class="w-lede">Write things down once, find them in seconds, keep them current. Every workspace has its own MCP server and REST API, so Claude, ChatGPT, Cursor and your own agents can search, write and edit alongside your team.</p>
+
+      <form id="signup" class="w-claim" novalidate>
+        <label class="w-claim-label" for="ws-address">Pick your team's address</label>
+        <div class="w-claim-row">
+          <div class="w-url">
+            <span class="w-url-fix" data-scheme aria-hidden="true">https://</span>
+            <input id="ws-address" name="address" required maxlength="32" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="your-team" aria-describedby="ws-address-suffix ws-address-status">
+            <span class="w-url-fix" id="ws-address-suffix">.<span data-root>dumbslab.com</span></span>
+          </div>
+          <button class="btn btn-primary w-claim-go" type="submit">Create workspace</button>
+        </div>
+        <p class="w-status" id="ws-address-status" aria-live="polite">Lowercase letters, numbers and hyphens. You can change it later.</p>
+        <p class="form-error" id="signup-error" role="alert" hidden></p>
+        <p class="w-fine">Free, with no credit card. Next you'll name the workspace and create your admin account. By continuing you agree to the <a href="#rules">rules</a>.</p>
+      </form>
+    </div>
+
+    <figure class="w-demo" role="img" aria-label="Example: Claude adds a line to the Accounts section of an onboarding doc through MCP, and the doc shows the change and who made it.">
+      <div class="w-window">
+        <div class="w-window-bar">
+          <span class="w-dots"><i></i><i></i><i></i></span>
+          <span class="w-window-url"><span data-address>acme</span>.<span data-root>dumbslab.com</span>/p/q7m2kx9wbd</span>
+        </div>
+        <div class="w-doc">
+          <p class="w-doc-topic">Engineering</p>
+          <p class="w-doc-title">Engineer onboarding <span class="w-verified">Verified</span></p>
+          <p class="w-doc-meta"><span class="w-meta-before">Updated by Priya yesterday</span><span class="w-meta-after">Updated by <b>Claude</b> via MCP just now</span></p>
+          <p class="w-doc-h">Accounts</p>
+          <ul class="w-doc-list">
+            <li>GitHub: ask in #eng-help</li>
+            <li>Sentry: your lead adds you</li>
+            <li class="w-added"><span>DumbSlab: you're reading it</span></li>
+          </ul>
+        </div>
+      </div>
+      <div class="w-call">
+        <p class="w-call-head"><span class="w-call-who">Claude</span> called <code>edit_post</code></p>
+<pre class="w-call-body"><code>{
+  "id": "q7m2kx9wbd",
+  "base_version": 12,
+  "edits": [{
+    "type": "append_to_section",
+    "heading": "Accounts",
+    "content": "- DumbSlab: you're reading it"
+  }]
+}</code></pre>
+        <p class="w-call-done">Saved as version 13</p>
+      </div>
+    </figure>
+  </section>
+
+  <section id="how" class="w-how w-wrap" aria-labelledby="how-title">
+    <h2 id="how-title">Up and running in about a minute</h2>
+    <ol class="w-steps">
+      <li>
+        <h3>Pick an address</h3>
+        <p>Your workspace lives at <strong><span data-address>acme</span>.<span data-root>dumbslab.com</span></strong>. You can move it later.</p>
+      </li>
+      <li>
+        <h3>Create your admin account</h3>
+        <p>Name the workspace, then add your name, email and a password. A Getting Started topic is waiting inside.</p>
+      </li>
+      <li>
+        <h3>Bring in people and agents</h3>
+        <p>Add teammates under Settings › People. Paste your MCP URL into Claude, ChatGPT or Cursor, and your agents can start reading and writing.</p>
+      </li>
+    </ol>
+  </section>
+
+  <section id="agents" class="w-agents" aria-labelledby="agents-title">
+    <div class="w-wrap w-agents-grid">
+      <div class="w-agents-intro">
+        <h2 id="agents-title">Built for agents, not bolted on</h2>
+        <p>Everything a person can do in DumbSlab, an agent can do through MCP or the REST API. The web app runs on the same public API, so nothing is out of an agent's reach.</p>
+        <div class="w-connect">
+          <p class="w-connect-label" id="connect-cli">Claude Code</p>
+          <div class="w-copy">
+            <pre aria-labelledby="connect-cli"><code><span class="w-prompt" aria-hidden="true">$ </span><span data-copy-source>claude mcp add --transport http dumbslab <span data-scheme>https://</span><span data-address>acme</span>.<span data-root>dumbslab.com</span>/mcp</span></code></pre>
+            <button class="w-copy-btn" type="button" aria-label="Copy the Claude Code command">Copy</button>
+          </div>
+          <p class="w-connect-label" id="connect-url">Claude, ChatGPT or Cursor: add a custom connector with this URL</p>
+          <div class="w-copy">
+            <pre aria-labelledby="connect-url"><code><span data-copy-source><span data-scheme>https://</span><span data-address>acme</span>.<span data-root>dumbslab.com</span>/mcp</span></code></pre>
+            <button class="w-copy-btn" type="button" aria-label="Copy the MCP URL">Copy</button>
+          </div>
+        </div>
+      </div>
+      <ul class="w-agent-points">
+        <li>
+          <h3>Sign in with OAuth</h3>
+          <p>Clients that support OAuth need only the URL. You approve access in the browser and can revoke it any time in Settings.</p>
+        </li>
+        <li>
+          <h3>Edits that don't clobber</h3>
+          <p>Agents find and replace a passage or change one section by its heading. An edit made against an old version gets a conflict, not your teammate's work.</p>
+        </li>
+        <li>
+          <h3>A name on every change</h3>
+          <p>Give each agent its own bot account. Its edits show in history and activity under its name, marked MCP, API or CLI.</p>
+        </li>
+        <li>
+          <h3>Documented for machines</h3>
+          <p>Typed tool schemas with read-only hints, an OpenAPI 3.1 spec, signed webhooks, and an agent guide at <code>/llms.txt</code> in every workspace.</p>
+        </li>
       </ul>
     </div>
+  </section>
 
-    <div class="w-card">
-      <h2>Create your workspace</h2>
-      <form id="signup" class="w-form" novalidate>
-        <div class="field">
-          <label class="field-label" for="ws-name">Workspace name</label>
-          <input class="input" id="ws-name" name="workspace_name" required maxlength="80" autocomplete="organization" placeholder="Acme Inc.">
-        </div>
-        <div class="field">
-          <label class="field-label" for="ws-address">Address</label>
-          <div class="w-address">
-            <input class="input" id="ws-address" name="address" required maxlength="32" autocomplete="off" spellcheck="false" placeholder="acme" aria-describedby="ws-address-hint">
-            <span class="w-suffix">.<span data-root>dumbslab.com</span></span>
-          </div>
-          <p class="field-hint" id="ws-address-hint">Lowercase letters, numbers and hyphens.</p>
-        </div>
-        <p class="form-error" id="signup-error" role="alert" hidden></p>
-        <button class="btn btn-primary btn-block" type="submit">Create workspace</button>
-        <p class="w-fine">Next you'll set up your admin account. By creating a workspace you agree to the <a href="#rules">rules</a>.</p>
-      </form>
+  <section id="features" class="w-features w-wrap" aria-labelledby="features-title">
+    <h2 id="features-title">Everything a team wiki needs</h2>
+    <p class="w-section-lede">The parts people use every day, with nothing that only works for people.</p>
+    <dl class="w-feature-list">
+      <div><dt>Posts and topics</dt><dd>Markdown docs with live preview, organized into nested topics. Drafts, templates and pinned posts.</dd></div>
+      <div><dt>Search</dt><dd>Full-text search across posts, comments and topics, with highlighted matches. Press <kbd>⌘K</kbd> anywhere.</dd></div>
+      <div><dt>History</dt><dd>Every save is a version. Compare any two, and restore any of them.</dd></div>
+      <div><dt>Verification</dt><dd>Mark a doc verified for a set time. Stale and expired docs show up in Insights, so you know what to review.</dd></div>
+      <div><dt>Comments</dt><dd>Comment on a whole doc or one highlighted passage. Mention teammates, react and resolve threads.</dd></div>
+      <div><dt>Embeds and files</dt><dd>Upload images and files, or paste a YouTube, Loom, Figma, Google Docs or Miro link to embed it.</dd></div>
+      <div><dt>Roles and private topics</dt><dd>Admins, members and viewers. Private topics for the things only some people should see.</dd></div>
+      <div><dt>Follows and notifications</dt><dd>Follow posts and topics to hear about mentions, replies and new posts.</dd></div>
+      <div><dt>Import and export</dt><dd>Bring Markdown files in all at once. Download the whole workspace as JSON whenever you like.</dd></div>
+    </dl>
+  </section>
 
-      <form id="goto" class="w-goto" novalidate>
-        <label class="field-label" for="goto-address">Already have a workspace?</label>
-        <div class="w-address">
-          <input class="input" id="goto-address" required maxlength="32" autocomplete="off" spellcheck="false" placeholder="acme">
-          <span class="w-suffix">.<span data-root>dumbslab.com</span></span>
-          <button class="btn" type="submit">Go</button>
-        </div>
-      </form>
+  <section id="open-source" class="w-open w-wrap" aria-labelledby="open-title">
+    <div>
+      <h2 id="open-title">Dumb on purpose</h2>
+      <p>DumbSlab is one Rust binary and one SQLite file. Run it on a laptop or a small server, or deploy it to Cloudflare Workers, where each workspace gets its own database. The code is MIT or Apache-2.0, so you can read it, fork it or host it for your company.</p>
+      <p class="w-open-links"><a href="https://github.com/tstout729/dumbslab">Source on GitHub</a> <a href="https://github.com/tstout729/dumbslab/blob/main/docs/cloudflare.md">Deploy to Cloudflare</a></p>
+    </div>
+    <pre class="w-terminal" aria-label="Run DumbSlab from source"><code>git clone https://github.com/tstout729/dumbslab
+cd dumbslab
+cargo run --release -p dumbslab -- serve</code></pre>
+  </section>
+
+  <section id="faq" class="w-faq w-wrap" aria-labelledby="faq-title">
+    <h2 id="faq-title">Questions</h2>
+    <div class="w-faq-list">
+      <details>
+        <summary>Is DumbSlab free?</summary>
+        <p>Yes. Hosted workspaces at dumbslab.com are free, with no credit card and no trial. The code is open source, so you can also run your own copy.</p>
+      </details>
+      <details>
+        <summary>Which AI tools work with DumbSlab?</summary>
+        <p>Any MCP client. Claude, ChatGPT, Cursor and other clients that support OAuth need only your workspace's MCP URL, such as https://acme.dumbslab.com/mcp, and you approve access in the browser. Other tools can use a personal access token with the MCP server or the REST API.</p>
+      </details>
+      <details>
+        <summary>Can an agent overwrite my team's work?</summary>
+        <p>Not by accident. Agents change one section or one passage at a time instead of rewriting the whole doc, and they send the version they last read. If a teammate saved since then, the edit is refused with a conflict instead of erasing their change. Every save is a version you can compare and restore.</p>
+      </details>
+      <details>
+        <summary>Who can see my workspace?</summary>
+        <p>Only the people you add. Admins add people and choose each person's role: admin, member or viewer. Private topics are visible only to their members, and drafts only to their author. Search engines are told to stay out of workspaces.</p>
+      </details>
+      <details>
+        <summary>Can I change my address later?</summary>
+        <p>Yes. Admins can move the workspace to a new address in Settings. Anyone who opens the old address in a browser is sent to the new one; AI tools need the new MCP URL.</p>
+      </details>
+      <details>
+        <summary>Can I get my data out?</summary>
+        <p>Yes. Posts are Markdown, and an admin can download the whole workspace as JSON at any time from Settings. You can bring Markdown files in, too.</p>
+      </details>
+      <details>
+        <summary>Can I self-host DumbSlab?</summary>
+        <p>Yes. It's one Rust binary and one SQLite file, or a Cloudflare Worker with a separate database for each workspace. The source is on GitHub under the MIT or Apache-2.0 license.</p>
+      </details>
+      <details>
+        <summary>Is DumbSlab related to Slab?</summary>
+        <p>No. DumbSlab is an independent open-source project inspired by Slab's team wiki. It isn't affiliated with or endorsed by Slab, Inc.</p>
+      </details>
     </div>
   </section>
 
-  <section id="features" class="w-features">
-    <div><h3>Posts and topics</h3><p>Markdown docs with live preview, organized into nested topics. Private topics for things only some people should see.</p></div>
-    <div><h3>Search everything</h3><p>Full-text search across posts, comments and topics, with highlighted results. Press ⌘K anywhere.</p></div>
-    <div><h3>History you can trust</h3><p>Every save is a version you can compare and restore. Verify docs for a while; stale ones get flagged.</p></div>
-    <div><h3>Discussion in place</h3><p>Comment on a whole doc or a highlighted passage, mention teammates, react, resolve threads.</p></div>
+  <section class="w-end w-wrap" aria-labelledby="end-title">
+    <h2 id="end-title">Start your team's wiki</h2>
+    <p>It's free, takes about a minute, and your agents can join on day one.</p>
+    <a class="btn btn-primary w-end-go" href="#signup" data-focus-signup>Pick your address</a>
   </section>
 
-  <section id="agents" class="w-agents">
-    <h2>Built for agents, not bolted on</h2>
-    <p>Everything a person can do in the app, an agent can do through MCP or the API. Each workspace has its own server at <code>https://acme.<span data-root>dumbslab.com</span>/mcp</code>; clients that support OAuth just need the URL.</p>
-    <pre><code>claude mcp add --transport http dumbslab https://acme.<span data-root>dumbslab.com</span>/mcp</code></pre>
-    <p>Agents edit precisely (find and replace, section edits) and never overwrite a teammate's change. Give each agent its own bot account so its work shows up under its own name.</p>
-  </section>
-
-  <section id="rules" class="w-rules">
-    <h2>The rules</h2>
+  <section id="rules" class="w-rules w-wrap" aria-labelledby="rules-title">
+    <h2 id="rules-title">The rules</h2>
     <p>Don't use DumbSlab for anything illegal, for spam or malware, or to harass people. Workspaces that do are removed.</p>
-    <p>DumbSlab is a free service offered as is, without uptime or data guarantees. Keep your own copy of anything important: admins can export a workspace any time with the <code>export_workspace</code> operation, or self-host DumbSlab from the source.</p>
+    <p>DumbSlab is a free service offered as is, without uptime or data guarantees. Keep your own copy of anything important: admins can download a workspace's export any time from Settings, or self-host DumbSlab from the source.</p>
   </section>
 </main>
 
-<footer class="w-foot">
-  <span>DumbSlab is open source under MIT or Apache-2.0. Not affiliated with Slab, Inc.</span>
-  <a href="https://github.com/tstout729/dumbslab">Source on GitHub</a>
+<footer class="w-foot w-wrap">
+  <p>DumbSlab is open source under MIT or Apache-2.0. Not affiliated with Slab, Inc.</p>
+  <nav aria-label="Footer">
+    <a href="https://github.com/tstout729/dumbslab">GitHub</a>
+    <a href="https://github.com/tstout729/dumbslab/blob/main/docs/cloudflare.md">Self-hosting</a>
+    <a href="/llms.txt">llms.txt</a>
+    <a href="#rules">Rules</a>
+  </nav>
 </footer>
 </body>
 </html>

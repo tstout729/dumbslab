@@ -100,6 +100,13 @@ impl DurableObject for Directory {
                     Ok(json!({ "reserved_until": until.timestamp() }))
                 })?
             }
+            (Method::Post, "/available") => {
+                let input: ApiResult<SlugInput> = parse(&body);
+                self.run(move |db| {
+                    let reason = tenancy::address_unavailable(db, &input?.slug, Utc::now())?;
+                    Ok(json!({ "available": reason.is_none(), "message": reason }))
+                })?
+            }
             (Method::Post, "/check") => {
                 let input: ApiResult<CheckInput> = parse(&body);
                 self.run(move |db| {
