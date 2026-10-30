@@ -280,8 +280,13 @@ async fn handle(
     if !dumbslab_core::http::is_core_path(&path) {
         return web::serve(&path, &parts.headers);
     }
+    let body = match axum::body::to_bytes(body, MAX_BODY).await {
+        Ok(b) => b.to_vec(),
+        Err(_) => return plain(StatusCode::PAYLOAD_TOO_LARGE, "request body too large"),
+    };
     // Rotating emails can't get around this: the core's sign-in limits stop repeated failures, and
-    // this keeps a burst from queueing password checks in front of every other request.
+    // this keeps a burst from queueing password checks in front of every other request. Taken only
+    // once the body has arrived, so slow uploads can't hold the slots.
     let _sign_in = if path == "/api/v1/auth/login" {
         match app.sign_ins.clone().try_acquire_owned() {
             Ok(permit) => Some(permit),
@@ -289,10 +294,6 @@ async fn handle(
         }
     } else {
         None
-    };
-    let body = match axum::body::to_bytes(body, MAX_BODY).await {
-        Ok(b) => b.to_vec(),
-        Err(_) => return plain(StatusCode::PAYLOAD_TOO_LARGE, "request body too large"),
     };
     let header = |name: &str| parts.headers.get(name).and_then(|v| v.to_str().ok()).map(str::to_string);
     let scheme = header("x-forwarded-proto").unwrap_or_else(|| "http".into());
