@@ -2,6 +2,7 @@
 //! `# heading`, or the file name), and its relative links and images pointed at what they became
 //! here (posts, uploaded files) or at the repository.
 
+use std::collections::HashSet;
 use std::ops::Range;
 
 use pulldown_cmark::{Event, HeadingLevel, LinkType, Options, Parser, Tag, TagEnd};
@@ -133,7 +134,7 @@ pub fn sites(md: &str) -> Vec<Site> {
         }
     }
     // An image used through a reference definition is still an image.
-    let images: Vec<String> = Parser::new_ext(md, options())
+    let images: HashSet<String> = Parser::new_ext(md, options())
         .filter_map(|ev| match ev {
             Event::Start(Tag::Image { link_type: LinkType::Reference | LinkType::Collapsed | LinkType::Shortcut, dest_url, .. }) => {
                 Some(dest_url.to_string())

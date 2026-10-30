@@ -233,6 +233,16 @@ pub fn refuse_edit(db: &dyn Db, post_id: &str, title: &str) -> ApiResult<()> {
     }
 }
 
+/// The topic a synced post must stay in: its source's.
+pub fn source_topic(db: &dyn Db, post_id: &str) -> ApiResult<Option<String>> {
+    Ok(db
+        .one(
+            "SELECT s.topic_id FROM docs_items i JOIN docs_sources s ON s.id = i.source_id WHERE i.kind = 'doc' AND i.target_id = ? LIMIT 1",
+            &params![post_id],
+        )?
+        .map(|r| r.str("topic_id")))
+}
+
 // ---------------------------------------------------------------------------
 // The job
 
@@ -340,11 +350,13 @@ struct Item {
     sha: Option<String>,
     refs: Vec<String>,
     removed: bool,
+    /// A blob that can never be synced, and why (see `docs_items.skipped_sha`).
+    skipped: Option<(String, String)>,
 }
 
 fn items(db: &dyn Db, source_id: &str, kind: &str) -> ApiResult<BTreeMap<String, Item>> {
     let rows = db.query(
-        "SELECT path, target_id, sha, refs, removed_at FROM docs_items WHERE source_id = ? AND kind = ?",
+        "SELECT path, target_id, sha, refs, removed_at, skipped_sha, skip_reason FROM docs_items WHERE source_id = ? AND kind = ?",
         &params![source_id, kind],
     )?;
     Ok(rows
@@ -355,6 +367,7 @@ fn items(db: &dyn Db, source_id: &str, kind: &str) -> ApiResult<BTreeMap<String,
                 sha: r.opt_str("sha"),
                 refs: r.str("refs").lines().filter(|l| !l.is_empty()).map(str::to_string).collect(),
                 removed: r.opt_str("removed_at").is_some(),
+                skipped: r.opt_str("skipped_sha").map(|sha| (sha, r.str("skip_reason"))),
             };
             (r.str("path"), item)
         })
@@ -388,6 +401,64 @@ impl Audience {
     fn exceeded_by(&self, other: &Audience) -> bool {
         self.private && (!other.private || !other.members.is_subset(&self.members))
     }
+}
+
+/// Why a file's folder (or a folder above it) is blocked, if it is.
+fn blocked_by(plan: &Plan, path: &str) -> Option<String> {
+    let mut dir = dir_of(path);
+    while !dir.is_empty() {
+        if let Some(why) = plan.blocked.get(dir) {
+            return Some(why.clone());
+        }
+        dir = dir_of(dir);
+    }
+    None
+}
+
+/// A synced post is never visible to more people than the source's topic. A folder's topic that
+/// is, now (made public, or given members the source's topic lacks since the last sync), gets
+/// none of the source's posts: each goes back in the source's topic first, so taking it out never
+/// leaves it in fewer or wider topics, and then comes out of that one. Such folders are blocked
+/// (`plan.blocked`) and their files wait, marked to be synced again, until it's fixed. No topic's
+/// visibility is changed. Runs before reading, and again in the step that writes, since topics can
+/// change while files are fetched. `Some` says why the sync can't go on.
+fn guard(db: &dyn Db, j: &DocsJob, plan: &mut Plan, now: DateTime<Utc>) -> ApiResult<Option<String>> {
+    let Some(target) = Audience::of(db, &j.source.topic_id)? else {
+        return Ok(Some("The source's topic was deleted.".into()));
+    };
+    plan.blocked.clear();
+    let source_id = j.source.id.clone();
+    for (folder, topic_id) in &plan.folders {
+        let Some(a) = Audience::of(db, topic_id)? else { continue };
+        if !target.exceeded_by(&a) {
+            continue;
+        }
+        let synced = "SELECT target_id FROM docs_items WHERE source_id = ? AND kind = 'doc'";
+        db.execute(
+            &format!(
+                "INSERT INTO post_topics (post_id, topic_id, pinned, added_at)
+                 SELECT pt.post_id, ?, 0, ? FROM post_topics pt WHERE pt.topic_id = ? AND pt.post_id IN ({synced})
+                 ON CONFLICT DO NOTHING"
+            ),
+            &params![j.source.topic_id.clone(), ts(now), topic_id.clone(), source_id.clone()],
+        )?;
+        db.execute(
+            &format!("DELETE FROM post_topics WHERE topic_id = ? AND post_id IN ({synced})"),
+            &params![topic_id.clone(), source_id.clone()],
+        )?;
+        // Synced again once the topic is fixed, to be put back in it.
+        let prefix = format!("{folder}/");
+        db.execute(
+            "UPDATE docs_items SET sha = NULL WHERE source_id = ? AND kind = 'doc' AND substr(path, 1, ?) = ?",
+            &params![source_id.clone(), prefix.chars().count() as i64, prefix],
+        )?;
+        let why = format!(
+            "the topic “{}” for its folder shows posts to people who can't see “{}”. Make it private with only their shared members, or delete it and the next sync makes a new one",
+            a.name, target.name
+        );
+        plan.blocked.insert(folder.clone(), why);
+    }
+    Ok(None)
 }
 
 /// Archives a synced post (it's gone from the repository) or publishes it again (it's back).
@@ -509,16 +580,19 @@ fn listing(db: &dyn Db, cfg: &HostConfig, j: &mut DocsJob, replies: &[HttpReply]
                     "INSERT INTO docs_items (source_id, kind, path, target_id) VALUES (?, 'doc', ?, ?)",
                     &params![source_id.clone(), path.clone(), id.clone()],
                 )?;
-                docs.insert(path.clone(), Item { target_id: id, sha: None, refs: vec![], removed: false });
+                docs.insert(path.clone(), Item { target_id: id, sha: None, refs: vec![], removed: false, skipped: None });
                 changed.insert(path.clone());
             }
+            // Back in the repository. It stays marked removed until it's synced and its post is
+            // published again, however many runs that takes.
             Some(item) if item.removed => {
-                db.execute(
-                    "UPDATE docs_items SET removed_at = NULL, sha = NULL WHERE source_id = ? AND kind = 'doc' AND path = ?",
-                    &params![source_id.clone(), path.clone()],
-                )?;
-                item.removed = false;
-                item.sha = None;
+                if item.sha.is_some() {
+                    db.execute(
+                        "UPDATE docs_items SET sha = NULL WHERE source_id = ? AND kind = 'doc' AND path = ?",
+                        &params![source_id.clone(), path.clone()],
+                    )?;
+                    item.sha = None;
+                }
                 revive.insert(path.clone());
                 changed.insert(path.clone());
             }
@@ -555,44 +629,11 @@ fn listing(db: &dyn Db, cfg: &HostConfig, j: &mut DocsJob, replies: &[HttpReply]
     plan.images = tree_images;
     plan.folders = items(db, &source_id, "folder")?.into_iter().map(|(p, i)| (p, i.target_id)).collect();
 
-    // A synced post is never visible to more people than the source's topic. A folder's topic
-    // that is, now (made public, or given other members since the last sync), gets none: the
-    // source's posts come out of it, and its files wait until it's fixed. Its visibility is
-    // never changed here.
-    let Some(target) = Audience::of(db, &j.source.topic_id)? else {
-        return fail(db, j, "The source's topic was deleted.", now);
-    };
-    for (folder, topic_id) in &plan.folders {
-        if let Some(a) = Audience::of(db, topic_id)?
-            && target.exceeded_by(&a)
-        {
-            db.execute(
-                "DELETE FROM post_topics WHERE topic_id = ? AND post_id IN (SELECT target_id FROM docs_items WHERE source_id = ? AND kind = 'doc')",
-                &params![topic_id.clone(), source_id.clone()],
-            )?;
-            let why = format!(
-                "the topic “{}” for its folder shows posts to people who can't see “{}”. Make it private with only their shared members, or delete it and the next sync makes a new one",
-                a.name, target.name
-            );
-            plan.blocked.insert(folder.clone(), why);
-        }
+    if let Some(message) = guard(db, j, &mut plan, now)? {
+        return fail(db, j, &message, now);
     }
-    let blocked = |path: &str| -> Option<String> {
-        let mut dir = dir_of(path);
-        while !dir.is_empty() {
-            if let Some(why) = plan.blocked.get(dir) {
-                return Some(why.clone());
-            }
-            dir = dir_of(dir);
-        }
-        None
-    };
-    // Synced again once their folder's topic is fixed, to be put back in it.
-    for (path, d) in docs.iter_mut().filter(|(p, d)| d.sha.is_some() && blocked(p).is_some()) {
-        db.execute(
-            "UPDATE docs_items SET sha = NULL WHERE source_id = ? AND kind = 'doc' AND path = ?",
-            &params![source_id.clone(), path.clone()],
-        )?;
+    let blocked = |path: &str| blocked_by(&plan, path);
+    for (_, d) in docs.iter_mut().filter(|(p, _)| blocked(p).is_some()) {
         d.sha = None;
     }
 
@@ -631,6 +672,8 @@ fn listing(db: &dyn Db, cfg: &HostConfig, j: &mut DocsJob, replies: &[HttpReply]
             j.result.unchanged += 1;
         } else if let Some(why) = blocked(path) {
             j.result.skip(path, why);
+        } else if let Some((_, why)) = item.skipped.as_ref().filter(|(sha, _)| *sha == entry.sha) {
+            j.result.skip(path, why.clone());
         } else if trashed.contains(&item.target_id) {
             j.result.skip(path, "its post is in the trash; restore it to sync it again");
         } else if entry.size.is_some_and(|s| s > MAX_DOC_BYTES) {
@@ -668,15 +711,28 @@ fn reading(db: &dyn Db, cfg: &HostConfig, j: &mut DocsJob, mut plan: Plan, repli
     let has_token = !j.source.token().is_empty();
     let mut texts: Vec<Text> = vec![];
     for (work, reply) in plan.batch.iter().zip(replies) {
-        match j.source.repo.read_blob(reply, has_token) {
-            Ok(bytes) if bytes.len() as u64 > MAX_DOC_BYTES => j.result.skip(&work.path, "larger than 1 MB"),
+        let never = match j.source.repo.read_blob(reply, has_token) {
+            Ok(bytes) if bytes.len() as u64 > MAX_DOC_BYTES => "larger than 1 MB".to_string(),
             Ok(bytes) => {
                 let md = String::from_utf8_lossy(&bytes).replace("\r\n", "\n");
                 let (title, body) = rewrite::title_and_body(&md, &fallback_title(&j.source.repo, &work.path));
                 texts.push(Text { work: work.clone(), title, body });
+                continue;
             }
-            Err(message) => j.result.skip(&work.path, message),
-        }
+            // The app answered, but not with a file that fits in an answer: too large.
+            Err(_) if reply.ok() => format!("larger than {} MB", crate::connect::MAX_REPLY_BYTES / (1024 * 1024)),
+            // Tried again at the next sync.
+            Err(message) => {
+                j.result.skip(&work.path, message);
+                continue;
+            }
+        };
+        // Not read again until the file changes, so files like it can't hold up the rest.
+        db.execute(
+            "UPDATE docs_items SET skipped_sha = ?, skip_reason = ? WHERE source_id = ? AND kind = 'doc' AND path = ?",
+            &params![work.sha.clone(), never.clone(), j.source.id.clone(), work.path.clone()],
+        )?;
+        j.result.skip(&work.path, never);
     }
     // Images these files show that aren't uploaded at their current version.
     let mut wanted: Vec<String> = vec![];
@@ -870,6 +926,10 @@ fn write(ctx: &mut Ctx, j: &mut DocsJob, mut plan: Plan, texts: Vec<Text>, ready
     if !super::holds(db, TABLE, source_id.as_str().into(), &j.lease)? {
         return Ok(lost());
     }
+    // Topics may have changed while the files were fetched.
+    if let Some(message) = guard(db, j, &mut plan, now)? {
+        return fail(db, j, &message, now);
+    }
     for r in &ready {
         let name = files::clean_name(name_of(&r.fetching.path));
         plan.uploaded.insert(r.fetching.path.clone(), (r.fetching.file_id.clone(), name));
@@ -878,7 +938,8 @@ fn write(ctx: &mut Ctx, j: &mut DocsJob, mut plan: Plan, texts: Vec<Text>, ready
     let mut first_post: HashMap<String, String> = HashMap::new();
     let mut reused: BTreeSet<String> = BTreeSet::new();
     for t in &texts {
-        if plan.blocked.contains_key(dir_of(&t.work.path)) {
+        if let Some(why) = blocked_by(&plan, &t.work.path) {
+            j.result.skip(&t.work.path, why);
             continue;
         }
         let mut used = BTreeSet::new();
@@ -913,7 +974,8 @@ fn write(ctx: &mut Ctx, j: &mut DocsJob, mut plan: Plan, texts: Vec<Text>, ready
             }
         }
         db.execute(
-            "UPDATE docs_items SET sha = ?, refs = ?, synced_at = ? WHERE source_id = ? AND kind = 'doc' AND path = ?",
+            "UPDATE docs_items SET sha = ?, refs = ?, synced_at = ?, removed_at = NULL, skipped_sha = NULL, skip_reason = NULL
+             WHERE source_id = ? AND kind = 'doc' AND path = ?",
             &params![t.work.sha.clone(), refs.join("\n"), ts(now), source_id.clone(), t.work.path.clone()],
         )?;
     }

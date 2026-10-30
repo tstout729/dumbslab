@@ -91,8 +91,12 @@ CREATE TABLE IF NOT EXISTS docs_items (
   sha TEXT,
   -- Paths this file links to or shows, one per line: it's synced again when one of them changes.
   refs TEXT NOT NULL DEFAULT '',
-  -- Set when the file is gone from the repository; its post is archived.
+  -- Set when the file is gone from the repository; its post is archived. It stays set until the
+  -- file, back again, has been synced and its post published again.
   removed_at TEXT,
+  -- A blob that can never be synced (too large, say), and why: skipped until the file changes.
+  skipped_sha TEXT,
+  skip_reason TEXT,
   synced_at TEXT,
   PRIMARY KEY (source_id, kind, path)
 );

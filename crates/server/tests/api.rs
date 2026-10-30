@@ -4469,6 +4469,28 @@ mod syncs {
             .str("target_id");
         assert_eq!(fetch(&h, &format!("/files/{first}/00.png"), &mo).status, 200, "readers of the post see its images");
 
+        // A file that comes back is published again once it's written, however many runs that
+        // takes: here its 11 images changed, more than one run uploads.
+        let gallery_md = repo.remove("gallery.md");
+        let r = h.call("POST", &format!("/api/v1/docs-sources/{source}/sync"), None, &admin);
+        assert_eq!(filled(drive(&h, job_of(&r), &answer).0)["archived"], 1);
+        for i in 0..11 {
+            let mut png = PNG.to_vec();
+            png.extend([i as u8, 0xFF]);
+            repo.put(&format!("gallery/{i:02}.png"), &png);
+        }
+        repo.put("gallery.md", &gallery_md);
+        let r = h.call("POST", &format!("/api/v1/docs-sources/{source}/sync"), None, &admin);
+        let v = filled(drive(&h, job_of(&r), &answer).0);
+        assert_eq!((v["images_uploaded"].as_i64(), v["restored"].as_i64(), v["done"].as_bool()), (Some(10), Some(0), Some(false)), "{v}");
+        let waiting = post(&h, &gallery_id, &admin);
+        assert_eq!((waiting["status"].as_str(), waiting["synced_from"]["removed"].as_bool()), (Some("archived"), Some(true)));
+        let r = h.call("POST", &format!("/api/v1/docs-sources/{source}/sync"), None, &admin);
+        let v = filled(drive(&h, job_of(&r), &answer).0);
+        assert_eq!((v["images_uploaded"].as_i64(), v["restored"].as_i64(), v["done"].as_bool()), (Some(1), Some(1), Some(true)), "{v}");
+        let back = post(&h, &gallery_id, &mo);
+        assert_eq!((back["status"].as_str(), back["synced_from"]["removed"].as_bool()), (Some("published"), Some(false)));
+
         // A folder that comes back empty (renamed, or a bad branch) archives nothing.
         let r = h.call("PATCH", &format!("/api/v1/docs-sources/{source}"), Some(json!({ "branch": "gone" })), &admin);
         assert_eq!(r.status, 200);
@@ -4497,6 +4519,64 @@ mod syncs {
         assert_eq!(edited["content"], "local edit");
     }
 
+    /// GitLab, for the project `ops/runbooks` on `trunk` at git.acme.test: files by path. Files in
+    /// `too_large` answer the way a blob cut short at the size limit does.
+    struct Lab {
+        files: RefCell<BTreeMap<String, Vec<u8>>>,
+        too_large: RefCell<Vec<String>>,
+    }
+
+    impl Lab {
+        fn new(files: &[(&str, &[u8])]) -> Lab {
+            Lab { files: RefCell::new(files.iter().map(|(p, b)| (p.to_string(), b.to_vec())).collect()), too_large: RefCell::new(vec![]) }
+        }
+
+        fn put(&self, path: &str, bytes: &[u8]) {
+            self.files.borrow_mut().insert(path.into(), bytes.to_vec());
+        }
+
+        fn answer(&self, c: &HttpCall) -> HttpReply {
+            let base = "https://git.acme.test/api/v4/projects/ops%2Frunbooks/repository";
+            let files = self.files.borrow();
+            if let Some(page) = c.url.strip_prefix(&format!("{base}/tree?ref=trunk&recursive=true&per_page=100&page=")) {
+                let page: usize = page.split('&').next().unwrap().parse().unwrap();
+                let entries: Vec<Value> = files
+                    .iter()
+                    .map(|(p, b)| json!({ "id": sha(b), "name": p.rsplit('/').next(), "type": "blob", "path": p, "mode": "100644" }))
+                    .collect();
+                return ok(json!(entries.chunks(100).nth(page - 1).map(<[Value]>::to_vec).unwrap_or_default()));
+            }
+            if let Some(blob) = c.url.strip_prefix(&format!("{base}/blobs/"))
+                && let Some((path, b)) = files.iter().find(|(_, b)| sha(b) == blob)
+            {
+                if self.too_large.borrow().contains(path) {
+                    return HttpReply { status: 200, body: "{\"content\": \"aGVsbG8".into() };
+                }
+                return ok(json!({ "content": base64::engine::general_purpose::STANDARD.encode(b), "encoding": "base64" }));
+            }
+            HttpReply { status: 404, body: "{}".into() }
+        }
+    }
+
+    /// One step of a job, in its own transaction.
+    fn step_once(h: &H, job: &mut Job, replies: Vec<HttpReply>) -> Step {
+        h.store
+            .with_tx(|db| {
+                let step = connect::step(db, &h.cfg, job, replies, chrono::Utc::now());
+                let ok = step.is_ok();
+                (step, ok)
+            })
+            .unwrap()
+            .unwrap()
+    }
+
+    fn gitlab_source(h: &H, admin: &Auth, topic: &str) -> (String, String) {
+        let input = json!({ "provider": "gitlab", "repository": "https://git.acme.test/ops/runbooks", "topic_id": topic, "token": "glpat-secret", "branch": "trunk" });
+        let created = h.ok("POST", "/api/v1/docs-sources", Some(input), admin);
+        assert_eq!(created["source"]["host"], "git.acme.test");
+        (created["source"]["id"].as_str().unwrap().to_string(), created["webhook_secret"].as_str().unwrap().to_string())
+    }
+
     #[test]
     fn docs_sync_from_gitlab() {
         let mut h = H::new();
@@ -4506,30 +4586,10 @@ mod syncs {
         let (zed_id, zed) = h.user(&admin, "zed@acme.test", "Zed", "member");
         let ops = json!({ "name": "Ops", "visibility": "private", "members": [mo_id] });
         let topic = h.ok("POST", "/api/v1/topics", Some(ops), &admin)["id"].as_str().unwrap().to_string();
-        let input = json!({ "provider": "gitlab", "repository": "https://git.acme.test/ops/runbooks", "topic_id": topic, "token": "glpat-secret", "branch": "trunk" });
-        let created = h.ok("POST", "/api/v1/docs-sources", Some(input), &admin);
-        assert_eq!(created["source"]["host"], "git.acme.test");
-        let source = created["source"]["id"].as_str().unwrap().to_string();
-        let secret = created["webhook_secret"].as_str().unwrap().to_string();
-        let md = b"# Paging\n\nSee [deploys](deploys/rollback.md).\n".to_vec();
-        let md2 = b"# Rollback\n".to_vec();
-        let tree = json!([
-            { "id": sha(&md), "name": "paging.md", "type": "blob", "path": "paging.md", "mode": "100644" },
-            { "id": "f".repeat(40), "name": "deploys", "type": "tree", "path": "deploys", "mode": "040000" },
-            { "id": sha(&md2), "name": "rollback.md", "type": "blob", "path": "deploys/rollback.md", "mode": "100644" },
-        ]);
-        let answer = |c: &HttpCall| -> HttpReply {
-            let base = "https://git.acme.test/api/v4/projects/ops%2Frunbooks/repository";
-            if c.url.starts_with(&format!("{base}/tree?ref=trunk&recursive=true&per_page=100&page=")) {
-                return ok(if c.url.ends_with("page=1") { tree.clone() } else { json!([]) });
-            }
-            for b in [&md, &md2] {
-                if c.url == format!("{base}/blobs/{}", sha(b)) {
-                    return ok(json!({ "content": base64::engine::general_purpose::STANDARD.encode(b), "encoding": "base64" }));
-                }
-            }
-            HttpReply { status: 404, body: "{}".into() }
-        };
+        let (source, secret) = gitlab_source(&h, &admin, &topic);
+        let lab =
+            Lab::new(&[("paging.md", b"# Paging\n\nSee [deploys](deploys/rollback.md).\n"), ("deploys/rollback.md", b"# Rollback\n")]);
+        let answer = |c: &HttpCall| lab.answer(c);
         // GitLab sends the secret token itself.
         let push = json!({ "ref": "refs/heads/trunk", "object_kind": "push" }).to_string();
         let path = format!("/hooks/docs/{source}");
@@ -4567,7 +4627,8 @@ mod syncs {
             let r = h.call("POST", &format!("/api/v1/docs-sources/{source}/sync"), None, &admin);
             filled(drive(h, job_of(&r), &answer).0)
         };
-        h.ok("PATCH", &format!("/api/v1/topics/{deploys}"), Some(json!({ "visibility": "org" })), &admin);
+        let set_visibility = |v: &str| h.ok("PATCH", &format!("/api/v1/topics/{deploys}"), Some(json!({ "visibility": v })), &admin);
+        set_visibility("org");
         let v = sync(&h);
         assert_eq!(v["skipped"][0]["path"], "deploys/rollback.md", "{v}");
         assert!(v["skipped"][0]["reason"].as_str().unwrap().contains("Deploys"), "{v}");
@@ -4575,7 +4636,7 @@ mod syncs {
         assert_eq!(h.call("GET", &format!("/api/v1/posts/{rollback_id}"), None, &zed).status, 404);
         assert_eq!(h.ok("GET", &format!("/api/v1/topics/{deploys}"), None, &admin)["visibility"], "org");
         // Private again, but with a member the source's topic doesn't have: still skipped.
-        h.ok("PATCH", &format!("/api/v1/topics/{deploys}"), Some(json!({ "visibility": "private" })), &admin);
+        set_visibility("private");
         h.ok("POST", &format!("/api/v1/topics/{deploys}/members"), Some(json!({ "user": zed_id })), &admin);
         let v = sync(&h);
         assert_eq!(v["skipped"][0]["path"], "deploys/rollback.md", "{v}");
@@ -4586,5 +4647,87 @@ mod syncs {
         assert_eq!(v["skipped"], json!([]), "{v}");
         assert_eq!(topic_names(&h), vec!["Deploys", "Ops"]);
         assert_eq!(h.call("GET", &format!("/api/v1/posts/{}", ids["paging.md"]), None, &zed).status, 404);
+
+        // A synced post stays in its source's topic...
+        let r = h.call("PATCH", &format!("/api/v1/posts/{rollback_id}"), Some(json!({ "remove_topic_ids": [topic] })), &admin);
+        assert_eq!(r.status, 409, "{}", r.body);
+        // ...and one that left it anyway, so that only the sub-topic holds it, isn't left in no
+        // topic (visible to everyone) when the sub-topic is made public: the sync puts it back in
+        // the source's topic first.
+        db_run(&h, |db| db.execute(&format!("DELETE FROM post_topics WHERE post_id = '{rollback_id}' AND topic_id = '{topic}'"), &[]));
+        set_visibility("org");
+        sync(&h);
+        assert_eq!(topic_names(&h), vec!["Ops"]);
+        assert_eq!(h.call("GET", &format!("/api/v1/posts/{rollback_id}"), None, &zed).status, 404);
+        set_visibility("private");
+        sync(&h);
+        assert_eq!(topic_names(&h), vec!["Deploys", "Ops"]);
+
+        // A sub-topic made public while a sync is fetching files gets nothing new: the step that
+        // writes checks again.
+        lab.put("deploys/rollback.md", b"# Rollback\n\nThe private steps.\n");
+        let r = h.call("POST", &format!("/api/v1/docs-sources/{source}/sync"), None, &admin);
+        let mut job = job_of(&r);
+        let tree = match step_once(&h, &mut job, vec![]) {
+            Step::Fetch(calls) => calls.iter().map(&answer).collect(),
+            other => panic!("{other:?}"),
+        };
+        let blobs = match step_once(&h, &mut job, tree) {
+            Step::Fetch(calls) => calls.iter().map(&answer).collect(),
+            other => panic!("{other:?}"),
+        };
+        set_visibility("org");
+        let v = match step_once(&h, &mut job, blobs) {
+            Step::Done(f) => filled(f),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(v["skipped"][0]["path"], "deploys/rollback.md", "{v}");
+        let rollback = post(&h, &rollback_id, &admin);
+        assert!(!rollback["content"].as_str().unwrap().contains("private steps"), "not written");
+        assert_eq!(topic_names(&h), vec!["Ops"]);
+        assert_eq!(h.call("GET", &format!("/api/v1/posts/{rollback_id}"), None, &zed).status, 404);
+        // Fixed, it's written at the next sync.
+        set_visibility("private");
+        let v = sync(&h);
+        assert_eq!(v["updated"], 1, "{v}");
+        assert!(post(&h, &rollback_id, &mo)["content"].as_str().unwrap().contains("private steps"));
+    }
+
+    #[test]
+    fn docs_sync_skips_large_files_for_good() {
+        let mut h = H::new();
+        let (admin, _) = h.setup();
+        with_key(&mut h);
+        let topic = h.ok("POST", "/api/v1/topics", Some(json!({ "name": "Runbooks" })), &admin)["id"].as_str().unwrap().to_string();
+        let (source, _) = gitlab_source(&h, &admin, &topic);
+        // GitLab's listing has no sizes: these turn out too large only once read.
+        let lab = Lab::new(&[]);
+        for i in 0..21 {
+            let name = format!("big-{i:02}.md");
+            lab.put(&name, format!("# Big {i}\n").as_bytes());
+            lab.too_large.borrow_mut().push(name);
+        }
+        lab.put("zz-small.md", b"# Small\n");
+        let answer = |c: &HttpCall| lab.answer(c);
+        let sync = || -> (Value, usize) {
+            let r = h.call("POST", &format!("/api/v1/docs-sources/{source}/sync"), None, &admin);
+            let (finish, sent) = drive(&h, job_of(&r), &answer);
+            (filled(finish), sent.iter().filter(|c| c.url.contains("/blobs/")).count())
+        };
+        let (v, read) = sync();
+        assert_eq!((v["created"].as_i64(), v["remaining"].as_i64(), read), (Some(0), Some(2), 20), "{v}");
+        assert_eq!(v["skipped"].as_array().unwrap().len(), 20);
+        // The next sync doesn't read them again, so the rest get their turn.
+        let (v, read) = sync();
+        assert_eq!((v["created"].as_i64(), v["remaining"].as_i64(), v["done"].as_bool(), read), (Some(1), Some(0), Some(true), 2), "{v}");
+        assert_eq!(v["skipped"].as_array().unwrap().len(), 21, "{v}");
+        assert!(v["skipped"][0]["reason"].as_str().unwrap().contains("larger than"), "{v}");
+        let (v, read) = sync();
+        assert_eq!((v["unchanged"].as_i64(), read), (Some(1), 0), "{v}");
+        // A file that changes is tried again.
+        lab.too_large.borrow_mut().retain(|p| p != "big-00.md");
+        lab.put("big-00.md", b"# Big 0, smaller now\n");
+        let (v, read) = sync();
+        assert_eq!((v["created"].as_i64(), read), (Some(1), 1), "{v}");
     }
 }

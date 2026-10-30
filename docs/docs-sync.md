@@ -5,8 +5,8 @@ Docs sync keeps the Markdown files in a repository folder as posts in a topic. W
 - **Each file is a published post.** Files ending in `.md` or `.markdown`, in the folder and its sub-folders. Hidden folders (like `.github`) and `node_modules` are skipped.
 - **Titles.** A post's title comes from the file's front matter (`title:`), or from a `# heading` at the very top (which then leaves the body, since the post shows its title), or from the file name: `getting-started.md` becomes "Getting started". A `README.md` or `index.md` is named after its folder.
 - **Folders become sub-topics** of the topic you choose, with the same visibility. In a private topic, they're private and start with the topic's members. Each post sits in the chosen topic and in its folder's sub-topic.
-- **A synced post is never visible to more people than the chosen topic.** Every sync checks each sub-topic. A sub-topic fails the check if someone made it public, or gave it a member the chosen topic doesn't have (admins don't count, since they see every topic). When one fails:
-  - the source's posts are taken out of it;
+- **A synced post is never visible to more people than the chosen topic.** It always stays in the chosen topic: removing it from there is refused. Every sync checks each sub-topic, before reading files and again in the step that writes them. A sub-topic fails the check if someone made it public, or gave it a member the chosen topic doesn't have (admins don't count, since they see every topic). When one fails:
+  - the source's posts are taken out of it, after making sure each is still in the chosen topic, so none is left in no topic;
   - its files are skipped, and the result gives the reason;
   - its visibility is never changed.
   Make it private with the topic's members, or delete it so the next sync makes a new one; the next sync then puts the posts back.
@@ -15,7 +15,7 @@ Docs sync keeps the Markdown files in a repository folder as posts in a topic. W
 - **Other uploads stay private.** A synced post only gets the images the sync uploaded itself. If the text names another upload here (`/files/…`), that file isn't attached to the post, so the link opens only for people who could already open it. Anyone who can push to the repository writes these posts, so this keeps them from exposing private files.
 - **Changes.** Each sync that changes a post saves a new version, like an edit, so history and diffs work. Synced changes don't notify anyone.
 - **Renames.** A file moved or renamed without changes keeps its post, with its comments, links and history.
-- **Removed files.** When a file is gone from the repository, its post is **archived, never deleted**. It stays linked to the repository: if the file comes back at the same path, the post is published again.
+- **Removed files.** When a file is gone from the repository, its post is **archived, never deleted**. It stays linked to the repository: if the file comes back at the same path, the post is published again once the file has been synced, even if that takes several runs.
 - **Read-only here.** A synced post's title and content can only change in the repository. Saving, `edit_post` and restoring an old version are refused with a `synced_post` error that links to the file. The post shows "Synced from …; edit it there". Topics, status, pins, verification, comments and reactions still work. To edit a synced post here, duplicate it, or remove the source (its posts then become ordinary posts).
 
 Only admins can set up, run or change a source (Settings › Docs sync, or the `list_docs_sources`, `create_docs_source`, `update_docs_source`, `sync_docs_source` and `delete_docs_source` operations). It's available on every plan. It needs the server's connector key (`CONNECTOR_KEY` on Cloudflare, `DUMBSLAB_CONNECTOR_KEY` self-hosted; see [connected apps](connected-apps.md)): tokens and webhook secrets are encrypted with it, and no operation returns a token. Synced posts are written as the admin who added the source.
@@ -49,7 +49,7 @@ After that, every push to the branch syncs. **Sync now** syncs any time. **New w
 | Markdown files per source | 500 | Keeps one listing and its bookkeeping small; split a larger folder into several sources |
 | Changed files per sync | 20 | A sync is one job of at most 4 steps; `remaining` says what's left, and the next sync carries on |
 | Images uploaded per sync | 10 | Same; a file whose images don't fit waits for the next sync |
-| Markdown file size | 1 MB | Larger files are skipped and listed |
+| Markdown file size | 1 MB | Larger files are skipped and listed. GitLab's listing has no sizes, so there a file turns out too large when it's read; it's then skipped until it changes, so it doesn't hold up other files |
 | Image size | 3 MB | Images arrive as base64 in JSON, which must fit in a 4 MB answer; larger ones link to the repository |
 | GitLab folder listing | 1,000 files and folders | GitLab lists 100 per page; a sync asks for 10 pages at once |
 | Sources per workspace | 20 | |

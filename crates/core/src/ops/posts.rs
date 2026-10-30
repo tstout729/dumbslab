@@ -676,6 +676,15 @@ pub(crate) fn update_post(ctx: &mut Ctx, input: UpdatePostInput) -> ApiResult<Po
         ids.extend(input.add_topic_ids.unwrap_or_default());
         let remove = input.remove_topic_ids.unwrap_or_default();
         ids.retain(|t| !remove.contains(t));
+        // A synced post stays in its source's topic, which no sub-topic shows to more people.
+        if let Some(keep) = crate::sync::docs::source_topic(ctx.db, &id)?
+            && !ids.contains(&keep)
+            && load_topic(ctx, &keep).is_ok()
+        {
+            return Err(ApiError::conflict(
+                "this post is synced from a repository and stays in its docs sync topic; add other topics instead, or remove the source in Settings › Docs sync",
+            ));
+        }
         let (added, removed) = set_topics(ctx, &id, &ids)?;
         if !added.is_empty() || !removed.is_empty() {
             fields.push("topics");
