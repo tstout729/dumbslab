@@ -77,6 +77,32 @@ export function renderSetup(root, authState) {
   ws.select();
 }
 
+/**
+ * What a single sign-on that didn't work comes back with: `?sso_error=` holds only a code, and
+ * the message is ours, so a link to the sign-in page can't make it say anything else.
+ */
+export function ssoMessage(code, name) {
+  const p = name || 'single sign-on';
+  const messages = {
+    not_configured: 'Single sign-on isn’t set up for this workspace.',
+    expired: 'That sign-in link expired or was already used. Sign in again.',
+    other_browser: 'Start signing in from this browser’s sign-in page, then try again.',
+    denied: `You didn’t finish signing in with ${p}.`,
+    provider_error: `${p} couldn’t sign you in. Try again; if it keeps happening, a workspace admin can check Settings › Single sign-on.`,
+    invalid_token: `${p}’s answer didn’t check out. Sign in again.`,
+    not_in_org: `Use your organization’s ${p} account.`,
+    unverified_email: `${p} didn’t confirm your email address, so it can’t be matched to an account here. Sign in with your password and link ${p} in Settings › Profile, or ask a workspace admin.`,
+    domain_not_allowed: 'Your email address isn’t at one of this workspace’s sign-in domains. Ask a workspace admin to add you.',
+    no_account: 'No one here has your email address. Ask a workspace admin to add you.',
+    deactivated: 'Your account here is deactivated. Ask a workspace admin to reactivate it.',
+    bot: 'Bot accounts sign in with API tokens, not single sign-on.',
+    email_linked: `Your email address is linked to a different ${p} account here. Ask a workspace admin to unlink it.`,
+    wrong_person: 'Sign in as the person who started linking, then try again.',
+    already_linked: `That ${p} account is already linked to someone else here.`,
+  };
+  return Object.hasOwn(messages, code) ? messages[code] : `Signing in with ${p} didn’t work. Try again or use your password.`;
+}
+
 export function renderLogin(root, authState) {
   document.title = `Sign in - ${authState.workspace_name}`;
   const params = new URLSearchParams(location.search);
@@ -87,8 +113,8 @@ export function renderLogin(root, authState) {
   const err = errorBox();
   const submit = button('Sign in', { variant: sso ? 'subtle' : 'primary', type: 'submit', cls: 'btn-block' });
   const form = h('form', { class: 'auth-form', novalidate: true }, field('Email', email), field('Password', password), err, submit);
-  // A sign-in with the provider that didn't work comes back here with why.
-  const ssoError = params.get('sso_error');
+  // A sign-in with the provider that didn't work comes back here with a code saying why.
+  const ssoError = params.get('sso_error') ? ssoMessage(params.get('sso_error'), sso && sso.name) : null;
   if (ssoError && !sso) showError(err, ssoError);
   form.addEventListener('submit', (e) => {
     e.preventDefault();

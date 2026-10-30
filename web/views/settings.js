@@ -8,6 +8,7 @@ import {
 } from '/ui.js';
 import { state, emit, navigate, canAdmin, myId } from '/state.js';
 import { connectionsSection } from '/views/connected.js';
+import { ssoMessage } from '/views/auth.js';
 
 const SECTIONS = [
   { id: 'profile', label: 'Profile', icon: 'user' },
@@ -129,7 +130,7 @@ async function ssoProfilePanel() {
   const mine = r.items.filter((i) => i.current);
   const notes = [];
   if (query.get('sso_linked')) notes.push(h('p', { class: 'callout', role: 'status' }, icon('check', { size: 15 }), h('span', null, `Your ${sso.name} account is linked. You can sign in with it now.`)));
-  if (query.get('sso_error')) notes.push(h('p', { class: 'callout callout-warn', role: 'alert' }, icon('alert', { size: 15 }), h('span', null, query.get('sso_error'))));
+  if (query.get('sso_error')) notes.push(h('p', { class: 'callout callout-warn', role: 'alert' }, icon('alert', { size: 15 }), h('span', null, ssoMessage(query.get('sso_error'), sso.name))));
   const body = h('div', { class: 'stack' }, ...notes);
   const unlinkButton = (identity, row) => {
     const b = button('Unlink', { size: 'xs', variant: 'ghost', cls: 'text-danger' });

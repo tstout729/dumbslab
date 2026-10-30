@@ -107,7 +107,7 @@ Auth0, Keycloak, JumpCloud, Ping, Authentik and others work the same way.
 - The ID token arrives straight from the token endpoint over TLS, so, as OpenID Connect Core 1.0 section 3.1.3.7 allows, its signature isn't checked. Its issuer, audience, authorized party, expiry, issue time and nonce are. When it has no email, DumbSlab asks the userinfo endpoint (except Microsoft's), whose answer must be about the same `sub`.
 - The core builds every request and reads every answer; the host only sends them, over https, without following redirects, within 8 seconds and reading at most 4 MB. The self-hosted server refuses private network addresses unless it runs with `--allow-private-webhooks`.
 - A sign-in starts an ordinary browser session, with the same cookie rules and 30-day length as a password sign-in.
-- Problems send people back to the sign-in page with a message they can read. Tokens and the provider's raw answers are never shown.
+- Problems send people back to the sign-in page (or Settings › Profile, when linking) with only an error code, such as `?sso_error=unverified_email`. The page shows its own message for each code, so a link can't make the sign-in page say anything else, and nothing the provider sends (error text, tokens) ever reaches it. The admin's settings check gives the details of a provider that doesn't check out.
 - Changes to the settings, linked accounts and people who join appear in the admins' activity log (`sso.updated`, `sso.linked`, `sso.unlinked`, `user.created`). Events that happen during a sign-in aren't sent to webhooks.
 
 ## For agents and scripts

@@ -2772,8 +2772,15 @@ mod sso {
                 .filter(|v| !v.is_empty())
                 .map(|v| Auth::Cookie(v.to_string()))
         }
+        /// What went wrong. Redirects carry a known code and nothing else, so nobody can put their
+        /// own words on the sign-in page, and nothing from the provider ends up there.
         fn error(&self) -> String {
-            query_of(&self.location).get("sso_error").cloned().unwrap_or_default()
+            let q = query_of(&self.location);
+            let Some(code) = q.get("sso_error") else { return String::new() };
+            let known: Vec<&str> = dumbslab_core::sso::Problem::ALL.iter().map(|p| p.code()).collect();
+            assert!(known.contains(&code.as_str()), "unknown code `{code}` in {}", self.location);
+            assert!(q.keys().all(|k| k == "sso_error" || k == "next"), "only a code and where to go: {}", self.location);
+            code.clone()
         }
     }
 
@@ -3077,19 +3084,19 @@ mod sso {
         let verified = || json!({ "email_verified": true });
         let no_session = |l: &Landing| l.session().is_none() && l.location.starts_with("https://kb.test/login?sso_error=");
 
-        for (claim, value, why) in [
-            ("aud", json!("someone-elses-app"), "meant for another app"),
-            ("azp", json!("someone-elses-app"), "meant for another app"),
-            ("iss", json!("https://evil.test"), "another issuer"),
-            ("exp", json!(now - 600), "expired"),
-            ("iat", json!(now + 7200), "future"),
-            ("nonce", json!("not-this-sign-ins-nonce"), "doesn't belong to this sign-in"),
+        for (claim, value) in [
+            ("aud", json!("someone-elses-app")),
+            ("azp", json!("someone-elses-app")),
+            ("iss", json!("https://evil.test")),
+            ("exp", json!(now - 600)),
+            ("iat", json!(now + 7200)),
+            ("nonce", json!("not-this-sign-ins-nonce")),
         ] {
             let mut c = claims(OKTA, "sub-mo", "mo@acme.test", verified());
             c[claim] = value;
             let landing = sign_in_with(&h, OKTA, c);
             assert!(no_session(&landing), "{claim}: {}", landing.location);
-            assert!(landing.error().contains(why), "{claim}: {}", landing.error());
+            assert_eq!(landing.error(), "invalid_token", "{claim}");
             assert!(landing.location.contains("next=%2Fp%2Fabc"), "keeps where they were going");
         }
 
@@ -3097,19 +3104,19 @@ mod sso {
         let r = h.call("GET", "/sso/start", None, &Auth::None);
         let (finish, _) = drive(&h, job_of(&r), &|_| ok(discovery("https://evil.test")));
         let landing = land(&r, Some(finish));
-        assert!(landing.error().contains("don't check out"), "{}", landing.error());
+        assert_eq!(landing.error(), "provider_error");
         assert_eq!(count(&h, "SELECT COUNT(*) FROM sso_requests"), 0);
         // No answer at all: the request's own fallback, not an error page.
         let r = h.call("GET", "/sso/start", None, &Auth::None);
         let landing = land(&r, Some(Finish::Fail(dumbslab_core::ApiError::internal("the host gave up"))));
-        assert!(landing.error().contains("didn't start"), "{}", landing.error());
+        assert_eq!(landing.error(), "failed");
 
         // Each sign-in link works once.
         let s = start(&h, OKTA);
         let (first, _) = come_back(&h, &s, claims(OKTA, "sub-mo", "mo@acme.test", verified()), &tokens);
         assert!(first.session().is_some(), "{}", first.error());
         let (replayed, _) = come_back(&h, &s, claims(OKTA, "sub-mo", "mo@acme.test", verified()), &tokens);
-        assert!(no_session(&replayed) && replayed.error().contains("no longer valid"), "{}", replayed.error());
+        assert!(no_session(&replayed) && replayed.error() == "expired", "{}", replayed.location);
 
         // Only the browser that started can finish (no signing someone in to the attacker's account).
         for cookies in [vec![], vec!["dumbslab_sso=someone-elses".to_string()]] {
@@ -3117,7 +3124,7 @@ mod sso {
             let q = format!("code=attackers-code&state={}", urlencoding::encode(&s.query["state"]));
             let r = h.send(&callback_request(&q, &cookies));
             assert!(r.effects.is_empty());
-            assert!(land(&r, None).error().contains("this browser"), "{:?}", r.header("location"));
+            assert_eq!(land(&r, None).error(), "other_browser");
         }
 
         // Too slow.
@@ -3125,35 +3132,41 @@ mod sso {
         let past = dumbslab_core::util::ts(chrono::Utc::now() - chrono::Duration::minutes(16));
         h.store.with_tx(|db| (db.execute("UPDATE sso_requests SET created_at = ?", &dumbslab_core::params![past]), true)).unwrap().unwrap();
         let (late, _) = come_back(&h, &s, claims(OKTA, "sub-mo", "mo@acme.test", verified()), &tokens);
-        assert!(late.error().contains("too long"), "{}", late.error());
+        assert_eq!(late.error(), "expired");
 
         // The provider saying no, or refusing the code: a readable message, nothing raw.
         let s = start(&h, OKTA);
         let q = format!("error=access_denied&error_description=User+cancelled&state={}", urlencoding::encode(&s.query["state"]));
         let r = h.send(&callback_request(&q, &[format!("dumbslab_sso={}", s.cookie)]));
-        assert!(land(&r, None).error().contains("didn't finish signing in with Okta"));
+        assert_eq!(land(&r, None).error(), "denied");
+        // Any other error, with whatever text the provider (or someone) puts in the link, is just that: an error.
+        let s = start(&h, OKTA);
+        let q = format!(
+            "error=server_error&error_description=Your+account+is+locked.+Call+555-0100&state={}",
+            urlencoding::encode(&s.query["state"])
+        );
+        let landing = land(&h.send(&callback_request(&q, &[format!("dumbslab_sso={}", s.cookie)])), None);
+        assert_eq!(landing.error(), "provider_error");
+        assert!(!landing.location.contains("locked") && !landing.location.contains("555"), "{}", landing.location);
         let s = start(&h, OKTA);
         let refused = |_: &HttpCall, _: &str| HttpReply {
             status: 400,
             body: json!({ "error": "invalid_grant", "error_description": "code expired", "access_token": "leaked?" }).to_string(),
         };
         let (landing, _) = come_back(&h, &s, claims(OKTA, "sub-mo", "mo@acme.test", verified()), &refused);
-        assert!(
-            landing.error().contains("didn't accept the sign-in (invalid_grant)") && !landing.location.contains("leaked"),
-            "{}",
-            landing.error()
-        );
+        assert_eq!(landing.error(), "provider_error");
+        assert!(!landing.location.contains("invalid_grant") && !landing.location.contains("leaked"), "{}", landing.location);
         // An answer that isn't a signed ID token.
         let s = start(&h, OKTA);
         let unsigned = |_: &HttpCall, _: &str| ok(json!({ "access_token": "at", "id_token": "eyJhbGciOiJub25lIn0.eyJzdWIiOiJ4In0." }));
         let (landing, _) = come_back(&h, &s, json!({}), &unsigned);
-        assert!(landing.error().contains("signed ID token"), "{}", landing.error());
+        assert_eq!(landing.error(), "invalid_token");
 
         // Settings changing mid-sign-in.
         let s = start(&h, OKTA);
         set_up(&h, &admin, json!({ "issuer": "https://acme-new.okta.test" }), "https://acme-new.okta.test");
         let (landing, _) = come_back(&h, &s, claims(OKTA, "sub-mo", "mo@acme.test", verified()), &tokens);
-        assert!(landing.error().contains("settings changed"), "{}", landing.error());
+        assert_eq!(landing.error(), "expired");
     }
 
     #[test]
@@ -3164,15 +3177,12 @@ mod sso {
         let refused = |c: Value, why: &str| {
             let landing = sign_in_with(&h, OKTA, c);
             assert!(landing.session().is_none(), "{why}");
-            assert!(landing.error().contains(why), "{why}: {}", landing.error());
+            assert_eq!(landing.error(), why);
         };
-        refused(claims(OKTA, "sub-mo", "mo@acme.test", json!({ "email_verified": false })), "didn't confirm that mo@acme.test is verified");
-        refused(claims(OKTA, "sub-mo", "mo@acme.test", json!({})), "didn't confirm");
-        refused(
-            claims(OKTA, "sub-mo", "mo@other.test", json!({ "email_verified": true })),
-            "other.test isn't one of this workspace's sign-in domains",
-        );
-        refused(claims(OKTA, "sub-new", "new@acme.test", json!({ "email_verified": true })), "No one here has the email new@acme.test");
+        refused(claims(OKTA, "sub-mo", "mo@acme.test", json!({ "email_verified": false })), "unverified_email");
+        refused(claims(OKTA, "sub-mo", "mo@acme.test", json!({})), "unverified_email");
+        refused(claims(OKTA, "sub-mo", "mo@other.test", json!({ "email_verified": true })), "domain_not_allowed");
+        refused(claims(OKTA, "sub-new", "new@acme.test", json!({ "email_verified": true })), "no_account");
         assert_eq!(count(&h, "SELECT COUNT(*) FROM sso_identities"), 0);
 
         // Some providers give the email in the userinfo answer only; it must be about the same account.
@@ -3200,7 +3210,7 @@ mod sso {
             }
         };
         let (landing, _) = come_back(&h, &s, c, &someone_else);
-        assert!(landing.error().contains("didn't share your email"), "{}", landing.error());
+        assert_eq!(landing.error(), "unverified_email");
 
         // Deactivated people can't sign in, linked or not.
         assert!(sign_in_with(&h, OKTA, claims(OKTA, "sub-mo", "mo@acme.test", json!({ "email_verified": true }))).session().is_some());
@@ -3209,10 +3219,10 @@ mod sso {
         refused(claims(OKTA, "sub-mo-2", "mo@acme.test", json!({ "email_verified": true })), "deactivated");
         // Nor bots.
         h.ok("POST", "/api/v1/users", Some(json!({ "email": "bot@acme.test", "name": "Bot", "is_bot": true })), &admin);
-        refused(claims(OKTA, "sub-bot", "bot@acme.test", json!({ "email_verified": true })), "Bot accounts");
+        refused(claims(OKTA, "sub-bot", "bot@acme.test", json!({ "email_verified": true })), "bot");
         // An address already linked to another account at this provider isn't taken over.
         h.ok("PATCH", &format!("/api/v1/users/{mo_id}"), Some(json!({ "deactivated": false })), &admin);
-        refused(claims(OKTA, "sub-mo-2", "mo@acme.test", json!({ "email_verified": true })), "linked to a different Okta account");
+        refused(claims(OKTA, "sub-mo-2", "mo@acme.test", json!({ "email_verified": true })), "email_linked");
 
         // Auto-provisioning: people the provider vouches for join as members.
         set_up(&h, &admin, json!({ "auto_provision": true }), OKTA);
@@ -3226,8 +3236,8 @@ mod sso {
         let activity = h.ok("GET", "/api/v1/activity", None, &admin).to_string();
         assert!(activity.contains("joined by signing in with Okta"), "{activity}");
         // Still only from allowed domains, with verified emails.
-        refused(claims(OKTA, "sub-x", "x@other.test", json!({ "email_verified": true })), "isn't one of this workspace's sign-in domains");
-        refused(claims(OKTA, "sub-y", "y@acme.test", json!({ "email_verified": false })), "didn't confirm");
+        refused(claims(OKTA, "sub-x", "x@other.test", json!({ "email_verified": true })), "domain_not_allowed");
+        refused(claims(OKTA, "sub-y", "y@acme.test", json!({ "email_verified": false })), "unverified_email");
     }
 
     #[test]
@@ -3244,7 +3254,7 @@ mod sso {
         // A personal Google account (no hosted domain), or another company's, never signs in.
         for extra in [json!({ "email_verified": true }), json!({ "email_verified": true, "hd": "other.test" })] {
             let landing = sign_in_with(&h, google, claims(google, "g-mo", "mo@acme.test", extra));
-            assert!(landing.session().is_none() && landing.error().contains("acme.test Google account"), "{}", landing.error());
+            assert!(landing.session().is_none() && landing.error() == "not_in_org", "{}", landing.location);
         }
         // Google's ID tokens may name the issuer without its scheme.
         let landing = sign_in_with(
@@ -3266,7 +3276,7 @@ mod sso {
             slack,
             claims(slack, "U1", "mo@acme.test", json!({ "email_verified": true, "https://slack.com/team_id": "T0OTHER" })),
         );
-        assert!(landing.error().contains("Slack workspace"), "{}", landing.error());
+        assert_eq!(landing.error(), "not_in_org");
     }
 
     #[test]
@@ -3284,14 +3294,14 @@ mod sso {
         // `email` alone, even "verified" and matching the UPN, isn't proof of the address (nOAuth).
         let unproven = json!({ "tid": TENANT, "email_verified": true, "upn": "mo@acme.test", "preferred_username": "mo@acme.test" });
         let landing = sign_in_with(&h, &issuer, claims(&issuer, "ms-mo", "mo@acme.test", unproven.clone()));
-        assert!(landing.session().is_none() && landing.error().contains("didn't confirm who owns mo@acme.test"), "{}", landing.error());
+        assert!(landing.session().is_none() && landing.error() == "unverified_email", "{}", landing.location);
         // Another directory's account, even with xms_edov.
         let landing = sign_in_with(
             &h,
             &issuer,
             claims(&issuer, "ms-mo", "mo@acme.test", json!({ "tid": "00000000-0000-0000-0000-000000000000", "xms_edov": true })),
         );
-        assert!(landing.error().contains("organization's directory"), "{}", landing.error());
+        assert_eq!(landing.error(), "not_in_org");
 
         // Mo links their Microsoft account while signed in with a password...
         let mo = sign_in(&h, "mo@acme.test", "password123");
@@ -3316,11 +3326,8 @@ mod sso {
         };
         // ...in their own browser only.
         let landing = link(&admin, "ms-mo");
-        assert!(
-            landing.location.contains("/settings/profile?sso_error=") && landing.location.contains("person%20who%20started"),
-            "{}",
-            landing.location
-        );
+        assert_eq!(landing.location, "https://kb.test/settings/profile?sso_error=wrong_person");
+        assert_eq!(landing.error(), "wrong_person");
         let r = h.call("POST", "/api/v1/me/sso", None, &mo);
         let (finish, _) = drive(&h, job_of(&r), &|_| ok(discovery(&issuer)));
         let Finish::Fill(v) = finish else { panic!("{finish:?}") };
@@ -3357,7 +3364,7 @@ mod sso {
         ));
         let id = jwt(&claims(&issuer, "ms-mo", "mo@acme.test", json!({ "tid": TENANT, "nonce": q3["nonce"] })));
         let (finish, _) = drive(&h, job_of(&r), &|c| tokens(c, &id));
-        assert!(land(&r, Some(finish)).location.contains("already%20linked%20to%20someone%20else"));
+        assert_eq!(land(&r, Some(finish)).error(), "already_linked");
 
         // Unlinking (yours, or anyone's for admins) stops it signing in.
         let id = mine["items"][0]["id"].as_str().unwrap().to_string();
@@ -3397,6 +3404,6 @@ mod sso {
         set_up(&h, &admin, json!({ "enabled": false }), OKTA);
         assert_eq!(login("mo@acme.test", "password123").status, 200);
         let r = h.call("GET", "/sso/start", None, &Auth::None);
-        assert!(r.effects.is_empty() && land(&r, None).error().contains("isn't set up"));
+        assert!(r.effects.is_empty() && land(&r, None).error() == "not_configured");
     }
 }

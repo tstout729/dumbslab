@@ -478,68 +478,36 @@ fn check_claims(conf: &Config, claims: &Value, nonce: &str, now: DateTime<Utc>) 
     Ok(())
 }
 
-fn domains_text(conf: &Config) -> String {
-    match conf.allowed_domains.as_slice() {
-        [] => "your organization's".into(),
-        [one] => one.clone(),
-        many => format!("{} or {}", many[..many.len() - 1].join(", "), many[many.len() - 1]),
-    }
-}
-
 /// Whether the account belongs to the organization at all. Some issuers serve everyone (Google,
 /// Slack), others every directory's accounts; this narrows them to the workspace's.
-fn org_check(conf: &Config, claims: &Value) -> Result<(), String> {
-    let (belongs, message) = match conf.provider {
-        Some(Provider::Google) => {
-            let hd = claims["hd"].as_str().unwrap_or_default();
-            (!hd.is_empty() && conf.domain_allowed(hd), format!("Sign in with your {} Google account.", domains_text(conf)))
-        }
-        Some(Provider::Microsoft) => (
-            claims["tid"].as_str().is_some_and(|t| t.eq_ignore_ascii_case(&conf.tenant)),
-            "Sign in with a Microsoft account from your organization's directory.".to_string(),
-        ),
-        Some(Provider::Slack) => (
-            conf.team.is_empty() || claims["https://slack.com/team_id"].as_str() == Some(conf.team.as_str()),
-            "Sign in with your account in your organization's Slack workspace.".to_string(),
-        ),
-        _ => (true, String::new()),
+fn org_check(conf: &Config, claims: &Value) -> Result<(), Problem> {
+    let belongs = match conf.provider {
+        Some(Provider::Google) => claims["hd"].as_str().is_some_and(|hd| !hd.is_empty() && conf.domain_allowed(hd)),
+        Some(Provider::Microsoft) => claims["tid"].as_str().is_some_and(|t| t.eq_ignore_ascii_case(&conf.tenant)),
+        Some(Provider::Slack) => conf.team.is_empty() || claims["https://slack.com/team_id"].as_str() == Some(conf.team.as_str()),
+        _ => true,
     };
-    if belongs { Ok(()) } else { Err(message) }
+    if belongs { Ok(()) } else { Err(Problem::NotInOrg) }
 }
 
 /// The email address the provider vouches for, which a first sign-in may match to an existing
 /// account (or join with): the provider must say it's verified, and its domain must be one of the
 /// workspace's. Microsoft's `email` is only trusted with `xms_edov` (the domain's owner verified
 /// it), never alone and never `upn`, so another directory can't claim an address it doesn't own.
-fn vouched_email(conf: &Config, claims: &Value) -> Result<String, String> {
-    let name = conf.name();
+fn vouched_email(conf: &Config, claims: &Value) -> Result<String, Problem> {
     let email = claims["email"].as_str().map(|e| e.trim().to_ascii_lowercase()).unwrap_or_default();
-    let link_hint = format!("Sign in with your password and link {name} in Settings › Profile, or ask a workspace admin.");
-    if email.is_empty() {
-        return Err(format!("{name} didn't share your email address, so it can't be matched to an account here. {link_hint}"));
-    }
     let verified = match conf.provider {
         Some(Provider::Microsoft) => truthy(&claims["xms_edov"]),
         _ => truthy(&claims["email_verified"]),
     };
-    if !verified {
-        return Err(match conf.provider {
-            Some(Provider::Microsoft) => format!(
-                "Your Microsoft account isn't linked to an account here yet, and Microsoft didn't confirm who owns {email}. {link_hint}"
-            ),
-            _ => format!("{name} didn't confirm that {email} is verified, so it can't be matched to an account here. {link_hint}"),
-        });
+    if email.is_empty() || !verified {
+        return Err(Problem::UnverifiedEmail);
     }
     let domain = email.rsplit_once('@').map(|(_, d)| d).unwrap_or_default();
     if !conf.domain_allowed(domain) {
-        return Err(format!("{domain} isn't one of this workspace's sign-in domains. Ask a workspace admin to add you."));
+        return Err(Problem::DomainNotAllowed);
     }
     Ok(email)
-}
-
-/// A provider's error code, safe to show: short, and only the characters codes use.
-fn error_code(code: &str) -> String {
-    code.chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.')).take(60).collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -573,9 +541,87 @@ pub fn safe_next(next: Option<&str>) -> String {
     }
 }
 
-/// Back to the sign-in page, with a message for the person.
-fn to_login(base_url: &str, message: &str, next: &str) -> Response {
-    let mut url = format!("{base_url}/login?sso_error={}", urlencoding::encode(message));
+/// Why a sign-in, or linking an account, didn't work. Redirects carry only its code
+/// (`?sso_error=…`), never text: the web app shows its own message for each code, so a link to
+/// the sign-in page can't make it say anything else, and nothing from the provider reaches it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Problem {
+    /// Single sign-on isn't on, or isn't fully set up.
+    NotConfigured,
+    /// The sign-in link was used, took too long, or the settings changed meanwhile.
+    Expired,
+    /// Finished in a browser other than the one that started.
+    OtherBrowser,
+    /// The person said no at the provider.
+    Denied,
+    /// The provider refused, didn't answer, or its settings don't check out.
+    ProviderError,
+    /// The ID token didn't check out.
+    InvalidToken,
+    /// An account outside the organization (Google's hosted domain, Microsoft's directory, Slack's workspace).
+    NotInOrg,
+    /// The provider didn't vouch for the email address.
+    UnverifiedEmail,
+    DomainNotAllowed,
+    /// Nobody here has the email, and auto-provisioning is off.
+    NoAccount,
+    Deactivated,
+    Bot,
+    /// The person with that email has a different account at the provider linked.
+    EmailLinked,
+    /// Linking: finished signed in as someone else.
+    WrongPerson,
+    /// Linking: the provider account is someone else's here.
+    AlreadyLinked,
+    /// Anything else.
+    Failed,
+}
+
+impl Problem {
+    pub const ALL: [Problem; 16] = [
+        Problem::NotConfigured,
+        Problem::Expired,
+        Problem::OtherBrowser,
+        Problem::Denied,
+        Problem::ProviderError,
+        Problem::InvalidToken,
+        Problem::NotInOrg,
+        Problem::UnverifiedEmail,
+        Problem::DomainNotAllowed,
+        Problem::NoAccount,
+        Problem::Deactivated,
+        Problem::Bot,
+        Problem::EmailLinked,
+        Problem::WrongPerson,
+        Problem::AlreadyLinked,
+        Problem::Failed,
+    ];
+
+    pub fn code(self) -> &'static str {
+        match self {
+            Problem::NotConfigured => "not_configured",
+            Problem::Expired => "expired",
+            Problem::OtherBrowser => "other_browser",
+            Problem::Denied => "denied",
+            Problem::ProviderError => "provider_error",
+            Problem::InvalidToken => "invalid_token",
+            Problem::NotInOrg => "not_in_org",
+            Problem::UnverifiedEmail => "unverified_email",
+            Problem::DomainNotAllowed => "domain_not_allowed",
+            Problem::NoAccount => "no_account",
+            Problem::Deactivated => "deactivated",
+            Problem::Bot => "bot",
+            Problem::EmailLinked => "email_linked",
+            Problem::WrongPerson => "wrong_person",
+            Problem::AlreadyLinked => "already_linked",
+            Problem::Failed => "failed",
+        }
+    }
+}
+
+/// Back to the sign-in page, saying what went wrong.
+fn to_login(base_url: &str, problem: Problem, next: &str) -> Response {
+    let mut url = format!("{base_url}/login?sso_error={}", problem.code());
     if next != "/" {
         url.push_str(&format!("&next={}", urlencoding::encode(next)));
     }
@@ -583,10 +629,10 @@ fn to_login(base_url: &str, message: &str, next: &str) -> Response {
 }
 
 /// Back to Settings › Profile after linking an account.
-fn to_profile(base_url: &str, outcome: Result<(), &str>) -> Response {
+fn to_profile(base_url: &str, outcome: Result<(), Problem>) -> Response {
     let url = match outcome {
         Ok(()) => format!("{base_url}/settings/profile?sso_linked=1"),
-        Err(message) => format!("{base_url}/settings/profile?sso_error={}", urlencoding::encode(message)),
+        Err(problem) => format!("{base_url}/settings/profile?sso_error={}", problem.code()),
     };
     no_store(Response::redirect(&url))
 }
@@ -697,14 +743,14 @@ pub fn start(db: &dyn Db, cfg: &HostConfig, req: &Request) -> Outcome {
     let next = safe_next(query.get("next").map(String::as_str));
     let run = || -> ApiResult<Outcome> {
         if !active(cfg, &load(db)?) {
-            return Ok(crate::http::done(to_login(&base, "Single sign-on isn't set up for this workspace.", &next)));
+            return Ok(crate::http::done(to_login(&base, Problem::NotConfigured, &next)));
         }
-        let mut out = crate::http::done(to_login(&base, "Signing in didn't start. Try again.", &next));
+        let mut out = crate::http::done(to_login(&base, Problem::Failed, &next));
         let job = SsoJob { base_url: base.clone(), kind: Kind::SignIn { next: next.clone() }, phase: Phase::Start };
         out.effects.push(Effect::Connect(Job::Sso(job)));
         Ok(out)
     };
-    run().unwrap_or_else(|e| crate::http::done(to_login(&base, &e.message, &next)))
+    run().unwrap_or_else(|_| crate::http::done(to_login(&base, Problem::Failed, &next)))
 }
 
 /// `GET /sso/callback`: the provider sent someone back. The sign-in must be one this browser
@@ -720,60 +766,55 @@ pub fn callback(db: &dyn Db, cfg: &HostConfig, req: &Request) -> Outcome {
         let Some(row) =
             db.one("SELECT browser_hash, user_id, flow, created_at FROM sso_requests WHERE state_hash = ?", &params![state_hash.clone()])?
         else {
-            return Ok(redirect(to_login(&base, "That sign-in link is no longer valid. Sign in again.", "/")));
+            return Ok(redirect(to_login(&base, Problem::Expired, "/")));
         };
         // Each sign-in link works once.
         db.execute("DELETE FROM sso_requests WHERE state_hash = ?", &params![state_hash])?;
         let flow: Flow = serde_json::from_str(&row.str("flow")).map_err(|e| ApiError::internal(e.to_string()))?;
         let link_user = row.opt_str("user_id");
-        let back = |message: &str| match link_user {
-            Some(_) => redirect(to_profile(&base, Err(message))),
-            None => redirect(to_login(&base, message, &flow.next)),
+        let back = |problem: Problem| match link_user {
+            Some(_) => redirect(to_profile(&base, Err(problem))),
+            None => redirect(to_login(&base, problem, &flow.next)),
         };
         let started = parse_ts(&row.str("created_at")).unwrap_or(now);
         if now - started > Duration::minutes(SIGN_IN_MINUTES) {
-            return Ok(back("Signing in took too long. Sign in again."));
+            return Ok(back(Problem::Expired));
         }
         match &link_user {
             Some(user_id) => {
                 let actor = auth::authenticate(db, cfg, req, now).ok().flatten();
                 if actor.is_none_or(|a| a.user_id != *user_id || a.session_hash.is_none()) {
-                    return Ok(back("Sign in as the person who started linking, then try again."));
+                    return Ok(back(Problem::WrongPerson));
                 }
             }
             None => {
                 let cookie = auth::cookie_value(req, BROWSER_COOKIE).unwrap_or_default();
                 let expected = row.str("browser_hash");
                 if cookie.is_empty() || !crate::util::secure_eq(&sha256_hex(cookie), &expected) {
-                    return Ok(back("Start signing in from this browser's sign-in page, then try again."));
+                    return Ok(back(Problem::OtherBrowser));
                 }
             }
         }
         let conf = load(db)?;
         if !active(cfg, &conf) {
-            return Ok(back("Single sign-on isn't set up for this workspace any more."));
+            return Ok(back(Problem::NotConfigured));
         }
         if conf.fingerprint() != flow.fingerprint {
-            return Ok(back("The workspace's single sign-on settings changed while you were signing in. Try again."));
+            return Ok(back(Problem::Expired));
         }
-        let name = conf.name();
+        // The provider's own error text never reaches the sign-in page; only what kind of failure.
         let code = match (query.get("code").filter(|c| !c.is_empty()), query.get("error")) {
             (Some(c), _) => c.clone(),
-            (None, Some(e)) if e == "access_denied" => return Ok(back(&format!("You didn't finish signing in with {name}."))),
-            (None, Some(e)) => {
-                let why = query.get("error_description").map(|d| connect::excerpt(d, 200)).filter(|d| !d.is_empty());
-                let why = why.unwrap_or_else(|| error_code(e));
-                return Ok(back(&format!("{name} couldn't sign you in: {why}")));
-            }
-            (None, None) => return Ok(back(&format!("{name} sent no sign-in code. Try again."))),
+            (None, Some(e)) if e == "access_denied" => return Ok(back(Problem::Denied)),
+            (None, _) => return Ok(back(Problem::ProviderError)),
         };
-        let mut out = back("Signing in didn't finish. Try again.");
+        let mut out = back(Problem::Failed);
         let returned = Returned { code, flow, link_user, user_agent: req.header("user-agent").map(str::to_string) };
         let job = SsoJob { base_url: base.clone(), kind: Kind::Finish(Box::new(returned)), phase: Phase::Start };
         out.effects.push(Effect::Connect(Job::Sso(job)));
         Ok(out)
     };
-    run().unwrap_or_else(|e| redirect(to_login(&base, &e.message, "/")))
+    run().unwrap_or_else(|_| redirect(to_login(&base, Problem::Failed, "/")))
 }
 
 fn pkce_challenge(verifier: &str) -> String {
@@ -885,7 +926,7 @@ pub fn step(db: &dyn Db, cfg: &HostConfig, j: &mut SsoJob, replies: Vec<HttpRepl
             };
             if !usable {
                 return Ok(match &j.kind {
-                    Kind::SignIn { next } => respond(to_login(&base, "Single sign-on isn't set up for this workspace.", next)),
+                    Kind::SignIn { next } => respond(to_login(&base, Problem::NotConfigured, next)),
                     Kind::Check => fill(settings_view(db, cfg, &base, None)?)?,
                     _ => Step::Done(Finish::Fail(ApiError::bad_request("single sign-on isn't set up for this workspace"))),
                 });
@@ -906,14 +947,7 @@ pub fn step(db: &dyn Db, cfg: &HostConfig, j: &mut SsoJob, replies: Vec<HttpRepl
                 let cookie = browser_cookie(&browser.unwrap_or_default(), secure(&base));
                 Ok(respond(no_store(Response::redirect(&url)).with_header("set-cookie", cookie)))
             }
-            Err(_) => Ok(respond(to_login(
-                &base,
-                &format!(
-                    "Signing in with {} isn't working right now: its settings don't check out. A workspace admin can check Settings › Single sign-on.",
-                    conf.name()
-                ),
-                next,
-            ))),
+            Err(_) => Ok(respond(to_login(&base, Problem::ProviderError, next))),
         },
         (Kind::Link { user_id }, _) => match read_discovery(&conf, &reply) {
             Ok(d) => {
@@ -945,18 +979,17 @@ fn finish_step(
     now: DateTime<Utc>,
 ) -> ApiResult<Step> {
     let base = j.base_url.clone();
-    let name = conf.name();
-    let back = |message: &str| match r.link_user {
-        Some(_) => respond(to_profile(&base, Err(message))),
-        None => respond(to_login(&base, message, &r.flow.next)),
+    let back = |problem: Problem| match r.link_user {
+        Some(_) => respond(to_profile(&base, Err(problem))),
+        None => respond(to_login(&base, problem, &r.flow.next)),
     };
     if !active(cfg, conf) || conf.fingerprint() != r.flow.fingerprint {
-        return Ok(back("The workspace's single sign-on settings changed while you were signing in. Try again."));
+        return Ok(back(Problem::Expired));
     }
     match phase {
         Phase::Start | Phase::Discovering => {
             let Some(secret) = client_secret(cfg, conf) else {
-                return Ok(back(&format!("Signing in with {name} needs its client secret entered again. Ask a workspace admin.")));
+                return Ok(back(Problem::ProviderError));
             };
             j.phase = Phase::Exchanging;
             Ok(Step::Fetch(vec![token_call(conf, &r.flow, &r.code, &secret)]))
@@ -965,17 +998,11 @@ fn finish_step(
             let v = reply.json();
             let id_token = v["id_token"].as_str().filter(|t| reply.ok() && !t.is_empty());
             let Some(id_token) = id_token else {
-                let why = match reply.status {
-                    0 => "it didn't answer in time".to_string(),
-                    s => v["error"].as_str().map(error_code).filter(|e| !e.is_empty()).unwrap_or_else(|| format!("HTTP {s}")),
-                };
-                return Ok(back(&format!(
-                    "{name} didn't accept the sign-in ({why}). Try again; if it keeps happening, a workspace admin can check Settings › Single sign-on."
-                )));
+                return Ok(back(Problem::ProviderError));
             };
             let claims = match jwt_claims(id_token).and_then(|c| check_claims(conf, &c, &r.flow.nonce, now).map(|()| c)) {
                 Ok(c) => c,
-                Err(why) => return Ok(back(&format!("{name}'s answer didn't check out: {why}. Sign in again."))),
+                Err(_) => return Ok(back(Problem::InvalidToken)),
             };
             // Some providers put the email in the userinfo answer only. Microsoft's would never
             // be trusted on its own (see `vouched_email`), so it isn't asked.
@@ -1032,11 +1059,11 @@ fn find_person(db: &dyn Db, user_id: &str) -> ApiResult<Option<Person>> {
 }
 
 /// Why `p` may not sign in, if they may not.
-fn refusal(p: &Person) -> Option<&'static str> {
+fn refusal(p: &Person) -> Option<Problem> {
     if p.deactivated {
-        Some("Your account here is deactivated. Ask a workspace admin to reactivate it.")
+        Some(Problem::Deactivated)
     } else if p.is_bot {
-        Some("Bot accounts sign in with API tokens, not single sign-on.")
+        Some(Problem::Bot)
     } else {
         None
     }
@@ -1081,12 +1108,12 @@ fn link_identity(db: &dyn Db, user_id: &str, conf: &Config, claims: &Value, now:
 /// The ID token checked out: link the account, or sign the person in.
 fn complete(db: &dyn Db, cfg: &HostConfig, base: &str, conf: &Config, r: &Returned, claims: &Value, now: DateTime<Utc>) -> ApiResult<Step> {
     let name = conf.name();
-    let back = |message: &str| match r.link_user {
-        Some(_) => respond(to_profile(base, Err(message))),
-        None => respond(to_login(base, message, &r.flow.next)),
+    let back = |problem: Problem| match r.link_user {
+        Some(_) => respond(to_profile(base, Err(problem))),
+        None => respond(to_login(base, problem, &r.flow.next)),
     };
-    if let Err(message) = org_check(conf, claims) {
-        return Ok(back(&message));
+    if let Err(problem) = org_check(conf, claims) {
+        return Ok(back(problem));
     }
     let subject = claims["sub"].as_str().unwrap_or_default();
     let linked = db.one(
@@ -1095,12 +1122,12 @@ fn complete(db: &dyn Db, cfg: &HostConfig, base: &str, conf: &Config, r: &Return
     )?;
 
     if let Some(user_id) = &r.link_user {
-        let Some(p) = find_person(db, user_id)? else { return Ok(back("Your account here no longer exists.")) };
-        if let Some(why) = refusal(&p) {
-            return Ok(back(why));
+        let Some(p) = find_person(db, user_id)? else { return Ok(back(Problem::Failed)) };
+        if let Some(problem) = refusal(&p) {
+            return Ok(back(problem));
         }
         match linked {
-            Some(row) if row.str("id") != p.id => return Ok(back(&format!("That {name} account is already linked to someone else here."))),
+            Some(row) if row.str("id") != p.id => return Ok(back(Problem::AlreadyLinked)),
             Some(_) => {}
             None => {
                 link_identity(db, &p.id, conf, claims, now)?;
@@ -1119,12 +1146,12 @@ fn complete(db: &dyn Db, cfg: &HostConfig, base: &str, conf: &Config, r: &Return
         None => {
             let email = match vouched_email(conf, claims) {
                 Ok(e) => e,
-                Err(message) => return Ok(back(&message)),
+                Err(problem) => return Ok(back(problem)),
             };
             match db.one(&format!("SELECT {PERSON_COLS} FROM users u WHERE u.email = ?"), &params![email.clone()])?.map(|r| person(&r)) {
                 Some(p) => {
-                    if let Some(why) = refusal(&p) {
-                        return Ok(back(why));
+                    if let Some(problem) = refusal(&p) {
+                        return Ok(back(problem));
                     }
                     // Linked to another account at this issuer: the address may have changed hands.
                     let other = db.scalar_i64(
@@ -1132,20 +1159,18 @@ fn complete(db: &dyn Db, cfg: &HostConfig, base: &str, conf: &Config, r: &Return
                         &params![p.id.clone(), conf.issuer.clone()],
                     )?;
                     if other > 0 {
-                        return Ok(back(&format!(
-                            "{email} is linked to a different {name} account here. Ask a workspace admin to unlink it in Settings › Single sign-on."
-                        )));
+                        return Ok(back(Problem::EmailLinked));
                     }
                     link_identity(db, &p.id, conf, claims, now)?;
                     p
                 }
                 None if conf.auto_provision => provision(db, cfg, base, conf, claims, &email, now)?,
-                None => return Ok(back(&format!("No one here has the email {email}. Ask a workspace admin to add you."))),
+                None => return Ok(back(Problem::NoAccount)),
             }
         }
     };
-    if let Some(why) = refusal(&p) {
-        return Ok(back(why));
+    if let Some(problem) = refusal(&p) {
+        return Ok(back(problem));
     }
     let token = auth::create_session(db, &p.id, r.user_agent.as_deref(), now)?;
     db.execute("UPDATE users SET last_seen_at = ? WHERE id = ?", &params![ts(now), p.id.clone()])?;
