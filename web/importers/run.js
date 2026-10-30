@@ -8,6 +8,10 @@
 // Running a plan again is safe. Pages already there are matched, not duplicated, and their
 // remaining placeholders are finished, so a file that failed to upload the first time is
 // uploaded then. A file already uploaded to a page is reused by checksum and name.
+//
+// Only the importer's own posts are ever finished. import_documents matches only the caller's
+// posts; a page whose title someone else's post already has is reported, not imported, and
+// before changing an existing post the runner checks that the importer wrote it.
 
 import { fillTokens, pendingLink, pendingFile, byteLength, MAX_FILE_BYTES } from './plan.js';
 import { topicSegment } from './paths.js';
@@ -39,8 +43,9 @@ const ambiguous = (e) => {
 };
 
 /**
- * opts: { api: { get, post, patch }, source, rootTopic, status, sha256(bytes), base64(bytes),
- * onProgress(progress), signal, sleep(ms) }. Resolves to a report; never throws for a failed page.
+ * opts: { api: { get, post, patch }, source, rootTopic, status, userId (the importer),
+ * sha256(bytes), base64(bytes), onProgress(progress), signal, sleep(ms) }. Resolves to a report;
+ * never throws for a failed page.
  */
 export async function runImport(plan, opts) {
   const { api, source, sha256, base64, signal } = opts;
@@ -48,7 +53,7 @@ export async function runImport(plan, opts) {
   const status = opts.status === 'draft' ? 'draft' : 'published';
   const root = topicSegment(opts.rootTopic || '');
   const report = {
-    created: [], existing: [], failed: [], notImported: [], stopped: null,
+    created: [], existing: [], taken: [], failed: [], notImported: [], stopped: null,
     files: { uploaded: 0, reused: 0, failed: [] },
     linked: 0, linkFailed: [],
   };
@@ -102,8 +107,15 @@ export async function runImport(plan, opts) {
   }
 
   function record(d, result, sent) {
+    const entry = { title: d.title, id: result.id, url: result.url, path: d.path };
+    if (result.taken) {
+      // Someone else's post has this title here. It isn't this import's page: never link to,
+      // upload to or change it.
+      report.taken.push(entry);
+      return;
+    }
     docs.set(d.n, { id: result.id, url: result.url, created: !result.skipped, sent });
-    (result.skipped ? report.existing : report.created).push({ title: d.title, id: result.id, url: result.url, path: d.path });
+    (result.skipped ? report.existing : report.created).push(entry);
   }
 
   const batches = [];
@@ -246,6 +258,13 @@ export async function runImport(plan, opts) {
           version = 1;
         } else {
           const post = await call(() => api.get(`/posts/${encodeURIComponent(t.id)}`));
+          // Only finish a post the importer wrote, whatever the server matched.
+          if (!opts.userId || !post.author || post.author.id !== opts.userId) {
+            report.linkFailed.push({ title: d.title, url: t.url, reason: 'Someone else wrote this post, so the import left it alone.' });
+            progress.finishDone++;
+            tell();
+            continue;
+          }
           text = post.content;
           version = post.version;
         }
@@ -275,6 +294,7 @@ export async function runImport(plan, opts) {
             if (e instanceof StopImport || e.status !== 409) throw e;
             // Someone edited the page meanwhile: apply the same changes to their version.
             const post = await call(() => api.get(`/posts/${encodeURIComponent(t.id)}`));
+            if (!opts.userId || !post.author || post.author.id !== opts.userId) throw new Error('Someone else wrote this post, so the import left it alone.');
             next = apply(post.content);
             if (next !== post.content) {
               await call(() => api.patch(`/posts/${encodeURIComponent(t.id)}`, { content: next, base_version: post.version, note: 'Added imported files and links' }));

@@ -5,7 +5,7 @@
 
 import { api } from '/api.js';
 import { h, icon, button, toast, field, input, select, checkbox, plural, spinner } from '/ui.js';
-import { state, refreshTopics } from '/state.js';
+import { state, refreshTopics, myId } from '/state.js';
 import { FORMATS, openSource, detectFormat, convert } from '/importers/index.js';
 import { estimate } from '/importers/plan.js';
 import { runImport } from '/importers/run.js';
@@ -242,6 +242,7 @@ async function run() {
       source: c.source,
       rootTopic: c.rootTopic,
       status: c.status,
+      userId: myId(),
       sha256,
       base64,
       signal: c.controller.signal,
@@ -252,7 +253,7 @@ async function run() {
     });
   } catch (e) {
     console.error(e);
-    c.report = { created: [], existing: [], failed: [], notImported: [], stopped: e.message || String(e), files: { uploaded: 0, reused: 0, failed: [] }, linked: 0, linkFailed: [] };
+    c.report = { created: [], existing: [], taken: [], failed: [], notImported: [], stopped: e.message || String(e), files: { uploaded: 0, reused: 0, failed: [] }, linked: 0, linkFailed: [] };
   } finally {
     window.removeEventListener('beforeunload', warnLeaving);
   }
@@ -337,6 +338,7 @@ function doneView(c) {
       c.topic ? h('p', null, h('a', { href: `/t/${encodeURIComponent(c.topic.id)}`, class: 'btn btn-primary' }, icon('folder'), h('span', null, `Open ${c.topic.name}`))) : null,
       list('Pages that failed', r.failed, (x) => h('li', null, h('strong', null, x.title), h('span', { class: 'muted' }, ` ${x.reason}`))),
       list('Not imported because the import stopped', r.notImported, (x) => h('li', null, x.title)),
+      list('Not imported because someone else’s post in the topic has the same title (rename the page, or import into another topic)', r.taken, (x) => h('li', null, h('a', { href: x.url }, x.title))),
       list('Files that failed to upload (running the import again adds them)', r.files.failed, (x) => h('li', null, h('code', null, x.name), h('span', { class: 'muted' }, ` on ${x.page}: ${x.reason}`))),
       list('Pages whose images, files or links couldn’t be added', r.linkFailed, (x) => h('li', null, h('a', { href: x.url }, x.title), h('span', { class: 'muted' }, ` ${x.reason}`))),
       list('Imported pages', r.created, (x) => h('li', null, h('a', { href: x.url }, x.title))),

@@ -9,12 +9,13 @@ import { parseHtml } from './mini-dom.mjs';
 import { zipSource } from '../../web/importers/source.js';
 import { convert } from '../../web/importers/index.js';
 import { runImport } from '../../web/importers/run.js';
+import { pendingFile } from '../../web/importers/plan.js';
 
 const sha256 = async (b) => createHash('sha256').update(b).digest('hex');
 const base64 = (b) => Buffer.from(b).toString('base64');
 const fail = (status, code, message) => Object.assign(new Error(message), { status, code });
 
-function fakeServer({ rejectContent, rejectFile, loseUploadAnswer, importCalls = Infinity, flaky = 0 } = {}) {
+function fakeServer({ rejectContent, rejectFile, loseUploadAnswer, legacyMatch = false, importCalls = Infinity, flaky = 0 } = {}) {
   const posts = [];
   const files = [];
   let seq = 0;
@@ -33,7 +34,7 @@ function fakeServer({ rejectContent, rejectFile, loseUploadAnswer, importCalls =
       }
       const post = posts.find((p) => path === `/posts/${p.id}`);
       if (!post) throw fail(404, 'not_found', 'post not found');
-      return { id: post.id, content: post.content, version: post.version };
+      return { id: post.id, content: post.content, version: post.version, author: { id: post.author || 'me' } };
     },
     async post(path, body) {
       api.calls.push(['POST', path]);
@@ -60,9 +61,13 @@ function fakeServer({ rejectContent, rejectFile, loseUploadAnswer, importCalls =
         const results = [];
         for (const d of body.documents) {
           if (rejectContent && d.content.includes(rejectContent)) throw fail(400, 'bad_request', 'content is larger than 2 MB');
-          const match = body.skip_existing && [...posts, ...staged].find((p) => p.title === d.title && key(p.topic) === key(d.topic));
+          // Like the server: the caller's own post first; someone else's is `taken` (an older
+          // server, `legacyMatch`, matched anyone's as skipped).
+          const same = [...posts, ...staged].filter((p) => p.title === d.title && key(p.topic) === key(d.topic));
+          const match = body.skip_existing && (same.find((p) => (p.author || 'me') === 'me') || same[0]);
           if (match) {
-            results.push({ id: match.id, title: match.title, url: `https://kb.test/p/${match.id}`, skipped: true });
+            const taken = (match.author || 'me') !== 'me' && !legacyMatch;
+            results.push({ id: match.id, title: match.title, url: `https://kb.test/p/${match.id}`, skipped: true, taken });
             continue;
           }
           const p = { id: `p${String(++seq).padStart(9, '0')}`, title: d.title, topic: d.topic, content: d.content, status: d.status, version: 1 };
@@ -92,7 +97,7 @@ async function plan(name) {
   return { source, plan: await convert(name, source, { parseHtml }) };
 }
 
-const run = (p, server, extra = {}) => runImport(p.plan, { api: server.api, source: p.source, rootTopic: p.plan.rootTopic, sha256, base64, sleep: async () => {}, ...extra });
+const run = (p, server, extra = {}) => runImport(p.plan, { api: server.api, source: p.source, rootTopic: p.plan.rootTopic, userId: 'me', sha256, base64, sleep: async () => {}, ...extra });
 
 test('imports everything, uploads files once and links pages to each other', async () => {
   const p = await plan('confluence');
@@ -151,7 +156,7 @@ test('an import that runs out of writes stops, then finishes when run again', as
   assert.ok(!/dsimport:|\/search\?q=/.test(all), all);
 });
 
-test('a file that fails to upload is added by the next run', async () => {
+test('a file that fails to upload is added to the importer’s own page by the next run', async () => {
   const p = await plan('confluence');
   const server = fakeServer({ rejectFile: 'dock.png', flaky: 1 });
   const first = await run(p, server);
@@ -203,5 +208,33 @@ test('drafts, a different top topic and every format run cleanly', async () => {
     assert.equal(report.created.length, p.plan.documents.length, name);
     assert.ok(server.posts.every((x) => x.status === 'draft' && x.topic.startsWith('Imported')), name);
     assert.ok(!/dsimport:|\/search\?q=/.test(server.posts.map((x) => x.content).join('\n')), name);
+  }
+});
+
+test('someone else’s same-titled post is never adopted, uploaded to or changed', async () => {
+  for (const legacyMatch of [false, true]) {
+    const p = await plan('confluence');
+    const server = fakeServer({ legacyMatch });
+    // Bob's post has the title one of the pages will use, and a planted upload placeholder.
+    const dock = p.plan.attachments.find((a) => a.name === 'dock.png');
+    const planted = `Send it here ![x](${pendingFile(dock)}) and [x](/search?q=Onboarding&import=00000000)`;
+    server.posts.push({ id: 'pbob000001', title: 'Laptop setup', topic: 'Engineering Handbook/Onboarding', content: planted, status: 'published', version: 1, author: 'bob' });
+    const report = await run(p, server);
+    const bobs = server.posts.find((x) => x.id === 'pbob000001');
+    assert.equal(bobs.content, planted, `legacyMatch ${legacyMatch}`);
+    assert.equal(bobs.version, 1);
+    assert.ok(!server.files.some((f) => f.post_id === 'pbob000001'), 'no files go to Bob’s post');
+    assert.ok(!server.api.calls.some(([m, path]) => m === 'PATCH' && path.includes('pbob000001')));
+    assert.equal(report.created.length, 6);
+    if (legacyMatch) {
+      // An older server matched it; the runner checks who wrote it and leaves it alone.
+      assert.deepEqual(report.linkFailed.map((x) => x.title), ['Laptop setup']);
+    } else {
+      assert.deepEqual(report.taken.map((x) => x.title), ['Laptop setup']);
+      assert.ok(!report.existing.some((x) => x.id === 'pbob000001'));
+      // Links to that page don't point at Bob's post either.
+      const onboarding = server.posts.find((x) => x.title === 'Onboarding');
+      assert.ok(!onboarding.content.includes('/p/pbob000001'), onboarding.content);
+    }
   }
 });

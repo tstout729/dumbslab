@@ -39,7 +39,7 @@ pub fn ops() -> Vec<Op> {
             .build(),
         op("admin", "import_documents", "POST", "/import", Access::Write, import_documents)
             .title("Import Markdown documents")
-            .desc("Create many posts at once, e.g. when migrating from Confluence, Guru, a GitHub wiki, Notion or a docs folder. Each document can name a topic path like `Engineering/Runbooks`; missing topics are created, and those created under a private topic are private with the same members. Imports don't notify topic followers or mentioned people. Pass `skip_existing: true` to skip documents whose title already exists in the same topic, so an interrupted import can be re-run without duplicates. A failing document rolls back the whole call, so send batches (25 is a good size) and retry a failed batch one document at a time. To migrate a whole export: convert each page to Markdown, import the pages (`results` lists the post for each document in order), upload each page's images with upload_file and that page's `post_id`, then use edit_post to put the returned `/files/...` paths and links to the new posts (`/p/<id>`) in place.")
+            .desc("Create many posts at once, e.g. when migrating from Confluence, Guru, a GitHub wiki, Notion or a docs folder. Each document can name a topic path like `Engineering/Runbooks`; missing topics are created, and those created under a private topic are private with the same members. Imports don't notify topic followers or mentioned people. Pass `skip_existing: true` to skip documents whose title is already one of your posts in the same topic, so an interrupted import can be re-run without duplicates; a title someone else's post has there is reported in `taken` and not imported. A failing document rolls back the whole call, so send batches (25 is a good size) and retry a failed batch one document at a time. To migrate a whole export: convert each page to Markdown, import the pages (`results` lists the post for each document in order), upload each page's images with upload_file and that page's `post_id`, then use edit_post to put the returned `/files/...` paths and links to the new posts (`/p/<id>`) in place.")
             .build(),
     ]
 }
@@ -518,9 +518,11 @@ pub struct ImportDocument {
 pub struct ImportInput {
     /// Up to 500 documents per call.
     pub documents: Vec<ImportDocument>,
-    /// Skip a document when a post you can see with exactly the same title is already in its
-    /// topic (for a document without a topic: among posts with no topic), and report that post
-    /// instead. Trashed posts and templates don't count. Default false.
+    /// Skip a document when a post with exactly the same title is already in its topic (for a
+    /// document without a topic: among posts with no topic), and report that post instead. Only
+    /// your own posts count as already imported: when the post is someone else's, nothing is
+    /// created and the document is reported in `taken`. Trashed posts and templates don't count.
+    /// Default false.
     pub skip_existing: Option<bool>,
 }
 
@@ -532,14 +534,20 @@ pub struct ImportedDocument {
     pub url: String,
     /// True when `skip_existing` matched an existing post and nothing was created.
     pub skipped: bool,
+    /// With `skipped`: the matching post is someone else's, so the document wasn't imported.
+    /// Leave that post alone; rename the document or import it into another topic.
+    pub taken: bool,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct ImportResult {
     /// Posts this call created.
     pub created: Vec<PostLink>,
-    /// Existing posts that `skip_existing` matched, so their documents weren't imported again.
+    /// Your existing posts that `skip_existing` matched, so their documents weren't imported again.
     pub skipped: Vec<PostLink>,
+    /// Someone else's posts that already have a document's title in its topic, so with
+    /// `skip_existing` those documents weren't imported.
+    pub taken: Vec<PostLink>,
     /// One entry per document, in the order sent.
     pub results: Vec<ImportedDocument>,
     pub topics_created: i64,
@@ -602,9 +610,10 @@ fn ensure_topic_path(ctx: &mut Ctx, path: &str, created: &mut i64) -> ApiResult<
 }
 
 /// A post the actor can see with exactly this title in the topic (or, without a topic, in no
-/// topic). Trashed posts and templates don't count.
-fn existing_post(ctx: &Ctx, title: &str, topic_id: Option<&str>) -> ApiResult<Option<PostLink>> {
-    let mut p = params![title];
+/// topic), the actor's own first, and whether it is the actor's. Trashed posts and templates
+/// don't count.
+fn existing_post(ctx: &Ctx, title: &str, topic_id: Option<&str>) -> ApiResult<Option<(PostLink, bool)>> {
+    let mut p = params![ctx.actor.user_id.clone(), title];
     let place = match topic_id {
         Some(tid) => {
             p.push(tid.into());
@@ -615,11 +624,11 @@ fn existing_post(ctx: &Ctx, title: &str, topic_id: Option<&str>) -> ApiResult<Op
     let vis = post_visible_sql(&ctx.actor, "p", &mut p);
     let row = ctx.db.one(
         &format!(
-            "SELECT p.id, p.title, p.slug FROM posts p WHERE p.title = ? AND {place} AND p.deleted_at IS NULL AND p.is_template = 0 AND {vis} ORDER BY p.created_at LIMIT 1"
+            "SELECT p.id, p.title, p.slug, p.author_id = ? AS own FROM posts p WHERE p.title = ? AND {place} AND p.deleted_at IS NULL AND p.is_template = 0 AND {vis} ORDER BY own DESC, p.created_at LIMIT 1"
         ),
         &p,
     )?;
-    Ok(row.map(|r| PostLink { url: post_url(ctx, &r.str("id"), &r.str("slug")), id: r.str("id"), title: r.str("title") }))
+    Ok(row.map(|r| (PostLink { url: post_url(ctx, &r.str("id"), &r.str("slug")), id: r.str("id"), title: r.str("title") }, r.bool("own"))))
 }
 
 fn import_documents(ctx: &mut Ctx, input: ImportInput) -> ApiResult<ImportResult> {
@@ -628,16 +637,28 @@ fn import_documents(ctx: &mut Ctx, input: ImportInput) -> ApiResult<ImportResult
         return Err(ApiError::bad_request("import at most 500 documents per call"));
     }
     let skip_existing = input.skip_existing.unwrap_or(false);
-    let (mut created, mut skipped, mut results) = (vec![], vec![], vec![]);
+    let (mut created, mut skipped, mut taken, mut results) = (vec![], vec![], vec![], vec![]);
     let mut topics_created = 0;
     for doc in input.documents {
         let topic_id = match clean(doc.topic) {
             Some(path) => ensure_topic_path(ctx, &path, &mut topics_created)?,
             None => None,
         };
-        if skip_existing && let Some(post) = existing_post(ctx, doc.title.trim(), topic_id.as_deref())? {
-            results.push(ImportedDocument { id: post.id.clone(), title: post.title.clone(), url: post.url.clone(), skipped: true });
-            skipped.push(post);
+        // Only the caller's own post counts as this document already imported. Someone else's post
+        // with the title is neither adopted (a retry would then change it) nor duplicated.
+        if skip_existing && let Some((post, own)) = existing_post(ctx, doc.title.trim(), topic_id.as_deref())? {
+            results.push(ImportedDocument {
+                id: post.id.clone(),
+                title: post.title.clone(),
+                url: post.url.clone(),
+                skipped: true,
+                taken: !own,
+            });
+            if own {
+                skipped.push(post)
+            } else {
+                taken.push(post)
+            }
             continue;
         }
         // Imported text was written elsewhere: its @handles aren't meant for people here, and
@@ -655,13 +676,19 @@ fn import_documents(ctx: &mut Ctx, input: ImportInput) -> ApiResult<ImportResult
             false,
         )?;
         let link = PostLink { id: post.summary.id, title: post.summary.title, url: post.summary.url };
-        results.push(ImportedDocument { id: link.id.clone(), title: link.title.clone(), url: link.url.clone(), skipped: false });
+        results.push(ImportedDocument {
+            id: link.id.clone(),
+            title: link.title.clone(),
+            url: link.url.clone(),
+            skipped: false,
+            taken: false,
+        });
         created.push(link);
     }
     emit(
         ctx,
         Event::new("import.completed", "workspace", "import", format!("imported {} documents", created.len()))
-            .data(json!({ "count": created.len(), "skipped": skipped.len() })),
+            .data(json!({ "count": created.len(), "skipped": skipped.len(), "taken": taken.len() })),
     )?;
-    Ok(ImportResult { created, skipped, results, topics_created })
+    Ok(ImportResult { created, skipped, taken, results, topics_created })
 }

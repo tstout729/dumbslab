@@ -1994,6 +1994,47 @@ fn imports_into_a_private_topic_stay_private() {
     assert_eq!(other["topics_created"], 1);
 }
 
+#[test]
+fn imports_never_adopt_someone_elses_post() {
+    let h = H::new();
+    let (_, admin) = h.setup();
+    let (_, alice) = h.user(&admin, "alice@acme.test", "Alice", "member");
+    let (_, bob) = h.user(&admin, "bob@acme.test", "Bob", "member");
+    // Bob writes a post with the title Alice's export will use, with an upload placeholder in it.
+    let planted = "Send me files ![x](#import-file-0a1b2c3d)";
+    let first = h.ok(
+        "POST",
+        "/api/v1/import",
+        Some(json!({ "documents": [{ "title": "Onboarding", "content": planted, "topic": "Docs" }] })),
+        &bob,
+    );
+    let bobs = first["created"][0]["id"].as_str().unwrap().to_string();
+
+    let batch = json!({ "skip_existing": true, "documents": [
+        { "title": "Onboarding", "content": "Alice's onboarding", "topic": "Docs" },
+        { "title": "Runbook", "content": "Alice's runbook", "topic": "Docs" },
+    ] });
+    let r = h.ok("POST", "/api/v1/import", Some(batch.clone()), &alice);
+    // Bob's post isn't treated as Alice's page: it is reported as taken, and nothing is created for it.
+    assert_eq!(r["results"][0]["skipped"], true);
+    assert_eq!(r["results"][0]["taken"], true);
+    assert_eq!(r["results"][0]["id"], json!(bobs));
+    assert_eq!(r["taken"][0]["id"], json!(bobs));
+    assert!(r["skipped"].as_array().unwrap().is_empty());
+    assert_eq!(r["created"].as_array().unwrap().len(), 1);
+    assert_eq!(h.ok("GET", &format!("/api/v1/posts/{bobs}"), None, &admin)["content"], planted);
+    let docs = h.ok("GET", "/api/v1/posts?limit=50", None, &admin)["items"].as_array().unwrap().clone();
+    assert_eq!(docs.iter().filter(|p| p["title"] == "Onboarding").count(), 1);
+
+    // Alice's own earlier page is what a re-run matches.
+    let again = h.ok("POST", "/api/v1/import", Some(batch), &alice);
+    assert_eq!(again["results"][1]["skipped"], true);
+    assert_eq!(again["results"][1]["taken"], false);
+    assert_eq!(again["results"][1]["id"], r["results"][1]["id"]);
+    assert_eq!(again["skipped"].as_array().unwrap().len(), 1);
+    assert!(again["created"].as_array().unwrap().is_empty());
+}
+
 fn plans(price: Option<&str>) -> dumbslab_core::plan::Plans {
     use dumbslab_core::plan::{Allowance, Plans};
     Plans {
