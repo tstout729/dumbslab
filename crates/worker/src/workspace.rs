@@ -579,19 +579,22 @@ impl DurableObject for Workspace {
         }
 
         let mut effects = outcome.effects;
-        // Connected apps: run the job, then answer with its result.
+        let mut response = outcome.response;
+        // Connected apps and single sign-on: run the job and answer with its result. The request's
+        // own webhooks (say, `sso.updated` from saving the settings) still go out below, as on the
+        // native server. Events recorded inside the job send none.
         if let Some(i) = effects.iter().position(|e| matches!(e, Effect::Connect(_))) {
             let Effect::Connect(job) = effects.remove(i) else { unreachable!() };
             let finish = self.run_job(job, &move_cfg).await?;
-            return to_response(dumbslab_core::connect::respond(outcome.response, finish));
+            response = dumbslab_core::connect::respond(response, finish);
         }
         // upgrade_plan and manage_billing: the answer holds a placeholder for the Stripe page's URL.
         if let Some(Effect::Stripe(call)) = effects.iter().find(|e| matches!(e, Effect::Stripe(_))) {
-            let filled = crate::billing::page(&self.env, call).await?.and_then(|url| plan::fill_stripe_url(&outcome.response.body, &url));
+            let filled = crate::billing::page(&self.env, call).await?.and_then(|url| plan::fill_stripe_url(&response.body, &url));
             let Some(body) = filled else {
                 return error_response(502, "billing_unavailable", "Stripe couldn't open that page just now. Try again in a minute.");
             };
-            return to_response(dumbslab_core::Response { body, ..outcome.response });
+            return to_response(dumbslab_core::Response { body, ..response });
         }
         if let Some(i) = effects.iter().position(|e| matches!(e, Effect::MoveAddress(_))) {
             let Effect::MoveAddress(mv) = effects.remove(i) else { unreachable!() };
@@ -625,7 +628,7 @@ impl DurableObject for Workspace {
             });
         }
 
-        to_response(outcome.response)
+        to_response(response)
     }
 }
 

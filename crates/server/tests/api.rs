@@ -3546,4 +3546,89 @@ mod sso {
         assert_eq!(h.ok("GET", "/api/v1/auth/state", None, &Auth::None)["sso"]["required"], true);
         assert_eq!(login(&h), 403);
     }
+
+    #[test]
+    fn userinfo_can_vouch_for_the_id_tokens_email() {
+        let (h, admin) = workspace();
+        let (mo_id, _) = h.user(&admin, "mo@acme.test", "Mo", "member");
+        okta(&h, &admin, json!({}));
+        // The ID token gives Mo's address but doesn't say whether it's verified.
+        let id_token = || claims(OKTA, "sub-mo", "mo@acme.test", json!({}));
+        let provider = |info: HttpReply| {
+            move |call: &HttpCall, jwt: &str| {
+                if call.url.ends_with("/userinfo") {
+                    assert!(call.headers.contains(&("authorization".into(), "Bearer provider-access-token".into())));
+                    info.clone()
+                } else {
+                    tokens(call, jwt)
+                }
+            }
+        };
+        let sign_in = |info: HttpReply, c: Value| {
+            let s = start(&h, OKTA);
+            come_back(&h, &s, c, &provider(info))
+        };
+        let refused = |info: HttpReply, c: Value| {
+            let (landing, sent) = sign_in(info, c);
+            assert!(landing.session().is_none());
+            (landing.error(), sent.len())
+        };
+
+        // An answer about another account, or another address, vouches for nothing.
+        let other_account = ok(json!({ "sub": "sub-eve", "email": "mo@acme.test", "email_verified": true }));
+        assert_eq!(refused(other_account, id_token()), ("unverified_email".to_string(), 2));
+        let other_address = ok(json!({ "sub": "sub-mo", "email": "eve@acme.test", "email_verified": true }));
+        assert_eq!(refused(other_address, id_token()), ("unverified_email".to_string(), 2));
+        // No answer at all (or one that isn't JSON): the ID token alone decides.
+        assert_eq!(refused(HttpReply::default(), id_token()), ("unverified_email".to_string(), 2));
+        assert_eq!(
+            refused(HttpReply { status: 200, body: "eyJhbGciOiJSUzI1NiJ9.e30.c2ln".into() }, id_token()),
+            ("unverified_email".to_string(), 2)
+        );
+        // An ID token that says the address isn't verified isn't overruled, so nobody asks.
+        let unverified = claims(OKTA, "sub-mo", "mo@acme.test", json!({ "email_verified": false }));
+        let verified_answer = || ok(json!({ "sub": "sub-mo", "email": "MO@acme.test", "email_verified": true }));
+        assert_eq!(refused(verified_answer(), unverified), ("unverified_email".to_string(), 1));
+        assert_eq!(count(&h, "SELECT COUNT(*) FROM sso_identities"), 0);
+
+        // The same account vouching for the same address: Mo is matched and linked.
+        let (landing, sent) = sign_in(verified_answer(), id_token());
+        assert_eq!(sent.len(), 2);
+        assert!(sent[1].url.ends_with("/userinfo"));
+        assert_eq!(me(&h, &landing.session().unwrap_or_else(|| panic!("{}", landing.error())))["id"], mo_id.as_str());
+        // Linked now, so later sign-ins don't need to ask.
+        let (landing, sent) = sign_in(HttpReply::default(), id_token());
+        assert!(landing.session().is_some());
+        assert_eq!(sent.len(), 1);
+    }
+
+    #[test]
+    fn saving_settings_keeps_its_webhooks_next_to_the_check() {
+        let (h, admin) = workspace();
+        h.ok("POST", "/api/v1/webhooks", Some(json!({ "url": "https://hooks.test/dumbslab", "events": ["sso.*"] })), &admin);
+        let r = h.call(
+            "PATCH",
+            "/api/v1/sso",
+            Some(json!({ "provider": "okta", "issuer": OKTA, "client_id": "app-id", "client_secret": "shh-client-secret" })),
+            &admin,
+        );
+        assert_eq!(r.status, 200, "{}", r.body);
+        // One job (the discovery check) and the `sso.updated` delivery, which hosts send after the job.
+        let jobs = r.effects.iter().filter(|e| matches!(e, Effect::Connect(_))).count();
+        let hooks: Vec<_> = r
+            .effects
+            .iter()
+            .filter_map(|e| match e {
+                Effect::Webhook(d) => Some(d),
+                _ => None,
+            })
+            .collect();
+        assert_eq!((jobs, hooks.len()), (1, 1), "{:?}", r.effects);
+        assert!(hooks[0].headers.contains(&("x-dumbslab-event".into(), "sso.updated".into())));
+        assert!(!hooks[0].body.contains("shh-client-secret"));
+        // Connected apps' requests are unchanged: just their job.
+        let r = h.call("POST", "/api/v1/connections", Some(json!({ "app": "github", "fields": { "token": "ghp_x" } })), &admin);
+        assert_eq!(r.effects.len(), 1);
+        assert!(matches!(r.effects[0], Effect::Connect(_)));
+    }
 }

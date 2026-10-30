@@ -691,6 +691,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn jobs_keep_the_requests_own_webhooks() {
+        // Saving single sign-on settings both checks the provider (a job) and records
+        // `sso.updated` (a webhook): running the job must leave the webhook to be delivered.
+        let dir = tempfile::tempdir().unwrap();
+        let app = App::new(Store::open(&dir.path().join("t.db")).unwrap(), HostConfig::default(), false);
+        let job = connect::Job::Sso(dumbslab_core::sso::SsoJob::check("https://kb.test"));
+        let outcome = Outcome {
+            response: dumbslab_core::Response::json(200, &serde_json::json!(connect::PENDING)),
+            commit: true,
+            effects: vec![Effect::Connect(job), Effect::Webhook(delivery("https://hooks.test/sso"))],
+        };
+        let done = finish_jobs(&app, outcome).await;
+        assert!(!String::from_utf8_lossy(&done.response.body).contains(connect::PENDING), "the job's result is filled in");
+        assert_eq!(done.effects.len(), 1);
+        assert!(matches!(&done.effects[0], Effect::Webhook(d) if d.url == "https://hooks.test/sso"));
+    }
+
+    #[tokio::test]
     async fn webhook_deliveries_are_bounded() {
         let dir = tempfile::tempdir().unwrap();
         let app = App::new(Store::open(&dir.path().join("t.db")).unwrap(), HostConfig::default(), false);

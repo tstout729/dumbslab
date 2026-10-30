@@ -1030,10 +1030,15 @@ fn finish_step(
                 Ok(c) => c,
                 Err(_) => return Ok(back(Problem::InvalidToken)),
             };
-            // Some providers put the email in the userinfo answer only. Microsoft's would never
-            // be trusted on its own (see `vouched_email`), so it isn't asked.
+            // A first sign-in matches people by email, and some providers give the address, or
+            // say whether it's verified, only in their userinfo answer: ask it then. Microsoft's
+            // would never be trusted on its own (see `vouched_email`), so it isn't asked.
             let access = v["access_token"].as_str().filter(|t| !t.is_empty());
-            let asks = claims.get("email").is_none() && conf.provider != Some(Provider::Microsoft);
+            let lacks_email = claims.get("email").is_none() || claims.get("email_verified").is_none();
+            let asks = lacks_email
+                && r.link_user.is_none()
+                && conf.provider != Some(Provider::Microsoft)
+                && !is_linked(db, conf, claims["sub"].as_str().unwrap_or_default())?;
             if let (true, Some(url), Some(access)) = (asks, r.flow.userinfo_endpoint.clone(), access) {
                 j.phase = Phase::UserInfo { claims };
                 return Ok(Step::Fetch(vec![HttpCall::get(url).bearer(access).header("accept", "application/json")]));
@@ -1041,16 +1046,41 @@ fn finish_step(
             complete(db, cfg, &base, conf, r, &claims, now)
         }
         Phase::UserInfo { mut claims } => {
-            let info = reply.json();
-            // The answer must be about the same account (OpenID Connect Core 1.0, 5.3.2).
-            if reply.ok() && info["sub"].as_str().is_some() && info["sub"] == claims["sub"] {
-                for key in ["email", "email_verified", "name", "given_name", "family_name"] {
-                    if claims.get(key).is_none() && !info[key].is_null() {
-                        claims[key] = info[key].clone();
-                    }
-                }
+            // No answer, or one that isn't JSON, adds nothing: the sign-in goes on with the ID token alone.
+            if reply.ok() {
+                merge_userinfo(&mut claims, &reply.json());
             }
             complete(db, cfg, &base, conf, r, &claims, now)
+        }
+    }
+}
+
+/// Whether an account at the provider is linked to someone here already.
+fn is_linked(db: &dyn Db, conf: &Config, subject: &str) -> ApiResult<bool> {
+    let n =
+        db.scalar_i64("SELECT COUNT(*) FROM sso_identities WHERE issuer = ? AND subject = ?", &params![conf.issuer.clone(), subject])?;
+    Ok(n > 0)
+}
+
+/// Adds what the userinfo answer says to what the ID token didn't. Only an answer about the same
+/// account counts (OpenID Connect Core 1.0, 5.3.2), and its `email_verified` only with its own
+/// `email`, which must be the ID token's address when the token has one. Nothing the ID token
+/// says is replaced.
+fn merge_userinfo(claims: &mut Value, info: &Value) {
+    let same_account = info["sub"].as_str().is_some_and(|s| !s.is_empty() && Some(s) == claims["sub"].as_str());
+    if !same_account {
+        return;
+    }
+    let normalize = |v: &Value| v.as_str().map(|e| e.trim().to_ascii_lowercase()).filter(|e| !e.is_empty());
+    let mut keys = vec!["name", "given_name", "family_name"];
+    match (normalize(&claims["email"]), normalize(&info["email"])) {
+        (Some(token), Some(answer)) if token != answer => {}
+        (_, Some(_)) => keys.extend(["email", "email_verified"]),
+        (_, None) => {}
+    }
+    for key in keys {
+        if claims.get(key).is_none() && !info[key].is_null() {
+            claims[key] = info[key].clone();
         }
     }
 }
@@ -1371,6 +1401,35 @@ mod tests {
         assert!(check_claims(&c, &short, "n", now).is_err());
         let g = Config { issuer: "https://accounts.google.com".into(), ..conf(Provider::Google) };
         assert!(check_claims(&g, &short, "n", now).is_ok());
+    }
+
+    #[test]
+    fn userinfo_fills_in_only_for_the_same_account_and_address() {
+        let token = || json!({ "sub": "u1", "email": "Ada@acme.com" });
+        let merged = |claims: Value, info: Value| {
+            let mut c = claims;
+            merge_userinfo(&mut c, &info);
+            c
+        };
+        let c = merged(token(), json!({ "sub": "u1", "email": "ada@acme.com", "email_verified": true, "name": "Ada" }));
+        assert_eq!(
+            (c["email_verified"].as_bool(), c["name"].as_str(), c["email"].as_str()),
+            (Some(true), Some("Ada"), Some("Ada@acme.com"))
+        );
+        // Another account, another address, or no address to vouch for: nothing about the email.
+        assert!(merged(token(), json!({ "sub": "u2", "email": "ada@acme.com", "email_verified": true })).get("email_verified").is_none());
+        assert!(merged(token(), json!({ "sub": "u1", "email": "eve@acme.com", "email_verified": true })).get("email_verified").is_none());
+        assert!(merged(token(), json!({ "sub": "u1", "email_verified": true })).get("email_verified").is_none());
+        assert!(merged(token(), json!({ "email": "ada@acme.com", "email_verified": true })).get("email_verified").is_none());
+        // A token without an address takes the answer's.
+        let c = merged(json!({ "sub": "u1" }), json!({ "sub": "u1", "email": "ada@acme.com", "email_verified": "true" }));
+        assert_eq!((c["email"].as_str(), c["email_verified"].as_str()), (Some("ada@acme.com"), Some("true")));
+        // What the token says stands.
+        let c = merged(
+            json!({ "sub": "u1", "email": "ada@acme.com", "email_verified": false }),
+            json!({ "sub": "u1", "email": "ada@acme.com", "email_verified": true }),
+        );
+        assert_eq!(c["email_verified"], false);
     }
 
     #[test]

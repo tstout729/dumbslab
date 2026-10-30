@@ -43,7 +43,7 @@ Settings › Single sign-on shows it with a copy button. If the workspace's addr
 | Okta, OneLogin, other OIDC | accounts at your issuer | `email_verified` is true |
 | Slack | members of your Slack workspace, when you name it | `email_verified` is true |
 
-In every case the email's domain must be one of the allowed domains. If your provider doesn't send `email_verified`, first sign-ins can't find people by email, so people link their accounts from Settings › Profile, or you turn on auto-provisioning only where the provider does vouch for addresses.
+In every case the email's domain must be one of the allowed domains. When the ID token doesn't give the email or say whether it's verified, DumbSlab asks the provider's userinfo endpoint (never Microsoft's), and uses its answer only when it's about the same account (`sub`) and, if the ID token has an address, the same address. If your provider doesn't send `email_verified` at all, first sign-ins can't find people by email, so people link their accounts from Settings › Profile, or you turn on auto-provisioning only where the provider does vouch for addresses.
 
 ## Requiring single sign-on
 
@@ -104,7 +104,7 @@ Auth0, Keycloak, JumpCloud, Ping, Authentik and others work the same way.
 - Signing in uses OpenID Connect's authorization code flow with PKCE (S256), a `state` and a `nonce`. The `state` is stored hashed and works once, for 15 minutes, in the browser that started it (a short-lived cookie names that browser).
 - Each sign-in reads `<issuer>/.well-known/openid-configuration`. Its `issuer` must equal the configured issuer exactly, and its endpoints must be https.
 - The code is exchanged at the token endpoint with the client secret: with HTTP Basic, or in the form for providers that only take that (Slack).
-- The ID token arrives straight from the token endpoint over TLS, so, as OpenID Connect Core 1.0 section 3.1.3.7 allows, its signature isn't checked. Its issuer, audience, authorized party, expiry, issue time and nonce are. When it has no email, DumbSlab asks the userinfo endpoint (except Microsoft's), whose answer must be about the same `sub`.
+- The ID token arrives straight from the token endpoint over TLS, so, as OpenID Connect Core 1.0 section 3.1.3.7 allows, its signature isn't checked. Its issuer, audience, authorized party, expiry, issue time and nonce are. When it lacks the email or `email_verified`, and the account isn't linked yet, DumbSlab asks the userinfo endpoint (except Microsoft's). Its answer must be about the same `sub`, and its `email_verified` counts only for the ID token's own address.
 - The core builds every request and reads every answer; the host only sends them, over https, without following redirects, within 8 seconds and reading at most 4 MB. The self-hosted server refuses private network addresses unless it runs with `--allow-private-webhooks`.
 - A sign-in starts an ordinary browser session, with the same cookie rules and 30-day length as a password sign-in.
 - Problems send people back to the sign-in page (or Settings › Profile, when linking) with only an error code, such as `?sso_error=unverified_email`. The page shows its own message for each code, so a link can't make the sign-in page say anything else, and nothing the provider sends (error text, tokens) ever reaches it. The admin's settings check gives the details of a provider that doesn't check out.
