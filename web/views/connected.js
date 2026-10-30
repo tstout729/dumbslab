@@ -156,6 +156,22 @@ export function attachPreviews(root) {
 // ---------------------------------------------------------------------------
 // Settings › Connected apps
 
+// What the codes in `?connect_error=` mean. The link carries only a code, never a message:
+// anyone can make a link to this page.
+const connectErrors = {
+  expired_link: () => 'That sign-in link is no longer valid. Start connecting again.',
+  wrong_person: () => 'Sign in to DumbSlab as the person who started connecting, then try again.',
+  too_slow: () => 'Signing in took too long. Start connecting again.',
+  unavailable: (app) => `Signing in with ${app} isn’t available on this server.`,
+  declined: (app) => `${app} didn’t allow the connection. Try again, and allow access when ${app} asks.`,
+  no_code: (app) => `${app} didn’t finish signing in. Try again.`,
+  failed: (app) => `Connecting ${app} didn’t work. Try again.`,
+};
+
+function connectError(code, app) {
+  return Object.hasOwn(connectErrors, code) ? connectErrors[code](app) : 'Connecting didn’t work. Try again.';
+}
+
 export async function connectionsSection() {
   const list = await connections({ fresh: true });
   const query = new URLSearchParams(location.search);
@@ -165,7 +181,9 @@ export async function connectionsSection() {
     notes.push(h('p', { class: 'callout', role: 'status' }, icon('check', { size: 15 }), h('span', null, `${app ? app.name : 'The app'} is connected.`)));
   }
   if (query.get('connect_error')) {
-    notes.push(h('p', { class: 'callout callout-warn', role: 'alert' }, icon('alert', { size: 15 }), h('span', null, query.get('connect_error'))));
+    const app = list.apps.find((a) => a.id === query.get('app'));
+    notes.push(h('p', { class: 'callout callout-warn', role: 'alert' }, icon('alert', { size: 15 }),
+      h('span', null, connectError(query.get('connect_error'), app ? app.name : 'the app'))));
   }
   if (!list.enabled) {
     return h('section', { class: 'panel' }, emptyState({ iconName: 'plug', title: 'Connected apps aren’t set up here',

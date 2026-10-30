@@ -2516,8 +2516,14 @@ mod connected {
         // The person who started must be the one coming back.
         let state = start(&admin);
         let r = callback(&state, &mo);
-        assert!(r.effects.is_empty() && location(&r).contains("connect_error="), "{}", location(&r));
-        assert!(location(&callback(&state, &admin)).contains("no%20longer%20valid"), "a state works once");
+        // Links back to Settings carry only a code (and the app), never text anyone could write.
+        assert_eq!(location(&r), "https://kb.test/settings/connections?connect_error=wrong_person&app=github");
+        assert!(r.effects.is_empty());
+        assert_eq!(
+            location(&callback(&state, &admin)),
+            "https://kb.test/settings/connections?connect_error=expired_link",
+            "a state works once"
+        );
 
         // Success: the code is exchanged with the client secret, the account read, and the person sent to Settings.
         let state = start(&admin);
@@ -2536,7 +2542,19 @@ mod connected {
         assert!(matches!(&finish, Finish::Redirect(u) if u == "https://kb.test/settings/connections?connected=github"), "{finish:?}");
         assert_eq!(h.ok("GET", "/api/v1/connections", None, &admin)["apps"][0]["connected"]["account"], "@ada");
 
-        // The app saying no lands back in Settings with its reason.
+        // A failed exchange lands back in Settings with a code, not GitHub's answer.
+        let state = start(&admin);
+        let refused = |_: &HttpCall| HttpReply {
+            status: 400,
+            body: json!({ "error": "bad_verification_code", "error_description": "Call 555-0100" }).to_string(),
+        };
+        let (finish, _) = drive(&h, job_of(&callback(&state, &admin)), &refused);
+        assert!(
+            matches!(&finish, Finish::Redirect(u) if u == "https://kb.test/settings/connections?connect_error=failed&app=github"),
+            "{finish:?}"
+        );
+
+        // The app saying no lands back in Settings.
         let state = start(&admin);
         let r = h.call(
             "GET",
@@ -2544,7 +2562,8 @@ mod connected {
             None,
             &admin,
         );
-        assert!(r.effects.is_empty() && location(&r).contains("said%20no"), "{}", location(&r));
+        assert_eq!(location(&r), "https://kb.test/settings/connections?connect_error=declined&app=github", "the app's own words stay out");
+        assert!(r.effects.is_empty());
 
         // Hosted workspaces name themselves in the state, so the root domain can forward the person.
         let mut hosted = h;

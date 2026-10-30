@@ -712,11 +712,44 @@ pub fn start_sign_in(
     Ok(format!("{}?{qs}", spec.authorize_url))
 }
 
-/// The settings page, with a result for the person to see.
-fn settings_url(base_url: &str, outcome: Result<&str, &str>) -> String {
+/// Why connecting by signing in didn't work. Only these codes go in the link back to Settings,
+/// never text: anyone can make a link to Settings, and the page shows what the code means.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum SignInError {
+    /// The sign-in link was used already, or never existed.
+    ExpiredLink,
+    /// Someone other than the person who started came back.
+    WrongPerson,
+    TooSlow,
+    /// The app, or signing in with it, isn't available on this server.
+    Unavailable,
+    /// The app refused, e.g. the person didn't allow access.
+    Declined,
+    NoCode,
+    Failed,
+}
+
+impl SignInError {
+    fn code(self) -> &'static str {
+        match self {
+            SignInError::ExpiredLink => "expired_link",
+            SignInError::WrongPerson => "wrong_person",
+            SignInError::TooSlow => "too_slow",
+            SignInError::Unavailable => "unavailable",
+            SignInError::Declined => "declined",
+            SignInError::NoCode => "no_code",
+            SignInError::Failed => "failed",
+        }
+    }
+}
+
+/// The settings page, with how connecting `provider` went (empty when the app isn't known).
+fn settings_url(base_url: &str, provider: &str, outcome: Result<(), SignInError>) -> String {
+    let app = urlencoding::encode(provider);
     match outcome {
-        Ok(provider) => format!("{base_url}/settings/connections?connected={}", urlencoding::encode(provider)),
-        Err(message) => format!("{base_url}/settings/connections?connect_error={}", urlencoding::encode(message)),
+        Ok(()) => format!("{base_url}/settings/connections?connected={app}"),
+        Err(e) if provider.is_empty() => format!("{base_url}/settings/connections?connect_error={}", e.code()),
+        Err(e) => format!("{base_url}/settings/connections?connect_error={}&app={app}", e.code()),
     }
 }
 
@@ -743,31 +776,25 @@ pub fn callback(db: &dyn Db, cfg: &HostConfig, req: &Request) -> crate::Outcome 
             &params![sha256_hex(&state)],
         )?
         else {
-            return Ok(redirect(settings_url(&base, Err("That sign-in link is no longer valid. Start connecting again."))));
+            return Ok(redirect(settings_url(&base, "", Err(SignInError::ExpiredLink))));
         };
         let started = parse_ts(&row.str("created_at")).unwrap_or(now);
         let provider = row.str("provider");
         db.execute("DELETE FROM connect_requests WHERE state_hash = ?", &params![sha256_hex(&state)])?;
         let actor = crate::auth::authenticate(db, cfg, req, now)?;
         if actor.as_ref().map(|a| a.user_id.as_str()) != Some(row.str("user_id").as_str()) {
-            return Ok(redirect(settings_url(
-                &base,
-                Err("Sign in to the workspace as the person who started connecting, then try again."),
-            )));
+            return Ok(redirect(settings_url(&base, &provider, Err(SignInError::WrongPerson))));
         }
         if now - started > Duration::minutes(SIGN_IN_MINUTES) {
-            return Ok(redirect(settings_url(&base, Err("Signing in took too long. Start connecting again."))));
+            return Ok(redirect(settings_url(&base, &provider, Err(SignInError::TooSlow))));
         }
         let Some(connector) = providers::get(&provider) else {
-            return Ok(redirect(settings_url(&base, Err("That app isn't available any more."))));
+            return Ok(redirect(settings_url(&base, "", Err(SignInError::Unavailable))));
         };
         let code = match (query.get("code"), query.get("error")) {
             (Some(c), _) if !c.is_empty() => c.clone(),
-            (_, Some(e)) => {
-                let why = query.get("error_description").cloned().unwrap_or_else(|| e.clone());
-                return Ok(redirect(settings_url(&base, Err(&format!("{} didn't connect: {why}", connector.info().name)))));
-            }
-            _ => return Ok(redirect(settings_url(&base, Err("The app sent no sign-in code. Try again.")))),
+            (_, Some(_)) => return Ok(redirect(settings_url(&base, &provider, Err(SignInError::Declined)))),
+            _ => return Ok(redirect(settings_url(&base, &provider, Err(SignInError::NoCode)))),
         };
         let job = Job::Connect(ConnectJob {
             user_id: row.str("user_id"),
@@ -778,11 +805,11 @@ pub fn callback(db: &dyn Db, cfg: &HostConfig, req: &Request) -> crate::Outcome 
             phase: ConnectPhase::Start,
             back_to: Some(base.clone()),
         });
-        let mut out = redirect(settings_url(&base, Err("Connecting didn't finish. Try again.")));
+        let mut out = redirect(settings_url(&base, &provider, Err(SignInError::Failed)));
         out.effects.push(crate::Effect::Connect(job));
         Ok(out)
     };
-    run().unwrap_or_else(|e| redirect(settings_url(&base, Err(&e.message))))
+    run().unwrap_or_else(|_| redirect(settings_url(&base, "", Err(SignInError::Failed))))
 }
 
 // ---------------------------------------------------------------------------
@@ -1299,9 +1326,10 @@ fn start_searching(j: &mut SearchJob, conns: Vec<Connection>, failed: Vec<AppRes
 fn connect_step(db: &dyn Db, cfg: &HostConfig, j: &mut ConnectJob, replies: Vec<HttpReply>, now: DateTime<Utc>) -> ApiResult<Step> {
     let connector = providers::get(j.provider).ok_or_else(|| ApiError::bad_request("unknown app"))?;
     let name = connector.info().name;
-    let fail = |j: &ConnectJob, message: String| -> Step {
+    // A sign-in goes back to Settings with a code; the app's own words stay out of the link.
+    let fail = |j: &ConnectJob, code: SignInError, message: String| -> Step {
         match &j.back_to {
-            Some(base) => Step::Done(Finish::Redirect(settings_url(base, Err(&message)))),
+            Some(base) => Step::Done(Finish::Redirect(settings_url(base, j.provider, Err(code)))),
             None => Step::Done(Finish::Fail(ApiError::new(400, "connect_failed", message))),
         }
     };
@@ -1309,7 +1337,7 @@ fn connect_step(db: &dyn Db, cfg: &HostConfig, j: &mut ConnectJob, replies: Vec<
         ConnectPhase::Start => match &j.sign_in {
             Some(sign_in) => {
                 let Some(app) = oauth_app(cfg, j.provider) else {
-                    return Ok(fail(j, format!("Signing in with {name} isn't set up on this server any more.")));
+                    return Ok(fail(j, SignInError::Unavailable, format!("Signing in with {name} isn't set up on this server any more.")));
                 };
                 let mut form = vec![
                     ("grant_type".into(), "authorization_code".into()),
@@ -1338,14 +1366,14 @@ fn connect_step(db: &dyn Db, cfg: &HostConfig, j: &mut ConnectJob, replies: Vec<
                     j.phase = ConnectPhase::Profiling;
                     Ok(Step::Fetch(connector.profile(&j.cred)))
                 }
-                Err(e) => Ok(fail(j, e)),
+                Err(e) => Ok(fail(j, SignInError::Failed, e)),
             }
         }
         ConnectPhase::Profiling => match connector.read_profile(&j.cred, &replies) {
             Ok(account) => {
                 save(db, cfg, j, &account, now)?;
                 match &j.back_to {
-                    Some(base) => Ok(Step::Done(Finish::Redirect(settings_url(base, Ok(j.provider))))),
+                    Some(base) => Ok(Step::Done(Finish::Redirect(settings_url(base, j.provider, Ok(()))))),
                     None => {
                         let shown = ConnectedAccount {
                             provider: j.provider.into(),
@@ -1358,7 +1386,7 @@ fn connect_step(db: &dyn Db, cfg: &HostConfig, j: &mut ConnectJob, replies: Vec<
                     }
                 }
             }
-            Err(e) => Ok(fail(j, e)),
+            Err(e) => Ok(fail(j, SignInError::Failed, e)),
         },
     }
 }
