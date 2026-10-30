@@ -3,10 +3,15 @@
 use super::Connector;
 
 pub mod github;
+pub mod gitlab;
 pub mod google_drive;
+pub mod linear;
+pub mod shortcut;
+pub mod todoist;
 
 /// Every app this build can connect to, in the order Settings shows them.
-pub static ALL: &[&dyn Connector] = &[&github::GitHub, &google_drive::GoogleDrive];
+pub static ALL: &[&dyn Connector] =
+    &[&github::GitHub, &google_drive::GoogleDrive, &gitlab::GitLab, &linear::Linear, &shortcut::Shortcut, &todoist::Todoist];
 
 pub fn get(id: &str) -> Option<&'static dyn Connector> {
     ALL.iter().copied().find(|c| c.info().id == id)
