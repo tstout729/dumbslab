@@ -1,6 +1,6 @@
 # DumbSlab
 
-An open-source team knowledge base in the spirit of [Slab](https://slab.com), written in Rust and built so AI agents can do everything people can.
+An open-source team knowledge base, written in Rust and built so AI agents can do everything people can.
 
 **Try it free at [dumbslab.com](https://dumbslab.com).** Pick an address, and your workspace lives at `name.dumbslab.com`. Every feature is free there; a Pro plan adds storage and daily writes for teams that need more room. Or self-host it from this repository, with no limits at all.
 
@@ -122,5 +122,3 @@ See [AGENTS.md](AGENTS.md) for conventions, which apply to people too.
 ## License
 
 Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.
-
-DumbSlab is an independent project. It is not affiliated with or endorsed by Slab, Inc.

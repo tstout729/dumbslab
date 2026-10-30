@@ -153,7 +153,7 @@ pub fn root_llms_txt(root: &str) -> String {
     format!(
         "# DumbSlab
 
-> DumbSlab is a free, open-source team wiki and knowledge base, in the spirit of Slab, built so AI agents can do everything people can. Every workspace has its own MCP server and REST API.
+> DumbSlab is a free, open-source team wiki and knowledge base, built so AI agents can do everything people can. Every workspace has its own MCP server and REST API.
 
 Hosted workspaces are free at https://{root}/ with no credit card. Each workspace has its own address, such as https://acme.{root}. The same software runs self-hosted as one Rust binary with one SQLite file, or on Cloudflare Workers.
 
@@ -177,8 +177,6 @@ Hosted workspaces are free at https://{root}/ with no credit card. Each workspac
 - [Source code](https://github.com/tstout729/dumbslab): Rust, dual-licensed MIT or Apache-2.0.
 - [README](https://github.com/tstout729/dumbslab/blob/main/README.md): features, quick start, MCP, REST and the CLI.
 - [Deploying to Cloudflare](https://github.com/tstout729/dumbslab/blob/main/docs/cloudflare.md)
-
-DumbSlab is an independent project, not affiliated with Slab, Inc.
 "
     )
 }
