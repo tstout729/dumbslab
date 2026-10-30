@@ -22,7 +22,8 @@ An open-source team knowledge base, written in Rust and built so AI agents can d
 | Search | Full-text search (SQLite FTS5) across posts, comments and topics; stemming, phrases, prefix matching, highlighted snippets, permission-aware |
 | People | Admin, member and viewer roles, bot accounts, deactivation |
 | Notifications | Mentions, replies, comments and updates on followed posts, new posts in followed topics |
-| Admin | Workspace settings, API tokens with scopes, signed webhooks, JSON export, bulk Markdown import |
+| Import | Confluence spaces (HTML export), Guru collections, GitHub wikis and folders of Markdown files, with their topics, links between pages, images and attachments. Converted in the browser with a preview first; running an import again skips what's already there. Agents can import through MCP too. See [docs/import.md](docs/import.md) |
+| Admin | Workspace settings, API tokens with scopes, signed webhooks, JSON export |
 | Slack | `/dumbslab search` and `/dumbslab new` from Slack as yourself, previews of links to posts everyone can see, and messages in chosen channels when posts are published or updated. See [docs/slack.md](docs/slack.md) |
 | Connected apps | Everyone connects their own GitHub, Google Drive, Slack, Jira, Confluence, Zendesk, Asana, Box, Dropbox, Guru and more, to search them from DumbSlab and preview links to them in posts. See [docs/connected-apps.md](docs/connected-apps.md) |
 | Single sign-on | Sign in with Google Workspace, Microsoft Entra ID, Okta, OneLogin, Slack or any OpenID Connect provider, set up per workspace on every plan. Optional auto-provisioning, and an option to require it for everyone but admins. See [docs/sso.md](docs/sso.md) |
