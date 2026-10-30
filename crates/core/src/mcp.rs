@@ -247,21 +247,17 @@ fn call_tool(ctx: &mut Ctx, toolset: Toolset, id: Value, params: &Value) -> (Opt
         return (Some(rpc_result(id, tool_error(&ApiError::forbidden("this MCP connection is read-only (toolset=read)")))), true);
     }
     match op.call(ctx, args) {
-        Ok(value) => {
-            let text = serde_json::to_string(&value).unwrap_or_default();
-            (
-                Some(rpc_result(
-                    id,
-                    json!({ "content": [{ "type": "text", "text": text }], "structuredContent": value, "isError": false }),
-                )),
-                true,
-            )
-        }
+        Ok(value) => (Some(rpc_result(id, tool_result(value))), true),
         Err(e) => (Some(rpc_result(id, tool_error(&e))), e.keep_writes),
     }
 }
 
-fn tool_error(e: &ApiError) -> Value {
+pub(crate) fn tool_result(value: Value) -> Value {
+    let text = serde_json::to_string(&value).unwrap_or_default();
+    json!({ "content": [{ "type": "text", "text": text }], "structuredContent": value, "isError": false })
+}
+
+pub(crate) fn tool_error(e: &ApiError) -> Value {
     let mut text = format!("Error ({}): {}", e.code, e.message);
     if let Some(d) = &e.details {
         text.push_str(&format!("\nDetails: {d}"));

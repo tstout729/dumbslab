@@ -44,6 +44,7 @@ pub fn is_core_path(path: &str) -> bool {
         || path == API_PREFIX
         || path.starts_with("/api/")
         || path.starts_with("/files/")
+        || path.starts_with("/connect/")
 }
 
 /// Handles a request. `None` means the path isn't ours (the host serves static files).
@@ -61,6 +62,10 @@ pub fn handle(db: &dyn Db, cfg: &HostConfig, req: &Request) -> Option<Outcome> {
         crate::oauth::handle(db, cfg, req)
     } else if path.starts_with("/files/") {
         crate::ops::files::serve(db, cfg, req)
+    } else if path == "/connect/callback" && req.method == "GET" {
+        crate::connect::callback(db, cfg, req)
+    } else if path.starts_with("/connect/") {
+        failed(&ApiError::not_found("route"))
     } else {
         let rest = path.strip_prefix(API_PREFIX)?;
         let r = api(db, cfg, req, rest);

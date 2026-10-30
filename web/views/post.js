@@ -8,6 +8,7 @@ import {
 } from '/ui.js';
 import { state, navigate, myId } from '/state.js';
 import { statusBadges } from '/views/common.js';
+import { attachPreviews } from '/views/connected.js';
 
 export const QUICK_EMOJI = ['👍', '❤️', '🎉', '😄', '🚀', '👀', '🙏', '✅'];
 
@@ -170,6 +171,7 @@ export async function render(ctx) {
       /* leave odd links alone */
     }
   }
+  attachPreviews(body);
 
   // --- Header -------------------------------------------------------------------
   function verifyMenuItems() {

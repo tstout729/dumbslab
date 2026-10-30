@@ -11,6 +11,13 @@ fn random_string(alphabet: &[u8], len: usize) -> String {
     (0..len).map(|_| alphabet[rng.random_range(0..alphabet.len())] as char).collect()
 }
 
+/// Random bytes, e.g. for a nonce.
+pub fn random_bytes<const N: usize>() -> [u8; N] {
+    let mut out = [0u8; N];
+    rand::rng().fill(&mut out);
+    out
+}
+
 /// A short, URL-friendly random id, e.g. `k3v9q0x2mz`.
 pub fn new_id() -> String {
     random_string(ID_ALPHABET, 10)

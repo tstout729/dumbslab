@@ -296,6 +296,55 @@ impl Workspace {
         }
     }
 
+    /// Runs a connected-apps job (see `dumbslab_core::connect::step`), each step in its own
+    /// transaction, sending the requests it asks for in between.
+    /// Its writes count against the plan like the request's own.
+    async fn run_job(&self, mut job: dumbslab_core::connect::Job, cfg: &HostConfig) -> Result<dumbslab_core::connect::Finish> {
+        use dumbslab_core::connect::{self, Finish, Step};
+        let mut replies = vec![];
+        let mut written = 0;
+        let mut finish = Finish::Fail(ApiError::internal("connected apps took too many steps"));
+        for _ in 0..connect::MAX_STEPS {
+            let storage = self.state.storage();
+            let cfg = cfg.clone();
+            let db = self.db();
+            let sql = db.sql.clone();
+            let ran = transaction(&storage, db.clone(), move |db| {
+                let before = sql.database_size() as u64;
+                let mut job = job;
+                let mut step = connect::step(db, &cfg, &mut job, replies, Utc::now());
+                if let Some(e) =
+                    cfg.hosting.as_ref().filter(|_| step.is_ok()).and_then(|h| storage_refusal(db, h, before, sql.database_size() as u64))
+                {
+                    step = Err(e);
+                }
+                let ok = step.is_ok();
+                ((step, job), ok)
+            });
+            written += db.rows_written();
+            let (step, next) = ran?;
+            job = next;
+            match step {
+                Err(e) => {
+                    finish = Finish::Fail(e);
+                    break;
+                }
+                Ok(Step::Done(done)) => {
+                    finish = done;
+                    break;
+                }
+                Ok(Step::Fetch(calls)) => replies = futures_util::future::join_all(calls.iter().map(crate::connect::send)).await,
+            }
+        }
+        if let Some(h) = cfg.hosting.as_ref().filter(|_| written > 0) {
+            if let Err(e) = plan::record_writes(&self.db(), Utc::now(), written) {
+                console_error!("recording usage failed: {}", e.message);
+            }
+            self.report_usage(&h.home, false);
+        }
+        Ok(finish)
+    }
+
     /// Answers for an address nobody has set up yet, without creating storage.
     fn unclaimed(&self, method: &Method, path: &str, url: &Url, origin: &str, slug: &str) -> Result<Response> {
         let root = var(&self.env, "ROOT_DOMAIN").unwrap_or_default();
@@ -461,6 +510,7 @@ impl DurableObject for Workspace {
             signup_secret: if multi { signup_secret } else { None },
             workspace: workspace.clone(),
             hosting,
+            connectors: crate::connect::connectors(&self.env, &origin, multi),
         };
         let move_cfg = cfg.clone();
 
@@ -478,16 +528,10 @@ impl DurableObject for Workspace {
                     let commit = o.commit && (!creating || o.response.status == 200);
                     // Upgrading must work when the workspace is full; its first one stores a billing id.
                     let upgrading = o.effects.iter().any(|e| matches!(e, Effect::Stripe(_)));
-                    if let Some(h) = cfg.hosting.as_ref().filter(|_| !exempt && !upgrading) {
-                        let after = sql.database_size() as u64;
-                        if commit && after > before {
-                            let plan = plan::current(db).map(|s| s.plan()).unwrap_or(Plan::Free);
-                            let shared_full = plan == Plan::Free && h.capacity.growth_paused;
-                            let own_full = after > h.plans.allowance(plan).storage_bytes;
-                            if own_full || shared_full {
-                                return (Err(plan::storage_full(&h.plans, plan, !own_full)), false);
-                            }
-                        }
+                    if let Some(h) = cfg.hosting.as_ref().filter(|_| commit && !exempt && !upgrading)
+                        && let Some(e) = storage_refusal(db, h, before, sql.database_size() as u64)
+                    {
+                        return (Err(e), false);
                     }
                     (Ok(Some(o)), commit)
                 }
@@ -530,6 +574,12 @@ impl DurableObject for Workspace {
         }
 
         let mut effects = outcome.effects;
+        // Connected apps: run the job, then answer with its result.
+        if let Some(i) = effects.iter().position(|e| matches!(e, Effect::Connect(_))) {
+            let Effect::Connect(job) = effects.remove(i) else { unreachable!() };
+            let finish = self.run_job(job, &move_cfg).await?;
+            return to_response(dumbslab_core::connect::respond(outcome.response, finish));
+        }
         // upgrade_plan and manage_billing: the answer holds a placeholder for the Stripe page's URL.
         if let Some(Effect::Stripe(call)) = effects.iter().find(|e| matches!(e, Effect::Stripe(_))) {
             let filled = crate::billing::page(&self.env, call).await?.and_then(|url| plan::fill_stripe_url(&outcome.response.body, &url));
@@ -572,4 +622,16 @@ impl DurableObject for Workspace {
 
         to_response(outcome.response)
     }
+}
+
+/// Refuses a transaction that grew a full workspace's storage: past its plan's allowance, or a
+/// free workspace while the free plan is at capacity (see [`plan::storage_full`]).
+fn storage_refusal(db: &dyn Db, h: &Hosting, before: u64, after: u64) -> Option<ApiError> {
+    if after <= before {
+        return None;
+    }
+    let plan = plan::current(db).map(|s| s.plan()).unwrap_or(Plan::Free);
+    let shared_full = plan == Plan::Free && h.capacity.growth_paused;
+    let own_full = after > h.plans.allowance(plan).storage_bytes;
+    (own_full || shared_full).then(|| plan::storage_full(&h.plans, plan, !own_full))
 }

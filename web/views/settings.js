@@ -7,11 +7,13 @@ import {
   select, checkbox, avatar, timeEl, copyField, copyText, emptyState, setTheme, themePref, frag, menuButton, absTime, plural,
 } from '/ui.js';
 import { state, emit, navigate, canAdmin, myId } from '/state.js';
+import { connectionsSection } from '/views/connected.js';
 
 const SECTIONS = [
   { id: 'profile', label: 'Profile', icon: 'user' },
   { id: 'agents', label: 'Connect agents', icon: 'plug' },
   { id: 'tokens', label: 'API tokens', icon: 'key' },
+  { id: 'connections', label: 'Connected apps', icon: 'link' },
   { id: 'people', label: 'People', icon: 'users', admin: true },
   { id: 'webhooks', label: 'Webhooks', icon: 'zap', admin: true },
   { id: 'workspace', label: 'Workspace', icon: 'settings', admin: true },
@@ -675,6 +677,7 @@ const RENDER = {
   profile: profileSection,
   agents: agentsSection,
   tokens: tokensSection,
+  connections: connectionsSection,
   people: peopleSection,
   webhooks: webhooksSection,
   workspace: workspaceSection,

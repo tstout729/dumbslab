@@ -1074,6 +1074,23 @@ a.stat:hover { background: var(--bg-hover); text-decoration: none; }
 .usage-high .usage-fill { background: var(--amber); }
 .usage-full .usage-fill { background: var(--red); }
 .plan-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.connected-results { margin-top: 28px; display: flex; flex-direction: column; gap: 14px; }
+.connected-title { font-size: 15px; font-weight: 650; }
+.connected-group { display: flex; flex-direction: column; gap: 8px; }
+.connected-app { font-size: 13px; font-weight: 650; color: var(--ink-2); text-transform: uppercase; letter-spacing: .04em; }
+.connected-hint { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.app-list { display: flex; flex-direction: column; gap: 12px; }
+.app-card { border: 1px solid var(--line); border-radius: var(--r-md); padding: 14px 16px; display: flex; flex-direction: column; gap: 10px; }
+.app-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; }
+.app-name { font-weight: 650; }
+.app-body { display: flex; flex-direction: column; gap: 10px; }
+.token-form { max-width: 460px; }
+.link-preview { padding: 12px 14px; display: flex; flex-direction: column; gap: 6px; max-width: 360px; font-size: 13.5px; }
+.link-preview-title { font-weight: 650; font-size: 14.5px; line-height: 1.35; }
+.link-preview-facts { display: grid; grid-template-columns: auto 1fr; gap: 2px 10px; margin: 2px 0; }
+.link-preview-facts dt { color: var(--ink-3); }
+.link-preview-facts dd { margin: 0; }
+.link-preview-desc { color: var(--ink-2); line-height: 1.45; display: -webkit-box; -webkit-line-clamp: 4; -webkit-box-orient: vertical; overflow: hidden; }
 .plan-list { margin: 0; padding-left: 18px; display: flex; flex-direction: column; gap: 4px; font-size: 14px; color: var(--ink-2); }
 
 .snippet { display: flex; flex-direction: column; gap: 6px; }

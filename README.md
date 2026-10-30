@@ -23,6 +23,7 @@ An open-source team knowledge base, written in Rust and built so AI agents can d
 | People | Admin, member and viewer roles, bot accounts, deactivation |
 | Notifications | Mentions, replies, comments and updates on followed posts, new posts in followed topics |
 | Admin | Workspace settings, API tokens with scopes, signed webhooks, JSON export, bulk Markdown import |
+| Connected apps | Everyone connects their own GitHub, Google Drive, Slack, Jira, Confluence, Zendesk, Asana, Box, Dropbox, Guru and more, to search them from DumbSlab and preview links to them in posts. See [docs/connected-apps.md](docs/connected-apps.md) |
 
 ## Quick start
 
@@ -40,6 +41,7 @@ Options (flags or environment variables):
 | `--bind` | `DUMBSLAB_BIND` | `127.0.0.1:8080` |
 | `--base-url` | `DUMBSLAB_BASE_URL` | the request's origin |
 | `--setup-token` | `DUMBSLAB_SETUP_TOKEN` | generated and logged |
+| | `DUMBSLAB_CONNECTOR_KEY` | unset: [connected apps](docs/connected-apps.md) are off |
 | `--open-setup` | | off (local development only: setup without a token) |
 
 ### Docker

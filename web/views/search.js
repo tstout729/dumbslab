@@ -4,6 +4,7 @@ import { api } from '/api.js';
 import { h, icon, kbd, modKey, debounce, timeEl, topicChip, urlPath, button, busy, toastError, emptyState, pageHeader, userLink, select, checkbox, setTheme, themePref } from '/ui.js';
 import { state, navigate, canEdit } from '/state.js';
 import { statusBadges, inlineLoading } from '/views/common.js';
+import { connectedResults } from '/views/connected.js';
 
 const KIND_ICON = { post: 'file', comment: 'comment', topic: 'hash' };
 const KIND_LABEL = { post: 'Post', comment: 'Comment', topic: 'Topic' };
@@ -265,6 +266,7 @@ export async function renderPage(ctx) {
     add(first);
     results.append(list, more);
   }
+  results.append(connectedResults(q));
   ctx.main.replaceChildren(page);
   void inlineLoading;
   void state;
