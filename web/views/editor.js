@@ -40,12 +40,15 @@ export async function renderNew(ctx) {
 export async function renderEdit(ctx) {
   const post = await api.get(`/posts/${enc(ctx.params.id)}`);
   if (!ctx.isCurrent()) return;
-  if (!post.can_edit) {
+  if (!post.can_edit || post.synced_from) {
     ctx.setTitle(`Edit ${post.title}`);
+    const synced = post.synced_from;
     ctx.main.replaceChildren(h('div', { class: 'page page-narrow' }, emptyState({
       iconName: 'lock',
-      title: post.deleted_at ? 'This post is in the trash' : 'You can’t edit this post',
-      body: post.deleted_at ? 'Restore it before editing.' : 'Viewers can read and comment but not edit.',
+      title: post.deleted_at ? 'This post is in the trash' : synced ? 'This post is synced from a repository' : 'You can’t edit this post',
+      body: post.deleted_at ? 'Restore it before editing.'
+        : synced ? `Edit ${synced.repository}/${synced.path} there; each push updates this post.`
+          : 'Viewers can read and comment but not edit.',
       action: h('a', { class: 'btn btn-primary', href: `/p/${post.id}/${post.slug}` }, 'Back to the post'),
     })));
     return;

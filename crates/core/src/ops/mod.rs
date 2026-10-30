@@ -16,6 +16,7 @@ pub mod notifications;
 pub mod plan;
 pub mod posts;
 pub mod search;
+pub mod sync;
 pub mod topics;
 pub mod users;
 
@@ -28,6 +29,7 @@ pub fn all() -> Vec<Op> {
     ops.extend(files::ops());
     ops.extend(search::ops());
     ops.extend(connections::ops());
+    ops.extend(sync::ops());
     ops.extend(notifications::ops());
     ops.extend(admin::ops());
     ops.extend(plan::ops());

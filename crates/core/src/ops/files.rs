@@ -34,7 +34,7 @@ pub const MAX_FILE_SIZE: usize = 10 * 1024 * 1024;
 /// Bytes per stored chunk. A Durable Object row holds at most 2 MB.
 const CHUNK_SIZE: usize = 1024 * 1024;
 /// Types shown inline. They're only ever set from the file's own bytes, never from a claim.
-const INLINE_TYPES: &[&str] = &["image/png", "image/jpeg", "image/gif", "image/webp", "image/avif"];
+pub(crate) const INLINE_TYPES: &[&str] = &["image/png", "image/jpeg", "image/gif", "image/webp", "image/avif"];
 const OCTET_STREAM: &str = "application/octet-stream";
 const MAX_NAME_CHARS: usize = 200;
 /// Unattached uploads one post save can attach.
@@ -295,25 +295,7 @@ fn upload_file(ctx: &mut Ctx, input: UploadFileInput) -> ApiResult<FileInfo> {
     let content_type = content_type_for(&bytes, input.content_type.as_deref());
     let id = new_id();
     let post_id = post.as_ref().map(|p| p.str("id"));
-    ctx.db.execute(
-        "INSERT INTO files (id, name, content_type, size, sha256, uploaded_by, post_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        &params![
-            id.clone(),
-            name.clone(),
-            content_type.clone(),
-            bytes.len(),
-            hex::encode(Sha256::digest(&bytes)),
-            ctx.actor.user_id.clone(),
-            post_id.clone(),
-            ctx.now_s()
-        ],
-    )?;
-    for (seq, chunk) in bytes.chunks(CHUNK_SIZE).enumerate() {
-        ctx.db.execute(
-            "INSERT INTO file_chunks (file_id, seq, data) VALUES (?, ?, ?)",
-            &[SqlValue::from(id.as_str()), SqlValue::from(seq), SqlValue::Blob(chunk.to_vec())],
-        )?;
-    }
+    store(ctx, &id, &name, &content_type, &bytes, post_id.as_deref())?;
     // A file that belongs to no post may be meant for a private one, so its name stays out of
     // the activity everyone sees.
     let summary = match &post {
@@ -331,6 +313,22 @@ fn upload_file(ctx: &mut Ctx, input: UploadFileInput) -> ApiResult<FileInfo> {
     };
     emit(ctx, event)?;
     info_for(ctx, &id)
+}
+
+/// Stores a file's bytes as the actor's upload, in `post_id` when given. Shared with docs sync,
+/// which uploads a repository's images.
+pub(crate) fn store(ctx: &Ctx, id: &str, name: &str, content_type: &str, bytes: &[u8], post_id: Option<&str>) -> ApiResult<()> {
+    ctx.db.execute(
+        "INSERT INTO files (id, name, content_type, size, sha256, uploaded_by, post_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        &params![id, name, content_type, bytes.len(), hex::encode(Sha256::digest(bytes)), ctx.actor.user_id.clone(), post_id, ctx.now_s()],
+    )?;
+    for (seq, chunk) in bytes.chunks(CHUNK_SIZE).enumerate() {
+        ctx.db.execute(
+            "INSERT INTO file_chunks (file_id, seq, data) VALUES (?, ?, ?)",
+            &[SqlValue::from(id), SqlValue::from(seq), SqlValue::Blob(chunk.to_vec())],
+        )?;
+    }
+    Ok(())
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]

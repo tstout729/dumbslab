@@ -133,7 +133,23 @@ pub struct UserKeyInput {
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct UserProfile {
     pub user: User,
+    /// Job details from the people sync (BambooHR). Empty strings when unknown.
+    pub details: Details,
+    /// The person's manager, when the people sync found them in the workspace too.
+    pub manager: Option<UserRef>,
     pub recent_posts: PostList,
+}
+
+#[derive(Debug, Default, Serialize, JsonSchema)]
+pub struct Details {
+    /// Job title.
+    pub title: String,
+    pub department: String,
+    /// Office or location.
+    pub location: String,
+    /// Work phone.
+    pub phone: String,
+    pub pronouns: String,
 }
 
 fn get_user(ctx: &mut Ctx, input: UserKeyInput) -> ApiResult<UserProfile> {
@@ -147,7 +163,23 @@ fn get_user(ctx: &mut Ctx, input: UserKeyInput) -> ApiResult<UserProfile> {
         ),
         &p,
     )?;
-    Ok(UserProfile { user: User::from_row(&row), recent_posts: PostList { items: summaries(ctx, &rows)?, next_cursor: None } })
+    let synced = ctx.db.one("SELECT * FROM user_profiles WHERE user_id = ?", &params![row.str("id")])?;
+    let details = synced
+        .as_ref()
+        .map(|d| Details {
+            title: d.str("title"),
+            department: d.str("department"),
+            location: d.str("location"),
+            phone: d.str("phone"),
+            pronouns: d.str("pronouns"),
+        })
+        .unwrap_or_default();
+    let manager = match synced.and_then(|d| d.opt_str("manager_id")) {
+        Some(m) => user_refs(ctx.db, std::slice::from_ref(&m))?.remove(&m),
+        None => None,
+    };
+    let recent_posts = PostList { items: summaries(ctx, &rows)?, next_cursor: None };
+    Ok(UserProfile { user: User::from_row(&row), details, manager, recent_posts })
 }
 
 fn unique_handle(ctx: &Ctx, wanted: &str, exclude_user: Option<&str>) -> ApiResult<String> {

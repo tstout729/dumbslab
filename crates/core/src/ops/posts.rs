@@ -110,6 +110,10 @@ pub struct Post {
     pub can_edit: bool,
     /// Topic ids where this post is pinned.
     pub pinned_in: Vec<String>,
+    /// Set when the post is kept in sync with a file in a repository (docs sync): its title and
+    /// content change only there, and edits here are refused. Topics, status, verification,
+    /// comments and reactions still work here.
+    pub synced_from: Option<crate::sync::docs::SyncedFrom>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -294,6 +298,7 @@ pub fn full_post(ctx: &Ctx, row: &Row, with_html: bool) -> ApiResult<Post> {
         reactions: reaction_groups(ctx, "post", &id)?,
         can_edit: ctx.actor.role >= Role::Member && row.opt_str("deleted_at").is_none(),
         pinned_in,
+        synced_from: crate::sync::docs::synced_from(ctx.db, &id)?,
         content,
         summary,
     })
@@ -395,7 +400,17 @@ fn on_first_publish(ctx: &Ctx, post_id: &str, title: &str, content: &str) -> Api
 }
 
 /// Saves a new version when the title or content changed. Returns whether anything changed.
+/// Synced posts change only in their repository.
 fn save_revision(ctx: &Ctx, post: &Row, title: &str, content: &str, note: &str) -> ApiResult<bool> {
+    if title != post.str("title") || content != post.str("content") {
+        crate::sync::docs::refuse_edit(ctx.db, &post.str("id"), &post.str("title"))?;
+    }
+    write_revision(ctx, post, title, content, note, true)
+}
+
+/// Saves a new version when the title or content changed: the path every change to a post's
+/// text takes, edits and docs sync alike. `notify: false` sends no notifications.
+pub(crate) fn write_revision(ctx: &Ctx, post: &Row, title: &str, content: &str, note: &str, notify: bool) -> ApiResult<bool> {
     let old_title = post.str("title");
     let old_content = post.str("content");
     if title == old_title && content == old_content {
@@ -429,7 +444,7 @@ fn save_revision(ctx: &Ctx, post: &Row, title: &str, content: &str, note: &str) 
     if title != old_title {
         search::reindex_post_comments(ctx.db, &id)?;
     }
-    if post.str("status") == "published" {
+    if notify && post.str("status") == "published" {
         let before: HashSet<String> = markdown::mentions(&old_content).into_iter().collect();
         let new: Vec<String> = markdown::mentions(content).into_iter().filter(|m| !before.contains(m)).collect();
         notify_mentions(ctx, &id, title, &new)?;
@@ -529,6 +544,69 @@ pub fn create_post(ctx: &mut Ctx, input: CreatePostInput) -> ApiResult<Post> {
     reload(ctx, &id)
 }
 
+/// What [`sync_post`] did.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum Synced {
+    Created,
+    Updated,
+    Unchanged,
+    /// The post is in the trash; it was left alone.
+    Trashed,
+}
+
+/// Docs sync: sets a post's title and content, creating it (published) with this id when there's
+/// no such post. Changes take the same path as edits ([`write_revision`]), so each one is a version
+/// in the history; but they notify nobody, since the text was written elsewhere.
+pub(crate) fn sync_post(ctx: &mut Ctx, id: &str, title: &str, content: &str, note: &str) -> ApiResult<Synced> {
+    let title = required(title, "title", 300)?;
+    if let Some(post) = ctx.db.one(&format!("SELECT {POST_COLS}, p.content FROM posts p WHERE p.id = ?"), &params![id])? {
+        if post.opt_str("deleted_at").is_some() {
+            return Ok(Synced::Trashed);
+        }
+        if !write_revision(ctx, &post, &title, content, note, false)? {
+            return Ok(Synced::Unchanged);
+        }
+        emit(
+            ctx,
+            Event::new("post.updated", "post", id, format!("synced “{title}”"))
+                .post(id)
+                .data(json!({ "fields": ["content"], "version": post.i64("version") + 1, "synced": true })),
+        )?;
+        return Ok(Synced::Updated);
+    }
+    check_content(content)?;
+    let now = ctx.now_s();
+    ctx.db.execute(
+        "INSERT INTO posts (id, title, slug, content, excerpt, status, author_id, last_editor_id, version, word_count, created_at, updated_at, published_at)
+         VALUES (?, ?, ?, ?, ?, 'published', ?, ?, 1, ?, ?, ?, ?)",
+        &params![
+            id,
+            title.clone(),
+            slugify(&title),
+            content,
+            markdown::excerpt(content, 240),
+            ctx.actor.user_id.clone(),
+            ctx.actor.user_id.clone(),
+            markdown::word_count(content),
+            now.clone(),
+            now.clone(),
+            now.clone()
+        ],
+    )?;
+    ctx.db.execute(
+        "INSERT INTO post_versions (post_id, version, title, content, editor_id, note, created_at) VALUES (?, 1, ?, ?, ?, ?, ?)",
+        &params![id, title.clone(), content, ctx.actor.user_id.clone(), note, now],
+    )?;
+    update_links(ctx, id, content)?;
+    crate::ops::files::attach_referenced(ctx, id, content)?;
+    search::index_post(ctx.db, id)?;
+    emit(
+        ctx,
+        Event::new("post.created", "post", id, format!("synced “{title}”")).post(id).data(json!({ "status": "published", "synced": true })),
+    )?;
+    Ok(Synced::Created)
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct UpdatePostInput {
@@ -551,7 +629,7 @@ pub struct UpdatePostInput {
     pub note: Option<String>,
 }
 
-fn update_post(ctx: &mut Ctx, input: UpdatePostInput) -> ApiResult<Post> {
+pub(crate) fn update_post(ctx: &mut Ctx, input: UpdatePostInput) -> ApiResult<Post> {
     let post = load_post(ctx, &input.id, false)?;
     require_post_edit(ctx, &post)?;
     let id = post.str("id");

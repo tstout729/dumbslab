@@ -1,0 +1,306 @@
+// Settings › People sync (BambooHR) and Settings › Docs sync (GitHub, GitLab), for admins.
+
+import { api, enc, request } from '/api.js';
+import {
+  h, icon, button, busy, toast, toastError, confirmDialog, secretDialog, field, input, select, emptyState, timeEl, copyField, frag, plural,
+} from '/ui.js';
+
+function panel(title, description, ...body) {
+  return h('section', { class: 'panel' },
+    h('header', { class: 'panel-head' }, h('h2', { class: 'panel-title' }, title), description ? h('p', { class: 'panel-desc' }, description) : null),
+    ...body);
+}
+
+function off(what) {
+  return h('section', { class: 'panel' }, emptyState({ iconName: 'plug', title: `${what} isn’t available here`,
+    body: 'The server needs a connector key to encrypt the credentials a sync uses. Whoever runs it can set CONNECTOR_KEY (or DUMBSLAB_CONNECTOR_KEY when self-hosting).' }));
+}
+
+/** Where a sync stands: running, how the last one went, and when. */
+function stateLine(s) {
+  if (s.running) return h('span', { class: 'muted' }, icon('refresh', { size: 13 }), ' Syncing now…');
+  if (!s.last_status) return h('span', { class: 'muted' }, 'Not synced yet');
+  const good = s.last_status === 'ok';
+  const label = { ok: 'Synced', partial: 'Partly synced', failed: 'Last sync failed' }[s.last_status] || s.last_status;
+  return h('span', { class: good ? 'status-ok' : 'status-bad' }, icon(good ? 'checkCircle' : 'alert', { size: 13 }), label, ' ',
+    timeEl(s.last_finished_at || s.last_started_at));
+}
+
+function stateNotes(s) {
+  return frag(
+    s.last_error ? h('p', { class: 'form-error small' }, s.last_error) : null,
+    s.pending && !s.running ? h('p', { class: 'small muted' }, 'A change was reported while the last sync ran. Sync again to be sure it’s in.') : null);
+}
+
+// ---------------------------------------------------------------------------
+// People sync
+
+function peopleResult(r) {
+  if (!r) return null;
+  const facts = [
+    `${plural(r.employees, 'employee')} read`,
+    `${r.matched} matched`,
+    `${r.updated} updated`,
+    r.skipped ? `${r.skipped} skipped` : null,
+    r.without_record ? `${plural(r.without_record, 'person', 'people')} here without a BambooHR record` : null,
+  ].filter(Boolean);
+  return frag(
+    h('p', { class: 'small' }, facts.join(' · ')),
+    r.truncated ? h('p', { class: 'small form-error' }, 'BambooHR has more active employees than one sync reads (7,500).') : null,
+    r.not_found_count
+      ? h('details', { class: 'small' },
+        h('summary', null, `${plural(r.not_found_count, 'employee')} not in this workspace`),
+        h('ul', { class: 'plan-list' }, r.not_found.map((p) => h('li', null, `${p.name} `, h('span', { class: 'muted' }, p.email)))),
+        r.not_found_count > r.not_found.length ? h('p', { class: 'muted' }, `and ${r.not_found_count - r.not_found.length} more`) : null)
+      : null);
+}
+
+export async function peopleSyncSection(ctx) {
+  const s = await api.get('/people-sync');
+  if (!s.enabled) return off('People sync');
+  const reload = () => ctx.reload();
+  const subdomain = input({ required: true, value: s.subdomain || '', placeholder: 'acme', spellcheck: 'false', autocapitalize: 'off' });
+  const apiKey = input({ type: 'password', required: !s.configured, placeholder: s.configured ? 'Saved. Leave empty to keep it.' : '', spellcheck: 'false' });
+  const hookKey = input({ type: 'password', placeholder: s.webhook ? 'Saved. Leave empty to keep it.' : 'Optional', spellcheck: 'false' });
+  const save = button(s.configured ? 'Save' : 'Save and sync', { variant: 'primary', type: 'submit' });
+  const f = h('form', { class: 'stack token-form', novalidate: true },
+    field('BambooHR company domain', subdomain, { hint: 'The acme in acme.bamboohr.com.' }),
+    field('API key', apiKey, { hint: 'In BambooHR: your name › API Keys › Add new key. Its user must be able to see employees’ work emails and job details. It’s encrypted and never shown again.' }),
+    field('Webhook private key (optional)', hookKey, { hint: frag('To sync when someone changes in BambooHR, add a webhook in BambooHR (Settings › Webhooks) that posts to the address below, and paste its private key here.') }),
+    copyField(s.webhook_url, { label: 'Webhook address' }),
+    h('div', null, save));
+  f.addEventListener('submit', (e) => {
+    e.preventDefault();
+    if (!f.checkValidity()) {
+      f.reportValidity();
+      return;
+    }
+    busy(save, async () => {
+      const body = { subdomain: subdomain.value.trim() };
+      if (apiKey.value.trim()) body.api_key = apiKey.value.trim();
+      if (hookKey.value.trim()) body.webhook_key = hookKey.value.trim();
+      await request('PUT', '/people-sync', { body });
+      toast('People sync saved');
+      if (!s.configured) await runPeople();
+      reload();
+    }).catch(toastError);
+  });
+
+  const runPeople = async () => {
+    const r = await api.post('/people-sync/run');
+    toast(`Synced from BambooHR: ${plural(r.updated, 'profile')} updated`);
+  };
+  const run = button('Sync now', { icon: 'refresh', variant: 'subtle', size: 'sm' });
+  run.addEventListener('click', () => busy(run, async () => { await runPeople(); reload(); }).catch((e) => { toastError(e); reload(); }));
+  const remove = button('Remove', { variant: 'ghost', size: 'sm' });
+  remove.addEventListener('click', async () => {
+    const ok = await confirmDialog({ title: 'Remove the people sync?', message: 'DumbSlab forgets the BambooHR key. Details already synced stay on people’s profiles.', confirmLabel: 'Remove', danger: true });
+    if (!ok) return;
+    busy(remove, async () => { await api.del('/people-sync'); toast('People sync removed'); reload(); }).catch(toastError);
+  });
+
+  const status = s.configured
+    ? panel('Status', null,
+      h('div', { class: 'token-meta' }, stateLine(s), s.webhook ? h('span', null, icon('zap', { size: 13 }), ' Webhook on') : null),
+      stateNotes(s),
+      peopleResult(s.last_result),
+      h('div', { class: 'plan-actions' }, run, remove))
+    : null;
+  return frag(
+    panel('People sync', 'Fill in people’s title, department, location, work phone, pronouns and manager from BambooHR. People are matched by email to their BambooHR work email; a sync never adds, deactivates or removes anyone, and changes only those details.', f),
+    status);
+}
+
+// ---------------------------------------------------------------------------
+// Docs sync
+
+function docsResult(r) {
+  if (!r) return null;
+  const facts = [
+    `${plural(r.files, 'file')}`,
+    r.created ? `${r.created} new` : null,
+    r.updated ? `${r.updated} updated` : null,
+    r.renamed ? `${r.renamed} moved` : null,
+    r.archived ? `${r.archived} archived` : null,
+    r.restored ? `${r.restored} restored` : null,
+    r.images_uploaded ? `${plural(r.images_uploaded, 'image')} uploaded` : null,
+    r.remaining ? `${r.remaining} still to sync` : null,
+  ].filter(Boolean);
+  return frag(
+    h('p', { class: 'small' }, facts.join(' · ')),
+    r.skipped && r.skipped.length
+      ? h('details', { class: 'small' }, h('summary', null, `${plural(r.skipped.length, 'file')} skipped`),
+        h('ul', { class: 'plan-list' }, r.skipped.map((x) => h('li', null, h('code', null, x.path), ` ${x.reason}`))))
+      : null);
+}
+
+/** Syncs until everything is in (a run takes at most 20 changed files), showing progress. */
+async function syncAll(source, onProgress) {
+  let total = { created: 0, updated: 0 };
+  for (let round = 0; round < 40; round++) {
+    const r = await api.post(`/docs-sources/${enc(source.id)}/sync`);
+    total = { created: total.created + r.created, updated: total.updated + r.updated };
+    if (r.done || !r.remaining) return { ...r, ...total };
+    onProgress(`Synced ${total.created + total.updated} so far, ${r.remaining} to go…`);
+  }
+  return null;
+}
+
+function webhookHelp(source) {
+  const steps = source.provider === 'github'
+    ? ['In the repository on GitHub: Settings › Webhooks › Add webhook.', 'Payload URL: the address below. Content type: application/json.', 'Secret: this secret. Events: just the push event.']
+    : ['In the project on GitLab: Settings › Webhooks › Add new webhook.', 'URL: the address below.', 'Secret token: this secret. Trigger: Push events.'];
+  return frag(h('ol', { class: 'plan-list' }, steps.map((s) => h('li', null, s))), copyField(source.webhook_url, { label: 'Webhook address' }));
+}
+
+function showSecret(source, secret) {
+  return secretDialog({ title: 'Sync on every push', intro: 'Add a webhook so each push to the branch syncs. Use this secret:', secret, extra: webhookHelp(source) });
+}
+
+function sourceCard(source, reload) {
+  const where = `${source.repository}${source.folder ? `/${source.folder}` : ''}`;
+  const run = button('Sync now', { icon: 'refresh', variant: 'subtle', size: 'sm' });
+  const progress = h('span', { class: 'small muted', role: 'status' });
+  run.addEventListener('click', () => busy(run, async () => {
+    const r = await syncAll(source, (text) => { progress.textContent = text; });
+    toast(r ? `Synced ${where}: ${r.created} new, ${r.updated} updated` : 'Synced part of the folder; sync again to continue');
+    reload();
+  }).catch((e) => { toastError(e); reload(); }));
+  const token = button(source.has_token ? 'Change token' : 'Add token', { variant: 'ghost', size: 'sm' });
+  const tokenInput = input({ type: 'password', placeholder: 'Leave empty to remove the token', spellcheck: 'false' });
+  const tokenSave = button('Save token', { variant: 'primary', size: 'sm', type: 'submit' });
+  const tokenForm = h('form', { class: 'stack token-form', novalidate: true, hidden: true }, field('Token', tokenInput, { hint: tokenHint(source.provider) }), h('div', null, tokenSave));
+  token.addEventListener('click', () => { tokenForm.hidden = false; tokenInput.focus(); });
+  tokenForm.addEventListener('submit', (e) => {
+    e.preventDefault();
+    busy(tokenSave, async () => {
+      await api.patch(`/docs-sources/${enc(source.id)}`, { token: tokenInput.value.trim() });
+      toast(tokenInput.value.trim() ? 'Token saved' : 'Token removed');
+      reload();
+    }).catch(toastError);
+  });
+  const rotate = button('New webhook secret', { variant: 'ghost', size: 'sm' });
+  rotate.addEventListener('click', async () => {
+    const ok = await confirmDialog({ title: 'Make a new webhook secret?', message: `The current secret stops working. Update the webhook in ${source.provider === 'github' ? 'GitHub' : 'GitLab'} with the new one.`, confirmLabel: 'Make a new secret' });
+    if (!ok) return;
+    busy(rotate, async () => {
+      const r = await api.patch(`/docs-sources/${enc(source.id)}`, { new_webhook_secret: true });
+      await showSecret(r.source, r.webhook_secret);
+    }).catch(toastError);
+  });
+  const remove = button('Remove', { variant: 'ghost', size: 'sm' });
+  remove.addEventListener('click', async () => {
+    const ok = await confirmDialog({ title: `Stop syncing ${where}?`, message: 'DumbSlab forgets the token. The synced posts and topics stay, and become ordinary posts anyone with access can edit.', confirmLabel: 'Stop syncing', danger: true });
+    if (!ok) return;
+    busy(remove, async () => { await api.del(`/docs-sources/${enc(source.id)}`); toast('Docs sync removed'); reload(); }).catch(toastError);
+  });
+  const link = (url, label) => h('a', { href: url, target: '_blank', rel: 'noopener noreferrer' }, label);
+  return h('div', { class: 'app-card' },
+    h('div', { class: 'app-head' },
+      h('div', null,
+        h('p', { class: 'app-name' }, link(source.folder_url, where)),
+        h('p', { class: 'muted small' }, `${source.provider === 'github' ? 'GitHub' : `GitLab (${source.host})`}, branch ${source.branch} → `,
+          source.topic ? h('a', { href: new URL(source.topic.url).pathname }, source.topic.name) : 'a deleted topic')),
+      h('span', { class: 'badge' }, plural(source.synced_files, 'post'))),
+    h('div', { class: 'app-body' },
+      h('div', { class: 'token-meta' }, stateLine(source), source.has_token ? h('span', null, icon('key', { size: 13 }), ' Token saved') : h('span', null, 'No token (public repository)')),
+      stateNotes(source),
+      docsResult(source.last_result),
+      h('details', { class: 'small' }, h('summary', null, 'Sync on every push'), webhookHelp(source),
+        h('p', { class: 'muted' }, 'The secret was shown when the source was added. Make a new one if you don’t have it.')),
+      h('div', { class: 'plan-actions' }, run, token, rotate, remove, progress),
+      tokenForm));
+}
+
+function tokenHint(provider) {
+  return provider === 'github'
+    ? 'A fine-grained personal access token with read-only access to the repository’s Contents (github.com › Settings › Developer settings). Leave out for public repositories.'
+    : 'A personal, group or project access token with the read_api scope. Leave out for public projects.';
+}
+
+function addSourceForm(topics, reload) {
+  const provider = select([{ value: 'github', label: 'GitHub' }, { value: 'gitlab', label: 'GitLab' }]);
+  const repository = input({ required: true, placeholder: 'acme/handbook', spellcheck: 'false', autocapitalize: 'off' });
+  const host = input({ placeholder: 'https://gitlab.example.com', spellcheck: 'false', type: 'url' });
+  const hostField = field('GitLab address (self-managed only)', host, { hint: 'Leave empty for gitlab.com.' });
+  const branch = input({ value: 'main', required: true, spellcheck: 'false' });
+  const folder = input({ placeholder: 'docs', spellcheck: 'false' });
+  const topic = select([{ value: '', label: 'Choose a topic…' }, ...topics.map((t) => ({ value: t.id, label: t.label }))], { required: true });
+  const token = input({ type: 'password', spellcheck: 'false' });
+  const tokenField = field('Token (private repositories)', token, { hint: tokenHint('github') });
+  const sync = () => {
+    const gh = provider.value === 'github';
+    hostField.hidden = gh;
+    repository.placeholder = gh ? 'acme/handbook' : 'group/project';
+    tokenField.querySelector('.field-hint').textContent = tokenHint(provider.value);
+  };
+  provider.addEventListener('change', sync);
+  sync();
+  const submit = button('Add and sync', { variant: 'primary', type: 'submit' });
+  const progress = h('span', { class: 'small muted', role: 'status' });
+  const f = h('form', { class: 'stack token-form', novalidate: true },
+    field('From', provider),
+    field('Repository', repository, { hint: 'owner/name, a GitLab project’s path, or the repository’s web address.' }),
+    hostField,
+    field('Branch', branch),
+    field('Folder', folder, { hint: 'The folder whose Markdown files to sync, with its sub-folders. Leave empty for the whole repository.' }),
+    field('Topic', topic, { hint: 'Posts go here; sub-folders become sub-topics with the same visibility.' }),
+    tokenField,
+    h('div', { class: 'plan-actions' }, submit, progress));
+  f.addEventListener('submit', (e) => {
+    e.preventDefault();
+    if (!f.checkValidity()) {
+      f.reportValidity();
+      return;
+    }
+    busy(submit, async () => {
+      const body = { provider: provider.value, repository: repository.value.trim(), branch: branch.value.trim(), folder: folder.value.trim(), topic_id: topic.value };
+      if (token.value.trim()) body.token = token.value.trim();
+      if (provider.value === 'gitlab' && host.value.trim()) body.host = host.value.trim();
+      const r = await api.post('/docs-sources', body);
+      progress.textContent = 'Syncing…';
+      try {
+        const done = await syncAll(r.source, (text) => { progress.textContent = text; });
+        toast(done ? `Synced ${plural(done.created, 'post')}` : 'Synced part of the folder; sync again to continue');
+      } catch (err) {
+        toastError(err);
+      }
+      await showSecret(r.source, r.webhook_secret);
+      reload();
+    }).catch(toastError);
+  });
+  return f;
+}
+
+/** Topics as an indented list, for choosing one. */
+function topicOptions(list) {
+  const byParent = new Map();
+  for (const t of list) {
+    const k = t.parent_id || '';
+    if (!byParent.has(k)) byParent.set(k, []);
+    byParent.get(k).push(t);
+  }
+  const out = [];
+  const walk = (parent, depth) => {
+    for (const t of byParent.get(parent) || []) {
+      out.push({ id: t.id, label: `${'  '.repeat(depth)}${t.name}${t.visibility === 'private' ? ' (private)' : ''}` });
+      walk(t.id, depth + 1);
+    }
+  };
+  walk('', 0);
+  return out;
+}
+
+export async function docsSyncSection(ctx) {
+  const [list, topics] = await Promise.all([api.get('/docs-sources'), api.get('/topics')]);
+  if (!list.enabled) return off('Docs sync');
+  const reload = () => ctx.reload();
+  const add = addSourceForm(topicOptions(topics.items), reload);
+  add.hidden = list.items.length > 0;
+  const show = button('Add a folder', { icon: 'plus', variant: 'primary', size: 'sm', onClick: () => { add.hidden = false; show.remove(); } });
+  return frag(
+    panel('Docs sync', 'Keep a GitHub or GitLab folder’s Markdown files as posts in a topic. Each file is a post, sub-folders become sub-topics, and relative links and images keep working. It’s one way: synced posts are edited in the repository, and each push brings the change here.',
+      list.items.length ? h('div', { class: 'app-list' }, list.items.map((s) => sourceCard(s, reload))) : null,
+      list.items.length ? h('div', null, show) : null,
+      add));
+}

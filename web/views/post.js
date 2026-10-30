@@ -136,6 +136,8 @@ export async function render(ctx) {
   const isAuthor = () => post.author.id === myId();
   const trashed = () => !!post.deleted_at;
   const canEditPost = () => post.can_edit && !trashed();
+  // A synced post's text changes only in its repository.
+  const canEditText = () => canEditPost() && !post.synced_from;
 
   // --- Layout skeleton ------------------------------------------------------
   const head = h('header', { class: 'post-head' });
@@ -153,7 +155,7 @@ export async function render(ctx) {
   const article = h('article', { class: 'post' }, head);
 
   if (!post.content.trim()) {
-    body.replaceChildren(h('p', { class: 'muted' }, 'This post is empty.', canEditPost() ? ' ' : '', canEditPost() ? h('a', { href: `${canonical}/edit` }, 'Start writing') : null));
+    body.replaceChildren(h('p', { class: 'muted' }, 'This post is empty.', canEditText() ? ' ' : '', canEditText() ? h('a', { href: `${canonical}/edit` }, 'Start writing') : null));
   }
 
   // Heading anchor links and external links in the rendered body.
@@ -332,6 +334,18 @@ export async function render(ctx) {
     return null;
   }
 
+  /** Synced posts say where to edit them. */
+  function syncedNote() {
+    const s = post.synced_from;
+    if (!s) return null;
+    const app = s.provider === 'github' ? 'GitHub' : 'GitLab';
+    const where = h('a', { href: /^https:\/\//.test(s.url) ? s.url : '#', target: '_blank', rel: 'noopener noreferrer' }, `${s.repository}/${s.path}`);
+    return h('div', { class: 'banner banner-muted', role: 'note' }, icon('link', { size: 16 }),
+      s.removed
+        ? h('span', null, `Synced from ${app}: `, where, ' was removed from the repository, so this post was archived.')
+        : h('span', null, `Synced from ${app}: `, where, '. Edit it there; each push updates it here.'));
+  }
+
   function followButton() {
     const b = button(post.following ? 'Following' : 'Follow', {
       icon: post.following ? 'check' : 'bell',
@@ -353,11 +367,11 @@ export async function render(ctx) {
   function renderHead() {
     const editor = post.last_editor && post.last_editor.id !== post.author.id ? post.last_editor : null;
     const actions = h('div', { class: 'post-actions' },
-      canEditPost() ? h('a', { class: 'btn btn-subtle btn-sm', href: `${canonical}/edit`, 'aria-keyshortcuts': 'E', title: 'Edit (E)' }, icon('pencil'), h('span', null, 'Edit')) : null,
+      canEditText() ? h('a', { class: 'btn btn-subtle btn-sm', href: `${canonical}/edit`, 'aria-keyshortcuts': 'E', title: 'Edit (E)' }, icon('pencil'), h('span', null, 'Edit')) : null,
       !trashed() ? followButton() : null,
       menuButton(moreItems, { size: 'sm', ariaLabel: 'More post actions' }));
     head.replaceChildren(
-      ...[banner()].filter(Boolean),
+      ...[banner(), syncedNote()].filter(Boolean),
       h('div', { class: 'post-crumbs' },
         post.topics.length ? h('span', { class: 'chips' }, post.topics.map(topicChip)) : h('span', { class: 'muted small' }, 'No topic'),
         ...statusBadges(post).filter((b) => !b.classList.contains('badge-trash'))),
@@ -675,7 +689,7 @@ export async function render(ctx) {
     update();
   }
 
-  ctx.onKey('e', () => { if (canEditPost()) navigate(`${canonical}/edit`); });
+  ctx.onKey('e', () => { if (canEditText()) navigate(`${canonical}/edit`); });
   ctx.onCleanup(closeLayers);
   void emptyState;
 }

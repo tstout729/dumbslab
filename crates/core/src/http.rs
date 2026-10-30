@@ -45,6 +45,7 @@ pub fn is_core_path(path: &str) -> bool {
         || path.starts_with("/api/")
         || path.starts_with("/files/")
         || path.starts_with("/connect/")
+        || path.starts_with("/hooks/")
 }
 
 /// Handles a request. `None` means the path isn't ours (the host serves static files).
@@ -66,6 +67,8 @@ pub fn handle(db: &dyn Db, cfg: &HostConfig, req: &Request) -> Option<Outcome> {
         crate::connect::callback(db, cfg, req)
     } else if path.starts_with("/connect/") {
         failed(&ApiError::not_found("route"))
+    } else if path.starts_with("/hooks/") {
+        no_store(crate::sync::hook(db, cfg, req))
     } else {
         let rest = path.strip_prefix(API_PREFIX)?;
         let r = api(db, cfg, req, rest);

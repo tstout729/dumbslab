@@ -1012,6 +1012,7 @@ mark { background: var(--mark-bg); color: inherit; border-radius: 3px; padding: 
 .profile-text { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 8px; }
 .profile-handle { display: flex; align-items: center; gap: 8px; color: var(--ink-3); flex-wrap: wrap; }
 .profile-bio { color: var(--ink-2); line-height: 1.6; max-width: 62ch; white-space: pre-line; }
+.profile-details { display: flex; flex-direction: column; gap: 2px; }
 
 .notif-list { list-style: none; border-top: 1px solid var(--line); }
 .notif { display: flex; align-items: flex-start; gap: 12px; padding: 13px 4px 13px 0; border-bottom: 1px solid var(--line); }

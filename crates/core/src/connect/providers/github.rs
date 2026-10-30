@@ -57,12 +57,12 @@ fn api(path: &str, token: &str) -> HttpCall {
 }
 
 /// A GitHub user or organization name.
-fn valid_owner(name: &str) -> bool {
+pub(crate) fn valid_owner(name: &str) -> bool {
     (1..=39).contains(&name.len()) && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
 }
 
 /// A repository name; never `.` or `..`, which would climb out of `/repos/{owner}`.
-fn valid_repo(name: &str) -> bool {
+pub(crate) fn valid_repo(name: &str) -> bool {
     (1..=100).contains(&name.len())
         && name.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
         && name != "."

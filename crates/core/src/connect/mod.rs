@@ -577,7 +577,7 @@ pub struct Connection {
     lease: Option<String>,
 }
 
-fn key_of(cfg: &HostConfig) -> ApiResult<&str> {
+pub(crate) fn key_of(cfg: &HostConfig) -> ApiResult<&str> {
     cfg.connectors
         .key
         .as_deref()
@@ -917,6 +917,10 @@ pub enum Job {
     Search(SearchJob),
     Preview(PreviewJob),
     Connect(ConnectJob),
+    /// Profile details from the HR system (see [`crate::sync::people`]).
+    People(Box<crate::sync::people::PeopleJob>),
+    /// A repository folder's Markdown files as posts (see [`crate::sync::docs`]).
+    Docs(Box<crate::sync::docs::DocsJob>),
 }
 
 #[derive(Clone, Debug)]
@@ -1177,6 +1181,8 @@ pub fn step(db: &dyn Db, cfg: &HostConfig, job: &mut Job, replies: Vec<HttpReply
         Job::Search(j) => search_step(db, cfg, j, replies, now),
         Job::Preview(j) => preview_step(db, cfg, j, replies, now),
         Job::Connect(j) => connect_step(db, cfg, j, replies, now),
+        Job::People(j) => crate::sync::people::step(db, cfg, j, replies, now),
+        Job::Docs(j) => crate::sync::docs::step(db, cfg, j, replies, now),
     }
 }
 

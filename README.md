@@ -21,6 +21,8 @@ An open-source team knowledge base, written in Rust and built so AI agents can d
 | Collaboration | Threaded and inline (quoted) comments, resolve/reopen, emoji reactions, `@mentions`, backlinks |
 | Search | Full-text search (SQLite FTS5) across posts, comments and topics; stemming, phrases, prefix matching, highlighted snippets, permission-aware |
 | People | Admin, member and viewer roles, bot accounts, deactivation |
+| People sync | Titles, departments, locations, work phones, pronouns and managers from BambooHR, matched by work email, on demand or by BambooHR webhook. Admins set it up in Settings › People sync. See [docs/people-sync.md](docs/people-sync.md) |
+| Docs sync | A GitHub or GitLab folder's Markdown files kept as read-only posts in a topic, one way: sub-folders become sub-topics, relative links and images keep working, and each push syncs. Admins set it up in Settings › Docs sync. See [docs/docs-sync.md](docs/docs-sync.md) |
 | Notifications | Mentions, replies, comments and updates on followed posts, new posts in followed topics |
 | Admin | Workspace settings, API tokens with scopes, signed webhooks, JSON export, bulk Markdown import |
 | Connected apps | Everyone connects their own GitHub, Google Drive, Slack, Jira, Confluence, Zendesk, Asana, Box, Dropbox, Guru and more, to search them from DumbSlab and preview links to them in posts. See [docs/connected-apps.md](docs/connected-apps.md) |
@@ -41,7 +43,7 @@ Options (flags or environment variables):
 | `--bind` | `DUMBSLAB_BIND` | `127.0.0.1:8080` |
 | `--base-url` | `DUMBSLAB_BASE_URL` | the request's origin |
 | `--setup-token` | `DUMBSLAB_SETUP_TOKEN` | generated and logged |
-| | `DUMBSLAB_CONNECTOR_KEY` | unset: [connected apps](docs/connected-apps.md) are off |
+| | `DUMBSLAB_CONNECTOR_KEY` | unset: [connected apps](docs/connected-apps.md), people sync and docs sync are off |
 | `--open-setup` | | off (local development only: setup without a token) |
 
 ### Docker

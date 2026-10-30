@@ -1,5 +1,5 @@
-// Settings: profile, connecting agents, API tokens, and (for admins) people, webhooks, workspace
-// and, on hosted DumbSlab, the plan.
+// Settings: profile, connecting agents, API tokens, and (for admins) people, people and docs sync,
+// webhooks, workspace and, on hosted DumbSlab, the plan.
 
 import { api, enc } from '/api.js';
 import {
@@ -8,6 +8,7 @@ import {
 } from '/ui.js';
 import { state, emit, navigate, canAdmin, myId } from '/state.js';
 import { connectionsSection } from '/views/connected.js';
+import { peopleSyncSection, docsSyncSection } from '/views/sync.js';
 
 const SECTIONS = [
   { id: 'profile', label: 'Profile', icon: 'user' },
@@ -15,6 +16,8 @@ const SECTIONS = [
   { id: 'tokens', label: 'API tokens', icon: 'key' },
   { id: 'connections', label: 'Connected apps', icon: 'link' },
   { id: 'people', label: 'People', icon: 'users', admin: true },
+  { id: 'people-sync', label: 'People sync', icon: 'refresh', admin: true },
+  { id: 'docs-sync', label: 'Docs sync', icon: 'folder', admin: true },
   { id: 'webhooks', label: 'Webhooks', icon: 'zap', admin: true },
   { id: 'workspace', label: 'Workspace', icon: 'settings', admin: true },
   { id: 'plan', label: 'Plan', icon: 'layers', admin: true, hosted: true },
@@ -679,6 +682,8 @@ const RENDER = {
   tokens: tokensSection,
   connections: connectionsSection,
   people: peopleSection,
+  'people-sync': peopleSyncSection,
+  'docs-sync': docsSyncSection,
   webhooks: webhooksSection,
   workspace: workspaceSection,
   plan: planSection,
