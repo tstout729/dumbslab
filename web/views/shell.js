@@ -167,7 +167,11 @@ export function buildShell(root) {
     canEdit() ? h('a', { class: 'btn btn-ghost btn-icon', href: '/new', 'aria-label': 'New post' }, icon('plus')) : null);
 
   const main = h('main', { id: 'main', class: 'main', tabindex: '-1' });
-  root.replaceChildren(h('div', { class: 'app' }, sidebar, backdrop, h('div', { class: 'main-col' }, topbar, main)));
+  const footer = h('footer', { class: 'app-footer' },
+    h('nav', { 'aria-label': 'Footer' },
+      h('a', { href: 'https://github.com/tstout729/dumbslab/issues/new?template=bug_report.yml' }, 'Report a bug'),
+      h('a', { href: 'mailto:simplycoo+dumbslab@mail.grokbot.com' }, 'Support')));
+  root.replaceChildren(h('div', { class: 'app' }, sidebar, backdrop, h('div', { class: 'main-col' }, topbar, main, footer)));
 
   renderTopicTree(topicsBox);
   on('topics', () => renderTopicTree(topicsBox));
