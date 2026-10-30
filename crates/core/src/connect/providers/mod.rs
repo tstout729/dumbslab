@@ -2,6 +2,7 @@
 
 use super::Connector;
 
+pub mod clickup;
 pub mod confluence;
 pub mod freshdesk;
 pub mod github;
@@ -9,9 +10,12 @@ pub mod gitlab;
 pub mod google_drive;
 pub mod jira;
 pub mod linear;
+pub mod monday;
 pub mod shortcut;
 pub mod slack;
 pub mod todoist;
+pub mod trello;
+pub mod wrike;
 pub mod zendesk;
 
 /// Every app this build can connect to, in the order Settings shows them.
@@ -27,6 +31,10 @@ pub static ALL: &[&dyn Connector] = &[
     &freshdesk::Freshdesk,
     &shortcut::Shortcut,
     &todoist::Todoist,
+    &trello::Trello,
+    &clickup::ClickUp,
+    &monday::Monday,
+    &wrike::Wrike,
 ];
 
 pub fn get(id: &str) -> Option<&'static dyn Connector> {
