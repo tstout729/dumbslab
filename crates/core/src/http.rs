@@ -281,6 +281,8 @@ fn auth_state(db: &dyn Db, cfg: &HostConfig, req: &Request) -> Outcome {
             "api_url": format!("{}{API_PREFIX}", base_url(cfg, req)),
             // Signing in with the workspace's identity provider, when it's set up.
             "sso": crate::sso::sign_in_option(db, cfg, &base_url(cfg, req))?,
+            // Session recordings and browser error reports, or null when the host didn't set them up.
+            "telemetry": cfg.telemetry.web_config(cfg.workspace.as_deref()),
         }))
     };
     match run() {

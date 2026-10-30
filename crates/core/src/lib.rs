@@ -28,6 +28,7 @@ pub mod registry;
 pub mod search;
 pub mod seed;
 pub mod sso;
+pub mod telemetry;
 pub mod tenancy;
 pub mod util;
 
@@ -56,6 +57,8 @@ pub struct HostConfig {
     pub hosting: Option<Hosting>,
     /// Connected apps (see [`connect`]): the key that encrypts credentials, and OAuth apps.
     pub connectors: connect::Connectors,
+    /// The web app's session recordings and error reports. Off unless the host configures them.
+    pub telemetry: telemetry::Telemetry,
 }
 
 /// What a hosted workspace's plan depends on that only the host knows.
