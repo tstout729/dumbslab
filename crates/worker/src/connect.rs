@@ -95,9 +95,11 @@ pub fn root_callback_redirect(url: &Url, root: &str) -> Result<Response> {
         );
     }
     let port = url.port().map(|p| format!(":{p}")).unwrap_or_default();
-    let target = format!("{}://{address}.{root}{port}/connect/callback?{query}", url.scheme());
-    let mut resp = Response::redirect_with_status(Url::parse(&target)?, 302)?;
-    resp.headers_mut().set("cache-control", "no-store")?;
-    resp.headers_mut().set("referrer-policy", "no-referrer")?;
-    Ok(resp)
+    let target = Url::parse(&format!("{}://{address}.{root}{port}/connect/callback?{query}", url.scheme()))?;
+    // Built with all its headers: a `Response::redirect`'s headers can't be changed afterwards.
+    let headers = Headers::new();
+    headers.set("location", target.as_str())?;
+    headers.set("cache-control", "no-store")?;
+    headers.set("referrer-policy", "no-referrer")?;
+    Ok(Response::empty()?.with_status(302).with_headers(headers))
 }
