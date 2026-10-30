@@ -227,6 +227,7 @@ async fn call(
                 Some(job) => match run_job(&app, job).await {
                     connect::Finish::Fill(filled) => filled,
                     connect::Finish::Redirect(url) => serde_json::json!({ "url": url }),
+                    connect::Finish::Respond(_) => return Err(anyhow!("a sign-in can't finish on the command line")),
                     connect::Finish::Fail(e) => return Err(anyhow!("{} ({})", e.message, e.code)),
                 },
                 None => v,
@@ -272,7 +273,9 @@ async fn stdio_mcp(
                 let result = match run_job(&app, job).await {
                     connect::Finish::Fill(v) => Ok(v),
                     connect::Finish::Fail(e) => Err(e),
-                    connect::Finish::Redirect(_) => Err(dumbslab_core::ApiError::internal("a sign-in can't finish over stdio")),
+                    connect::Finish::Redirect(_) | connect::Finish::Respond(_) => {
+                        Err(dumbslab_core::ApiError::internal("a sign-in can't finish over stdio"))
+                    }
                 };
                 let id = reply["id"].clone();
                 Some(connect::fill(reply, result).unwrap_or_else(|e| dumbslab_core::mcp::rpc_error(id, -32603, &e.message)))

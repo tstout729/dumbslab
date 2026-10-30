@@ -298,9 +298,11 @@ impl Workspace {
 
     /// Runs a connected-apps job (see `dumbslab_core::connect::step`), each step in its own
     /// transaction, sending the requests it asks for in between.
-    /// Its writes count against the plan like the request's own.
+    /// Its writes count against the plan like the request's own. Sign-ins work even when the
+    /// workspace is full, like password sign-ins.
     async fn run_job(&self, mut job: dumbslab_core::connect::Job, cfg: &HostConfig) -> Result<dumbslab_core::connect::Finish> {
         use dumbslab_core::connect::{self, Finish, Step};
+        let signs_in = job.is_sign_in();
         let mut replies = vec![];
         let mut written = 0;
         let mut finish = Finish::Fail(ApiError::internal("connected apps took too many steps"));
@@ -313,8 +315,11 @@ impl Workspace {
                 let before = sql.database_size() as u64;
                 let mut job = job;
                 let mut step = connect::step(db, &cfg, &mut job, replies, Utc::now());
-                if let Some(e) =
-                    cfg.hosting.as_ref().filter(|_| step.is_ok()).and_then(|h| storage_refusal(db, h, before, sql.database_size() as u64))
+                if let Some(e) = cfg
+                    .hosting
+                    .as_ref()
+                    .filter(|_| step.is_ok() && !signs_in)
+                    .and_then(|h| storage_refusal(db, h, before, sql.database_size() as u64))
                 {
                     step = Err(e);
                 }

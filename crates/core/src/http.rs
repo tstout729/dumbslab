@@ -45,6 +45,7 @@ pub fn is_core_path(path: &str) -> bool {
         || path.starts_with("/api/")
         || path.starts_with("/files/")
         || path.starts_with("/connect/")
+        || path.starts_with("/sso/")
 }
 
 /// Handles a request. `None` means the path isn't ours (the host serves static files).
@@ -65,6 +66,12 @@ pub fn handle(db: &dyn Db, cfg: &HostConfig, req: &Request) -> Option<Outcome> {
     } else if path == "/connect/callback" && req.method == "GET" {
         crate::connect::callback(db, cfg, req)
     } else if path.starts_with("/connect/") {
+        failed(&ApiError::not_found("route"))
+    } else if path == crate::sso::START_PATH && req.method == "GET" {
+        crate::sso::start(db, cfg, req)
+    } else if path == crate::sso::CALLBACK_PATH && req.method == "GET" {
+        crate::sso::callback(db, cfg, req)
+    } else if path.starts_with("/sso/") {
         failed(&ApiError::not_found("route"))
     } else {
         let rest = path.strip_prefix(API_PREFIX)?;
@@ -272,6 +279,8 @@ fn auth_state(db: &dyn Db, cfg: &HostConfig, req: &Request) -> Outcome {
             "version": crate::VERSION,
             "mcp_url": format!("{}/mcp", base_url(cfg, req)),
             "api_url": format!("{}{API_PREFIX}", base_url(cfg, req)),
+            // Signing in with the workspace's identity provider, when it's set up.
+            "sso": crate::sso::sign_in_option(db, cfg, &base_url(cfg, req))?,
         }))
     };
     match run() {
@@ -371,9 +380,16 @@ fn login(db: &dyn Db, cfg: &HostConfig, req: &Request) -> Outcome {
     let keys = auth::password_keys(&input.email, req.client_ip.as_deref());
     let run = || -> ApiResult<Outcome> {
         auth::check_throttle(db, &keys, now)?;
-        let row = db.one("SELECT id, password_hash FROM users WHERE email = ? AND deactivated_at IS NULL", &params![input.email.trim()])?;
+        let row =
+            db.one("SELECT id, role, password_hash FROM users WHERE email = ? AND deactivated_at IS NULL", &params![input.email.trim()])?;
         let user_id = match row {
-            Some(r) if r.opt_str("password_hash").is_some_and(|h| auth::verify_password(&input.password, &h)) => r.str("id"),
+            Some(r) if r.opt_str("password_hash").is_some_and(|h| auth::verify_password(&input.password, &h)) => {
+                // A workspace that requires single sign-on takes passwords from admins only.
+                if let Some(refused) = crate::sso::password_refusal(db, cfg, Role::parse(&r.str("role")).unwrap_or(Role::Viewer))? {
+                    return Err(refused);
+                }
+                r.str("id")
+            }
             Some(_) => {
                 auth::record_failures(db, &keys, now)?;
                 // Commit the failure count even though the request fails.
