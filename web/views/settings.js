@@ -1,13 +1,14 @@
-// Settings: profile, connecting agents, API tokens, and (for admins) people, people and docs sync,
-// single sign-on, webhooks, workspace and, on hosted DumbSlab, the plan.
+// Settings: profile, connecting agents, API tokens, importing, and (for admins) people, people and
+// docs sync, single sign-on, webhooks, workspace and, on hosted DumbSlab, the plan.
 
 import { api, enc } from '/api.js';
 import {
   h, icon, button, busy, badge, toast, toastError, modal, confirmDialog, secretDialog, field, input, textarea,
   select, checkbox, avatar, timeEl, copyField, copyText, emptyState, setTheme, themePref, frag, menuButton, absTime, plural,
 } from '/ui.js';
-import { state, emit, navigate, canAdmin, myId } from '/state.js';
+import { state, emit, navigate, canAdmin, canEdit, myId } from '/state.js';
 import { connectionsSection } from '/views/connected.js';
+import { importSection } from '/views/import.js';
 import { ssoMessage } from '/views/auth.js';
 import { peopleSyncSection, docsSyncSection } from '/views/sync.js';
 
@@ -16,6 +17,7 @@ const SECTIONS = [
   { id: 'agents', label: 'Connect agents', icon: 'plug' },
   { id: 'tokens', label: 'API tokens', icon: 'key' },
   { id: 'connections', label: 'Connected apps', icon: 'link' },
+  { id: 'import', label: 'Import', icon: 'upload', edit: true },
   { id: 'people', label: 'People', icon: 'users', admin: true },
   { id: 'people-sync', label: 'People sync', icon: 'refresh', admin: true },
   { id: 'docs-sync', label: 'Docs sync', icon: 'folder', admin: true },
@@ -29,7 +31,7 @@ export async function render(ctx) {
   const id = ctx.params.section || 'profile';
   // Only hosted workspaces have an address, and a plan.
   const hosted = Boolean(state.settings && state.settings.address);
-  const sections = SECTIONS.filter((s) => (!s.admin || canAdmin()) && (!s.hosted || hosted));
+  const sections = SECTIONS.filter((s) => (!s.admin || canAdmin()) && (!s.hosted || hosted) && (!s.edit || canEdit()));
   const current = sections.find((s) => s.id === id);
   if (!current) {
     navigate('/settings', { replace: true });
@@ -761,7 +763,8 @@ async function workspaceSection() {
   return frag(
     panel('Workspace', null, f),
     s.address ? addressPanel(s.address) : null,
-    panel('Export','Download every topic, post (as Markdown), comment and person as JSON, for backups or moving elsewhere.', h('div', null, exportBtn)));
+    panel('Export','Download every topic, post (as Markdown), comment and person as JSON, for backups or moving elsewhere.', h('div', null, exportBtn)),
+    panel('Import', 'Bring in a Confluence space, a Guru collection, a GitHub wiki or a folder of Markdown files.', h('div', null, h('a', { class: 'btn btn-subtle btn-sm', href: '/settings/import' }, icon('upload'), h('span', null, 'Go to Import')))));
 }
 
 /** Hosted workspaces: move to another subdomain. */
@@ -892,6 +895,7 @@ const RENDER = {
   agents: agentsSection,
   tokens: tokensSection,
   connections: connectionsSection,
+  import: importSection,
   people: peopleSection,
   'people-sync': peopleSyncSection,
   'docs-sync': docsSyncSection,

@@ -24,7 +24,8 @@ An open-source team knowledge base, written in Rust and built so AI agents can d
 | People sync | Titles, departments, locations, work phones, pronouns and managers from BambooHR, matched by work email, on demand or by BambooHR webhook. Admins set it up in Settings › People sync. See [docs/people-sync.md](docs/people-sync.md) |
 | Docs sync | A GitHub or GitLab folder's Markdown files kept as read-only posts in a topic, one way: sub-folders become sub-topics, relative links and images keep working, and each push syncs. Admins set it up in Settings › Docs sync. See [docs/docs-sync.md](docs/docs-sync.md) |
 | Notifications | Mentions, replies, comments and updates on followed posts, new posts in followed topics |
-| Admin | Workspace settings, API tokens with scopes, signed webhooks, JSON export, bulk Markdown import |
+| Import | Confluence spaces (HTML export), Guru collections, GitHub wikis and folders of Markdown files, with their topics, links between pages, images and attachments. Converted in the browser with a preview first; running an import again skips what's already there. Agents can import through MCP too. See [docs/import.md](docs/import.md) |
+| Admin | Workspace settings, API tokens with scopes, signed webhooks, JSON export |
 | Connected apps | Everyone connects their own GitHub, Google Drive, Slack, Jira, Confluence, Zendesk, Asana, Box, Dropbox, Guru and more, to search them from DumbSlab and preview links to them in posts. See [docs/connected-apps.md](docs/connected-apps.md) |
 | Single sign-on | Sign in with Google Workspace, Microsoft Entra ID, Okta, OneLogin, Slack or any OpenID Connect provider, set up per workspace on every plan. Optional auto-provisioning, and an option to require it for everyone but admins. See [docs/sso.md](docs/sso.md) |
 
