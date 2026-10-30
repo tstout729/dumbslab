@@ -73,6 +73,8 @@ pub struct Embed {
     pub shape: Shape,
     /// The frame's `sandbox` flags: only what the provider needs. Empty when there is no frame.
     pub sandbox: &'static str,
+    /// The frame's `allow` list: browser features it may use. Empty for code and when there is no frame.
+    pub allow: &'static str,
     /// For cards: who posted it, e.g. "@handle".
     pub author: Option<String>,
 }
@@ -188,8 +190,7 @@ fn seconds(t: &str) -> Option<u64> {
     n.is_empty().then_some(total)
 }
 
-/// Players and viewers: scripts, fullscreen, and popups that stay sandboxed. A code playground runs
-/// the pen in its own inner frame, which inherits these flags.
+/// Players and viewers: scripts, fullscreen, and popups that stay sandboxed.
 const PLAYER: &str = "allow-scripts allow-same-origin allow-popups allow-presentation";
 /// Design tools: may also ask for their own cookies after a click, to show the viewer's access.
 const APP: &str = "allow-scripts allow-same-origin allow-popups allow-presentation allow-storage-access-by-user-activation";
@@ -201,9 +202,16 @@ const FORM: &str = "allow-scripts allow-same-origin allow-popups allow-forms";
 /// Microsoft Office: the viewer hands its inner frame an access token with a form, and signing in
 /// or opening the file in Word, Excel or PowerPoint needs an unsandboxed tab.
 const OFFICE: &str = "allow-scripts allow-same-origin allow-popups allow-popups-to-escape-sandbox allow-forms allow-presentation";
+/// Code playgrounds run code anyone wrote, in an inner frame that inherits these flags: scripts,
+/// and no popups, forms, dialogs or navigation. Both embed pages need their own origin: without it
+/// JSFiddle's scripts don't load, and CodePen covers the result with a phishing warning.
+const CODE: &str = "allow-scripts allow-same-origin";
+
+/// What a frame may use: media playback, copying to the clipboard and fullscreen.
+const FEATURES: &str = "autoplay; clipboard-write; encrypted-media; fullscreen; picture-in-picture";
 
 fn frame(provider: &'static str, shape: Shape, sandbox: &'static str, src: String) -> Option<Embed> {
-    Some(Embed { provider, src, shape, sandbox, author: None })
+    Some(Embed { provider, src, shape, sandbox, allow: FEATURES, author: None })
 }
 
 fn video(provider: &'static str, src: String) -> Option<Embed> {
@@ -216,7 +224,12 @@ fn document(provider: &'static str, src: String) -> Option<Embed> {
 
 /// An image or video file: no frame, so no sandbox.
 fn inline(provider: &'static str, shape: Shape, src: String) -> Option<Embed> {
-    Some(Embed { provider, src, shape, sandbox: "", author: None })
+    Some(Embed { provider, src, shape, sandbox: "", allow: "", author: None })
+}
+
+/// A code playground's frame, with no extra features.
+fn code(provider: &'static str, src: String) -> Option<Embed> {
+    Some(Embed { provider, src, shape: Shape::Document, sandbox: CODE, allow: "", author: None })
 }
 
 /// The embed for a link, when it points at a provider that can be embedded.
@@ -564,7 +577,7 @@ fn codepen(u: &Url) -> Option<Embed> {
         return None;
     }
     let pen = if seg(at + 1) == "preview" { seg(at + 2) } else { seg(at + 1) };
-    frame("CodePen", Shape::Document, PLAYER, format!("https://codepen.io/{owner}/embed/{}?default-tab=result", id(pen, 4, 20)?))
+    code("CodePen", format!("https://codepen.io/{owner}/embed/{}?default-tab=result", id(pen, 4, 20)?))
 }
 
 /// jsfiddle.net/{fiddle}/ or /{user}/{fiddle}/, either with a /{version}/; embeds add /embedded/
@@ -587,7 +600,7 @@ fn jsfiddle(u: &Url) -> Option<Embed> {
         None => String::new(),
     };
     let (fiddle, v) = (id(fiddle, 4, 16)?, v.map(|v| format!("/{v}")).unwrap_or_default());
-    frame("JSFiddle", Shape::Document, PLAYER, format!("https://jsfiddle.net/{user}{fiddle}{v}/embedded/result,js,html,css/"))
+    code("JSFiddle", format!("https://jsfiddle.net/{user}{fiddle}{v}/embedded/result,js,html,css/"))
 }
 
 /// Microsoft lets Word, Excel and PowerPoint files be embedded.
@@ -716,6 +729,7 @@ fn x_post(u: &Url) -> Option<Embed> {
         src: format!("https://x.com/{handle}/status/{post}"),
         shape: Shape::Card,
         sandbox: "",
+        allow: "",
         author: (handle != "i").then(|| format!("@{handle}")),
     })
 }
@@ -729,13 +743,17 @@ pub fn html(embed: &Embed, href: &str, label: Option<&str>) -> String {
         Shape::Video | Shape::Document => (
             if embed.shape == Shape::Video { "embed-video" } else { "embed-document" },
             format!(
-                "<div class=\"embed-frame\"><iframe src=\"{src}\" title=\"{title}\" loading=\"lazy\" \
-                 allow=\"autoplay; clipboard-write; encrypted-media; fullscreen; picture-in-picture\" allowfullscreen \
+                "<div class=\"embed-frame\"><iframe src=\"{src}\" title=\"{title}\" loading=\"lazy\" {allow}\
                  referrerpolicy=\"strict-origin-when-cross-origin\" \
                  sandbox=\"{sandbox}\">\
                  </iframe></div>",
                 sandbox = embed.sandbox,
                 title = html_escape(&format!("{}: {caption}", embed.provider)),
+                allow = match embed.allow {
+                    "" => String::new(),
+                    allow if allow.contains("fullscreen") => format!("allow=\"{allow}\" allowfullscreen "),
+                    allow => format!("allow=\"{allow}\" "),
+                },
             ),
         ),
         Shape::Image => (
@@ -1416,14 +1434,32 @@ mod tests {
         assert!(sheet.sandbox.contains("allow-forms"), "Google sign-in needs forms");
         assert!(html(&sheet, "https://docs.google.com/x", None).contains(&format!("sandbox=\"{}\"", sheet.sandbox)));
         for url in [
-            "https://codepen.io/chriscoyier/pen/gfdDu",
-            "https://jsfiddle.net/zalun/uc2oyafr/",
             "https://www.canva.com/design/DAGhbGUMnnI/gZyl0pFu9hrdUYmKXUictg/view",
             "https://viewer.diagrams.net/#R7Vhtb9o",
             "https://app.mode.com/acme/reports/0d0d0bbe1e2e",
         ] {
             let sandbox = from_url(url).unwrap().sandbox;
             assert_eq!(sandbox, PLAYER, "{url}");
+        }
+        let video = html(&from_url("https://youtu.be/9pasx0ghADM").unwrap(), "https://youtu.be/9pasx0ghADM", None);
+        assert!(video.contains(&format!("loading=\"lazy\" allow=\"{FEATURES}\" allowfullscreen referrerpolicy=")), "{video}");
+    }
+
+    #[test]
+    fn code_playgrounds_get_only_scripts_and_their_own_origin() {
+        for url in ["https://codepen.io/chriscoyier/pen/gfdDu", "https://jsfiddle.net/zalun/uc2oyafr/"] {
+            let e = from_url(url).unwrap();
+            assert_eq!((e.sandbox, e.allow), ("allow-scripts allow-same-origin", ""), "{url}");
+            let html = html(&e, url, None);
+            assert!(
+                html.contains(
+                    "loading=\"lazy\" referrerpolicy=\"strict-origin-when-cross-origin\" sandbox=\"allow-scripts allow-same-origin\">"
+                ),
+                "{html}"
+            );
+            for denied in ["allow=", "allowfullscreen", "clipboard", "popups", "forms", "modals", "top-navigation"] {
+                assert!(!html.contains(denied), "{denied}: {html}");
+            }
         }
     }
 

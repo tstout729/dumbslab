@@ -1575,6 +1575,54 @@ fn rich_content_embeds_callouts_and_bare_links() {
     assert!(preview["html"].as_str().unwrap().contains("https://player.vimeo.com/video/925549059?h=56f7392e1c"));
 }
 
+#[test]
+fn embeds_code_office_forms_files_and_posts() {
+    let h = H::new();
+    let (_, admin) = h.setup();
+    let (_, viewer) = h.user(&admin, "vic@acme.test", "Vic", "viewer");
+    let share = "https://1drv.ms/w/c/501d3fb1eb052268/EXyzEXyzEXyzEXyzEXyzEXyzEXyzEXyz?e=AbC123";
+    let content = format!(
+        "https://codepen.io/chriscoyier/pen/gfdDu\n\n\
+         https://1drv.ms/x/c/501d3fb1eb052268/IQTl3fqe7dWBR4yXmtb3biJLAcQq4RHDzlDdwrPC2xXOtUw?em=2\n\n\
+         https://acme.typeform.com/to/u6nXL7\n\n\
+         https://www.dropbox.com/s/abc123def456ghi/floor-plan.png?dl=0\n\n\
+         https://www.dropbox.com/s/abc123def456ghi/walkthrough.mp4?dl=0\n\n\
+         https://x.com/jack/status/20\n\n\
+         {share}"
+    );
+    let post = h.ok("POST", "/api/v1/posts", Some(json!({ "title": "Embeds", "content": content, "status": "published" })), &admin);
+    let got = h.ok("GET", &format!("/api/v1/posts/{}?format=html", post["id"].as_str().unwrap()), None, &viewer);
+    let html = got["html"].as_str().unwrap();
+
+    // Each frame's whole opening tag, found by its src.
+    let frame = |src: &str| -> String {
+        let start = html.find(&format!("<iframe src=\"{src}\"")).unwrap_or_else(|| panic!("no frame for {src}: {html}"));
+        html[start..start + html[start..].find('>').unwrap() + 1].to_string()
+    };
+    let code = frame("https://codepen.io/chriscoyier/embed/gfdDu?default-tab=result");
+    assert!(code.ends_with(" sandbox=\"allow-scripts allow-same-origin\">"), "{code}");
+    assert!(!code.contains("allow=") && !code.contains("allowfullscreen"), "{code}");
+    let excel = frame("https://1drv.ms/x/c/501d3fb1eb052268/IQTl3fqe7dWBR4yXmtb3biJLAcQq4RHDzlDdwrPC2xXOtUw?em=2");
+    assert!(excel.contains("title=\"Excel: ") && excel.contains("allow-forms allow-presentation\">"), "{excel}");
+    let form = frame("https://form.typeform.com/to/u6nXL7");
+    assert!(form.ends_with(" sandbox=\"allow-scripts allow-same-origin allow-popups allow-forms\">"), "{form}");
+    assert_eq!(html.matches("<iframe ").count(), 3, "{html}");
+
+    // Files show from Dropbox's content host; the X post is a card with no frame.
+    assert!(html.contains("<img src=\"https://dl.dropboxusercontent.com/s/abc123def456ghi/floor-plan.png\""), "{html}");
+    assert!(html.contains("<video src=\"https://dl.dropboxusercontent.com/s/abc123def456ghi/walkthrough.mp4\" controls"), "{html}");
+    assert!(
+        html.contains(
+            "<figure class=\"embed embed-card\"><a href=\"https://x.com/jack/status/20\" target=\"_blank\" rel=\"noopener noreferrer\">\
+             <span class=\"embed-card-title\">@jack</span><span class=\"embed-card-meta\">Post on X</span></a></figure>"
+        ),
+        "{html}"
+    );
+    // A OneDrive share link can't be framed, so it stays a plain link.
+    assert!(html.contains(&format!("<a href=\"{share}\"")), "{html}");
+    assert!(!html.contains("<iframe src=\"https://1drv.ms/w/"), "{html}");
+}
+
 // Uploaded images and files.
 
 const PNG: &[u8] = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR not really an image";
