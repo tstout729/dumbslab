@@ -420,6 +420,7 @@ fn save_revision(ctx: &Ctx, post: &Row, title: &str, content: &str, note: &str) 
         &params![id.clone(), version, title, content, ctx.actor.user_id.clone(), note, ctx.now_s()],
     )?;
     update_links(ctx, &id, content)?;
+    crate::ops::files::attach_referenced(ctx, &id, content)?;
     search::index_post(ctx.db, &id)?;
     if title != old_title {
         search::reindex_post_comments(ctx.db, &id)?;
@@ -513,6 +514,7 @@ pub fn create_post(ctx: &mut Ctx, input: CreatePostInput) -> ApiResult<Post> {
     )?;
     set_topics(ctx, &id, &input.topic_ids.unwrap_or_default())?;
     update_links(ctx, &id, &content)?;
+    crate::ops::files::attach_referenced(ctx, &id, &content)?;
     search::index_post(ctx.db, &id)?;
     let uid = ctx.actor.user_id.clone();
     notify::follow(ctx, &uid, "post", &id)?;
@@ -848,6 +850,7 @@ fn delete_post(ctx: &mut Ctx, input: DeletePostInput) -> ApiResult<DeleteResult>
             ctx.db.execute(&format!("DELETE FROM {table} WHERE post_id = ?"), &p)?;
         }
         ctx.db.execute("DELETE FROM post_links WHERE source_id = ?", &p)?;
+        crate::ops::files::delete_for_post(ctx.db, &id)?;
         ctx.db.execute("DELETE FROM posts WHERE id = ?", &p)?;
         emit(ctx, Event::new("post.purged", "post", &id, format!("permanently deleted “{title}”")).admin_only())?;
     } else if post.opt_str("deleted_at").is_none() {

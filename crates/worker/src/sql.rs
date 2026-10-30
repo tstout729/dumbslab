@@ -104,13 +104,12 @@ pub fn transaction<T: 'static>(storage: &Storage, db: DoDb, f: impl FnOnce(&dyn 
     slot.borrow_mut().take().ok_or_else(|| worker::Error::RustError("transaction produced no result".into()))
 }
 
-/// Same cap as the native server.
-pub const MAX_BODY: usize = 8 * 1024 * 1024;
-
-/// Reads the request body, or `None` when it is larger than [`MAX_BODY`].
+/// Reads the request body, or `None` when it is larger than the core's limit for its path (the
+/// same limit the native server applies: uploads get room for a file).
 pub async fn read_body(req: &mut Request) -> Result<Option<Vec<u8>>> {
+    let max_body = dumbslab_core::http::body_limit(req.url()?.path());
     let declared = req.headers().get("content-length")?.and_then(|v| v.parse::<usize>().ok());
-    if declared.is_some_and(|n| n > MAX_BODY) {
+    if declared.is_some_and(|n| n > max_body) {
         return Ok(None);
     }
     let Ok(mut stream) = req.stream() else {
@@ -122,7 +121,7 @@ pub async fn read_body(req: &mut Request) -> Result<Option<Vec<u8>>> {
         let chunk = chunk?;
         // Past the limit, keep reading but discard: answering before the upload ends breaks the
         // connection the next request arrives on.
-        too_large |= body.len() + chunk.len() > MAX_BODY;
+        too_large |= body.len() + chunk.len() > max_body;
         if !too_large {
             body.extend_from_slice(&chunk);
         }

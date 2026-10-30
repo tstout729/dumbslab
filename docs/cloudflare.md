@@ -60,7 +60,7 @@ Admins can move a workspace to another address under **Settings › Workspace**,
 | `SIGNUPS_PER_IP_PER_DAY` | `3` | New workspaces per visitor IP per day |
 | `SIGNUPS_PER_DAY` | `200` | New workspaces per day overall |
 | `MAX_WORKSPACES` | `1000` | Total workspaces; sign-up pauses at the cap |
-| `WORKSPACE_STORAGE_MB` | `50` | A workspace past this size stops accepting new content. Reading, deleting and signing in keep working. |
+| `WORKSPACE_STORAGE_MB` | `50` | A workspace past this size stops accepting new content, uploaded images and files included. Reading, deleting and signing in keep working. |
 
 What workspaces cost: a new workspace with its starter posts is about 0.3 MB. A busy one, with 100 documents each edited a few times, is about 6 MB. Workers Paid includes 5 GB of Durable Object storage and 1M Durable Object requests a month. So roughly a thousand active small-team workspaces, or many thousands of idle ones, fit in the included usage. Past that, storage is $0.20 per GB-month and requests are $0.15 per million.
 

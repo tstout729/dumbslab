@@ -126,6 +126,7 @@ pub fn llms_txt(base_url: &str) -> String {
          - Link posts with `/p/<id>` URLs (backlinks are tracked). Mention people with `@handle` to notify them.\n\
          - Embeds: a link on a line of its own to {providers} shows the video, document or design inline. Other URLs become links.\n\
          - Callouts: start a quote with `> [!NOTE]`, `[!TIP]`, `[!IMPORTANT]`, `[!WARNING]` or `[!CAUTION]`.\n\
+         - Images and files: `upload_file` takes the bytes as base64 (up to 10 MB) and returns `markdown` to put in a post, `![name](/files/<id>/<name>)` for images or `[name](/files/<id>/<name>)` for downloads. Fetch a file's bytes from its `url` with your token.\n\
          - Edit precisely with `edit_post` (find/replace, append, section edits by heading) and pass `base_version` from `get_post` to avoid overwriting others.\n\
          - `verify_post` marks a post as accurate for N days; `get_insights` lists expired and stale posts.\n\
          - Every change is in `list_activity`; poll it with `after_id`, or have an admin add a webhook.\n\n\

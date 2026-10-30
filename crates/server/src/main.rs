@@ -268,8 +268,6 @@ async fn serve(
     Ok(())
 }
 
-const MAX_BODY: usize = 8 * 1024 * 1024;
-
 async fn handle(
     State(app): State<Arc<App>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -280,7 +278,8 @@ async fn handle(
     if !dumbslab_core::http::is_core_path(&path) {
         return web::serve(&path, &parts.headers);
     }
-    let body = match axum::body::to_bytes(body, MAX_BODY).await {
+    // Uploads get room for a base64 file; every other route keeps the smaller limit.
+    let body = match axum::body::to_bytes(body, dumbslab_core::http::body_limit(&path)).await {
         Ok(b) => b.to_vec(),
         Err(_) => return plain(StatusCode::PAYLOAD_TOO_LARGE, "request body too large"),
     };
