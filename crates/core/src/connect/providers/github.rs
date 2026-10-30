@@ -56,6 +56,19 @@ fn api(path: &str, token: &str) -> HttpCall {
         .header("user-agent", "DumbSlab")
 }
 
+/// A GitHub user or organization name.
+fn valid_owner(name: &str) -> bool {
+    (1..=39).contains(&name.len()) && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+}
+
+/// A repository name; never `.` or `..`, which would climb out of `/repos/{owner}`.
+fn valid_repo(name: &str) -> bool {
+    (1..=100).contains(&name.len())
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+        && name != "."
+        && name != ".."
+}
+
 /// Accepts only `org:`, `user:` and `repo:` qualifiers, so "Search in" can't change the query.
 pub fn valid_scope(scope: &str) -> Result<String, String> {
     let words: Vec<&str> = scope.split_whitespace().collect();
@@ -64,16 +77,8 @@ pub fn valid_scope(scope: &str) -> Result<String, String> {
     }
     for w in &words {
         let ok = match w.split_once(':') {
-            Some(("org" | "user", name)) => !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'),
-            Some(("repo", name)) => match name.split_once('/') {
-                Some((owner, repo)) => {
-                    !owner.is_empty()
-                        && !repo.is_empty()
-                        && owner.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
-                        && repo.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
-                }
-                None => false,
-            },
+            Some(("org" | "user", name)) => valid_owner(name),
+            Some(("repo", name)) => name.split_once('/').is_some_and(|(owner, repo)| valid_owner(owner) && valid_repo(repo)),
             _ => false,
         };
         if !ok {
@@ -182,8 +187,8 @@ impl Connector for GitHub {
             return None;
         }
         match path_of(url).as_slice() {
-            [owner, repo, kind, number, ..] if matches!(kind.as_str(), "issues" | "pull") && number.parse::<u64>().is_ok() => {
-                Some(format!("{owner}/{repo}/{number}"))
+            [owner, repo, kind, number, ..] if matches!(kind.as_str(), "issues" | "pull") && valid_owner(owner) && valid_repo(repo) => {
+                Some(format!("{owner}/{repo}/{}", number.parse::<u64>().ok()?))
             }
             _ => None,
         }
@@ -291,6 +296,14 @@ mod tests {
             "https://github.com/acme/api/issues",
             "https://gitlab.com/acme/api/issues/7",
             "https://github.com.evil.test/a/b/issues/1",
+            // Encoded slashes and dots can't climb to another API path.
+            "https://github.com/%2E%2E%2F%2E%2E%2Fuser%3Fx%3D/repo/issues/7",
+            "https://github.com/acme/../issues/7",
+            "https://github.com/acme/%2e%2e/issues/7",
+            // Links with a user name or a backslash (a browser takes the first to evil.example).
+            "https://evil.example\\@github.com/acme/api/issues/7",
+            "https://evil.example@github.com/acme/api/issues/7",
+            "https://github.com\\acme/api/issues/7",
         ] {
             assert_eq!(GitHub.preview_target(&a, no), None, "{no}");
         }

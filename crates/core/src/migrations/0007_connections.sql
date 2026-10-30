@@ -12,6 +12,8 @@ CREATE TABLE IF NOT EXISTS connections (
   secret TEXT NOT NULL,
   -- When the access token expires and must be refreshed first, if it does.
   expires_at TEXT,
+  -- A request is refreshing the token until then; others wait for it (see `connect::renewal`).
+  refreshing_until TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   PRIMARY KEY (user_id, provider)

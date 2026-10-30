@@ -2209,9 +2209,34 @@ mod connected {
     }
 
     fn filled(r: &Res, finish: Finish) -> Value {
-        let body = serde_json::to_vec(&r.body).unwrap();
         match finish {
-            Finish::Fill(v) => serde_json::from_slice(&connect::fill_pending(&body, &v).expect("a placeholder to fill")).unwrap(),
+            Finish::Fill(v) => connect::fill(r.body.clone(), Ok(v)).expect("a placeholder to fill"),
+            other => panic!("expected a result, got {other:?}"),
+        }
+    }
+
+    /// Runs one step of a job.
+    fn step(h: &H, job: &mut Job, replies: Vec<HttpReply>) -> Step {
+        h.store
+            .with_tx(|db| {
+                let step = connect::step(db, &h.cfg, job, replies, chrono::Utc::now());
+                let ok = step.is_ok();
+                (step, ok)
+            })
+            .unwrap()
+            .unwrap()
+    }
+
+    fn fetches(step: Step) -> Vec<HttpCall> {
+        match step {
+            Step::Fetch(calls) => calls,
+            other => panic!("expected requests, got {other:?}"),
+        }
+    }
+
+    fn result(step: Step) -> Value {
+        match step {
+            Step::Done(Finish::Fill(v)) => v,
             other => panic!("expected a result, got {other:?}"),
         }
     }
@@ -2322,6 +2347,11 @@ mod connected {
         let r = h.call("GET", "/api/v1/connections/preview?url=https%3A%2F%2Fgithub.com%2Facme%2Fapi%2Fissues%2F7", None, &mo);
         assert!(r.effects.is_empty());
         assert_eq!((r.body["app"].as_str(), r.body["connected"].as_bool()), (Some("github"), Some(false)));
+        // Apps on a customer's own address too.
+        for (url, app) in [("https://acme.atlassian.net/browse/OPS-12", "jira"), ("https://acme.monday.com/boards/1/pulses/2", "monday")] {
+            let r = h.call("GET", &format!("/api/v1/connections/preview?url={}", urlencoding::encode(url)), None, &mo);
+            assert_eq!((r.body["app"].as_str(), r.body["connected"].as_bool()), (Some(app), Some(false)), "{url}");
+        }
         let r = h.call("GET", "/api/v1/connections/preview?url=https%3A%2F%2Fexample.com%2Fx", None, &admin);
         assert!(r.effects.is_empty() && r.body["app"].is_null());
 
@@ -2445,44 +2475,44 @@ mod connected {
         assert_eq!(connect::open("connector-key", &user_id, "google-drive", &secret).unwrap().token, "new");
         assert!(expires > dumbslab_core::util::ts(chrono::Utc::now()));
 
-        // Two searches refresh at once: the second's refresh token was already spent by the first,
-        // which saved new tokens, so the second uses those instead of asking to reconnect.
-        let stale = connect::seal(
-            "connector-key",
-            &user_id,
-            "google-drive",
-            &connect::Credential { token: "new".into(), refresh_token: Some("refresh-2".into()), ..Default::default() },
-        )
-        .unwrap();
-        h.store
-            .with_tx(|db| {
-                (db.execute("UPDATE connections SET secret = ?, expires_at = ?", &dumbslab_core::params![stale, past.clone()]), true)
-            })
-            .unwrap()
-            .unwrap();
-        let first = job_of(&h.call("GET", "/api/v1/search/connected?q=budget", None, &admin));
-        let second = job_of(&h.call("GET", "/api/v1/search/connected?q=budget", None, &admin));
-        let answer = |c: &HttpCall| {
-            if c.url.contains("oauth2.googleapis.com/token") {
-                ok(json!({ "access_token": "newer", "refresh_token": "refresh-3", "expires_in": 3600 }))
-            } else {
-                ok(json!({ "files": [] }))
-            }
+        // Two searches at once. Refresh tokens that work only once (Box, Atlassian) mean only the
+        // first may refresh; the second keeps using the current token, still good for a while.
+        let set = |token: &str, refresh: &str, expires: String| {
+            let cred = connect::Credential { token: token.into(), refresh_token: Some(refresh.into()), ..Default::default() };
+            let sealed = connect::seal("connector-key", &user_id, "google-drive", &cred).unwrap();
+            h.store
+                .with_tx(|db| {
+                    (db.execute("UPDATE connections SET secret = ?, expires_at = ?", &dumbslab_core::params![sealed, expires]), true)
+                })
+                .unwrap()
+                .unwrap();
         };
-        // The first refresh is answered; it saves "newer".
-        drive(&h, first, &answer);
-        let (finish, sent) = drive(&h, second, &|c: &HttpCall| {
-            if c.url.contains("oauth2.googleapis.com/token") {
-                HttpReply { status: 400, body: json!({ "error": "invalid_grant" }).to_string() }
-            } else {
-                ok(json!({ "files": [] }))
-            }
-        });
-        assert!(sent.last().unwrap().headers.contains(&("authorization".into(), "Bearer newer".into())), "{sent:?}");
-        let v = match finish {
-            Finish::Fill(v) => v,
-            other => panic!("{other:?}"),
+        let search = || job_of(&h.call("GET", "/api/v1/search/connected?q=budget", None, &admin));
+        let bearer = |calls: &[HttpCall]| {
+            calls.iter().find_map(|c| c.headers.iter().find(|(k, _)| k == "authorization").map(|(_, v)| v.clone())).unwrap_or_default()
         };
-        assert_eq!(v["apps"][0]["ok"], true, "{v}");
+        set("new", "refresh-2", dumbslab_core::util::ts(chrono::Utc::now() + chrono::Duration::minutes(2)));
+        let (mut first, mut second) = (search(), search());
+        let refreshing = fetches(step(&h, &mut first, vec![]));
+        assert!(refreshing[0].body.as_deref().unwrap().contains("refresh_token=refresh-2"));
+        assert_eq!(bearer(&fetches(step(&h, &mut second, vec![]))), "Bearer new", "the second searches with the current token");
+        let tokens = ok(json!({ "access_token": "newer", "refresh_token": "refresh-3", "expires_in": 3600 }));
+        assert_eq!(bearer(&fetches(step(&h, &mut first, vec![tokens]))), "Bearer newer");
+
+        // Once the token has expired, the second asks to try again, not to reconnect.
+        set("newer", "refresh-3", past.clone());
+        let (mut first, mut second) = (search(), search());
+        fetches(step(&h, &mut first, vec![]));
+        let v = result(step(&h, &mut second, vec![]));
+        assert!(v["apps"][0]["error"].as_str().unwrap().contains("Try again in a moment"), "{v}");
+        // The refresh times out: not a reason to reconnect either, and the next search refreshes.
+        let v = result(step(&h, &mut first, vec![HttpReply::default()]));
+        assert!(v["apps"][0]["error"].as_str().unwrap().contains("didn't answer in time"), "{v}");
+        let mut third = search();
+        assert!(fetches(step(&h, &mut third, vec![]))[0].url.contains("oauth2.googleapis.com/token"), "the first let go");
+
+        // A refused refresh token does mean reconnecting.
+        let v = result(step(&h, &mut third, vec![HttpReply { status: 400, body: json!({ "error": "invalid_grant" }).to_string() }]));
+        assert!(v["apps"][0]["error"].as_str().unwrap().contains("connect it again"), "{v}");
     }
 }

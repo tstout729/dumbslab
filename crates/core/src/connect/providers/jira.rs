@@ -321,6 +321,12 @@ impl Connector for Jira {
             .collect())
     }
 
+    /// Issue links on any Jira Cloud site, before the person connects theirs.
+    fn recognizes(&self, url: &str) -> bool {
+        let Some(site) = host_of(url).filter(|h| h.ends_with(".atlassian.net")) else { return false };
+        self.preview_target(&Account { settings: json!({ "site": site }), ..Default::default() }, url).is_some()
+    }
+
     /// Links to an issue on the connected site: `/browse/PROJ-123`, `/jira/…/issues/PROJ-123`, or a
     /// board or list with `?selectedIssue=PROJ-123`.
     fn preview_target(&self, account: &Account, url: &str) -> Option<String> {
@@ -587,6 +593,9 @@ mod tests {
         ] {
             assert_eq!(Jira.preview_target(&a, no), None, "{no}");
         }
+        assert!(Jira.recognizes("https://other.atlassian.net/browse/OPS-12"), "any site, unconnected");
+        assert!(!Jira.recognizes("https://other.atlassian.net/wiki/spaces/X/pages/1"));
+        assert!(!Jira.recognizes("https://jira.example.com/browse/OPS-12"));
         // Not connected: no site to match.
         assert_eq!(Jira.preview_target(&Account::default(), "https://acme.atlassian.net/browse/PROJ-1"), None);
 

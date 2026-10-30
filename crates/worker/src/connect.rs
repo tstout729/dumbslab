@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use dumbslab_core::connect::{self, Connectors, FETCH_TIMEOUT_SECS, HttpCall, HttpReply, MAX_REPLY_BYTES, OAuthApp};
+use futures_util::StreamExt;
 use futures_util::future::{Either, select};
 use wasm_bindgen::JsValue;
 use worker::*;
@@ -54,9 +55,19 @@ pub async fn send(call: &HttpCall) -> HttpReply {
         }
         let mut resp = Fetch::Request(Request::new_with_init(&call.url, &init)?).send().await?;
         let status = resp.status_code();
-        let mut bytes = resp.bytes().await?;
-        bytes.truncate(MAX_REPLY_BYTES);
-        Ok::<_, worker::Error>(HttpReply { status, body: String::from_utf8_lossy(&bytes).into_owned() })
+        let mut body = Vec::new();
+        // Read piece by piece and stop at the limit: an app (a self-managed GitLab, say) could send
+        // far more than a Worker's memory holds.
+        if let Ok(mut stream) = resp.stream() {
+            while let Some(chunk) = stream.next().await {
+                body.extend_from_slice(&chunk?);
+                if body.len() > MAX_REPLY_BYTES {
+                    body.truncate(MAX_REPLY_BYTES);
+                    break;
+                }
+            }
+        }
+        Ok::<_, worker::Error>(HttpReply { status, body: String::from_utf8_lossy(&body).into_owned() })
     };
     let timeout = Delay::from(Duration::from_secs(FETCH_TIMEOUT_SECS));
     futures_util::pin_mut!(attempt, timeout);

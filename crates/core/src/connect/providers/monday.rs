@@ -124,6 +124,12 @@ impl Connector for Monday {
         Ok(vec![])
     }
 
+    /// Item links on any monday.com account, before the person connects theirs.
+    fn recognizes(&self, url: &str) -> bool {
+        let Some(slug) = host_of(url).and_then(|h| h.strip_suffix(".monday.com").map(str::to_string)) else { return false };
+        self.preview_target(&Account { settings: json!({ "slug": slug }), ..Default::default() }, url).is_some()
+    }
+
     /// `https://acme.monday.com/boards/123/pulses/456` (or `…/boards/123/views/7/pulses/456`) →
     /// `456`, only on the connected account's own address.
     fn preview_target(&self, account: &Account, url: &str) -> Option<String> {
@@ -285,6 +291,9 @@ mod tests {
             assert_eq!(Monday.preview_target(&a, no), None, "{no}");
         }
         assert_eq!(Monday.preview_target(&Account::default(), "https://acme.monday.com/boards/123/pulses/456"), None, "no account");
+        assert!(Monday.recognizes("https://other.monday.com/boards/123/pulses/456"), "any account, unconnected");
+        assert!(!Monday.recognizes("https://other.monday.com/boards/123"));
+        assert!(!Monday.recognizes("https://monday.com.evil.test/boards/123/pulses/456"));
 
         let call = &Monday.preview(&Credential { token: "t".into(), ..Default::default() }, &a, "456")[0];
         let body: Value = serde_json::from_str(call.body.as_deref().unwrap()).unwrap();

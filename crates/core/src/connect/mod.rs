@@ -37,7 +37,7 @@ pub const MAX_STEPS: usize = 4;
 /// How long a sign-in with another app may take.
 const SIGN_IN_MINUTES: i64 = 15;
 /// Tokens this close to expiring are refreshed before use.
-const REFRESH_MARGIN_SECS: i64 = 60;
+const REFRESH_MARGIN_SECS: i64 = 300;
 
 /// An OAuth app registered with a provider, so people can connect by signing in.
 #[derive(Clone, Debug)]
@@ -311,6 +311,12 @@ pub trait Connector: Sync {
         None
     }
 
+    /// Whether `url` is a link this app previews, on anyone's account: says which app to connect
+    /// before the person has. Apps on a per-customer host (a Jira site) override this.
+    fn recognizes(&self, url: &str) -> bool {
+        self.preview_target(&Account::default(), url).is_some()
+    }
+
     /// Requests that read the item [`Connector::preview_target`] found.
     fn preview(&self, _cred: &Credential, _account: &Account, _target: &str) -> Vec<HttpCall> {
         vec![]
@@ -322,22 +328,27 @@ pub trait Connector: Sync {
     }
 }
 
+/// A web link's host and path, before any query or fragment. Links with a user name (`@`) or a
+/// backslash are refused: browsers and simple parsers disagree about which host those name.
+fn host_and_path(url: &str) -> Option<(&str, &str)> {
+    let rest = url.strip_prefix("https://").or_else(|| url.strip_prefix("http://"))?;
+    let rest = rest.split(['?', '#']).next()?;
+    let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
+    (!authority.contains('@') && !rest.contains('\\')).then_some((authority, path))
+}
+
 /// A URL's host, lowercase, without port or `www.`.
 pub fn host_of(url: &str) -> Option<String> {
-    let rest = url.strip_prefix("https://").or_else(|| url.strip_prefix("http://"))?;
-    let host = rest.split(['/', '?', '#']).next()?.rsplit('@').next()?.split(':').next()?.to_ascii_lowercase();
+    let host = host_and_path(url)?.0.split(':').next()?.to_ascii_lowercase();
     Some(host.strip_prefix("www.").map(str::to_string).unwrap_or(host)).filter(|h| !h.is_empty())
 }
 
-/// A URL's path segments, without the query or fragment.
+/// A URL's path segments, as written (still percent-encoded), without the query or fragment.
+/// Apps' recognizers accept only the characters their ids use, so a segment can't smuggle a `/`
+/// or `?` into the request built from it.
 pub fn path_of(url: &str) -> Vec<String> {
-    let rest = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
-    let path = rest.split(['?', '#']).next().unwrap_or_default();
-    path.split('/')
-        .skip(1)
-        .filter(|s| !s.is_empty())
-        .map(|s| urlencoding::decode(s).map(|c| c.into_owned()).unwrap_or_else(|_| s.to_string()))
-        .collect()
+    let path = host_and_path(url).map(|(_, p)| p).unwrap_or_default();
+    path.split('/').filter(|s| !s.is_empty()).map(str::to_string).collect()
 }
 
 /// Reads a standard OAuth token answer.
@@ -596,7 +607,7 @@ fn save(db: &dyn Db, cfg: &HostConfig, j: &ConnectJob, account: &Account, now: D
 fn save_token(db: &dyn Db, cfg: &HostConfig, user_id: &str, conn: &Connection, now: DateTime<Utc>) -> ApiResult<()> {
     let secret = seal(key_of(cfg)?, user_id, conn.provider, &conn.cred)?;
     db.execute(
-        "UPDATE connections SET secret = ?, expires_at = ?, updated_at = ? WHERE user_id = ? AND provider = ?",
+        "UPDATE connections SET secret = ?, expires_at = ?, refreshing_until = NULL, updated_at = ? WHERE user_id = ? AND provider = ?",
         &params![secret, conn.expires_at.map(ts), ts(now), user_id, conn.provider],
     )?;
     Ok(())
@@ -782,33 +793,43 @@ impl<T: JsonSchema> JsonSchema for Deferred<T> {
     }
 }
 
-/// Puts a job's result into the response in place of [`PENDING`]: as JSON where the placeholder
-/// is a JSON string (REST, MCP's structured content), and as escaped JSON where it sits inside a
-/// string (MCP's text content).
-pub fn fill_pending(body: &[u8], value: &Value) -> Option<Vec<u8>> {
-    let text = std::str::from_utf8(body).ok()?;
-    if !text.contains(PENDING) {
-        return None;
+/// Puts a job's result into the operation's answer in place of [`PENDING`]: the whole answer
+/// (REST), or an MCP tool call's result. A failed job makes that MCP result a tool error, so the
+/// reply keeps the request's id. `Err` only for REST, which answers with the error itself.
+pub fn fill(mut answer: Value, result: Result<Value, ApiError>) -> Result<Value, ApiError> {
+    if answer == PENDING {
+        return result;
     }
-    let raw = serde_json::to_string(value).ok()?;
-    let escaped = serde_json::to_string(&raw).ok()?;
-    let escaped = &escaped[1..escaped.len() - 1];
-    Some(text.replace(&format!("\\\"{PENDING}\\\""), escaped).replace(&format!("\"{PENDING}\""), &raw).into_bytes())
+    if answer.get("jsonrpc").is_none() {
+        return Err(ApiError::internal("the result had nowhere to go"));
+    }
+    match answer.get_mut("result").filter(|r| r["structuredContent"] == PENDING) {
+        Some(slot) => {
+            *slot = match result {
+                Ok(value) => crate::mcp::tool_result(value),
+                Err(e) => crate::mcp::tool_error(&e),
+            }
+        }
+        None => answer = crate::mcp::rpc_error(answer["id"].clone(), -32603, "the result had nowhere to go"),
+    }
+    Ok(answer)
 }
 
 /// The answer to send once a job finished: `response` with the result filled in, a redirect, or
 /// an error.
 pub fn respond(mut response: crate::Response, finish: Finish) -> crate::Response {
-    match finish {
-        Finish::Fill(value) => match fill_pending(&response.body, &value) {
-            Some(body) => {
-                response.body = body;
-                response
-            }
-            None => crate::Response::error(&ApiError::internal("the result had nowhere to go")),
-        },
-        Finish::Redirect(url) => crate::Response::redirect(&url).with_header("cache-control", "no-store"),
-        Finish::Fail(e) => crate::Response::error(&e),
+    let result = match finish {
+        Finish::Redirect(url) => return crate::Response::redirect(&url).with_header("cache-control", "no-store"),
+        Finish::Fill(value) => Ok(value),
+        Finish::Fail(e) => Err(e),
+    };
+    let answer = serde_json::from_slice(&response.body).unwrap_or_default();
+    match fill(answer, result).and_then(|v| serde_json::to_vec(&v).map_err(|e| ApiError::internal(e.to_string()))) {
+        Ok(body) => {
+            response.body = body;
+            response
+        }
+        Err(e) => crate::Response::error(&e),
     }
 }
 
@@ -855,8 +876,8 @@ pub struct SearchJob {
 #[derive(Clone, Debug)]
 enum SearchPhase {
     Start,
-    /// Refreshing these connections' tokens first.
-    Refreshing(Vec<Connection>, Vec<Connection>),
+    /// Refreshing these connections' tokens first; then the rest, and the apps that failed.
+    Refreshing(Vec<Connection>, Vec<Connection>, Vec<AppResult>),
     /// Waiting for search answers: each connection and how many requests it sent.
     Searching(Vec<(Connection, usize)>, Vec<AppResult>),
 }
@@ -979,7 +1000,42 @@ fn refresh_call(cfg: &HostConfig, conn: &Connection) -> HttpCall {
     p.token_request(app, vec![("grant_type".into(), "refresh_token".into()), ("refresh_token".into(), refresh)])
 }
 
-/// Saves a refreshed token. `false` when the app refused: the person must connect again.
+/// What a request does about a token that expires soon.
+#[derive(Debug, PartialEq)]
+enum Renewal {
+    /// Refresh it; this request holds the lease.
+    Refresh,
+    /// Another request is refreshing it, and the current token still works until it expires.
+    UseCurrent,
+    /// Another request is refreshing it, and the current token has expired.
+    Wait,
+}
+
+/// How long one request may take refreshing a token before another may try.
+const REFRESH_LEASE_SECS: i64 = 30;
+
+/// Lets one request at a time refresh a connection's token. Apps that hand out a new refresh token
+/// each time (Box, Atlassian, monday) refuse the old one once it's used, so two requests refreshing
+/// together would leave one asking the person to reconnect. Refreshing starts
+/// [`REFRESH_MARGIN_SECS`] before the token expires, so the others can keep using it meanwhile.
+fn renewal(db: &dyn Db, user_id: &str, conn: &Connection, now: DateTime<Utc>) -> ApiResult<Renewal> {
+    let claimed = db.execute(
+        "UPDATE connections SET refreshing_until = ? WHERE user_id = ? AND provider = ? AND (refreshing_until IS NULL OR refreshing_until <= ?)",
+        &params![ts(now + Duration::seconds(REFRESH_LEASE_SECS)), user_id, conn.provider, ts(now)],
+    )? > 0;
+    Ok(match claimed {
+        true => Renewal::Refresh,
+        false if conn.expires_at.is_some_and(|e| e > now) => Renewal::UseCurrent,
+        false => Renewal::Wait,
+    })
+}
+
+fn busy_message(name: &str) -> String {
+    format!("{name} is renewing its sign-in. Try again in a moment.")
+}
+
+/// Saves a refreshed token, or says why there isn't one. Either way, other requests may refresh
+/// again.
 fn apply_refresh(
     db: &dyn Db,
     cfg: &HostConfig,
@@ -987,17 +1043,21 @@ fn apply_refresh(
     conn: &mut Connection,
     reply: &HttpReply,
     now: DateTime<Utc>,
-) -> ApiResult<bool> {
+) -> ApiResult<Result<(), String>> {
     let p = providers::get(conn.provider).expect("known provider");
     let Ok(tokens) = p.read_token(reply) else {
-        // Apps that hand out a new refresh token each time (Box, Atlassian, monday) refuse the old
-        // one once another request used it first. That request saved fresh tokens: use them.
+        db.execute("UPDATE connections SET refreshing_until = NULL WHERE user_id = ? AND provider = ?", &params![user_id, conn.provider])?;
+        if reply.status == 0 || reply.status == 429 || reply.status >= 500 {
+            return Ok(Err(http_error(p.info().name, reply)));
+        }
+        // A request whose lease ran out may have refreshed meanwhile, spending this refresh token:
+        // use the tokens it saved.
         let saved = connections(db, cfg, user_id)?.into_iter().find(|c| c.provider == conn.provider);
         if let Some(saved) = saved.filter(|s| s.cred.token != conn.cred.token && !needs_refresh(cfg, s, now)) {
             *conn = saved;
-            return Ok(true);
+            return Ok(Ok(()));
         }
-        return Ok(false);
+        return Ok(Err(reconnect_message(p.info().name)));
     };
     conn.cred.token = tokens.access_token.clone();
     if let Some(r) = tokens.refresh_token.clone() {
@@ -1006,7 +1066,12 @@ fn apply_refresh(
     conn.cred.fields.extend(tokens.fields.clone());
     conn.expires_at = expiry(now, &tokens);
     save_token(db, cfg, user_id, conn, now)?;
-    Ok(true)
+    Ok(Ok(()))
+}
+
+fn failed_app(provider: &'static str, error: String) -> AppResult {
+    let name = providers::get(provider).expect("known provider").info().name;
+    AppResult { provider: provider.into(), name: name.into(), ok: false, error: Some(error), count: 0 }
 }
 
 fn reconnect_message(name: &str) -> String {
@@ -1042,18 +1107,32 @@ fn preview_step(db: &dyn Db, cfg: &HostConfig, j: &mut PreviewJob, replies: Vec<
         Ok(Step::Done(Finish::Fill(serde_json::to_value(value).map_err(|e| ApiError::internal(e.to_string()))?)))
     };
     match j.phase {
-        PreviewPhase::Start if needs_refresh(cfg, &j.conn, now) => {
-            j.phase = PreviewPhase::Refreshing;
-            Ok(Step::Fetch(vec![refresh_call(cfg, &j.conn)]))
-        }
-        PreviewPhase::Refreshing
-            if !apply_refresh(db, cfg, &j.user_id, &mut j.conn, &replies.first().cloned().unwrap_or_default(), now)? =>
-        {
-            done(Err(reconnect_message(p.info().name)))
-        }
-        PreviewPhase::Start | PreviewPhase::Refreshing => {
+        PreviewPhase::Start => {
+            // Another request may have refreshed the token since the preview was asked for.
+            if let Some(saved) = connections(db, cfg, &j.user_id)?.into_iter().find(|c| c.provider == j.conn.provider) {
+                j.conn = saved;
+            }
+            if needs_refresh(cfg, &j.conn, now) {
+                match renewal(db, &j.user_id, &j.conn, now)? {
+                    Renewal::Refresh => {
+                        j.phase = PreviewPhase::Refreshing;
+                        return Ok(Step::Fetch(vec![refresh_call(cfg, &j.conn)]));
+                    }
+                    Renewal::UseCurrent => {}
+                    Renewal::Wait => return done(Err(busy_message(p.info().name))),
+                }
+            }
             j.phase = PreviewPhase::Fetching;
             Ok(Step::Fetch(p.preview(&j.conn.cred, &j.conn.account, &j.target)))
+        }
+        PreviewPhase::Refreshing => {
+            match apply_refresh(db, cfg, &j.user_id, &mut j.conn, &replies.first().cloned().unwrap_or_default(), now)? {
+                Ok(()) => {
+                    j.phase = PreviewPhase::Fetching;
+                    Ok(Step::Fetch(p.preview(&j.conn.cred, &j.conn.account, &j.target)))
+                }
+                Err(message) => done(Err(message)),
+            }
         }
         PreviewPhase::Fetching => done(p.read_preview(&j.conn.account, &j.target, &replies)),
     }
@@ -1074,32 +1153,36 @@ fn search_calls(j: &SearchJob, conns: Vec<Connection>) -> (Vec<HttpCall>, Vec<(C
 fn search_step(db: &dyn Db, cfg: &HostConfig, j: &mut SearchJob, replies: Vec<HttpReply>, now: DateTime<Utc>) -> ApiResult<Step> {
     match std::mem::replace(&mut j.phase, SearchPhase::Start) {
         SearchPhase::Start => {
-            let conns: Vec<Connection> = connections(db, cfg, &j.user_id)?
-                .into_iter()
-                .filter(|c| j.only.is_empty() || j.only.iter().any(|o| o == c.provider))
-                .collect();
-            let (stale, fresh): (Vec<_>, Vec<_>) = conns.into_iter().partition(|c| needs_refresh(cfg, c, now));
+            let (mut fresh, mut stale, mut failed) = (vec![], vec![], vec![]);
+            for c in connections(db, cfg, &j.user_id)? {
+                if !(j.only.is_empty() || j.only.iter().any(|o| o == c.provider)) {
+                    continue;
+                }
+                if !needs_refresh(cfg, &c, now) {
+                    fresh.push(c);
+                    continue;
+                }
+                match renewal(db, &j.user_id, &c, now)? {
+                    Renewal::Refresh => stale.push(c),
+                    Renewal::UseCurrent => fresh.push(c),
+                    Renewal::Wait => {
+                        let name = providers::get(c.provider).expect("known provider").info().name;
+                        failed.push(failed_app(c.provider, busy_message(name)));
+                    }
+                }
+            }
             if !stale.is_empty() {
                 let calls = stale.iter().map(|c| refresh_call(cfg, c)).collect();
-                j.phase = SearchPhase::Refreshing(stale, fresh);
+                j.phase = SearchPhase::Refreshing(stale, fresh, failed);
                 return Ok(Step::Fetch(calls));
             }
-            start_searching(j, fresh, vec![])
+            start_searching(j, fresh, failed)
         }
-        SearchPhase::Refreshing(stale, mut fresh) => {
-            let mut failed = vec![];
+        SearchPhase::Refreshing(stale, mut fresh, mut failed) => {
             for (mut c, reply) in stale.into_iter().zip(replies) {
-                if apply_refresh(db, cfg, &j.user_id, &mut c, &reply, now)? {
-                    fresh.push(c);
-                } else {
-                    let name = providers::get(c.provider).expect("known provider").info().name;
-                    failed.push(AppResult {
-                        provider: c.provider.into(),
-                        name: name.into(),
-                        ok: false,
-                        error: Some(reconnect_message(name)),
-                        count: 0,
-                    });
+                match apply_refresh(db, cfg, &j.user_id, &mut c, &reply, now)? {
+                    Ok(()) => fresh.push(c),
+                    Err(message) => failed.push(failed_app(c.provider, message)),
                 }
             }
             start_searching(j, fresh, failed)
@@ -1125,13 +1208,7 @@ fn search_step(db: &dyn Db, cfg: &HostConfig, j: &mut SearchJob, replies: Vec<Ht
                         });
                         items.extend(hits);
                     }
-                    Err(e) => apps.push(AppResult {
-                        provider: c.provider.into(),
-                        name: p.info().name.into(),
-                        ok: false,
-                        error: Some(e),
-                        count: 0,
-                    }),
+                    Err(e) => apps.push(failed_app(c.provider, e)),
                 }
             }
             let value = serde_json::to_value(ConnectedResults { items, apps }).map_err(|e| ApiError::internal(e.to_string()))?;
@@ -1236,19 +1313,30 @@ mod tests {
     }
 
     #[test]
-    fn pending_results_fill_any_envelope() {
+    fn pending_results_fill_rest_and_mcp_answers() {
         let value = json!({ "items": [{ "title": "Say \"hi\"" }] });
-        let rest = serde_json::to_vec(&json!(PENDING)).unwrap();
-        let filled: Value = serde_json::from_slice(&fill_pending(&rest, &value).unwrap()).unwrap();
-        assert_eq!(filled, value);
-        let text = serde_json::to_string(&json!(PENDING)).unwrap();
-        let mcp = serde_json::to_vec(&json!({ "result": { "content": [{ "type": "text", "text": text }], "structuredContent": PENDING } }))
-            .unwrap();
-        let filled: Value = serde_json::from_slice(&fill_pending(&mcp, &value).unwrap()).unwrap();
+        let failed = || ApiError::new(400, "connect_failed", "GitHub said no");
+        assert_eq!(fill(json!(PENDING), Ok(value.clone())).unwrap(), value);
+        assert_eq!(fill(json!(PENDING), Err(failed())).unwrap_err().code, "connect_failed");
+        assert!(fill(json!({}), Ok(value.clone())).is_err());
+
+        // A caller's id that happens to equal the placeholder stays as it is.
+        let mcp = json!({ "jsonrpc": "2.0", "id": PENDING, "result": crate::mcp::tool_result(json!(PENDING)) });
+        let filled = fill(mcp.clone(), Ok(value.clone())).unwrap();
+        assert_eq!(filled["id"], PENDING);
         assert_eq!(filled["result"]["structuredContent"], value);
+        assert_eq!(filled["result"]["isError"], false);
         let inner: Value = serde_json::from_str(filled["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
         assert_eq!(inner, value);
-        assert!(fill_pending(b"{}", &value).is_none());
+
+        // A failed job is a tool error in the same reply, not a bare REST error.
+        let filled = fill(mcp, Err(failed())).unwrap();
+        assert_eq!((&filled["jsonrpc"], &filled["id"], &filled["result"]["isError"]), (&json!("2.0"), &json!(PENDING), &json!(true)));
+        assert!(filled["result"]["content"][0]["text"].as_str().unwrap().contains("GitHub said no"));
+        assert!(filled["result"].get("structuredContent").is_none());
+
+        let elsewhere = fill(json!({ "jsonrpc": "2.0", "id": 3, "result": { "structuredContent": "x" } }), Ok(value)).unwrap();
+        assert_eq!((&elsewhere["id"], &elsewhere["error"]["code"]), (&json!(3), &json!(-32603)));
     }
 
     #[test]

@@ -246,12 +246,15 @@ async fn stdio_mcp(db: PathBuf, allow_private_webhooks: bool, user: Option<Strin
         .await??;
         let mut effects = effects;
         let reply = match (take_job(&mut effects), reply) {
-            (Some(job), Some(reply)) => match run_job(&app, job).await {
-                connect::Finish::Fill(v) => {
-                    connect::fill_pending(reply.to_string().as_bytes(), &v).and_then(|b| serde_json::from_slice(&b).ok()).or(Some(reply))
-                }
-                _ => Some(reply),
-            },
+            (Some(job), Some(reply)) => {
+                let result = match run_job(&app, job).await {
+                    connect::Finish::Fill(v) => Ok(v),
+                    connect::Finish::Fail(e) => Err(e),
+                    connect::Finish::Redirect(_) => Err(dumbslab_core::ApiError::internal("a sign-in can't finish over stdio")),
+                };
+                let id = reply["id"].clone();
+                Some(connect::fill(reply, result).unwrap_or_else(|e| dumbslab_core::mcp::rpc_error(id, -32603, &e.message)))
+            }
             (_, reply) => reply,
         };
         pending.extend(deliver(app.clone(), effects));

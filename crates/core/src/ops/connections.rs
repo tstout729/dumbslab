@@ -9,8 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{DONE, Done, NoInput};
 use crate::connect::{
-    self, Account, ConnectJob, ConnectedAccount, ConnectedResults, Credential, Deferred, Field, Job, LinkPreview, PreviewJob, SearchJob,
-    providers,
+    self, ConnectJob, ConnectedAccount, ConnectedResults, Credential, Deferred, Field, Job, LinkPreview, PreviewJob, SearchJob, providers,
 };
 use crate::db::DbExt;
 use crate::error::{ApiError, ApiResult};
@@ -231,9 +230,6 @@ fn preview_link(ctx: &mut Ctx, input: PreviewInput) -> ApiResult<Deferred<LinkPr
         }
     }
     // Not connected: say which app it is anyway, where the link alone tells.
-    let app = providers::ALL
-        .iter()
-        .find(|p| p.info().preview && p.preview_target(&Account::default(), url).is_some())
-        .map(|p| p.info().id.to_string());
+    let app = providers::ALL.iter().find(|p| p.info().preview && p.recognizes(url)).map(|p| p.info().id.to_string());
     Ok(Deferred::Ready(LinkPreview { app, connected: false, preview: None, error: None }))
 }
