@@ -13,20 +13,19 @@ struct Assets;
 
 /// Matches `web/_headers`, which the Cloudflare host serves. Embeds may frame only the providers
 /// in [`dumbslab_core::embed::FRAME_ORIGINS`], and play video files only from
-/// [`dumbslab_core::embed::MEDIA_ORIGINS`].
-fn csp() -> &'static str {
-    static CSP: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    CSP.get_or_init(|| {
-        format!(
-            "default-src 'self'; img-src 'self' https: data:; style-src 'self' 'unsafe-inline'; script-src 'self'; \
-             connect-src 'self'; font-src 'self' data:; {}; {}; frame-ancestors 'none'; base-uri 'self'; form-action 'self'",
-            dumbslab_core::embed::media_src_directive(),
-            dumbslab_core::embed::frame_src_directive()
-        )
-    })
+/// [`dumbslab_core::embed::MEDIA_ORIGINS`]. `connect` adds the origins the web app sends
+/// recordings and error reports to, when they're configured.
+pub fn csp(connect: &[String]) -> String {
+    let connect: String = connect.iter().map(|o| format!(" {o}")).collect();
+    format!(
+        "default-src 'self'; img-src 'self' https: data:; style-src 'self' 'unsafe-inline'; script-src 'self'; \
+         connect-src 'self'{connect}; font-src 'self' data:; {}; {}; frame-ancestors 'none'; base-uri 'self'; form-action 'self'",
+        dumbslab_core::embed::media_src_directive(),
+        dumbslab_core::embed::frame_src_directive()
+    )
 }
 
-pub fn serve(path: &str, headers: &HeaderMap) -> Response {
+pub fn serve(path: &str, headers: &HeaderMap, csp: &str) -> Response {
     let wanted = path.trim_start_matches('/');
     let (name, file) = match Assets::get(wanted).filter(|_| !wanted.is_empty()) {
         Some(f) => (wanted.to_string(), f),
@@ -50,7 +49,7 @@ pub fn serve(path: &str, headers: &HeaderMap) -> Response {
         .header("x-content-type-options", "nosniff")
         .header("referrer-policy", "strict-origin-when-cross-origin");
     if name.ends_with(".html") {
-        b = b.header("content-security-policy", csp()).header("x-frame-options", "DENY");
+        b = b.header("content-security-policy", csp).header("x-frame-options", "DENY");
     }
     b.body(Body::from(file.data.into_owned())).unwrap_or_default()
 }
@@ -65,8 +64,16 @@ mod tests {
     fn both_hosts_allow_the_same_embeds() {
         let headers = include_str!("../../../web/_headers");
         for directive in [dumbslab_core::embed::media_src_directive(), dumbslab_core::embed::frame_src_directive()] {
-            assert!(super::csp().contains(&format!("; {directive};")), "{}", super::csp());
+            assert!(super::csp(&[]).contains(&format!("; {directive};")), "{}", super::csp(&[]));
             assert!(headers.contains(&format!("; {directive};")), "web/_headers must allow: {directive}");
         }
+    }
+
+    #[test]
+    fn configured_telemetry_hosts_may_be_reached() {
+        assert!(super::csp(&[]).contains("; connect-src 'self';"));
+        let csp = super::csp(&["https://t.example".into(), "https://o1.ingest.example".into()]);
+        assert!(csp.contains("; connect-src 'self' https://t.example https://o1.ingest.example;"), "{csp}");
+        assert!(csp.contains("; script-src 'self';"), "scripts stay same-origin: {csp}");
     }
 }
