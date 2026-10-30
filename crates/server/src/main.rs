@@ -318,8 +318,12 @@ fn respond(app: Arc<App>, outcome: Outcome) -> axum::response::Response {
 fn deliver(app: Arc<App>, effects: Vec<Effect>) -> Vec<tokio::task::JoinHandle<()>> {
     effects
         .into_iter()
-        .map(|effect| {
-            let Effect::Webhook(d) = effect;
+        // Address moves only exist for hosted workspaces, which this server never is.
+        .filter_map(|effect| match effect {
+            Effect::Webhook(d) => Some(d),
+            Effect::MoveAddress(_) => None,
+        })
+        .map(|d| {
             let app = app.clone();
             tokio::spawn(async move {
                 let mut last: (Option<u16>, Option<String>) = (None, None);

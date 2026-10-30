@@ -18,6 +18,10 @@ pub fn ops() -> Vec<Op> {
     vec![
         op("admin", "get_settings", "GET", "/settings", Access::Read, get_settings).title("Workspace settings").build(),
         op("admin", "update_settings", "PATCH", "/settings", Access::Admin, update_settings).title("Update workspace settings").build(),
+        op("admin", "change_address", "POST", "/settings/address", Access::Admin, change_address)
+            .title("Change the workspace address")
+            .desc("Hosted workspaces only (such as on dumbslab.com): move the workspace to a new subdomain, e.g. from acme to acme-docs. Posts, people and API tokens all move with it. The old address forwards people to the new one and stays reserved for this workspace. Everyone signs in again at the new address, and MCP clients need the new URL. A workspace can use at most 5 addresses; moving back to an earlier one always works.")
+            .build(),
         op("admin", "get_insights", "GET", "/insights", Access::Read, get_insights)
             .title("Knowledge base insights")
             .desc("Counts, most-viewed posts, posts whose verification expired, posts not updated in a long time, and top contributors. Useful for finding docs that need attention.")
@@ -63,18 +67,58 @@ pub struct Settings {
     pub welcome_message: String,
     /// Default verification period in days.
     pub default_verification_days: i64,
+    /// Hosted workspaces only: the subdomain, e.g. `acme` for acme.dumbslab.com. Change it with `change_address`.
+    pub address: Option<String>,
 }
 
-fn read_settings(db: &dyn Db) -> ApiResult<Settings> {
+fn read_settings(ctx: &Ctx) -> ApiResult<Settings> {
+    let db = ctx.db;
     Ok(Settings {
         workspace_name: setting(db, "workspace_name")?.unwrap_or_else(|| "DumbSlab".into()),
         welcome_message: setting(db, "welcome_message")?.unwrap_or_default(),
         default_verification_days: setting_i64(db, "default_verification_days", 90)?,
+        address: ctx.cfg.workspace.clone(),
     })
 }
 
 fn get_settings(ctx: &mut Ctx, _: NoInput) -> ApiResult<Settings> {
-    read_settings(ctx.db)
+    read_settings(ctx)
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ChangeAddressInput {
+    /// The new subdomain: 3 to 32 lowercase letters, digits and hyphens, e.g. `acme-docs` for acme-docs.dumbslab.com.
+    pub address: String,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct AddressChange {
+    /// The new subdomain.
+    pub address: String,
+    /// The workspace's new web address.
+    pub url: String,
+    /// The new MCP server URL. Update it in your AI tools.
+    pub mcp_url: String,
+    /// The old subdomain, which now forwards to the new one.
+    pub previous_address: String,
+}
+
+fn change_address(ctx: &mut Ctx, input: ChangeAddressInput) -> ApiResult<AddressChange> {
+    let Some(from) = ctx.cfg.workspace.clone() else {
+        return Err(ApiError::bad_request(
+            "only hosted workspaces (like those on dumbslab.com) have an address to change; a self-hosted server lives at its own domain",
+        ));
+    };
+    let to = input.address.trim().to_ascii_lowercase();
+    crate::tenancy::validate_slug(&to).map_err(ApiError::bad_request)?;
+    if to == from {
+        return Err(ApiError::conflict(format!("the workspace is already at {to}")));
+    }
+    // The host claims the address and records the move; nothing is written here.
+    ctx.effects.push(crate::Effect::MoveAddress(crate::AddressMove { from: from.clone(), to: to.clone(), actor: ctx.actor.clone() }));
+    let url = crate::tenancy::origin_for(&ctx.base_url, &from, &to);
+    Ok(AddressChange { address: to, mcp_url: format!("{url}/mcp"), url, previous_address: from })
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -96,7 +140,7 @@ fn update_settings(ctx: &mut Ctx, input: UpdateSettingsInput) -> ApiResult<Setti
         put_setting(ctx.db, "default_verification_days", &d.to_string())?;
     }
     emit(ctx, Event::new("settings.updated", "settings", "workspace", "updated workspace settings").admin_only())?;
-    read_settings(ctx.db)
+    read_settings(ctx)
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -448,7 +492,7 @@ fn export_workspace(ctx: &mut Ctx, _: NoInput) -> ApiResult<Export> {
     Ok(Export {
         format: "dumbslab-export-v1".into(),
         exported_at: ctx.now_s(),
-        settings: read_settings(ctx.db)?,
+        settings: read_settings(ctx)?,
         people,
         topics,
         posts,
