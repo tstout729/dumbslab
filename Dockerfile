@@ -2,7 +2,8 @@
 FROM rust:1-slim-bookworm AS build
 WORKDIR /src
 COPY . .
-RUN cargo build --release -p dumbslab
+ARG DUMBSLAB_GIT_SHA
+RUN DUMBSLAB_GIT_SHA="$DUMBSLAB_GIT_SHA" cargo build --release -p dumbslab
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/* \

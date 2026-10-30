@@ -54,7 +54,7 @@ pub fn is_core_path(path: &str) -> bool {
 pub fn handle(db: &dyn Db, cfg: &HostConfig, req: &Request) -> Option<Outcome> {
     let path = req.path.as_str();
     let outcome = if path == "/healthz" {
-        done(Response::json(200, &json!({ "ok": true, "version": crate::VERSION })))
+        done(Response::json(200, &json!({ "ok": true, "version": crate::VERSION, "git_sha": crate::GIT_SHA })))
     } else if path == "/llms.txt" {
         done(Response::text(200, "text/plain; charset=utf-8", crate::openapi::llms_txt(&base_url(cfg, req))))
     } else if path == "/robots.txt" {
