@@ -475,6 +475,9 @@ pub struct CreateDocsSourceInput {
     /// list_github_repositories. Then `repository` must be one listed there, and no token or
     /// webhook is needed. The branch defaults to the repository's default branch.
     pub installation_id: Option<i64>,
+    /// With `installation_id`: the repository's `id` from list_github_repositories. Then that very
+    /// repository is added, whatever its name is now, and `repository` is only for people to read.
+    pub repository_id: Option<i64>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -486,8 +489,9 @@ pub struct DocsSourceCreated {
 }
 
 /// A repository from an installation an admin here connected, which their GitHub account can read:
-/// (repository id, `owner/name`, default branch).
-fn app_repository(ctx: &Ctx, installation_id: i64, repo: &str) -> ApiResult<(i64, String, String)> {
+/// (repository id, `owner/name`, default branch). By its id when the picker gave it (the one the
+/// admin chose, whatever its name is now), else by name.
+fn app_repository(ctx: &Ctx, installation_id: i64, repo: &str, repo_id: Option<i64>) -> ApiResult<(i64, String, String)> {
     if github_app::app(ctx.cfg).is_none() {
         return Err(ApiError::new(503, "github_app_off", "DumbSlab's GitHub App isn't set up on this server; give a token instead."));
     }
@@ -498,10 +502,16 @@ fn app_repository(ctx: &Ctx, installation_id: i64, repo: &str) -> ApiResult<(i64
     if installation.opt_str("suspended_at").is_some() {
         return Err(ApiError::conflict("that installation of DumbSlab's GitHub App is suspended on GitHub"));
     }
-    let found = ctx.db.one(
-        "SELECT id, full_name, default_branch FROM github_repositories WHERE installation_id = ? AND lower(full_name) = lower(?) AND removed_at IS NULL",
-        &params![installation_id, repo],
-    )?;
+    let found = match repo_id {
+        Some(id) => ctx.db.one(
+            "SELECT id, full_name, default_branch FROM github_repositories WHERE installation_id = ? AND id = ? AND removed_at IS NULL",
+            &params![installation_id, id],
+        )?,
+        None => ctx.db.one(
+            "SELECT id, full_name, default_branch FROM github_repositories WHERE installation_id = ? AND lower(full_name) = lower(?) AND removed_at IS NULL",
+            &params![installation_id, repo],
+        )?,
+    };
     let r = found.ok_or_else(|| {
         ApiError::not_found(format!(
             "{repo} in that installation, among the repositories your GitHub account can read there. To add one, Connect GitHub again and give the App access to it"
@@ -522,7 +532,10 @@ fn create_docs_source(ctx: &mut Ctx, input: CreateDocsSourceInput) -> ApiResult<
         Some(_) if clean(input.token.clone()).is_some() => {
             return Err(ApiError::bad_request("a source read through DumbSlab's GitHub App takes no token; leave out `token`"));
         }
-        Some(installation) => Some((installation, app_repository(ctx, installation, &repo)?)),
+        Some(installation) => Some((installation, app_repository(ctx, installation, &repo, input.repository_id)?)),
+        None if input.repository_id.is_some() => {
+            return Err(ApiError::bad_request("`repository_id` goes with `installation_id`, from list_github_repositories"));
+        }
         None => None,
     };
     let repo = app.as_ref().map(|(_, (_, name, _))| name.clone()).unwrap_or(repo);
@@ -696,6 +709,7 @@ pub(crate) fn remove_sources(ctx: &mut Ctx, rows: &[Row]) -> ApiResult<()> {
             return Err(ApiError::conflict(format!("A sync of {} is running. Try again in a moment, once it's done.", row.str("repo"))));
         }
         ctx.db.execute("DELETE FROM docs_items WHERE source_id = ?", &params![id.clone()])?;
+        ctx.db.execute("DELETE FROM docs_rerender WHERE source_id = ?", &params![id.clone()])?;
         ctx.db.execute("DELETE FROM docs_sources WHERE id = ?", &params![id.clone()])?;
         emit(
             ctx,

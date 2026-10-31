@@ -9809,13 +9809,18 @@ mod syncs {
         assert_eq!((r.status, r.body["error"]["code"].as_str()), (409, Some("duplicate")), "{}", r.body);
         let down = |_: &HttpCall| HttpReply { status: 503, body: "{}".into() };
         drive(&h, job_of(&h.call("POST", &format!("/api/v1/docs-sources/{first}/sync"), None, &admin)), &down);
-        // A push starts the newer one's sync like any other, but it stops before asking GitHub
-        // for anything.
+        // A push starts the newer one's sync like any other. Once its token says what the
+        // repository is called now, it stops before reading anything.
         let push = json!({ "ref": "refs/heads/dev", "repository": { "id": 7, "full_name": "acme/manual" }, "installation": { "id": 42 } });
         let jobs = background(&app_hook(&h, "push", &push, "gh-hook-secret"));
         assert_eq!(jobs.len(), 1);
-        let (finish, sent) = drive(&h, jobs[0].clone(), &|c| panic!("asked GitHub {c:?}"));
-        assert!(matches!(finish, Finish::Fail(_)) && sent.is_empty());
+        let mint = |c: &HttpCall| {
+            assert_eq!(c.url, "https://api.github.com/app/installations/42/access_tokens", "only a token");
+            let body = json!({ "token": "ghs_x", "expires_at": "2099-01-01T00:00:00Z", "repositories": [{ "id": 7, "full_name": "acme/manual" }] });
+            HttpReply { status: 201, body: body.to_string() }
+        };
+        let (finish, sent) = drive(&h, jobs[0].clone(), &mint);
+        assert!(matches!(finish, Finish::Fail(_)) && sent.len() == 1);
         assert_eq!(listed(&app_dev)["last_error"], dumbslab_core::sync::docs::DUPLICATE);
 
         // With the older one gone, the newer one syncs again.
@@ -9880,6 +9885,158 @@ mod syncs {
         assert_eq!(source_of(&h, &admin)["repository"], "acme/manual");
         assert_eq!(sync()["updated"], 1);
         assert!(readme().contains("[the API](https://github.com/acme/manual/blob/main/api/README.md)"), "{}", readme());
+    }
+
+    #[test]
+    fn a_repository_that_takes_a_folders_old_name_is_another_repository() {
+        let (h, admin, first) = github_with_a_source();
+        let topic = source_of(&h, &admin)["topic"]["id"].as_str().unwrap().to_string();
+        // acme/docs (repository 7) is transferred out of the installation, and repository 9 takes
+        // its name. The folder on 7 is disconnected, and keeps the name it had.
+        let gh = GitHubNow::new();
+        gh.repos.borrow_mut().retain(|(id, _)| *id != 7);
+        gh.repos.borrow_mut().push((9, "acme/docs"));
+        check(
+            &h,
+            "installation_repositories",
+            &json!({ "action": "removed", "installation": { "id": 42 }, "repositories_removed": [] }),
+            &gh,
+        );
+        let s = source_of(&h, &admin);
+        assert!(s["disconnected"].as_str().unwrap().contains("taken out"), "{s}");
+        assert_eq!(s["repository"], "acme/docs");
+
+        // Connect GitHub again: the picker has repository 9 as acme/docs. The same folder of it is
+        // another repository's, so it's added, and it syncs.
+        let nine = |c: &HttpCall| {
+            let mut r = installer(c);
+            if c.url.contains("/user/installations/42/repositories") {
+                let mut v: Value = serde_json::from_str(&r.body).unwrap();
+                for repo in v["repositories"].as_array_mut().unwrap() {
+                    if repo["id"] == 7 {
+                        repo["id"] = json!(9);
+                    }
+                }
+                r.body = v.to_string();
+            }
+            r
+        };
+        connect_github(&h, &admin, "&installation_id=42&setup_action=install", &nine);
+        let input =
+            json!({ "provider": "github", "installation_id": 42, "repository_id": 9, "repository": "acme/docs", "topic_id": topic });
+        let r = h.call("POST", "/api/v1/docs-sources", Some(input), &admin);
+        assert_eq!(r.status, 200, "{}", r.body);
+        let second = r.body["source"]["id"].as_str().unwrap().to_string();
+        assert_eq!(r.body["source"]["disconnected"], Value::Null);
+        job_of(&h.call("POST", &format!("/api/v1/docs-sources/{second}/sync"), None, &admin));
+        assert!(source_of(&h, &admin)["disconnected"].as_str().unwrap().contains("taken out"), "the first still waits for 7");
+        assert_eq!(source_of(&h, &admin)["id"], first.as_str());
+        // A token folder has no id to tell them apart: by name, it's the same folder.
+        let token = json!({ "provider": "github", "repository": "acme/docs", "topic_id": topic, "token": "ghp_x" });
+        assert_eq!(h.call("POST", "/api/v1/docs-sources", Some(token), &admin).status, 409);
+    }
+
+    #[test]
+    fn the_picked_repository_is_added_whatever_its_name_is_now() {
+        let mut h = H::new();
+        let (admin, _) = h.setup();
+        with_key(&mut h);
+        with_app(&mut h);
+        connect_github(&h, &admin, "&installation_id=42&setup_action=install", &installer);
+        let topic = h.ok("POST", "/api/v1/topics", Some(json!({ "name": "Handbook" })), &admin)["id"].as_str().unwrap().to_string();
+        let picked = h.ok("GET", "/api/v1/docs-sources/github", None, &admin)["installations"][0]["repositories"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["full_name"] == "acme/docs")
+            .unwrap()
+            .clone();
+        assert_eq!(picked["id"], 7);
+        // Meanwhile acme/docs is renamed acme/handbook, repository 9 takes the name acme/docs, and
+        // someone connects GitHub again, so DumbSlab knows both.
+        let moved = |c: &HttpCall| {
+            let mut r = installer(c);
+            if c.url.contains("/user/installations/42/repositories") {
+                r.body = json!({ "total_count": 2, "repositories": [
+                    { "id": 7, "full_name": "acme/handbook", "default_branch": "main", "private": true },
+                    { "id": 9, "full_name": "acme/docs", "default_branch": "main", "private": true },
+                ] })
+                .to_string();
+            }
+            r
+        };
+        connect_github(&h, &admin, "&installation_id=42&setup_action=install", &moved);
+        // The admin adds what they picked: repository 7, under its name now.
+        let input = json!({ "provider": "github", "installation_id": 42, "repository_id": picked["id"], "repository": picked["full_name"], "topic_id": topic });
+        let r = h.call("POST", "/api/v1/docs-sources", Some(input), &admin);
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert_eq!(r.body["source"]["repository"], "acme/handbook");
+        let id = r.body["source"]["id"].as_str().unwrap().to_string();
+        assert_eq!(count(&h, &format!("SELECT repo_id FROM docs_source_links WHERE source_id = '{id}'")), 7);
+        // A name alone is looked up once, as it is now, and its id kept.
+        let by_name =
+            json!({ "provider": "github", "installation_id": 42, "repository": "acme/docs", "folder": "guides", "topic_id": topic });
+        let id = h.ok("POST", "/api/v1/docs-sources", Some(by_name), &admin)["source"]["id"].as_str().unwrap().to_string();
+        assert_eq!(count(&h, &format!("SELECT repo_id FROM docs_source_links WHERE source_id = '{id}'")), 9);
+        let no_installation =
+            json!({ "provider": "github", "repository_id": 7, "repository": "acme/docs", "topic_id": topic, "token": "ghp_x" });
+        assert_eq!(h.call("POST", "/api/v1/docs-sources", Some(no_installation), &admin).status, 400);
+        let unknown =
+            json!({ "provider": "github", "installation_id": 42, "repository_id": 77, "repository": "acme/docs", "topic_id": topic });
+        assert_eq!(h.call("POST", "/api/v1/docs-sources", Some(unknown), &admin).status, 404);
+    }
+
+    #[test]
+    fn a_file_moved_while_renders_are_owed_keeps_its_post() {
+        let mut h = H::new();
+        let (admin, _) = h.setup();
+        with_key(&mut h);
+        with_app(&mut h);
+        connect_github(&h, &admin, "&installation_id=42&setup_action=install", &installer);
+        let topic = h.ok("POST", "/api/v1/topics", Some(json!({ "name": "Handbook" })), &admin)["id"].as_str().unwrap().to_string();
+        let input =
+            json!({ "provider": "github", "installation_id": 42, "repository": "acme/docs", "folder": "handbook", "topic_id": topic });
+        let source = h.ok("POST", "/api/v1/docs-sources", Some(input), &admin)["source"]["id"].as_str().unwrap().to_string();
+        // One more file than a run renders: 20 docs, then `zz.md` last.
+        let mut files: Vec<(String, Vec<u8>)> =
+            (0..20).map(|i| (format!("doc{i:02}.md"), format!("# Doc {i}\n\nSee [the API](../api/README.md).\n").into_bytes())).collect();
+        files.push(("zz.md".into(), b"# Last\n\nSee [the API](../api/README.md).\n".to_vec()));
+        let refs: Vec<(&str, &[u8])> = files.iter().map(|(p, b)| (p.as_str(), b.as_slice())).collect();
+        let repo = Repo::new(&refs);
+        let name = RefCell::new("acme/docs");
+        let github = |c: &HttpCall| -> HttpReply {
+            let now = *name.borrow();
+            if c.url == "https://api.github.com/app/installations/42/access_tokens" {
+                let body = json!({ "token": "ghs_installation", "expires_at": "2099-01-01T00:00:00Z",
+                                   "repositories": [{ "id": 7, "full_name": now }] });
+                return HttpReply { status: 201, body: body.to_string() };
+            }
+            match c.url.strip_prefix(&format!("https://api.github.com/repos/{now}/")) {
+                Some(rest) => repo.github(&HttpCall { url: format!("https://api.github.com/repos/acme/docs/{rest}"), ..c.clone() }),
+                None => HttpReply { status: 404, body: "{}".into() },
+            }
+        };
+        let sync = || filled(drive(&h, job_of(&h.call("POST", &format!("/api/v1/docs-sources/{source}/sync"), None, &admin)), &github).0);
+        let content = |path: &str| post(&h, &doc_ids(&h)[path], &admin)["content"].as_str().unwrap().to_string();
+        assert_eq!((sync()["created"].as_i64(), sync()["created"].as_i64()), (Some(20), Some(1)));
+        let last = doc_ids(&h)["zz.md"].clone();
+
+        // Renamed: the first run renders 20 files again; zz.md is still owed one.
+        *name.borrow_mut() = "acme/handbook";
+        let r = sync();
+        assert_eq!((r["updated"].as_i64(), r["remaining"].as_i64()), (Some(20), Some(1)), "{r}");
+        assert!(content("zz.md").contains("acme/docs/blob"), "not rendered yet");
+        // zz.md moves, unchanged, before the next run: it's found by its last synced contents and
+        // keeps its post (comments, history and links), then is rendered under the new name.
+        repo.put("moved/zz.md", &repo.remove("zz.md"));
+        let r = sync();
+        assert_eq!((r["renamed"].as_i64(), r["archived"].as_i64(), r["created"].as_i64()), (Some(1), Some(0), Some(0)), "{r}");
+        assert_eq!(doc_ids(&h)["moved/zz.md"], last);
+        // (One folder deeper now, its link points elsewhere in the repository.)
+        let moved = content("moved/zz.md");
+        assert!(moved.contains("[the API](https://github.com/acme/handbook/blob/main/handbook/api/README.md)"), "{moved}");
+        assert_eq!(count(&h, "SELECT COUNT(*) FROM docs_rerender"), 0, "nothing owed");
+        assert_eq!(sync()["unchanged"], 21);
     }
 
     #[test]
