@@ -6221,7 +6221,9 @@ mod add_to_slack {
                         return HttpReply::default();
                     }
                     if token.starts_with("xoxb-own") {
-                        return ok(json!({ "ok": true, "team": "Own Slack", "team_id": "T9", "user_id": "UOWN" }));
+                        // A workspace's own app, in T9 unless its token names another (`xoxb-own-T1`).
+                        let team = token.strip_prefix("xoxb-own-").filter(|t| t.starts_with('T')).unwrap_or("T9");
+                        return ok(json!({ "ok": true, "team": "Own Slack", "team_id": team, "user_id": "UOWN" }));
                     }
                     match slack.live.iter().find(|(_, t)| t.as_str() == token) {
                         Some((team, _)) => ok(json!({ "ok": true, "team_id": team })),
@@ -7516,6 +7518,36 @@ mod add_to_slack {
         assert_eq!(world.holder("T1"), None);
         assert!(install(&beta, &beta_admin, &world, "T1").0.ends_with("slack=connected"));
         assert_eq!(settings(&acme, &world, &admin)["mode"], "own");
+    }
+
+    /// Round 9: as above, with the workspace's own app in the leftover's own Slack workspace. The
+    /// directory's installation of T1 isn't the own app's, so it's still let go of.
+    #[test]
+    fn a_leftover_in_your_own_apps_slack_workspace_is_let_go_of() {
+        let world = World::new();
+        let (acme, admin) = hosted_at("acme");
+        let (beta, beta_admin) = hosted_at("beta");
+        install(&acme, &admin, &world, "T1");
+        world.down.borrow_mut().push("/slack/release");
+        assert!(install(&acme, &admin, &world, "T2").0.ends_with("slack=connected"));
+        assert!(disconnect(&acme, &world, &admin).0.is_ok());
+        let own = patch(&acme, &world, &admin, json!({ "bot_token": "xoxb-own-T1", "signing_secret": "0123456789abcdef0123" })).unwrap();
+        assert_eq!((own["mode"].as_str(), own["slack_workspace_id"].as_str()), (Some("own"), Some("T1")), "{own}");
+        assert_eq!(world.holder("T1").as_deref(), Some("acme"), "the shared install is left over");
+
+        // Too new still: kept. Once it's been there 15 minutes, Settings lets go of it.
+        assert_eq!(urls(&settings_calls(&acme, &world, &admin).1), vec!["dumbslab-directory:/slack/status"]);
+        world.later();
+        let (s, calls) = settings_calls(&acme, &world, &admin);
+        assert_eq!(urls(&calls), vec!["dumbslab-directory:/slack/status", "dumbslab-directory:/slack/release"]);
+        assert_eq!(body(&calls[1])["team_ids"], json!(["T1"]));
+        assert_eq!(world.holder("T1"), None);
+        assert_eq!(
+            (s["mode"].as_str(), s["slack_workspace_id"].as_str(), s["connected"].as_bool()),
+            (Some("own"), Some("T1"), Some(true)),
+            "{s}"
+        );
+        assert!(install(&beta, &beta_admin, &world, "T1").0.ends_with("slack=connected"));
     }
 
     /// Round 8, S4: Add to Slack reads where the connection is before it exchanges the code. If the

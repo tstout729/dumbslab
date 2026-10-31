@@ -868,7 +868,8 @@ pub(super) fn step(
                     // Not saved: let go of what the directory just recorded, fenced on this job's
                     // value, so it's refused if something newer moved that on. Not if the
                     // connection here names it now (adding it again while something else changed).
-                    let named = load(db, cfg)?.is_some_and(|a| a.shared && a.team_id.as_deref() == Some(inst.team_id.as_str()));
+                    let named = load(db, cfg)?
+                        .is_some_and(|a| super::via_directory(cfg, &a) && a.team_id.as_deref() == Some(inst.team_id.as_str()));
                     if !named {
                         release_later(job, &inst.team_id, generation);
                     }
@@ -947,9 +948,12 @@ pub(super) fn step(
                 forget_stale(db, cfg, job, &team, now)?;
             }
             // Leftovers only (installed long enough ago that no Add to Slack is still finishing),
-            // never one this workspace has just saved meanwhile, and only if nothing changed this
-            // workspace's connection since the directory answered.
-            let leftovers: Vec<String> = status.leftovers.iter().filter(|t| app.team_id.as_deref() != Some(t.as_str())).cloned().collect();
+            // never the one this workspace's Add to Slack connection names (perhaps just saved
+            // meanwhile), and only if nothing changed this workspace's connection since the
+            // directory answered. A workspace's own app in the same Slack workspace doesn't count:
+            // the directory's installation isn't its.
+            let named = app.team_id.as_deref().filter(|_| super::via_directory(cfg, app));
+            let leftovers: Vec<String> = status.leftovers.iter().filter(|t| named != Some(t.as_str())).cloned().collect();
             job.held = status.owned;
             if leftovers.is_empty() {
                 return status_view(db, cfg, job, admin, now);
