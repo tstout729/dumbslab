@@ -342,13 +342,15 @@ pub(crate) fn begin(
 /// same browser session, within [`CONNECT_MINUTES`]. The state works once.
 pub(crate) struct Returned {
     pub user_id: String,
+    /// GitLab's PKCE verifier.
+    pub verifier: Option<String>,
 }
 
 pub(crate) fn returned(db: &dyn Db, cfg: &HostConfig, req: &Request, provider: &str, state: &str) -> ApiResult<Result<Returned, Problem>> {
     let now = Utc::now();
     let hash = sha256_hex(state);
     let Some(row) = db.one(
-        "SELECT user_id, session_hash, created_at FROM docs_connect_requests WHERE state_hash = ? AND provider = ?",
+        "SELECT user_id, session_hash, verifier, created_at FROM docs_connect_requests WHERE state_hash = ? AND provider = ?",
         &params![hash.clone(), provider],
     )?
     else {
@@ -368,7 +370,7 @@ pub(crate) fn returned(db: &dyn Db, cfg: &HostConfig, req: &Request, provider: &
     if !actor.is_some_and(|a| a.can_admin()) {
         return Ok(Err(Problem::NotAdmin));
     }
-    Ok(Ok(Returned { user_id: row.str("user_id") }))
+    Ok(Ok(Returned { user_id: row.str("user_id"), verifier: row.opt_str("verifier") }))
 }
 
 fn unavailable(cfg: &HostConfig) -> bool {
@@ -775,6 +777,7 @@ pub(crate) fn disconnected_message(code: &str) -> String {
         UNINSTALLED => "DumbSlab's GitHub App was uninstalled, so this folder doesn't sync. Connect GitHub again to pick it back up; its posts stay.",
         SUSPENDED => "DumbSlab's GitHub App is suspended on GitHub, so this folder doesn't sync. It picks up again when the App is unsuspended; its posts stay.",
         REPOSITORY_REMOVED => "The repository was taken out of DumbSlab's GitHub App on GitHub, so this folder doesn't sync. Add the repository to the App again, or Connect GitHub again; its posts stay.",
+        super::gitlab_app::SIGNED_OUT => "GitLab no longer accepts DumbSlab's access for this folder, so it doesn't sync. Choose Connect GitLab, then Reconnect on this folder; its posts stay.",
         _ => "This folder can't sync. Connect GitHub again; its posts stay.",
     }
     .to_string()

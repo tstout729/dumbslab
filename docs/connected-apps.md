@@ -73,4 +73,5 @@ Things worth knowing before you register apps:
 - **Slack**'s terms allow distributing an app commercially only through the Slack Marketplace, so hosted DumbSlab's shared Slack app needs a listing. A self-hosted server's own Slack app counts as internal. Message search uses `search.messages`, which works for any app.
 - **Zendesk** is retiring API tokens: no new ones since October 27, 2026, and existing ones stop working on April 30, 2027. Zendesk's own OAuth clients belong to one Zendesk account, so a shared app needs a global OAuth client that Zendesk approves; until then, Zendesk works only with existing tokens.
 - **Atlassian** (Jira, Confluence, Trello) uses one developer console. Add the "User identity API" so DumbSlab can show whose account it is.
+- **GitLab**: docs sync's Connect GitLab uses the same app, with the `api` scope and a second redirect URI, `<root>/sync/gitlab/callback` (see [hosting/gitlab-app.md](hosting/gitlab-app.md)). Connected apps keep asking for `read_api` only.
 - **Asana**'s OAuth app should ask only for `users:read`, `workspaces:read`, `workspaces.typeahead:read`, `tasks:read` and `projects:read`.

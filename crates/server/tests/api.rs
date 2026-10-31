@@ -6411,4 +6411,262 @@ mod syncs {
         assert_eq!((repos["available"].as_bool(), repos["connect_url"].clone()), (Some(false), Value::Null));
         assert_eq!(h.call("GET", "/sync/github/other", None, &admin).status, 404);
     }
+
+    // -----------------------------------------------------------------------
+    // Docs through DumbSlab's GitLab app
+
+    /// gitlab.com, for an admin `@ada` who maintains `acme/handbook` (id 3). Its access tokens are
+    /// `glo_<n>`, each refresh replacing the refresh token (`glr_<n>`), as GitLab does.
+    struct GitLabCom {
+        files: RefCell<BTreeMap<String, Vec<u8>>>,
+        /// The refresh token GitLab accepts now; empty once access is revoked.
+        refresh: RefCell<String>,
+        issued: RefCell<u32>,
+        hooks_added: RefCell<Vec<Value>>,
+        hooks_removed: RefCell<Vec<String>>,
+    }
+
+    impl GitLabCom {
+        fn new(files: &[(&str, &[u8])]) -> GitLabCom {
+            GitLabCom {
+                files: RefCell::new(files.iter().map(|(p, b)| (p.to_string(), b.to_vec())).collect()),
+                refresh: RefCell::new(String::new()),
+                issued: RefCell::new(0),
+                hooks_added: RefCell::new(vec![]),
+                hooks_removed: RefCell::new(vec![]),
+            }
+        }
+
+        fn tokens(&self) -> HttpReply {
+            *self.issued.borrow_mut() += 1;
+            let n = *self.issued.borrow();
+            *self.refresh.borrow_mut() = format!("glr_{n}");
+            ok(
+                json!({ "access_token": format!("glo_{n}"), "refresh_token": format!("glr_{n}"), "expires_in": 7200, "token_type": "Bearer" }),
+            )
+        }
+
+        fn answer(&self, c: &HttpCall) -> HttpReply {
+            let form = c.body.clone().unwrap_or_default();
+            if c.url == "https://gitlab.com/oauth/token" {
+                assert!(form.contains("client_id=gl-client") && form.contains("client_secret=gl-secret"), "{form}");
+                if form.contains("grant_type=authorization_code") {
+                    assert!(
+                        form.contains("code_verifier=") && form.contains("redirect_uri=https%3A%2F%2Fkb.test%2Fsync%2Fgitlab%2Fcallback"),
+                        "{form}"
+                    );
+                    return self.tokens();
+                }
+                let current = self.refresh.borrow().clone();
+                if !current.is_empty() && form.contains(&format!("refresh_token={current}")) {
+                    return self.tokens();
+                }
+                return HttpReply { status: 400, body: json!({ "error": "invalid_grant" }).to_string() };
+            }
+            let current = format!("Bearer glo_{}", self.issued.borrow());
+            if !c.headers.contains(&("authorization".into(), current)) {
+                return HttpReply { status: 401, body: "{}".into() };
+            }
+            let api = "https://gitlab.com/api/v4";
+            if c.url == format!("{api}/user") {
+                return ok(json!({ "username": "ada" }));
+            }
+            if c.url.starts_with(&format!("{api}/projects?membership=true&min_access_level=40")) {
+                let page1 = c.url.ends_with("&page=1");
+                return ok(if page1 {
+                    json!([{ "id": 3, "path_with_namespace": "acme/handbook", "default_branch": "main", "visibility": "private" }])
+                } else {
+                    json!([])
+                });
+            }
+            if c.url == format!("{api}/projects/acme%2Fhandbook") {
+                return ok(json!({ "id": 3, "path_with_namespace": "acme/handbook", "default_branch": "main" }));
+            }
+            if c.url == format!("{api}/projects/3/hooks") && c.method == "POST" {
+                self.hooks_added.borrow_mut().push(serde_json::from_str(&form).unwrap());
+                return HttpReply { status: 201, body: json!({ "id": 9 }).to_string() };
+            }
+            if c.method == "DELETE" && c.url.starts_with(&format!("{api}/projects/3/hooks/")) {
+                self.hooks_removed.borrow_mut().push(c.url.clone());
+                return HttpReply { status: 204, body: String::new() };
+            }
+            let base = format!("{api}/projects/acme%2Fhandbook/repository");
+            let files = self.files.borrow();
+            if c.url.starts_with(&format!("{base}/tree?ref=main&recursive=true&per_page=100&page=")) {
+                let first = c.url.contains("&page=1&");
+                let entries: Vec<Value> = files
+                    .iter()
+                    .map(|(p, b)| json!({ "id": sha(b), "name": p.rsplit('/').next(), "type": "blob", "path": p, "mode": "100644" }))
+                    .collect();
+                return ok(if first { json!(entries) } else { json!([]) });
+            }
+            if let Some(blob) = c.url.strip_prefix(&format!("{base}/blobs/"))
+                && let Some(b) = files.values().find(|b| sha(b) == blob)
+            {
+                return ok(json!({ "content": base64::engine::general_purpose::STANDARD.encode(b), "encoding": "base64" }));
+            }
+            HttpReply { status: 404, body: "{}".into() }
+        }
+    }
+
+    fn with_gitlab_app(h: &mut H) {
+        h.cfg
+            .connectors
+            .apps
+            .insert("gitlab".into(), connect::OAuthApp { client_id: "gl-client".into(), client_secret: "gl-secret".into() });
+    }
+
+    /// Connect GitLab in `who`'s browser session, all the way.
+    fn connect_gitlab(h: &H, who: &Auth, lab: &GitLabCom) {
+        let to = location(&h.raw("GET", "/sync/gitlab/start", vec![], "", who));
+        assert!(
+            to.starts_with(
+                "https://gitlab.com/oauth/authorize?client_id=gl-client&redirect_uri=https%3A%2F%2Fkb.test%2Fsync%2Fgitlab%2Fcallback"
+            ),
+            "{to}"
+        );
+        assert!(to.contains("&scope=api&") && to.contains("code_challenge_method=S256"), "{to}");
+        let state = to.split("&state=").nth(1).unwrap().split('&').next().unwrap().to_string();
+        let r = h.raw("GET", &format!("/sync/gitlab/callback?state={state}&code=gl-code"), vec![], "", who);
+        assert_eq!(redirect_of(drive(h, job_of(&r), &|c| lab.answer(c)).0), "https://kb.test/settings/docs-sync?connected=gitlab");
+    }
+
+    #[test]
+    fn gitlab_app_adds_its_own_webhook_and_refreshes_its_tokens() {
+        let mut h = H::new();
+        let (admin, _) = h.setup();
+        let (_, mo) = h.user(&admin, "mo@acme.test", "Mo", "member");
+        let mo_cookie = sign_in(&h, "mo@acme.test", "password123");
+        with_key(&mut h);
+        assert_eq!(h.ok("GET", "/api/v1/docs-sources", None, &admin)["gitlab_app"], false);
+        assert!(location(&h.raw("GET", "/sync/gitlab/start", vec![], "", &admin)).ends_with("connect_error=unavailable&app=gitlab"));
+        with_gitlab_app(&mut h);
+        assert_eq!(h.ok("GET", "/api/v1/docs-sources", None, &admin)["gitlab_app"], true);
+        let lab = GitLabCom::new(&[("docs/README.md", b"# Runbooks\n\nStart here.\n"), ("docs/deploy.md", b"# Deploy\n")]);
+        let answer = |c: &HttpCall| lab.answer(c);
+
+        // Not connected yet: nothing to list, and nothing to add a folder with.
+        let none = h.ok("GET", "/api/v1/docs-sources/gitlab", None, &admin);
+        assert_eq!((none["connected"].as_bool(), none["connect_url"].as_str()), (Some(false), Some("https://kb.test/sync/gitlab/start")));
+        assert!(location(&h.raw("GET", "/sync/gitlab/start", vec![], "", &mo_cookie)).ends_with("connect_error=not_admin&app=gitlab"));
+
+        connect_gitlab(&h, &admin, &lab);
+        assert_eq!(count(&h, "SELECT COUNT(*) FROM docs_connections WHERE secret LIKE '%glo_%' OR secret LIKE '%glr_%'"), 0, "sealed");
+        assert_eq!(count(&h, "SELECT COUNT(*) FROM activity WHERE event = 'gitlab.connected'"), 1);
+        let r = h.call("GET", "/api/v1/docs-sources/gitlab", None, &admin);
+        let listed = filled(drive(&h, job_of(&r), &answer).0);
+        assert_eq!((listed["account"].as_str(), listed["projects"][0]["path"].as_str()), (Some("@ada"), Some("acme/handbook")), "{listed}");
+        assert_eq!(h.call("GET", "/api/v1/docs-sources/gitlab", None, &mo).status, 403);
+
+        // Adding a folder: DumbSlab adds the project's webhook with the source's own secret.
+        let topic = h.ok("POST", "/api/v1/topics", Some(json!({ "name": "Runbooks" })), &admin)["id"].as_str().unwrap().to_string();
+        let input =
+            json!({ "provider": "gitlab", "repository": "acme/handbook", "folder": "docs", "topic_id": topic, "gitlab_connection": true });
+        let refused = |change: Value| {
+            let mut i = input.clone();
+            i.as_object_mut().unwrap().extend(change.as_object().unwrap().clone());
+            h.call("POST", "/api/v1/docs-sources", Some(i), &admin).status
+        };
+        assert_eq!(refused(json!({ "token": "glpat-x" })), 400);
+        assert_eq!(refused(json!({ "host": "https://git.acme.test" })), 400, "self-managed GitLab takes a token");
+        assert_eq!(refused(json!({ "provider": "github" })), 400);
+        assert_eq!(h.call("POST", "/api/v1/docs-sources", Some(input.clone()), &mo).status, 403);
+        let r = h.call("POST", "/api/v1/docs-sources", Some(input.clone()), &admin);
+        assert_eq!(r.status, 200, "{}", r.body);
+        let created = filled(drive(&h, job_of(&r), &answer).0);
+        let source = created["source"]["id"].as_str().unwrap().to_string();
+        assert_eq!((created["source"]["connection"].as_str(), created["source"]["branch"].as_str()), (Some("gitlab_oauth"), Some("main")));
+        assert_eq!((created["webhook_secret"].clone(), created["source"]["webhook_url"].clone()), (Value::Null, Value::Null));
+        let hook_body = lab.hooks_added.borrow()[0].clone();
+        assert_eq!(
+            (hook_body["url"].as_str(), hook_body["push_events"].as_bool()),
+            (Some(format!("https://kb.test/hooks/docs/{source}").as_str()), Some(true))
+        );
+        let secret = hook_body["token"].as_str().unwrap().to_string();
+        assert!(secret.starts_with("whsec_"));
+        assert!(!h.ok("GET", "/api/v1/docs-sources", None, &admin).to_string().contains(&secret), "the secret never comes back");
+        assert_eq!(count(&h, "SELECT COUNT(*) FROM docs_connections"), 0, "the approval moved to the source");
+        let again = h.call(
+            "POST",
+            "/api/v1/docs-sources",
+            Some(json!({ "provider": "gitlab", "repository": "acme/handbook", "topic_id": topic, "gitlab_connection": true })),
+            &admin,
+        );
+        assert_eq!(again.status, 409, "connect again for another folder");
+
+        // Syncs read with the source's own token, and pushes arrive through the webhook it added.
+        let r = h.call("POST", &format!("/api/v1/docs-sources/{source}/sync"), None, &admin);
+        assert_eq!(filled(drive(&h, job_of(&r), &answer).0)["created"], 2);
+        let push = json!({ "object_kind": "push", "ref": "refs/heads/main" }).to_string();
+        let r = hook(&h, &format!("/hooks/docs/{source}"), &push, &[("x-gitlab-event", "Push Hook"), ("x-gitlab-token", &secret)]);
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert_eq!(filled(drive(&h, job_of(&r), &answer).0)["unchanged"], 2);
+        assert_eq!(
+            hook(&h, &format!("/hooks/docs/{source}"), &push, &[("x-gitlab-event", "Push Hook"), ("x-gitlab-token", "nope")]).status,
+            401
+        );
+
+        // A token about to expire is refreshed first, and the new ones are kept (GitLab has
+        // replaced the old ones).
+        let expire = || db_run(&h, |db| db.execute("UPDATE docs_source_links SET token_expires_at = '2020-01-01T00:00:00.000Z'", &[]));
+        expire();
+        let r = h.call("POST", &format!("/api/v1/docs-sources/{source}/sync"), None, &admin);
+        let (finish, sent) = drive(&h, job_of(&r), &answer);
+        filled(finish);
+        assert_eq!(sent[0].url, "https://gitlab.com/oauth/token");
+        assert!(sent[1].headers.contains(&("authorization".into(), "Bearer glo_2".into())), "listed with the new token");
+        let r = h.call("POST", &format!("/api/v1/docs-sources/{source}/sync"), None, &admin);
+        let (_, sent) = drive(&h, job_of(&r), &answer);
+        assert!(sent.iter().all(|c| c.url != "https://gitlab.com/oauth/token"), "fresh now");
+
+        // Access revoked on GitLab: the folder waits, and Reconnect with a new approval fixes it.
+        *lab.refresh.borrow_mut() = String::new();
+        expire();
+        let r = h.call("POST", &format!("/api/v1/docs-sources/{source}/sync"), None, &admin);
+        let (finish, _) = drive(&h, job_of(&r), &answer);
+        assert!(matches!(finish, Finish::Fail(ref e) if e.message.contains("Connect GitLab again")), "{finish:?}");
+        assert!(source_of(&h, &admin)["disconnected"].as_str().unwrap().contains("Reconnect"));
+        assert_eq!(h.call("POST", &format!("/api/v1/docs-sources/{source}/sync"), None, &admin).status, 409);
+        assert_eq!(
+            h.call("PATCH", &format!("/api/v1/docs-sources/{source}"), Some(json!({ "gitlab_connection": true })), &admin).status,
+            409,
+            "connect first"
+        );
+        connect_gitlab(&h, &admin, &lab);
+        h.ok("PATCH", &format!("/api/v1/docs-sources/{source}"), Some(json!({ "gitlab_connection": true })), &admin);
+        assert_eq!(source_of(&h, &admin)["disconnected"], Value::Null);
+        let r = h.call("POST", &format!("/api/v1/docs-sources/{source}/sync"), None, &admin);
+        filled(drive(&h, job_of(&r), &answer).0);
+        let r = hook(&h, &format!("/hooks/docs/{source}"), &push, &[("x-gitlab-event", "Push Hook"), ("x-gitlab-token", &secret)]);
+        assert_eq!(r.status, 200, "the webhook kept its secret");
+        drive(&h, job_of(&r), &answer);
+
+        // Removing the source takes the webhook off the project.
+        let r = h.call("DELETE", &format!("/api/v1/docs-sources/{source}"), None, &admin);
+        assert_eq!(r.status, 200);
+        let jobs = background(&r);
+        assert_eq!(jobs.len(), 1);
+        filled(drive(&h, jobs[0].clone(), &answer).0);
+        assert_eq!(lab.hooks_removed.borrow().as_slice(), ["https://gitlab.com/api/v4/projects/3/hooks/9"]);
+
+        // A folder that can't be saved once GitLab took the webhook (its topic went meanwhile):
+        // the webhook comes off again, and the approval stays for another try.
+        connect_gitlab(&h, &admin, &lab);
+        let doomed = h.ok("POST", "/api/v1/topics", Some(json!({ "name": "Doomed" })), &admin)["id"].as_str().unwrap().to_string();
+        let r = h.call(
+            "POST",
+            "/api/v1/docs-sources",
+            Some(json!({ "provider": "gitlab", "repository": "acme/handbook", "topic_id": doomed, "gitlab_connection": true })),
+            &admin,
+        );
+        h.ok("DELETE", &format!("/api/v1/topics/{doomed}"), None, &admin);
+        let (finish, _, effects) = drive_all(&h, job_of(&r), &answer);
+        assert!(matches!(finish, Finish::Fail(ref e) if e.status == 404), "{finish:?}");
+        let undo: Vec<Job> = effects.into_iter().filter_map(|e| if let Effect::Background(j) = e { Some(j) } else { None }).collect();
+        assert_eq!(undo.len(), 1);
+        drive(&h, undo[0].clone(), &answer);
+        assert_eq!(lab.hooks_removed.borrow().len(), 2);
+        assert_eq!(count(&h, "SELECT COUNT(*) FROM docs_sources"), 0);
+        assert_eq!(count(&h, "SELECT COUNT(*) FROM docs_connections"), 1);
+    }
 }

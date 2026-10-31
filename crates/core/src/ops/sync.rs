@@ -7,16 +7,16 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use super::{DONE, Done, NoInput, clean};
-use crate::connect::{self, Credential, Deferred};
+use crate::connect::{self, Credential, Deferred, Job};
 use crate::db::{DbExt, Row};
 use crate::error::{ApiError, ApiResult};
 use crate::events::{Event, emit};
 use crate::model::{TopicRef, UserRef, load_topic, topic_url, user_refs};
 use crate::registry::{Access, Ctx, Op, op};
 use crate::sync::docs::{self, DocsSyncResult, Link, Source};
-use crate::sync::github_app;
 use crate::sync::people::{self, PeopleSyncResult};
 use crate::sync::{self, SyncState};
+use crate::sync::{github_app, gitlab_app};
 use crate::util::new_secret;
 use crate::{Effect, InstallationLink, params};
 
@@ -52,13 +52,17 @@ pub fn ops() -> Vec<Op> {
             .title("GitHub repositories for docs sync")
             .desc("The installations of DumbSlab's GitHub App that admins here connected (Settings › Docs sync › Connect GitHub, a browser step at `connect_url`), each with the repositories the connecting admin's GitHub account can read there and their default branches. Give one's `installation_id` and `full_name` to create_docs_source: no token or webhook needed.")
             .build(),
+        op("sync", "list_gitlab_projects", "GET", "/docs-sources/gitlab", Access::Admin, list_gitlab_projects)
+            .title("GitLab projects for docs sync")
+            .desc("The gitlab.com projects you can maintain, through your Connect GitLab approval (Settings › Docs sync › Connect GitLab, a browser step at `connect_url`), with their default branches. Give one's `path` to create_docs_source with `gitlab_connection: true`: DumbSlab adds its push webhook, so there's no token or webhook to copy.")
+            .build(),
         op("sync", "create_docs_source", "POST", "/docs-sources", Access::Admin, create_docs_source)
             .title("Add a docs sync source")
-            .desc("Keep a GitHub or GitLab folder's Markdown files as posts in a topic, one way: each file is a post, sub-folders become sub-topics, relative links and images keep working, and synced posts are edited in the repository, not here. For a repository from list_github_repositories, give its `installation_id`: DumbSlab's GitHub App reads it and reports pushes, with no token or webhook. Otherwise give a read-only token for private repositories; the answer then has the webhook secret, once: add a push webhook with it in GitHub or GitLab so pushes sync. Then run sync_docs_source.")
+            .desc("Keep a GitHub or GitLab folder's Markdown files as posts in a topic, one way: each file is a post, sub-folders become sub-topics, relative links and images keep working, and synced posts are edited in the repository, not here. For a repository from list_github_repositories, give its `installation_id`: DumbSlab's GitHub App reads it and reports pushes, with no token or webhook. For a project from list_gitlab_projects, give `gitlab_connection: true`: DumbSlab adds its push webhook. Otherwise give a read-only token for private repositories; the answer then has the webhook secret, once: add a push webhook with it in GitHub or GitLab so pushes sync. Then run sync_docs_source.")
             .build(),
         op("sync", "update_docs_source", "PATCH", "/docs-sources/{id}", Access::Admin, update_docs_source)
             .title("Change a docs sync source")
-            .desc("Replace its token (an empty string removes it), switch its branch, or make a new webhook secret (shown once). Sources read through DumbSlab's GitHub App have no token or webhook secret; only their branch changes. To sync another repository or folder, add a new source.")
+            .desc("Replace its token (an empty string removes it), switch its branch, or make a new webhook secret (shown once). Sources read through DumbSlab's GitHub App have no token or webhook secret; only their branch changes. A source read through DumbSlab's GitLab app takes `gitlab_connection: true` to use your newest Connect GitLab approval, e.g. after GitLab stopped accepting the old one. To sync another repository or folder, add a new source.")
             .build(),
         op("sync", "sync_docs_source", "POST", "/docs-sources/{id}/sync", Access::Admin, sync_docs_source)
             .title("Sync docs now")
@@ -66,7 +70,7 @@ pub fn ops() -> Vec<Op> {
             .build(),
         op("sync", "delete_docs_source", "DELETE", "/docs-sources/{id}", Access::Admin, delete_docs_source)
             .title("Remove a docs sync source")
-            .desc("Stop syncing a folder and forget its credentials. Its posts and topics stay, as ordinary posts anyone with access can edit.")
+            .desc("Stop syncing a folder and forget its credentials. Its posts and topics stay, as ordinary posts anyone with access can edit. A webhook DumbSlab added to a GitLab project is removed too.")
             .destructive()
             .build(),
     ]
@@ -222,7 +226,8 @@ pub struct DocsSource {
     /// Where synced posts go. Sub-folders become its sub-topics.
     pub topic: Option<TopicRef>,
     /// How it reads the repository: `token` (a saved token, or none for a public repository, and a
-    /// webhook you add) or `github_app` (DumbSlab's GitHub App: no token, and pushes arrive by themselves).
+    /// webhook you add), `github_app` (DumbSlab's GitHub App: no token, and pushes arrive by
+    /// themselves) or `gitlab_oauth` (an approval of DumbSlab's GitLab app, which added the webhook).
     pub connection: String,
     /// `github_app`: the App's installation that reads the repository.
     pub installation_id: Option<i64>,
@@ -231,7 +236,7 @@ pub struct DocsSource {
     /// A token is saved (it's never shown).
     pub has_token: bool,
     /// `token` sources: where GitHub or GitLab sends push events. Add a webhook for pushes there with
-    /// this source's secret. Null for `github_app` sources, whose pushes arrive through the App.
+    /// this source's secret. Null for the others: the apps' pushes arrive by themselves.
     pub webhook_url: Option<String>,
     /// Markdown files synced as posts.
     pub synced_files: i64,
@@ -250,6 +255,9 @@ pub struct DocsSourceList {
     /// DumbSlab's GitHub App is set up on this server, so GitHub repositories need no token: see
     /// list_github_repositories.
     pub github_app: bool,
+    /// DumbSlab's GitLab app is set up on this server, so gitlab.com projects need no token: see
+    /// list_gitlab_projects.
+    pub gitlab_app: bool,
     pub items: Vec<DocsSource>,
 }
 
@@ -279,7 +287,7 @@ fn source_view(ctx: &Ctx, r: &Row) -> ApiResult<DocsSource> {
         connection: source.link.id().into(),
         installation_id: match source.link {
             Link::GitHubApp { installation_id, .. } => Some(installation_id),
-            Link::Token => None,
+            _ => None,
         },
         disconnected: source.disconnected.as_deref().map(github_app::disconnected_message),
         has_token: !source.cred.token.is_empty(),
@@ -316,7 +324,59 @@ fn list_docs_sources(ctx: &mut Ctx, _: NoInput) -> ApiResult<DocsSourceList> {
             items.push(source_view(ctx, &r)?);
         }
     }
-    Ok(DocsSourceList { enabled, github_app: enabled && github_app::app(ctx.cfg).is_some(), items })
+    Ok(DocsSourceList {
+        enabled,
+        github_app: enabled && github_app::app(ctx.cfg).is_some(),
+        gitlab_app: gitlab_app::available(ctx.cfg),
+        items,
+    })
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct GitLabProjects {
+    /// DumbSlab's GitLab app is set up on this server.
+    pub available: bool,
+    /// You approved DumbSlab's GitLab app and haven't used the approval for a folder yet.
+    pub connected: bool,
+    /// Open this in a browser, signed in as an admin, to approve DumbSlab's GitLab app and come back
+    /// to Settings › Docs sync. Null when it isn't available.
+    pub connect_url: Option<String>,
+    /// Your GitLab account, e.g. `@ada`.
+    pub account: Option<String>,
+    /// Projects you can maintain on gitlab.com, most recently active first.
+    pub projects: Vec<GitLabProject>,
+    /// There are more than the 300 listed.
+    pub more: bool,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct GitLabProject {
+    pub id: i64,
+    /// `group/subgroup/project`: give it to create_docs_source as `repository`.
+    pub path: String,
+    /// GitLab leaves it out for empty projects.
+    pub default_branch: Option<String>,
+    /// `private`, `internal` or `public`.
+    pub visibility: String,
+}
+
+fn list_gitlab_projects(ctx: &mut Ctx, _: NoInput) -> ApiResult<Deferred<GitLabProjects>> {
+    let available = gitlab_app::available(ctx.cfg);
+    let connect_url = available.then(|| ctx.url(gitlab_app::START_PATH));
+    let pending = if available { gitlab_app::pending(ctx.db, ctx.cfg, &ctx.actor.user_id)? } else { None };
+    if pending.is_none() {
+        return Ok(Deferred::Ready(GitLabProjects {
+            available,
+            connected: false,
+            connect_url,
+            account: None,
+            projects: vec![],
+            more: false,
+        }));
+    }
+    let job = gitlab_app::GitLabJob::projects(&ctx.actor.user_id, &ctx.base_url);
+    ctx.effects.push(Effect::Connect(Job::GitLab(Box::new(job))));
+    Ok(Deferred::Pending)
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -408,6 +468,11 @@ pub struct CreateDocsSourceInput {
     /// list_github_repositories. Then `repository` must be one listed there, and no token or
     /// webhook is needed. The branch defaults to the repository's default branch.
     pub installation_id: Option<i64>,
+    /// gitlab.com only: read the project with your Connect GitLab approval (see
+    /// list_gitlab_projects) instead of a token. DumbSlab adds the project's push webhook itself,
+    /// so you need GitLab's Maintainer role there. The approval moves to this source; connect again
+    /// for another. The branch defaults to the project's default branch.
+    pub gitlab_connection: Option<bool>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -443,78 +508,145 @@ fn app_repository(ctx: &Ctx, installation_id: i64, repo: &str) -> ApiResult<(i64
     Ok((r.i64("id"), r.str("full_name"), r.str("default_branch")))
 }
 
-fn create_docs_source(ctx: &mut Ctx, input: CreateDocsSourceInput) -> ApiResult<DocsSourceCreated> {
+fn create_docs_source(ctx: &mut Ctx, input: CreateDocsSourceInput) -> ApiResult<Deferred<DocsSourceCreated>> {
     key_needed(ctx)?;
     let provider = sync::repo_provider(&input.provider)?;
     let (host, repo) = sync::repo_name(provider, &input.repository, input.host.as_deref().unwrap_or_default())?;
+    let token = secret_input(input.token, "token")?.filter(|t| !t.is_empty());
+    let gitlab = input.gitlab_connection.unwrap_or(false);
+    if (input.installation_id.is_some() || gitlab) && token.is_some() {
+        return Err(ApiError::bad_request("a source read through DumbSlab's GitHub or GitLab app takes no token; leave out `token`"));
+    }
     // Through DumbSlab's GitHub App: a repository the admin's own GitHub account showed it can read.
     let app = match input.installation_id {
         Some(_) if provider != sync::repo::Provider::GitHub => {
             return Err(ApiError::bad_request("`installation_id` is for GitHub repositories only"));
         }
-        Some(_) if clean(input.token.clone()).is_some() => {
-            return Err(ApiError::bad_request("a source read through DumbSlab's GitHub App takes no token; leave out `token`"));
-        }
         Some(installation) => Some((installation, app_repository(ctx, installation, &repo)?)),
         None => None,
     };
+    if gitlab && (provider != sync::repo::Provider::GitLab || host != gitlab_app::HOST) {
+        return Err(ApiError::bad_request("`gitlab_connection` is for projects on gitlab.com only; a self-managed GitLab takes a token"));
+    }
     let repo = app.as_ref().map(|(_, (_, name, _))| name.clone()).unwrap_or(repo);
     let default_branch = app.as_ref().map(|(_, (_, _, b))| b.clone()).unwrap_or_else(|| "main".into());
-    let branch = clean(input.branch).unwrap_or(default_branch);
-    let branch = sync::checked_branch(&branch)?;
-    let folder = sync::checked_folder(input.folder.as_deref().unwrap_or_default())?;
-    let topic = load_topic(ctx, input.topic_id.trim())?;
+    let typed_branch = clean(input.branch).map(|b| sync::checked_branch(&b)).transpose()?;
+    let fresh = docs::NewSource {
+        id: crate::util::new_id(),
+        provider,
+        host,
+        repo,
+        branch: typed_branch.clone().unwrap_or(default_branch),
+        folder: sync::checked_folder(input.folder.as_deref().unwrap_or_default())?,
+        topic_id: input.topic_id.trim().to_string(),
+    };
+    check_new_source(ctx, &fresh)?;
+    // Through DumbSlab's GitLab app: GitLab must first find the project for the admin and take
+    // the webhook, so a job finishes adding it (see `gitlab_app`).
+    if gitlab {
+        if !gitlab_app::available(ctx.cfg) {
+            return Err(ApiError::new(503, "gitlab_app_off", "DumbSlab's GitLab app isn't set up on this server; give a token instead."));
+        }
+        if gitlab_app::pending(ctx.db, ctx.cfg, &ctx.actor.user_id)?.is_none() {
+            return Err(ApiError::conflict("Connect GitLab first (Settings › Docs sync), then pick the project."));
+        }
+        let draft = gitlab_app::Draft {
+            webhook_url: ctx.url(&format!("/hooks/docs/{}", fresh.id)),
+            source_id: fresh.id,
+            repo: fresh.repo,
+            branch: typed_branch,
+            folder: fresh.folder,
+            topic_id: fresh.topic_id,
+        };
+        let job = gitlab_app::GitLabJob::create(&ctx.actor.user_id, &ctx.base_url, draft);
+        ctx.effects.push(Effect::Connect(Job::GitLab(Box::new(job))));
+        return Ok(Deferred::Pending);
+    }
+    // A GitHub App source keeps no token and needs no webhook secret.
+    let webhook_secret = app.is_none().then(|| new_secret("whsec_"));
+    let mut cred = Credential { token: token.unwrap_or_default(), ..Default::default() };
+    if let Some(s) = &webhook_secret {
+        cred.fields.insert("webhook_secret".into(), s.clone());
+    }
+    let link = match app {
+        Some((installation_id, (repo_id, _, _))) => Link::GitHubApp { installation_id, repo_id },
+        None => Link::Token,
+    };
+    insert_source(ctx, &fresh, &cred, &link)?;
+    let row = load_source_row(ctx, &fresh.id)?;
+    Ok(Deferred::Ready(DocsSourceCreated { source: source_view(ctx, &row)?, webhook_secret }))
+}
+
+/// Refuses a source that can't be added: its topic must be one the admin can see, the workspace
+/// has room, and the folder doesn't already sync into that topic.
+fn check_new_source(ctx: &Ctx, s: &docs::NewSource) -> ApiResult<()> {
+    load_topic(ctx, &s.topic_id)?;
     let count = ctx.db.scalar_i64("SELECT COUNT(*) FROM docs_sources", &[])?;
     if count >= MAX_SOURCES {
         return Err(ApiError::conflict(format!("a workspace can have at most {MAX_SOURCES} docs sync sources")));
     }
     let duplicate = ctx.db.one(
         "SELECT id FROM docs_sources WHERE provider = ? AND host = ? AND repo = ? AND branch = ? AND folder = ? AND topic_id = ?",
-        &params![provider.id(), host.clone(), repo.clone(), branch.clone(), folder.clone(), topic.str("id")],
+        &params![s.provider.id(), s.host.clone(), s.repo.clone(), s.branch.clone(), s.folder.clone(), s.topic_id.clone()],
     )?;
     if duplicate.is_some() {
         return Err(ApiError::conflict("that folder already syncs into that topic"));
     }
-    let id = crate::util::new_id();
-    // A GitHub App source keeps no token and needs no webhook secret.
-    let webhook_secret = app.is_none().then(|| new_secret("whsec_"));
-    let mut cred = Credential { token: secret_input(input.token, "token")?.unwrap_or_default(), ..Default::default() };
-    if let Some(s) = &webhook_secret {
-        cred.fields.insert("webhook_secret".into(), s.clone());
-    }
-    let secret = sync::seal(ctx.cfg, &docs::owner(&id), provider.id(), &cred)?;
+    Ok(())
+}
+
+/// Adds a source, checked again (see [`check_new_source`]), with its credentials sealed to it and how
+/// it connects. Synced posts are written as the admin adding it.
+pub(crate) fn insert_source(ctx: &mut Ctx, s: &docs::NewSource, cred: &Credential, link: &Link) -> ApiResult<()> {
+    check_new_source(ctx, s)?;
+    let secret = sync::seal(ctx.cfg, &docs::owner(&s.id), s.provider.id(), cred)?;
     let now = ctx.now_s();
     ctx.db.execute(
         "INSERT INTO docs_sources (id, provider, host, repo, branch, folder, topic_id, secret, owner_id, created_at, updated_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         &params![
-            id.clone(),
-            provider.id(),
-            host,
-            repo.clone(),
-            branch,
-            folder,
-            topic.str("id"),
+            s.id.clone(),
+            s.provider.id(),
+            s.host.clone(),
+            s.repo.clone(),
+            s.branch.clone(),
+            s.folder.clone(),
+            s.topic_id.clone(),
             secret,
             ctx.actor.user_id.clone(),
             now.clone(),
             now
         ],
     )?;
-    if let Some((installation_id, (repo_id, _, _))) = app {
-        ctx.db.execute(
-            "INSERT INTO docs_source_links (source_id, connection, installation_id, repo_id) VALUES (?, 'github_app', ?, ?)",
-            &params![id.clone(), installation_id, repo_id],
-        )?;
-        // The directory may have missed this installation's link; asking again does no harm.
-        ctx.effects.push(Effect::GitHubInstallation(InstallationLink { installation_id, linked: true }));
+    match link {
+        Link::Token => {}
+        Link::GitHubApp { installation_id, repo_id } => {
+            ctx.db.execute(
+                "INSERT INTO docs_source_links (source_id, connection, installation_id, repo_id) VALUES (?, 'github_app', ?, ?)",
+                &params![s.id.clone(), *installation_id, *repo_id],
+            )?;
+            // The directory may have missed this installation's link; asking again does no harm.
+            ctx.effects.push(Effect::GitHubInstallation(InstallationLink { installation_id: *installation_id, linked: true }));
+        }
+        Link::GitLabOAuth { project_id, hook_id, token_expires_at } => {
+            ctx.db.execute(
+                "INSERT INTO docs_source_links (source_id, connection, project_id, hook_id, token_expires_at) VALUES (?, 'gitlab_oauth', ?, ?, ?)",
+                &params![s.id.clone(), *project_id, *hook_id, token_expires_at.clone()],
+            )?;
+        }
     }
     emit(
         ctx,
-        Event::new("docs_source.created", "docs_source", &id, format!("added docs sync from {repo}")).topic(&topic.str("id")).admin_only(),
+        Event::new("docs_source.created", "docs_source", &s.id, format!("added docs sync from {}", s.repo)).topic(&s.topic_id).admin_only(),
     )?;
-    let row = load_source_row(ctx, &id)?;
-    Ok(DocsSourceCreated { source: source_view(ctx, &row)?, webhook_secret })
+    Ok(())
+}
+
+/// What adding a source answers, for one added by a job (it has no webhook secret to show).
+pub(crate) fn created_value(ctx: &Ctx, id: &str) -> ApiResult<serde_json::Value> {
+    let row = load_source_row(ctx, id)?;
+    let created = DocsSourceCreated { source: source_view(ctx, &row)?, webhook_secret: None };
+    serde_json::to_value(created).map_err(|e| ApiError::internal(e.to_string()))
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -527,6 +659,9 @@ pub struct UpdateDocsSourceInput {
     pub branch: Option<String>,
     /// Make a new webhook secret, shown only in this answer. The old one stops working.
     pub new_webhook_secret: Option<bool>,
+    /// Sources read through DumbSlab's GitLab app: use your newest Connect GitLab approval from now
+    /// on (it moves to this source), e.g. after GitLab stopped accepting the old one.
+    pub gitlab_connection: Option<bool>,
 }
 
 fn update_docs_source(ctx: &mut Ctx, input: UpdateDocsSourceInput) -> ApiResult<DocsSourceCreated> {
@@ -536,8 +671,23 @@ fn update_docs_source(ctx: &mut Ctx, input: UpdateDocsSourceInput) -> ApiResult<
     let (mut source, readable) = Source::from_row_or_blank(ctx.cfg, &row)?;
     if source.link != Link::Token && (input.token.is_some() || input.new_webhook_secret == Some(true)) {
         return Err(ApiError::bad_request(
-            "this source is read through DumbSlab's GitHub App: it has no token or webhook secret. Only its branch can change.",
+            "this source is read through DumbSlab's GitHub or GitLab app: it has no token or webhook secret to change.",
         ));
+    }
+    if input.gitlab_connection == Some(true) {
+        let Link::GitLabOAuth { .. } = source.link else {
+            return Err(ApiError::bad_request("`gitlab_connection` is for sources read through DumbSlab's GitLab app"));
+        };
+        let p = gitlab_app::pending(ctx.db, ctx.cfg, &ctx.actor.user_id)?
+            .ok_or_else(|| ApiError::conflict("Connect GitLab first (Settings › Docs sync), then reconnect this folder."))?;
+        // The webhook keeps its secret; only the tokens change.
+        source.cred.token = p.cred.token;
+        source.cred.refresh_token = p.cred.refresh_token;
+        gitlab_app::take_pending(ctx.db, &ctx.actor.user_id)?;
+        ctx.db.execute(
+            "UPDATE docs_source_links SET token_expires_at = ?, disconnected = NULL WHERE source_id = ?",
+            &params![p.expires_at.map(crate::util::ts), source.id.clone()],
+        )?;
     }
     if let Some(t) = secret_input(input.token, "token")? {
         source.cred.token = t;
@@ -588,6 +738,14 @@ fn sync_docs_source(ctx: &mut Ctx, input: SourceIdInput) -> ApiResult<Deferred<D
 fn delete_docs_source(ctx: &mut Ctx, input: SourceIdInput) -> ApiResult<Done> {
     let row = load_source_row(ctx, &input.id)?;
     let id = row.str("id");
+    // The webhook DumbSlab added to a GitLab project comes off too, once this is done.
+    if let Ok(source) = Source::from_row(ctx.cfg, &row)
+        && let Link::GitLabOAuth { project_id, hook_id: Some(hook_id), token_expires_at } = source.link
+    {
+        let expires_at = token_expires_at.as_deref().and_then(crate::util::parse_ts);
+        let job = gitlab_app::GitLabJob::remove_hook(project_id, hook_id, source.cred, expires_at);
+        ctx.effects.push(Effect::Background(Job::GitLab(Box::new(job))));
+    }
     ctx.db.execute("DELETE FROM docs_items WHERE source_id = ?", &params![id.clone()])?;
     ctx.db.execute("DELETE FROM docs_sources WHERE id = ?", &params![id.clone()])?;
     emit(ctx, Event::new("docs_source.deleted", "docs_source", &id, format!("removed docs sync from {}", row.str("repo"))).admin_only())?;

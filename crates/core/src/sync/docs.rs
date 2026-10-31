@@ -92,8 +92,8 @@ pub(crate) fn owner(source_id: &str) -> String {
 
 /// Sources, with how each reads its repository (`docs_source_links`; none for a token). Add a
 /// `WHERE` on `s.` columns.
-pub(crate) const SOURCES_SQL: &str = "SELECT s.*, l.connection, l.installation_id, l.repo_id, l.disconnected
-    FROM docs_sources s LEFT JOIN docs_source_links l ON l.source_id = s.id";
+pub(crate) const SOURCES_SQL: &str = "SELECT s.*, l.connection, l.installation_id, l.repo_id, l.disconnected, l.project_id,
+    l.hook_id, l.token_expires_at FROM docs_sources s LEFT JOIN docs_source_links l ON l.source_id = s.id";
 
 /// How a source reads its repository (`docs_source_links.connection`).
 #[derive(Clone, Debug, PartialEq)]
@@ -103,6 +103,9 @@ pub enum Link {
     /// DumbSlab's GitHub App: each sync mints a token for this one repository (see
     /// [`super::github_app`]), and the App's own webhook reports pushes.
     GitHubApp { installation_id: i64, repo_id: i64 },
+    /// An approval of DumbSlab's GitLab app (see [`super::gitlab_app`]): its tokens are the
+    /// source's own, refreshed during a sync, and DumbSlab added the project's webhook.
+    GitLabOAuth { project_id: i64, hook_id: Option<i64>, token_expires_at: Option<String> },
 }
 
 impl Link {
@@ -110,8 +113,26 @@ impl Link {
         match self {
             Link::Token => "token",
             Link::GitHubApp { .. } => "github_app",
+            Link::GitLabOAuth { .. } => "gitlab_oauth",
         }
     }
+
+    /// The source keeps credentials of its own (a token, a webhook secret).
+    pub fn keeps_credentials(&self) -> bool {
+        !matches!(self, Link::GitHubApp { .. })
+    }
+}
+
+/// A source about to be added, checked (see `ops::sync::insert_source`).
+#[derive(Clone, Debug)]
+pub struct NewSource {
+    pub id: String,
+    pub provider: Provider,
+    pub host: String,
+    pub repo: String,
+    pub branch: String,
+    pub folder: String,
+    pub topic_id: String,
 }
 
 /// A source, with its credentials.
@@ -131,7 +152,7 @@ impl Source {
     pub(crate) fn from_row(cfg: &HostConfig, r: &Row) -> ApiResult<Source> {
         let mut source = Source::without_credentials(r)?;
         // A GitHub App source keeps no credentials: its tokens are minted for each sync.
-        if source.link == Link::Token {
+        if source.link.keeps_credentials() {
             source.cred = super::open(cfg, &owner(&source.id), source.repo.provider.id(), &r.str("secret"))?;
         }
         Ok(source)
@@ -152,6 +173,11 @@ impl Source {
         let link = match (r.opt_str("connection").as_deref(), r.opt_i64("installation_id"), r.opt_i64("repo_id")) {
             (None, _, _) => Link::Token,
             (Some("github_app"), Some(installation_id), Some(repo_id)) => Link::GitHubApp { installation_id, repo_id },
+            (Some("gitlab_oauth"), _, _) if r.opt_i64("project_id").is_some() => Link::GitLabOAuth {
+                project_id: r.i64("project_id"),
+                hook_id: r.opt_i64("hook_id"),
+                token_expires_at: r.opt_str("token_expires_at"),
+            },
             _ => return Err(ApiError::internal("a docs sync source's connection is incomplete")),
         };
         Ok(Source {
@@ -318,6 +344,8 @@ enum Phase {
     Start,
     /// GitHub App sources: waiting for this sync's installation token.
     Minting,
+    /// GitLab app sources: waiting for a refreshed token.
+    Refreshing,
     Listing,
     /// Waiting for this run's Markdown files.
     Reading(Plan),
@@ -401,12 +429,22 @@ pub fn step(db: &dyn Db, cfg: &HostConfig, j: &mut DocsJob, replies: Vec<HttpRep
                     Err(message) => fail(db, j, &message, now),
                 }
             }
-            Link::Token => {
+            Link::GitLabOAuth { ref token_expires_at, .. }
+                if super::gitlab_app::needs_refresh(&j.source.cred, token_expires_at.as_deref().and_then(crate::util::parse_ts), now) =>
+            {
+                let Some(app) = super::gitlab_app::app(cfg) else {
+                    return fail(db, j, "DumbSlab's GitLab app isn't set up on this server any more, so this folder can't sync.", now);
+                };
+                j.phase = Phase::Refreshing;
+                Ok(Step::Fetch(vec![super::gitlab_app::refresh_call(app, &j.source.cred)]))
+            }
+            Link::Token | Link::GitLabOAuth { .. } => {
                 j.phase = Phase::Listing;
                 Ok(Step::Fetch(j.source.repo.tree_calls(j.source.token())))
             }
         },
         Phase::Minting => minted(db, j, &replies, now),
+        Phase::Refreshing => refreshed(db, cfg, j, &replies, now),
         Phase::Listing => listing(db, cfg, j, &replies, now),
         Phase::Reading(plan) => reading(db, cfg, j, plan, &replies, now),
         Phase::Images(plan, texts) => images(db, cfg, j, plan, texts, &replies, now),
@@ -639,6 +677,35 @@ fn minted(db: &dyn Db, j: &mut DocsJob, replies: &[HttpReply], now: DateTime<Utc
         j.source.repo.repo = name;
     }
     j.source.cred.token = minted.token;
+    j.phase = Phase::Listing;
+    Ok(Step::Fetch(j.source.repo.tree_calls(j.source.token())))
+}
+
+/// A GitLab app source's refreshed tokens arrived: they're saved at once (GitLab has replaced the
+/// old ones), then the folder is listed with them. A refusal means the approval is gone: the
+/// source waits for an admin to Connect GitLab again and reconnect it.
+fn refreshed(db: &dyn Db, cfg: &HostConfig, j: &mut DocsJob, replies: &[HttpReply], now: DateTime<Utc>) -> ApiResult<Step> {
+    let reply = replies.first().cloned().unwrap_or_default();
+    let tokens = match super::gitlab_app::read_refresh(&reply) {
+        Ok(t) => t,
+        Err(message) => {
+            if reply.status != 0 && reply.status < 500 && reply.status != 429 {
+                db.execute(
+                    "UPDATE docs_source_links SET disconnected = ? WHERE source_id = ?",
+                    &params![super::gitlab_app::SIGNED_OUT, j.source.id.clone()],
+                )?;
+            }
+            return fail(db, j, &message, now);
+        }
+    };
+    let expires_at = super::gitlab_app::expiry(now, &tokens).map(ts);
+    super::gitlab_app::apply_tokens(&mut j.source.cred, tokens);
+    if !super::holds(db, TABLE, j.source.id.as_str().into(), &j.lease)? {
+        return Ok(lost());
+    }
+    let sealed = super::seal(cfg, &owner(&j.source.id), j.source.repo.provider.id(), &j.source.cred)?;
+    db.execute("UPDATE docs_sources SET secret = ?, updated_at = ? WHERE id = ?", &params![sealed, ts(now), j.source.id.clone()])?;
+    db.execute("UPDATE docs_source_links SET token_expires_at = ? WHERE source_id = ?", &params![expires_at, j.source.id.clone()])?;
     j.phase = Phase::Listing;
     Ok(Step::Fetch(j.source.repo.tree_calls(j.source.token())))
 }

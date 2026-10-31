@@ -303,7 +303,14 @@ impl Workspace {
     /// [`drive_job`]).
     async fn run_job(&self, job: Job, cfg: &HostConfig) -> Result<Finish> {
         let (finish, effects, written) = drive_job(&self.state, job, cfg).await?;
+        // A job can leave another to run after the answer (taking a webhook off GitLab again).
+        let (later, effects): (Vec<Effect>, Vec<Effect>) = effects.into_iter().partition(|e| matches!(e, Effect::Background(_)));
         send_effects(&self.state, &self.env, cfg, effects);
+        for effect in later {
+            if let Effect::Background(job) = effect {
+                self.run_job_later(job, cfg.clone());
+            }
+        }
         if let Some(h) = cfg.hosting.as_ref().filter(|_| written > 0) {
             self.report_usage(&h.home, false);
         }
