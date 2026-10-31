@@ -17,6 +17,9 @@ CREATE TABLE IF NOT EXISTS docs_source_links (
   -- Why the source can't sync now (the App was uninstalled or suspended, or the repository taken
   -- out of it), as a code; NULL when it can. Its posts stay either way.
   disconnected TEXT,
+  -- 1 once the repository was renamed (it keeps its id) and its source followed: the next sync
+  -- renders every file again, since links out of the folder name the repository.
+  renamed INTEGER NOT NULL DEFAULT 0,
   -- `gitlab_oauth`: the project's id, the webhook DumbSlab added to it, and when the access token in
   -- the source's `secret` expires (it's refreshed during a sync, under the sync's lease).
   project_id INTEGER,

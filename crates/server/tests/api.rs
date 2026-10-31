@@ -8111,14 +8111,161 @@ mod syncs {
     }
 
     #[test]
+    fn renames_never_make_two_sources_sync_one_folder() {
+        let (h, admin, first) = github_with_a_source();
+        let topic = source_of(&h, &admin)["topic"]["id"].as_str().unwrap().to_string();
+        let add = |repo: &str, extra: Value| {
+            let mut input = json!({ "provider": "github", "repository": repo, "topic_id": topic });
+            input.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            h.call("POST", "/api/v1/docs-sources", Some(input), &admin)
+        };
+        let id_of = |r: Res| {
+            assert_eq!(r.status, 200, "{}", r.body);
+            r.body["source"]["id"].as_str().unwrap().to_string()
+        };
+        let listed = |id: &str| {
+            let list = h.ok("GET", "/api/v1/docs-sources", None, &admin);
+            list["items"].as_array().unwrap().iter().find(|s| s["id"] == id).unwrap().clone()
+        };
+        let disconnected = |id: &str| listed(id)["disconnected"].clone();
+        let refused = |r: Res| {
+            assert_eq!(r.status, 409, "{}", r.body);
+            assert_eq!(r.body["error"]["message"], "that folder already syncs into that topic");
+        };
+
+        // acme/docs is renamed acme/handbook on GitHub. Before DumbSlab hears of it, the admin
+        // connects GitHub again and picks the folder again under the new name: it's the same
+        // repository (by its id), so that's refused.
+        let renamed = |c: &HttpCall| {
+            let mut r = installer(c);
+            r.body = r.body.replace("\"acme/docs\"", "\"acme/handbook\"");
+            r
+        };
+        connect_github(&h, &admin, "&installation_id=42&setup_action=install", &renamed);
+        refused(add("acme/handbook", json!({ "installation_id": 42 })));
+        // Another branch is another folder. Moving it onto the first one's branch is refused too.
+        let token_dev = id_of(add("acme/manual", json!({ "branch": "dev", "token": "ghp_x" })));
+        let app_dev = id_of(add("acme/handbook", json!({ "installation_id": 42, "branch": "dev" })));
+        refused(h.call("PATCH", &format!("/api/v1/docs-sources/{app_dev}"), Some(json!({ "branch": "main" })), &admin));
+        let token_main = id_of(add("acme/manual", json!({ "token": "ghp_x" })));
+
+        // GitHub renames it again, to acme/manual, which two token sources (added later than one
+        // App source, earlier than the other) sync. Where two now sync the same folder, the older
+        // keeps syncing and the newer waits, saying why; nothing is deleted.
+        let gh = GitHubNow::new();
+        gh.repos.borrow_mut().retain(|(id, _)| *id != 7);
+        gh.repos.borrow_mut().push((7, "acme/manual"));
+        check(
+            &h,
+            "installation_repositories",
+            &json!({ "action": "removed", "installation": { "id": 42 }, "repositories_removed": [] }),
+            &gh,
+        );
+        assert_eq!(count(&h, "SELECT COUNT(*) FROM docs_sources WHERE repo = 'acme/manual'"), 4);
+        assert_eq!((disconnected(&first), disconnected(&token_dev)), (Value::Null, Value::Null), "the older ones");
+        for newer in [&token_main, &app_dev] {
+            assert!(disconnected(newer).as_str().unwrap().contains("Another source already syncs this folder"), "{newer}");
+        }
+        let r = h.call("POST", &format!("/api/v1/docs-sources/{token_main}/sync"), None, &admin);
+        assert_eq!((r.status, r.body["error"]["code"].as_str()), (409, Some("duplicate")), "{}", r.body);
+        let down = |_: &HttpCall| HttpReply { status: 503, body: "{}".into() };
+        drive(&h, job_of(&h.call("POST", &format!("/api/v1/docs-sources/{first}/sync"), None, &admin)), &down);
+        // A push starts the newer one's sync like any other, but it stops before asking GitHub
+        // for anything.
+        let push = json!({ "ref": "refs/heads/dev", "repository": { "id": 7, "full_name": "acme/manual" }, "installation": { "id": 42 } });
+        let jobs = background(&app_hook(&h, "push", &push, "gh-hook-secret"));
+        assert_eq!(jobs.len(), 1);
+        let (finish, sent) = drive(&h, jobs[0].clone(), &|c| panic!("asked GitHub {c:?}"));
+        assert!(matches!(finish, Finish::Fail(_)) && sent.is_empty());
+        assert_eq!(listed(&app_dev)["last_error"], dumbslab_core::sync::docs::DUPLICATE);
+
+        // With the older one gone, the newer one syncs again.
+        h.ok("DELETE", &format!("/api/v1/docs-sources/{first}"), None, &admin);
+        h.ok("DELETE", &format!("/api/v1/docs-sources/{token_dev}"), None, &admin);
+        assert_eq!((disconnected(&token_main), disconnected(&app_dev)), (Value::Null, Value::Null));
+        job_of(&h.call("POST", &format!("/api/v1/docs-sources/{token_main}/sync"), None, &admin));
+    }
+
+    #[test]
+    fn a_renamed_repositorys_posts_link_to_its_new_name() {
+        let mut h = H::new();
+        let (admin, _) = h.setup();
+        with_key(&mut h);
+        with_app(&mut h);
+        connect_github(&h, &admin, "&installation_id=42&setup_action=install", &installer);
+        let topic = h.ok("POST", "/api/v1/topics", Some(json!({ "name": "Handbook" })), &admin)["id"].as_str().unwrap().to_string();
+        let input =
+            json!({ "provider": "github", "installation_id": 42, "repository": "acme/docs", "folder": "handbook", "topic_id": topic });
+        let source = h.ok("POST", "/api/v1/docs-sources", Some(input), &admin)["source"]["id"].as_str().unwrap().to_string();
+        let repo = Repo::new(&[("README.md", b"# Handbook\n\nSee [the API](../api/README.md).\n"), ("guide.md", b"# Guide\n")]);
+        // GitHub, with the repository under its current name: the minted token names it, and the
+        // repository answers only there.
+        let name = RefCell::new("acme/docs");
+        let github = |c: &HttpCall| -> HttpReply {
+            let now = *name.borrow();
+            if c.url == "https://api.github.com/app/installations/42/access_tokens" {
+                let body = json!({ "token": "ghs_installation", "expires_at": "2099-01-01T00:00:00Z",
+                                   "repositories": [{ "id": 7, "full_name": now }] });
+                return HttpReply { status: 201, body: body.to_string() };
+            }
+            match c.url.strip_prefix(&format!("https://api.github.com/repos/{now}/")) {
+                Some(rest) => repo.github(&HttpCall { url: format!("https://api.github.com/repos/acme/docs/{rest}"), ..c.clone() }),
+                None => HttpReply { status: 404, body: "{}".into() },
+            }
+        };
+        let sync = || filled(drive(&h, job_of(&h.call("POST", &format!("/api/v1/docs-sources/{source}/sync"), None, &admin)), &github).0);
+        let readme = || post(&h, &doc_ids(&h)["README.md"], &admin)["content"].as_str().unwrap().to_string();
+        assert_eq!(sync()["created"], 2);
+        assert!(readme().contains("[the API](https://github.com/acme/docs/blob/main/api/README.md)"), "{}", readme());
+
+        // Renamed on GitHub, and the next sync's token says so: the source follows, and its files,
+        // unchanged in the repository, are rendered again with the new name.
+        *name.borrow_mut() = "acme/handbook";
+        let r = sync();
+        assert_eq!((r["updated"].as_u64(), r["unchanged"].as_u64(), r["done"].as_bool()), (Some(1), Some(1), Some(true)), "{r}");
+        assert_eq!(source_of(&h, &admin)["repository"], "acme/handbook");
+        assert!(readme().contains("[the API](https://github.com/acme/handbook/blob/main/api/README.md)"), "{}", readme());
+        assert_eq!((sync()["unchanged"].as_u64(), sync()["updated"].as_u64()), (Some(2), Some(0)), "then nothing to do");
+
+        // Renamed again, and a check of the installation hears of it first: the same.
+        *name.borrow_mut() = "acme/manual";
+        let gh = GitHubNow::new();
+        gh.repos.borrow_mut().retain(|(id, _)| *id != 7);
+        gh.repos.borrow_mut().push((7, "acme/manual"));
+        check(
+            &h,
+            "installation_repositories",
+            &json!({ "action": "removed", "installation": { "id": 42 }, "repositories_removed": [] }),
+            &gh,
+        );
+        assert_eq!(source_of(&h, &admin)["repository"], "acme/manual");
+        assert_eq!(sync()["updated"], 1);
+        assert!(readme().contains("[the API](https://github.com/acme/manual/blob/main/api/README.md)"), "{}", readme());
+    }
+
+    #[test]
     fn sync_now_on_a_disconnected_source_asks_github_again() {
         let (h, admin, source) = github_with_a_source();
         let gh = GitHubNow::new();
         let answer = |c: &HttpCall| gh.answer(c);
         let change = json!({ "action": "removed", "installation": { "id": 42 }, "repositories_removed": [] });
+        // Sync now on a disconnected source: nothing syncs, it says it's checking, and any check it
+        // starts comes with its answer.
+        let sync_now = || {
+            let r = h.call("POST", &format!("/api/v1/docs-sources/{source}/sync"), None, &admin);
+            assert_eq!(r.status, 200, "{}", r.body);
+            assert!(r.body["checking"].as_str().unwrap().contains("checking"), "{}", r.body);
+            background(&r)
+        };
         // Out of reach: disconnected.
         gh.repos.borrow_mut().retain(|(id, _)| *id != 7);
         check(&h, "installation_repositories", &change, &gh);
+        assert!(source_of(&h, &admin)["disconnected"].is_string());
+        // No check owed: Sync now asks for one, which finds it still out of reach.
+        let (asked, _) = gens(&h);
+        let checks = sync_now();
+        assert_eq!((checks.len(), gens(&h).0), (1, asked + 1));
+        assert_eq!(filled(drive(&h, checks[0].clone(), &answer).0)["state"], "active");
         assert!(source_of(&h, &admin)["disconnected"].is_string());
         // Access comes back, but the check of it fails (GitHub is down) and waits a while.
         gh.repos.borrow_mut().push((7, "acme/docs"));
@@ -8126,15 +8273,23 @@ mod syncs {
         let failing = check_of(&h, "installation_repositories", &change);
         assert!(matches!(drive(&h, failing, &answer).0, Finish::Fail(_)));
         *gh.down.borrow_mut() = false;
-        // Sync now: it can't sync yet, but the check it asks for is kept with its answer, runs,
-        // and reconnects the source.
-        let r = h.call("POST", &format!("/api/v1/docs-sources/{source}/sync"), None, &admin);
-        assert_eq!(r.status, 200, "{}", r.body);
-        assert!(r.body["checking"].as_str().unwrap().contains("checking"), "{}", r.body);
-        let checks = background(&r);
-        assert_eq!(checks.len(), 1);
+        // While that check is owed and waiting, Sync now neither asks for another nor skips the
+        // wait, however often it's clicked.
+        let owed = gens(&h);
+        for _ in 0..3 {
+            assert!(sync_now().is_empty());
+        }
+        assert_eq!(gens(&h), owed);
+        // Once the wait is over, Sync now runs the owed check (still asking for no other), and a
+        // second click meanwhile starts nothing. The check reconnects the source.
+        db_run(&h, |db| db.execute("UPDATE github_installations SET next_check_at = '2000-01-01T00:00:00.000Z'", &[]));
+        let checks = sync_now();
+        assert_eq!((checks.len(), gens(&h)), (1, owed));
+        assert!(sync_now().is_empty());
+        assert_eq!(gens(&h), owed);
         assert_eq!(filled(drive(&h, checks[0].clone(), &answer).0)["state"], "active");
         assert_eq!(source_of(&h, &admin)["disconnected"], Value::Null);
+        assert_eq!(gens(&h), (owed.0, owed.0), "nothing owed");
     }
 
     #[test]

@@ -22,6 +22,8 @@ use crate::{Effect, params};
 
 /// Docs sync sources a workspace may have.
 const MAX_SOURCES: i64 = 20;
+/// Two sources may not sync one folder into one topic.
+const ALREADY_SYNCED: &str = "that folder already syncs into that topic";
 const MAX_SECRET_CHARS: usize = 4096;
 
 pub fn ops() -> Vec<Op> {
@@ -226,7 +228,9 @@ pub struct DocsSource {
     pub connection: String,
     /// `github_app`: the App's installation that reads the repository.
     pub installation_id: Option<i64>,
-    /// Why it can't sync now, e.g. the GitHub App was uninstalled. Its posts stay. Null when it can.
+    /// Why it can't sync now, e.g. the GitHub App was uninstalled, or an older source syncs the same
+    /// folder into the same topic (a repository renamed into another's). Its posts stay. Null when
+    /// it can.
     pub disconnected: Option<String>,
     /// A token is saved (it's never shown).
     pub has_token: bool,
@@ -281,7 +285,10 @@ fn source_view(ctx: &Ctx, r: &Row) -> ApiResult<DocsSource> {
             Link::GitHubApp { installation_id, .. } => Some(installation_id),
             Link::Token => None,
         },
-        disconnected: source.disconnected.as_deref().map(github_app::disconnected_message),
+        disconnected: match source.disconnected.as_deref() {
+            Some(code) => Some(github_app::disconnected_message(code)),
+            None => docs::has_older_twin(ctx.db, &source)?.then(|| docs::DUPLICATE.to_string()),
+        },
         has_token: !source.cred.token.is_empty(),
         webhook_url: (source.link == Link::Token).then(|| ctx.url(&format!("/hooks/docs/{}", source.id))),
         synced_files,
@@ -484,12 +491,14 @@ fn create_docs_source(ctx: &mut Ctx, input: CreateDocsSourceInput) -> ApiResult<
     if count >= MAX_SOURCES {
         return Err(ApiError::conflict(format!("a workspace can have at most {MAX_SOURCES} docs sync sources")));
     }
-    let duplicate = ctx.db.one(
-        "SELECT id FROM docs_sources WHERE provider = ? AND host = ? AND repo = ? AND branch = ? AND folder = ? AND topic_id = ?",
-        &params![provider.id(), host.clone(), repo.clone(), branch.clone(), folder.clone(), topic.str("id")],
-    )?;
-    if duplicate.is_some() {
-        return Err(ApiError::conflict("that folder already syncs into that topic"));
+    // The same folder twice, by the repository's name or (renamed since) its id.
+    let wanted = sync::repo::Repo { provider, host: host.clone(), repo: repo.clone(), branch: branch.clone(), folder: folder.clone() };
+    let link = match &app {
+        Some((installation_id, (repo_id, _, _))) => Link::GitHubApp { installation_id: *installation_id, repo_id: *repo_id },
+        None => Link::Token,
+    };
+    if !docs::twins(ctx.db, &wanted, &link, &topic.str("id"), "")?.is_empty() {
+        return Err(ApiError::conflict(ALREADY_SYNCED));
     }
     let id = crate::util::new_id();
     // A GitHub App source keeps no token and needs no webhook secret.
@@ -557,7 +566,13 @@ fn update_docs_source(ctx: &mut Ctx, input: UpdateDocsSourceInput) -> ApiResult<
         source.cred.token = t;
     }
     if let Some(b) = clean(input.branch) {
-        source.repo.branch = sync::checked_branch(&b)?;
+        let branch = sync::checked_branch(&b)?;
+        if branch != source.repo.branch {
+            source.repo.branch = branch;
+            if !docs::twins(ctx.db, &source.repo, &source.link, &source.topic_id, &source.id)?.is_empty() {
+                return Err(ApiError::conflict(ALREADY_SYNCED));
+            }
+        }
     }
     // (A GitHub App source keeps no credentials, so it's always readable.)
     let webhook_secret = (input.new_webhook_secret.unwrap_or(false) || !readable).then(|| new_secret("whsec_"));
@@ -587,12 +602,16 @@ fn sync_docs_source(ctx: &mut Ctx, input: SourceIdInput) -> ApiResult<Deferred<D
     key_needed(ctx)?;
     let row = load_source_row(ctx, &input.id)?;
     let source = Source::from_row(ctx.cfg, &row)?;
+    if docs::has_older_twin(ctx.db, &source)? {
+        return Err(ApiError::new(409, "duplicate", docs::DUPLICATE));
+    }
     if let Link::GitHubApp { installation_id, .. } = source.link {
-        // Disconnected: Sync now asks GitHub again. The check is asked for in this answer (so it's
-        // kept), and decides whether the folder can sync.
+        // Disconnected: Sync now asks GitHub again (a check already owed or running covers it).
+        // The check is asked for in this answer (so it's kept), and decides whether the folder can
+        // sync.
         let known = ctx.db.one("SELECT 1 AS ok FROM github_installations WHERE id = ?", &params![installation_id])?.is_some();
         if source.disconnected.is_some() && known {
-            if let Some(check) = github_app::request_check(ctx.db, installation_id, &ctx.base_url, ctx.now)? {
+            if let Some(check) = github_app::recheck(ctx.db, installation_id, &ctx.base_url, ctx.now)? {
                 ctx.effects.push(Effect::Background(check));
             }
             let checking =

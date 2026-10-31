@@ -111,9 +111,9 @@ GitHub sends every installation's events to one address, `<ROOT>/hooks/github`.
 
 A delivery about the installation itself (uninstalled, suspended, unsuspended, new permissions, repositories added or taken out) only starts a check of what GitHub says now:
 - It reads the installation (`GET /app/installations/{id}` with the App's JWT; 404 means it's gone, `suspended_at` that it's suspended).
-- While the installation is active, it reads each repository a folder here syncs (`GET /repos/{owner}/{repo}` with a metadata-only installation token; 404 means the App can't reach it). That's at most 20 requests, however many repositories the installation has.
+- While the installation is active, it reads each repository a folder here syncs by its id (`GET /repositories/{id}` with a metadata-only installation token). On a 404 it asks once more by the folder's repository name (`GET /repos/{owner}/{repo}`), and only an answer about the same id counts. That's at most 40 requests, however many repositories the installation has. A renamed repository renames its folders, and their next sync renders every file again.
 - One check runs at a time per installation in each workspace. A change while it runs is noted, and checked right after.
-- A check that fails waits a while (a minute, doubling up to an hour). The change it owed is checked by the next change, push, Sync now, or opening Settings › Docs sync.
+- A check that fails waits a while (a minute, doubling up to an hour). The change it owed is checked by the next change GitHub reports, or after the wait by a push, Sync now, or opening Settings › Docs sync. Only a reported change skips the wait. Sync now and a refused sync token ask for a check only when none is owed.
 - Only a check marks folders as disconnected. A late, out-of-order or redelivered delivery can't undo a newer change, and a sync that GitHub refuses a token for (422) asks for a check instead of deciding itself.
 
 A workspace only syncs repositories its own admin's GitHub account can read in the installation. That's checked when they connect, so one workspace never gets repositories that only another workspace's admin chose.

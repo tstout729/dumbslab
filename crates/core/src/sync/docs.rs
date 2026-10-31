@@ -177,6 +177,56 @@ impl Source {
     }
 }
 
+/// What a source that waits for an older one doing the same work shows, and its syncs answer.
+pub const DUPLICATE: &str = "Another source already syncs this folder into this topic (its repository was renamed into this one's, say), so this one doesn't. The older one keeps syncing; remove one of them. Posts stay either way.";
+
+/// The other sources that sync the same folder of the same branch into the same topic as `repo`
+/// would: the same repository by name, or, read through DumbSlab's GitHub App, by the
+/// repository's id, which a rename keeps. Oldest first; `except` is left out.
+pub(crate) fn twins(db: &dyn Db, repo: &Repo, link: &Link, topic_id: &str, except: &str) -> ApiResult<Vec<Row>> {
+    let repo_id = match link {
+        Link::GitHubApp { repo_id, .. } => Some(*repo_id),
+        Link::Token => None,
+    };
+    db.query(
+        "SELECT s.id, s.created_at FROM docs_sources s LEFT JOIN docs_source_links l ON l.source_id = s.id
+         WHERE s.id != ? AND s.branch = ? AND s.folder = ? AND s.topic_id = ?
+           AND ((s.provider = ? AND s.host = ? AND lower(s.repo) = lower(?)) OR (l.connection = 'github_app' AND l.repo_id = ?))
+         ORDER BY s.created_at, s.id",
+        &params![
+            except,
+            repo.branch.clone(),
+            repo.folder.clone(),
+            topic_id,
+            repo.provider.id(),
+            repo.host.clone(),
+            repo.repo.clone(),
+            repo_id
+        ],
+    )
+}
+
+/// Another source, older than this one, already does its work (renames made them the same): this
+/// one waits, its posts kept, until one of them is removed. Never both syncing one folder.
+pub(crate) fn has_older_twin(db: &dyn Db, source: &Source) -> ApiResult<bool> {
+    let Some(me) = db.one("SELECT created_at FROM docs_sources WHERE id = ?", &params![source.id.clone()])? else { return Ok(false) };
+    let mine = (me.str("created_at"), source.id.clone());
+    Ok(twins(db, &source.repo, &source.link, &source.topic_id, &source.id)?.iter().any(|t| (t.str("created_at"), t.str("id")) < mine))
+}
+
+/// A repository renamed on GitHub keeps its id: its source follows the new name, and its next sync
+/// renders every file again (see `docs_source_links.renamed`), since links out of the folder name
+/// the repository.
+pub(crate) fn rename(db: &dyn Db, source_id: &str, name: &str, now: DateTime<Utc>) -> ApiResult<()> {
+    if db
+        .execute("UPDATE docs_sources SET repo = ?, updated_at = ? WHERE id = ? AND repo != ?", &params![name, ts(now), source_id, name])?
+        > 0
+    {
+        db.execute("UPDATE docs_source_links SET renamed = 1 WHERE source_id = ?", &params![source_id])?;
+    }
+    Ok(())
+}
+
 /// A file a sync skipped, and why.
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq)]
 pub struct Skipped {
@@ -393,6 +443,7 @@ pub(crate) fn start(db: &dyn Db, source: Source, base_url: &str, now: DateTime<U
 /// Runs a docs sync's next step (see [`crate::connect::step`]).
 pub fn step(db: &dyn Db, cfg: &HostConfig, j: &mut DocsJob, replies: Vec<HttpReply>, now: DateTime<Utc>) -> ApiResult<Step> {
     match std::mem::replace(&mut j.phase, Phase::Start) {
+        Phase::Start if has_older_twin(db, &j.source)? => fail(db, j, DUPLICATE, now),
         Phase::Start => match j.source.link {
             Link::GitHubApp { installation_id, repo_id } => {
                 let Some(app) = super::github_app::app(cfg) else {
@@ -653,7 +704,7 @@ fn minted(db: &dyn Db, j: &mut DocsJob, replies: &[HttpReply], link: bool, now: 
         // installation decides that (this answer may be older than a change GitHub reported since),
         // so one is asked for; it marks the source if it's so.
         Err(_) if reply.status == 422 => {
-            if let Some(check) = super::github_app::request_check(db, installation_id, &j.base_url, now)? {
+            if let Some(check) = super::github_app::recheck(db, installation_id, &j.base_url, now)? {
                 j.staged.push(crate::Effect::Background(check));
             }
             let message = "GitHub didn't let DumbSlab's App read this repository just now, so DumbSlab is checking the App's access to it. Settings shows what it finds; sync again in a moment.";
@@ -662,8 +713,12 @@ fn minted(db: &dyn Db, j: &mut DocsJob, replies: &[HttpReply], link: bool, now: 
         Err(message) => return fail(db, j, &message, now),
     };
     if let Some(name) = minted.full_name.filter(|n| *n != j.source.repo.repo) {
-        db.execute("UPDATE docs_sources SET repo = ?, updated_at = ? WHERE id = ?", &params![name.clone(), ts(now), j.source.id.clone()])?;
+        rename(db, &j.source.id, &name, now)?;
         j.source.repo.repo = name;
+        // Its new name may be another source's.
+        if has_older_twin(db, &j.source)? {
+            return fail(db, j, DUPLICATE, now);
+        }
     }
     j.source.cred.token = minted.token;
     j.phase = Phase::Listing;
@@ -821,6 +876,16 @@ fn listing(db: &dyn Db, cfg: &HostConfig, j: &mut DocsJob, replies: &[HttpReply]
     let blocked = |path: &str| blocked_by(&plan, path);
     for (_, d) in docs.iter_mut().filter(|(p, _)| blocked(p).is_some()) {
         d.sha = None;
+    }
+
+    // The repository was renamed: every file is synced again under its current name (links out of
+    // the folder name it), now or in later runs. Moves were found above, from the files as synced.
+    if db.execute("UPDATE docs_source_links SET renamed = 0 WHERE source_id = ? AND renamed = 1", &params![source_id.clone()])? > 0 {
+        db.execute("UPDATE docs_items SET sha = NULL WHERE source_id = ? AND kind = 'doc'", &params![source_id.clone()])?;
+        docs.values_mut().for_each(|d| d.sha = None);
+        if let Some(r) = db.one("SELECT repo FROM docs_sources WHERE id = ?", &params![source_id.clone()])? {
+            j.source.repo.repo = r.str("repo");
+        }
     }
 
     // Files that link to a changed path are synced again, now or in a later run.
