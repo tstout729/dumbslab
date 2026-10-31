@@ -7610,8 +7610,12 @@ mod syncs {
         assert_eq!(changed("installation_repositories", &removed).0["removed"], 1);
         let s = source_of(&h, &admin);
         assert!(s["disconnected"].as_str().unwrap().contains("taken out"), "{s}");
+        // Sync now syncs nothing, and asks GitHub again instead (still out of reach here).
         let r = h.call("POST", &format!("/api/v1/docs-sources/{source}/sync"), None, &admin);
-        assert_eq!((r.status, r.body["error"]["code"].as_str()), (409, Some("disconnected")));
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert!(r.body["checking"].is_string() && r.body["created"] == 0, "{}", r.body);
+        drive(&h, background(&r)[0].clone(), &|c| gh.answer(c));
+        assert!(source_of(&h, &admin)["disconnected"].is_string());
         assert!(background(&app_hook(&h, "push", &push(42, 7, "main", "acme/docs"), "gh-hook-secret")).is_empty());
         let listed = h.ok("GET", "/api/v1/docs-sources/github", None, &admin);
         assert_eq!(listed["installations"][0]["repositories"].as_array().unwrap().len(), 1, "no longer offered");
@@ -7657,11 +7661,12 @@ mod syncs {
     }
 
     /// GitHub's view of installation 42 now, for checks of it: `active`, `suspended` or `gone`; the
-    /// repositories it can reach; and repositories renamed since (old name → id).
+    /// repositories it can reach, by id and current name; and names other repositories now have
+    /// (name → their id), which it may or may not reach.
     struct GitHubNow {
         state: RefCell<&'static str>,
         repos: RefCell<Vec<(i64, &'static str)>>,
-        renamed: RefCell<Vec<(&'static str, i64)>>,
+        taken: RefCell<Vec<(&'static str, i64)>>,
         /// Answers GitHub can't give just now (5xx), for a while.
         down: RefCell<bool>,
     }
@@ -7671,7 +7676,7 @@ mod syncs {
             GitHubNow {
                 state: RefCell::new("active"),
                 repos: RefCell::new(vec![(7, "acme/docs"), (8, "acme/site")]),
-                renamed: RefCell::new(vec![]),
+                taken: RefCell::new(vec![]),
                 down: RefCell::new(false),
             }
         }
@@ -7706,12 +7711,8 @@ mod syncs {
             let repos = self.repos.borrow();
             let found = |id: i64| repos.iter().find(|(r, _)| *r == id).map(|(id, name)| ok(json!({ "id": id, "full_name": name })));
             if let Some(name) = c.url.strip_prefix("https://api.github.com/repos/") {
-                if let Some((_, id)) = self.renamed.borrow().iter().find(|(old, _)| *old == name) {
-                    return HttpReply {
-                        status: 301,
-                        body: json!({ "message": "Moved Permanently", "url": format!("https://api.github.com/repositories/{id}") })
-                            .to_string(),
-                    };
+                if let Some((_, id)) = self.taken.borrow().iter().find(|(n, _)| *n == name) {
+                    return found(*id).unwrap_or(HttpReply { status: 404, body: "{}".into() });
                 }
                 return repos
                     .iter()
@@ -8065,10 +8066,9 @@ mod syncs {
         gh.repos.borrow_mut().push((777, "acme/zz-big"));
         check(&h, "installation_repositories", &change, &gh);
         assert_eq!(disconnected(&h, &big), Value::Null);
-        // Renamed on GitHub: the check follows GitHub's pointer and keeps it connected.
+        // Renamed on GitHub: found by its id, so it stays connected, under its new name.
         gh.repos.borrow_mut().retain(|(id, _)| *id != 777);
         gh.repos.borrow_mut().push((777, "acme/huge"));
-        gh.renamed.borrow_mut().push(("acme/zz-big", 777));
         check(&h, "installation_repositories", &change, &gh);
         assert_eq!(disconnected(&h, &big), Value::Null);
         let names: Vec<String> = h.ok("GET", "/api/v1/docs-sources/github", None, &admin)["installations"][0]["repositories"]
@@ -8078,6 +8078,63 @@ mod syncs {
             .map(|r| r["full_name"].as_str().unwrap().to_string())
             .collect();
         assert!(names.contains(&"acme/huge".to_string()), "{names:?}");
+    }
+
+    #[test]
+    fn a_renamed_repository_whose_old_name_is_taken_stays_connected() {
+        let (h, admin, source) = github_with_a_source();
+        let gh = GitHubNow::new();
+        let change = json!({ "action": "removed", "installation": { "id": 42 }, "repositories_removed": [] });
+        // acme/docs is renamed acme/handbook; a private repository the App can't reach takes the
+        // name acme/docs.
+        gh.repos.borrow_mut().retain(|(id, _)| *id != 7);
+        gh.repos.borrow_mut().push((7, "acme/handbook"));
+        gh.taken.borrow_mut().push(("acme/docs", 99));
+        for _ in 0..2 {
+            check(&h, "installation_repositories", &change, &gh);
+            let s = source_of(&h, &admin);
+            assert_eq!((s["disconnected"].clone(), s["repository"].as_str()), (Value::Null, Some("acme/handbook")), "{s}");
+        }
+        assert_eq!(source_of(&h, &admin)["id"], source.as_str());
+        let names: Vec<String> = h.ok("GET", "/api/v1/docs-sources/github", None, &admin)["installations"][0]["repositories"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["full_name"].as_str().unwrap().to_string())
+            .collect();
+        assert!(names.contains(&"acme/handbook".to_string()) && !names.contains(&"acme/docs".to_string()), "{names:?}");
+        // Out of reach for real (not found by id, and its name is someone else's): it waits.
+        gh.repos.borrow_mut().retain(|(id, _)| *id != 7);
+        gh.taken.borrow_mut().push(("acme/handbook", 98));
+        check(&h, "installation_repositories", &change, &gh);
+        assert!(source_of(&h, &admin)["disconnected"].as_str().unwrap().contains("taken out"));
+    }
+
+    #[test]
+    fn sync_now_on_a_disconnected_source_asks_github_again() {
+        let (h, admin, source) = github_with_a_source();
+        let gh = GitHubNow::new();
+        let answer = |c: &HttpCall| gh.answer(c);
+        let change = json!({ "action": "removed", "installation": { "id": 42 }, "repositories_removed": [] });
+        // Out of reach: disconnected.
+        gh.repos.borrow_mut().retain(|(id, _)| *id != 7);
+        check(&h, "installation_repositories", &change, &gh);
+        assert!(source_of(&h, &admin)["disconnected"].is_string());
+        // Access comes back, but the check of it fails (GitHub is down) and waits a while.
+        gh.repos.borrow_mut().push((7, "acme/docs"));
+        *gh.down.borrow_mut() = true;
+        let failing = check_of(&h, "installation_repositories", &change);
+        assert!(matches!(drive(&h, failing, &answer).0, Finish::Fail(_)));
+        *gh.down.borrow_mut() = false;
+        // Sync now: it can't sync yet, but the check it asks for is kept with its answer, runs,
+        // and reconnects the source.
+        let r = h.call("POST", &format!("/api/v1/docs-sources/{source}/sync"), None, &admin);
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert!(r.body["checking"].as_str().unwrap().contains("checking"), "{}", r.body);
+        let checks = background(&r);
+        assert_eq!(checks.len(), 1);
+        assert_eq!(filled(drive(&h, checks[0].clone(), &answer).0)["state"], "active");
+        assert_eq!(source_of(&h, &admin)["disconnected"], Value::Null);
     }
 
     #[test]

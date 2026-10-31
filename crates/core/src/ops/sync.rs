@@ -62,7 +62,7 @@ pub fn ops() -> Vec<Op> {
             .build(),
         op("sync", "sync_docs_source", "POST", "/docs-sources/{id}/sync", Access::Admin, sync_docs_source)
             .title("Sync docs now")
-            .desc("Sync a source's folder now. One run syncs at most 20 changed files and 10 images; when `remaining` is above 0, run it again to continue.")
+            .desc("Sync a source's folder now. One run syncs at most 20 changed files and 10 images; when `remaining` is above 0, run it again to continue. For a disconnected GitHub App source, it asks GitHub again instead (`checking` says so) and syncs nothing; sync again once Settings shows it's connected.")
             .build(),
         op("sync", "delete_docs_source", "DELETE", "/docs-sources/{id}", Access::Admin, delete_docs_source)
             .title("Remove a docs sync source")
@@ -587,11 +587,22 @@ fn sync_docs_source(ctx: &mut Ctx, input: SourceIdInput) -> ApiResult<Deferred<D
     key_needed(ctx)?;
     let row = load_source_row(ctx, &input.id)?;
     let source = Source::from_row(ctx.cfg, &row)?;
-    // A check of its installation that's still owed (it failed earlier) is tried again too.
-    if let Link::GitHubApp { installation_id, .. } = source.link
-        && let Some(check) = github_app::resume_check(ctx.db, installation_id, &ctx.base_url, ctx.now)?
-    {
-        ctx.effects.push(Effect::Background(check));
+    if let Link::GitHubApp { installation_id, .. } = source.link {
+        // Disconnected: Sync now asks GitHub again. The check is asked for in this answer (so it's
+        // kept), and decides whether the folder can sync.
+        let known = ctx.db.one("SELECT 1 AS ok FROM github_installations WHERE id = ?", &params![installation_id])?.is_some();
+        if source.disconnected.is_some() && known {
+            if let Some(check) = github_app::request_check(ctx.db, installation_id, &ctx.base_url, ctx.now)? {
+                ctx.effects.push(Effect::Background(check));
+            }
+            let checking =
+                "DumbSlab is checking GitHub's access for this folder before it syncs. Settings shows what it finds; sync again then.";
+            return Ok(Deferred::Ready(DocsSyncResult { checking: Some(checking.into()), ..Default::default() }));
+        }
+        // A check of its installation that's still owed (it failed earlier) is tried again too.
+        if let Some(check) = github_app::resume_check(ctx.db, installation_id, &ctx.base_url, ctx.now)? {
+            ctx.effects.push(Effect::Background(check));
+        }
     }
     if let Some(code) = &source.disconnected {
         return Err(ApiError::new(409, "disconnected", github_app::disconnected_message(code)));

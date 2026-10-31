@@ -209,6 +209,10 @@ pub struct DocsSyncResult {
     pub done: bool,
     /// Files left out, and why (the first 100).
     pub skipped: Vec<Skipped>,
+    /// Nothing was synced: DumbSlab is checking GitHub's access for this folder first (it was
+    /// disconnected). Settings shows what it finds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checking: Option<String>,
 }
 
 impl DocsSyncResult {

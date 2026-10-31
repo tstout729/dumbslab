@@ -969,8 +969,17 @@ const MAX_BACKOFF_SECS: i64 = 3600;
 /// the installation itself (`GET /app/installations/{id}` with the App's JWT; 404 means it was
 /// uninstalled, `suspended_at` that it's suspended) and, while it's active, each repository a
 /// source here uses (`GET /repos/{owner}/{repo}` with an installation token that reads metadata:
-/// 404 means the installation can't reach it; a 301 for a renamed one is followed once). A
-/// workspace has at most 20 sources, so that's bounded, whatever the installation's size.
+/// 404 means the installation can't reach it). A workspace has at most 20 sources, so that's
+/// bounded, whatever the installation's size.
+///
+/// Repositories are looked up by id (`GET /repositories/{id}`), not by name: a renamed
+/// repository's old name can be taken by another one. That's the address GitHub's own redirect for
+/// a renamed repository points to; GitHub's docs say to follow a 301 to its `location`
+/// (https://docs.github.com/en/rest/using-the-rest-api/best-practices-for-using-the-rest-api#follow-redirects)
+/// but don't document the address itself. So an answer must name the same id, and a repository
+/// not found by id is asked for again by the name its sources have before anything is marked:
+/// only an answer about that same id counts as reachable. A rename renames the sources and the
+/// picker's entry.
 ///
 /// **One check at a time, and none lost.** Each verified change bumps the installation's
 /// `requested_gen`. A check holds the installation (`checking_until`) and starts from
@@ -1007,8 +1016,8 @@ pub struct CheckJob {
     /// (`Some(name)`: reachable; `None`: not).
     repos: Vec<(i64, String)>,
     found: std::collections::BTreeMap<i64, Option<String>>,
-    /// Renamed ones to follow: (id, GitHub's address for it).
-    renamed: Vec<(i64, String)>,
+    /// Ones GitHub didn't find by id, asked again by name before deciding.
+    unsure: Vec<i64>,
     effects: Vec<Effect>,
     staged: Vec<Effect>,
 }
@@ -1025,7 +1034,7 @@ enum CheckPhase {
     Start,
     Reading,
     Checking,
-    Following,
+    Confirming,
 }
 
 impl CheckJob {
@@ -1078,7 +1087,7 @@ fn claim_check(
         token: String::new(),
         repos: vec![],
         found: Default::default(),
-        renamed: vec![],
+        unsure: vec![],
         effects: vec![],
         staged: vec![],
     }))))
@@ -1126,13 +1135,6 @@ fn superseded() -> ApiResult<Step> {
     Ok(Step::Done(Finish::Fill(json!({ "ok": true, "state": "superseded" }))))
 }
 
-/// The address GitHub gives for a renamed repository, if it's one of its own.
-fn moved_to(reply: &HttpReply) -> Option<String> {
-    let url = reply.json()["url"].as_str()?.to_string();
-    let id = url.strip_prefix(&format!("{API}/repositories/"))?;
-    (!id.is_empty() && id.bytes().all(|b| b.is_ascii_digit())).then_some(url)
-}
-
 /// Runs the installation check's next step (see [`crate::connect::step`]).
 pub fn check_step(db: &dyn Db, cfg: &HostConfig, j: &mut CheckJob, replies: Vec<HttpReply>, now: DateTime<Utc>) -> ApiResult<Step> {
     if !holds_check(db, j)? {
@@ -1172,7 +1174,7 @@ pub fn check_step(db: &dyn Db, cfg: &HostConfig, j: &mut CheckJob, replies: Vec<
                         Ok(Step::Fetch(
                             j.repos
                                 .iter()
-                                .map(|(_, name)| api_call(HttpCall::get(format!("{API}/repos/{name}"))).bearer(&j.token))
+                                .map(|(id, _)| api_call(HttpCall::get(format!("{API}/repositories/{id}"))).bearer(&j.token))
                                 .collect(),
                         ))
                     }
@@ -1181,32 +1183,40 @@ pub fn check_step(db: &dyn Db, cfg: &HostConfig, j: &mut CheckJob, replies: Vec<
                 _ => check_failed(db, j, http_error("GitHub", &read), now),
             }
         }
-        CheckPhase::Checking | CheckPhase::Following => {
-            let asked: Vec<i64> = match j.phase {
-                CheckPhase::Checking => j.repos.iter().map(|(id, _)| *id).collect(),
-                _ => j.renamed.iter().map(|(id, _)| *id).collect(),
-            };
-            let following = j.phase == CheckPhase::Following;
-            j.renamed.clear();
+        CheckPhase::Checking | CheckPhase::Confirming => {
+            let confirming = j.phase == CheckPhase::Confirming;
+            let asked: Vec<i64> = if confirming { std::mem::take(&mut j.unsure) } else { j.repos.iter().map(|(id, _)| *id).collect() };
             for (id, reply) in asked.into_iter().zip(replies.iter()) {
+                let v = reply.json();
+                let same = v["id"].as_i64() == Some(id);
                 match reply.status {
-                    200 => {
-                        let name = reply.json()["full_name"].as_str().and_then(|n| super::repo::github_repo(n).ok());
-                        j.found.insert(id, Some(name.unwrap_or_default()));
+                    // GitHub's answer is about this very repository (its id): reachable, perhaps renamed.
+                    200 if same => {
+                        let name = v["full_name"].as_str().and_then(|n| super::repo::github_repo(n).ok()).unwrap_or_default();
+                        j.found.insert(id, Some(name));
                     }
-                    404 => {
+                    // By id, an answer about another repository is GitHub misbehaving: try later.
+                    200 if !confirming => {
+                        return check_failed(db, j, "GitHub answered about another repository. Trying again later.".into(), now);
+                    }
+                    // By name, it's someone else's repository that took the old name.
+                    200 => {
                         j.found.insert(id, None);
                     }
-                    301 if !following => match moved_to(reply) {
-                        Some(url) => j.renamed.push((id, url)),
-                        None => return check_failed(db, j, http_error("GitHub", reply), now),
-                    },
+                    404 if confirming => {
+                        j.found.insert(id, None);
+                    }
+                    // Not found by id: before deciding it's out of reach, ask by the name it had.
+                    404 => j.unsure.push(id),
                     _ => return check_failed(db, j, http_error("GitHub", reply), now),
                 }
             }
-            if !j.renamed.is_empty() {
-                j.phase = CheckPhase::Following;
-                return Ok(Step::Fetch(j.renamed.iter().map(|(_, url)| api_call(HttpCall::get(url.clone())).bearer(&j.token)).collect()));
+            if !confirming && !j.unsure.is_empty() {
+                j.phase = CheckPhase::Confirming;
+                let names: std::collections::BTreeMap<i64, String> = j.repos.iter().cloned().collect();
+                let calls =
+                    j.unsure.iter().map(|id| api_call(HttpCall::get(format!("{API}/repos/{}", names[id]))).bearer(&j.token)).collect();
+                return Ok(Step::Fetch(calls));
             }
             apply(db, cfg, j, Now::Active, now)
         }
@@ -1280,6 +1290,14 @@ fn apply(db: &dyn Db, cfg: &HostConfig, j: &mut CheckJob, now_is: Now, now: Date
                             "UPDATE github_repositories SET removed_at = NULL, full_name = CASE WHEN ? = '' THEN full_name ELSE ? END WHERE installation_id = ? AND id = ?",
                             &params![name.clone(), name.clone(), installation, *id],
                         )?;
+                        // Renamed: its sources follow, so their links and lookups use the new name.
+                        if !name.is_empty() {
+                            db.execute(
+                                "UPDATE docs_sources SET repo = ? WHERE repo != ? AND id IN
+                                   (SELECT source_id FROM docs_source_links WHERE connection = 'github_app' AND installation_id = ? AND repo_id = ?)",
+                                &params![name.clone(), name.clone(), installation, *id],
+                            )?;
+                        }
                         back += db.execute(
                             "UPDATE docs_source_links SET disconnected = NULL WHERE connection = 'github_app' AND installation_id = ? AND repo_id = ? AND disconnected = ?",
                             &params![installation, *id, REPOSITORY_REMOVED],

@@ -139,6 +139,8 @@ async function syncAll(source, onProgress) {
   let total = { created: 0, updated: 0 };
   for (let round = 0; round < 40; round++) {
     const r = await api.post(`/docs-sources/${enc(source.id)}/sync`);
+    // A disconnected GitHub App folder: nothing synced; DumbSlab is asking GitHub again.
+    if (r.checking) return r;
     total = { created: total.created + r.created, updated: total.updated + r.updated };
     if (r.done || !r.remaining) return { ...r, ...total };
     onProgress(`Synced ${total.created + total.updated} so far, ${r.remaining} to go…`);
@@ -166,11 +168,12 @@ function connectionMeta(source) {
 function sourceCard(source, reload) {
   const where = `${source.repository}${source.folder ? `/${source.folder}` : ''}`;
   const app = source.connection !== 'token';
-  const run = button('Sync now', { icon: 'refresh', variant: 'subtle', size: 'sm', disabled: Boolean(source.disconnected) });
+  // A disconnected GitHub App folder's Sync now asks GitHub again; others wait to be reconnected.
+  const run = button('Sync now', { icon: 'refresh', variant: 'subtle', size: 'sm', disabled: Boolean(source.disconnected) && source.connection !== 'github_app' });
   const progress = h('span', { class: 'small muted', role: 'status' });
   run.addEventListener('click', () => busy(run, async () => {
     const r = await syncAll(source, (text) => { progress.textContent = text; });
-    toast(r ? `Synced ${where}: ${r.created} new, ${r.updated} updated` : 'Synced part of the folder; sync again to continue');
+    toast(r && r.checking ? r.checking : r ? `Synced ${where}: ${r.created} new, ${r.updated} updated` : 'Synced part of the folder; sync again to continue');
     reload();
   }).catch((e) => { toastError(e); reload(); }));
   const token = button(source.has_token ? 'Change token' : 'Add token', { variant: 'ghost', size: 'sm' });
