@@ -8,6 +8,10 @@ ALTER TABLE slack_app ADD COLUMN scopes TEXT NOT NULL DEFAULT '';
 -- Work about one install changes the row only while it's still that install. On hosted DumbSlab it
 -- also names the install's claim on its Slack workspace in the directory.
 ALTER TABLE slack_app ADD COLUMN install_id TEXT;
+-- A random value that changes whenever the saved connection does: each save (an Add to Slack
+-- updated in place included), each new bot token, each confirmation. Work that started against
+-- one revision changes the row only while it's still that revision.
+ALTER TABLE slack_app ADD COLUMN revision TEXT;
 -- Add to Slack on hosted DumbSlab: the directory confirmed this install's claim. Until it has, the
 -- workspace doesn't act on Slack at all: no channel messages, command answers or link previews.
 ALTER TABLE slack_app ADD COLUMN confirmed INTEGER NOT NULL DEFAULT 0;

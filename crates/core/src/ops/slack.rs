@@ -172,9 +172,9 @@ fn get_slack(ctx: &mut Ctx, _: NoInput) -> ApiResult<SlackSettings> {
     if ctx.cfg.hosting.is_some() {
         // An Add to Slack whose confirmation never ran (its job died): try again, after the answer.
         if view.confirming
-            && let Some(id) = slack::load(ctx.db, ctx.cfg)?.and_then(|a| a.install_id)
+            && let Some(app) = slack::load(ctx.db, ctx.cfg)?
         {
-            ctx.effects.push(Effect::Background(crate::connect::Job::Slack(SlackJob::confirm(&ctx.base_url, &id))));
+            ctx.effects.push(Effect::Background(crate::connect::Job::Slack(SlackJob::confirm(&ctx.base_url, slack::At::of(&app)))));
         }
         // Claims a disconnect or a switch didn't finish letting go of, each by its exact install.
         for (team, id) in slack::queued_releases(ctx.db)? {
@@ -392,9 +392,10 @@ fn test_channel(ctx: &mut Ctx, input: ChannelIdInput) -> ApiResult<Deferred<Slac
     if slack::channel_row(ctx.db, &input.id)?.is_none() {
         return Err(ApiError::not_found("Slack channel"));
     }
-    if !slack::load(ctx.db, ctx.cfg)?.is_some_and(|a| a.bot_token.is_some()) {
+    let Some(app) = slack::load(ctx.db, ctx.cfg)?.filter(|a| a.bot_token.is_some()) else {
         return Err(ApiError::bad_request("Connect Slack first: save the bot token in Settings › Slack."));
-    }
-    ctx.effects.push(Effect::Connect(crate::connect::Job::Slack(SlackJob::test(&ctx.base_url, &input.id))));
+    };
+    // From the connection as it is now: a test that waits on the directory acts on no other.
+    ctx.effects.push(Effect::Connect(crate::connect::Job::Slack(SlackJob::test(&ctx.base_url, &input.id, &app))));
     Ok(Deferred::Pending)
 }
