@@ -4,7 +4,6 @@
 use chrono::Utc;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 
 use super::{DONE, Done, NoInput, clean};
 use crate::connect::{self, Credential, Deferred};
@@ -15,7 +14,7 @@ use crate::model::{TopicRef, UserRef, load_topic, topic_url, user_refs};
 use crate::registry::{Access, Ctx, Op, op};
 use crate::sync::docs::{self, DocsSyncResult, Link, Source};
 use crate::sync::github_app;
-use crate::sync::people::{self, PeopleSyncResult};
+use crate::sync::people::{self, PeopleSyncRemoved, PeopleSyncResult};
 use crate::sync::{self, SyncState};
 use crate::util::new_secret;
 use crate::{Effect, params};
@@ -30,11 +29,15 @@ pub fn ops() -> Vec<Op> {
     vec![
         op("sync", "get_people_sync", "GET", "/people-sync", Access::Admin, get_people_sync)
             .title("People sync settings")
-            .desc("The workspace's people sync from BambooHR: its company domain, whether a webhook is set up, and how the last sync went. Credentials are never shown.")
+            .desc("The workspace's people sync from BambooHR: its company domain, whether changes in BambooHR start a sync (its webhook) and why not, and how the last sync went. Credentials are never shown.")
+            .build(),
+        op("sync", "connect_people_sync", "POST", "/people-sync/sign-in", Access::Admin, connect_people_sync)
+            .title("Sign in with BambooHR")
+            .desc("Set up the people sync by signing in with BambooHR, the one way on hosted DumbSlab. Give the company domain, then open `authorize_url` in the admin's browser: they approve DumbSlab in BambooHR and come back to Settings › People sync, where DumbSlab checks access, adds BambooHR's webhook so changes there start a sync, and saves. The link works once, for 15 minutes, for the admin who asked. Needs the host's BambooHR app (`sign_in_available` in get_people_sync).")
             .build(),
         op("sync", "set_people_sync", "PUT", "/people-sync", Access::Admin, set_people_sync)
             .title("Set up the people sync")
-            .desc("Set up (or change) the people sync from BambooHR: the company domain and an API key, and optionally the private key of a BambooHR webhook so changes there start a sync. Leave a key out to keep the saved one. Then run sync_people. A sync fills in title, department, location, work phone, pronouns and manager for people here whose email matches a BambooHR work email; it never adds, deactivates or removes anyone.")
+            .desc("Set up the people sync with the company domain and an API key (self-hosted only: BambooHR's terms let hosted services use Sign in with BambooHR alone, see connect_people_sync), or save it again with the saved credentials, e.g. to move the webhook after the workspace moved. DumbSlab checks access with BambooHR first and saves nothing if it doesn't work. Then it adds a webhook in BambooHR, so changes there start a sync; saving again keeps that webhook when nothing changed and BambooHR still has it, and replaces it otherwise. If BambooHR won't let DumbSlab's user add webhooks, the sync is saved anyway, and `webhook_error` says why: add the webhook in BambooHR by hand and pass its private key as `webhook_key`. Leave the API key out to keep the saved credentials. Then run sync_people. A sync fills in title, department, location, work phone, pronouns and manager for people here whose email matches a BambooHR work email; it never adds, deactivates or removes anyone.")
             .idempotent()
             .build(),
         op("sync", "sync_people", "POST", "/people-sync/run", Access::Admin, sync_people)
@@ -43,7 +46,7 @@ pub fn ops() -> Vec<Op> {
             .build(),
         op("sync", "remove_people_sync", "DELETE", "/people-sync", Access::Admin, remove_people_sync)
             .title("Remove the people sync")
-            .desc("Stop syncing from BambooHR and forget its credentials. Profile details already synced stay.")
+            .desc("Stop syncing from BambooHR: delete the webhook DumbSlab added there, and forget the credentials. Profile details already synced stay.")
             .destructive()
             .build(),
         op("sync", "list_docs_sources", "GET", "/docs-sources", Access::Admin, list_docs_sources)
@@ -101,88 +104,106 @@ pub struct PeopleSync {
     pub provider: String,
     /// The BambooHR company domain: `acme` for acme.bamboohr.com.
     pub subdomain: Option<String>,
-    /// A webhook private key is saved, so BambooHR's webhooks start syncs.
+    /// How DumbSlab signs in to BambooHR: `oauth` (Sign in with BambooHR) or `api_key`.
+    pub auth: Option<String>,
+    /// Sign in with BambooHR works here: the host registered a BambooHR app.
+    pub sign_in_available: bool,
+    /// API keys are accepted here. Self-hosted only: BambooHR's developer terms allow API keys only in systems a company runs itself (https://www.bamboohr.com/legal/developer-terms-of-service, §3.2–3.3).
+    pub api_key_allowed: bool,
+    /// Changes in BambooHR start a sync: a webhook's private key is saved, so its calls are checked.
     pub webhook: bool,
+    /// DumbSlab added that webhook in BambooHR itself. When `webhook` is on and this is off, an admin added it by hand and pasted its private key.
+    pub automatic_webhook: bool,
+    /// Why changes in BambooHR don't start a sync on their own, or what to do about it: BambooHR wouldn't let DumbSlab add the webhook (save again once the key's user may add webhooks, or add it by hand), or the workspace moved address (save again).
+    pub webhook_error: Option<String>,
     /// Where BambooHR sends webhooks.
     pub webhook_url: String,
     #[serde(flatten)]
     pub state: SyncState,
     pub last_result: Option<PeopleSyncResult>,
+    /// Sets of credentials (old sign-ins or API keys) DumbSlab still has to look through for its old webhooks in BambooHR, to delete them. It tries again after saves and syncs, and when Settings › People sync opens.
+    pub webhook_cleanup: i64,
+    /// Only in set_people_sync's answer: something to know about this change, such as an old webhook BambooHR wouldn't let DumbSlab delete.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notice: Option<String>,
 }
 
 fn people_row(ctx: &Ctx) -> ApiResult<Option<Row>> {
     ctx.db.one("SELECT * FROM people_sync WHERE id = 1", &[])
 }
 
-fn people_view(ctx: &Ctx) -> ApiResult<PeopleSync> {
+pub(crate) fn people_view(ctx: &Ctx) -> ApiResult<PeopleSync> {
     let row = people_row(ctx)?;
+    let webhook_url = ctx.url(people::HOOK_PATH);
     Ok(PeopleSync {
         enabled: connect::enabled(ctx.cfg),
         configured: row.is_some(),
         provider: people::PROVIDER.into(),
         subdomain: row.as_ref().map(|r| r.str("subdomain")),
+        auth: row.as_ref().map(|r| r.str("auth")),
+        sign_in_available: people::sign_in_app(ctx.cfg).is_some(),
+        api_key_allowed: !people::hosted(ctx.cfg),
         webhook: row.as_ref().is_some_and(|r| r.bool("webhook")),
-        webhook_url: ctx.url("/hooks/people"),
+        automatic_webhook: row.as_ref().is_some_and(|r| r.bool("webhook") && r.opt_str("webhook_id").is_some()),
+        webhook_error: row.as_ref().and_then(|r| people::webhook_problem(r, &webhook_url)),
+        webhook_url,
         state: row.as_ref().map(|r| sync::state_of(r, ctx.now)).unwrap_or_default(),
         last_result: row.as_ref().and_then(|r| r.opt_str("last_result")).and_then(|v| serde_json::from_str(&v).ok()),
+        webhook_cleanup: people::cleanup_waiting(ctx.db)?,
+        notice: None,
     })
 }
 
 fn get_people_sync(ctx: &mut Ctx, _: NoInput) -> ApiResult<PeopleSync> {
+    // Opening Settings › People sync also runs a cleanup pass that's due (old webhooks to delete).
+    if people::cleanup_due(ctx.db, ctx.now)? {
+        ctx.effects.push(Effect::Background(people::cleanup_job(&ctx.base_url, None)));
+    }
     people_view(ctx)
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SetPeopleSyncInput {
-    /// The BambooHR company domain: `acme` for acme.bamboohr.com.
+    /// The BambooHR company domain: `acme` for acme.bamboohr.com. `acme.bamboohr.com` or any address on it works too.
     pub subdomain: String,
-    /// A BambooHR API key (in BambooHR: your name › API Keys). Its user must be able to see employees' work emails and job details. Required the first time; leave out to keep the saved one.
+    /// A BambooHR API key (in BambooHR: your name › API Keys), self-hosted only. Its user must be able to see employees' work emails and job details, and to add webhooks for changes to start a sync. Checked with BambooHR before it's saved. Required the first time; leave out to keep the saved one.
     pub api_key: Option<String>,
-    /// The private key of a BambooHR webhook that posts to `webhook_url`, so changes there start a sync. An empty string removes it; leave out to keep the saved one.
+    /// Only when DumbSlab can't add BambooHR's webhook itself (see `webhook_error`): the private key of a webhook you added in BambooHR that posts to `webhook_url`. DumbSlab then adds none. An empty string removes it, and DumbSlab adds its own again; leave out to keep the saved one.
     pub webhook_key: Option<String>,
 }
 
-fn set_people_sync(ctx: &mut Ctx, input: SetPeopleSyncInput) -> ApiResult<PeopleSync> {
+fn set_people_sync(ctx: &mut Ctx, input: SetPeopleSyncInput) -> ApiResult<Deferred<PeopleSync>> {
     key_needed(ctx)?;
     let subdomain = people::valid_subdomain(&input.subdomain).map_err(ApiError::bad_request)?;
-    let existing = people_row(ctx)?;
-    let mut cred = match &existing {
-        // Unreadable (the connector key changed): the keys must be entered again.
-        Some(r) => sync::open(ctx.cfg, people::OWNER, people::PROVIDER, &r.str("secret")).unwrap_or_default(),
-        None => Credential::default(),
-    };
-    if let Some(k) = secret_input(input.api_key, "api_key")?.filter(|k| !k.is_empty()) {
-        cred.token = k;
-    }
-    if cred.token.is_empty() {
-        return Err(ApiError::bad_request("a BambooHR API key is required"));
-    }
-    match secret_input(input.webhook_key, "webhook_key")? {
-        Some(k) if k.is_empty() => {
-            cred.fields.remove("webhook_key");
-        }
-        Some(k) => {
-            cred.fields.insert("webhook_key".into(), k);
-        }
-        None => {}
-    }
-    let webhook = cred.fields.contains_key("webhook_key");
-    let secret = sync::seal(ctx.cfg, people::OWNER, people::PROVIDER, &cred)?;
-    let now = ctx.now_s();
-    ctx.db.execute(
-        "INSERT INTO people_sync (id, provider, subdomain, secret, webhook, owner_id, created_at, updated_at) VALUES (1, ?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT(id) DO UPDATE SET subdomain = excluded.subdomain, secret = excluded.secret, webhook = excluded.webhook,
-           owner_id = excluded.owner_id, updated_at = excluded.updated_at",
-        &params![people::PROVIDER, subdomain.clone(), secret, webhook, ctx.actor.user_id.clone(), now.clone(), now],
-    )?;
-    emit(
-        ctx,
-        Event::new("people_sync.updated", "people_sync", "1", format!("set up the people sync from {subdomain}.bamboohr.com"))
-            .data(json!({ "webhook": webhook }))
-            .admin_only(),
-    )?;
-    people_view(ctx)
+    let api_key = secret_input(input.api_key, "api_key")?;
+    let webhook_key = secret_input(input.webhook_key, "webhook_key")?;
+    // The host checks the key with BambooHR and adds its webhook, then saves (see sync::people).
+    let job = people::setup_job(ctx, subdomain, api_key, webhook_key)?;
+    ctx.effects.push(Effect::Connect(job));
+    // Then, after the response, it deletes the webhooks DumbSlab still has to (the one this save
+    // replaced, when BambooHR wouldn't delete it now).
+    ctx.effects.push(Effect::Background(people::cleanup_job(&ctx.base_url, None)));
+    Ok(Deferred::Pending)
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ConnectPeopleSyncInput {
+    /// The BambooHR company domain: `acme` for acme.bamboohr.com. `acme.bamboohr.com` or any address on it works too.
+    pub subdomain: String,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct PeopleSyncSignIn {
+    /// BambooHR's sign-in page. Open it in the admin's browser, signed in to DumbSlab as the admin who asked.
+    pub authorize_url: String,
+}
+
+fn connect_people_sync(ctx: &mut Ctx, input: ConnectPeopleSyncInput) -> ApiResult<PeopleSyncSignIn> {
+    key_needed(ctx)?;
+    let subdomain = people::valid_subdomain(&input.subdomain).map_err(ApiError::bad_request)?;
+    Ok(PeopleSyncSignIn { authorize_url: people::start_sign_in(ctx, &subdomain)? })
 }
 
 fn sync_people(ctx: &mut Ctx, _: NoInput) -> ApiResult<Deferred<PeopleSyncResult>> {
@@ -190,18 +211,41 @@ fn sync_people(ctx: &mut Ctx, _: NoInput) -> ApiResult<Deferred<PeopleSyncResult
     match people::start(ctx.db, ctx.cfg, &ctx.base_url, Utc::now())? {
         Some(job) => {
             ctx.effects.push(Effect::Connect(job));
+            if people::cleanup_due(ctx.db, ctx.now)? {
+                ctx.effects.push(Effect::Background(people::cleanup_job(&ctx.base_url, None)));
+            }
             Ok(Deferred::Pending)
         }
         None => Err(ApiError::conflict("A people sync is already running. Try again in a minute.")),
     }
 }
 
-fn remove_people_sync(ctx: &mut Ctx, _: NoInput) -> ApiResult<Done> {
-    if ctx.db.execute("DELETE FROM people_sync WHERE id = 1", &[])? == 0 {
-        return Err(ApiError::not_found("people sync"));
+fn remove_people_sync(ctx: &mut Ctx, _: NoInput) -> ApiResult<Deferred<PeopleSyncRemoved>> {
+    let row = people_row(ctx)?.ok_or_else(|| ApiError::not_found("people sync"))?;
+    if people::saving(ctx.db, ctx.now)? {
+        return Err(people::busy());
     }
+    // A renewal under way would spend the refresh token the webhook's deletion needs.
+    if people::renewing(&row, ctx.now) {
+        return Err(ApiError::conflict(people::RENEWING));
+    }
+    ctx.db.execute("DELETE FROM people_sync WHERE id = 1", &[])?;
+    // A save that stalled past its lease can't bring the sync back.
+    people::end_saves(ctx.db)?;
     emit(ctx, Event::new("people_sync.removed", "people_sync", "1", "removed the people sync").admin_only())?;
-    Ok(DONE)
+    // Then the host deletes the webhook DumbSlab added in BambooHR, kept as a cleanup record (with
+    // the credentials that may delete it) until it's gone. The sync is gone either way.
+    match people::record_removed(ctx.db, ctx.cfg, &row, ctx.now)? {
+        Some(record) => {
+            ctx.effects.push(Effect::Connect(people::cleanup_job(&ctx.base_url, Some(record))));
+            Ok(Deferred::Pending)
+        }
+        // Its credentials can't be read any more (the connector key changed).
+        None if row.opt_str("webhook_id").is_some() => {
+            Ok(Deferred::Ready(PeopleSyncRemoved { ok: true, notice: Some(people::NOT_DELETED.into()) }))
+        }
+        None => Ok(Deferred::Ready(PeopleSyncRemoved { ok: true, notice: None })),
+    }
 }
 
 // ---------------------------------------------------------------------------
