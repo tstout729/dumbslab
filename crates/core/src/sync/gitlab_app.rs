@@ -42,6 +42,7 @@ pub const START_PATH: &str = "/sync/gitlab/start";
 pub const CALLBACK_PATH: &str = "/sync/gitlab/callback";
 pub const HOST: &str = "gitlab.com";
 const API: &str = "https://gitlab.com/api/v4";
+const TOKEN_URL: &str = "https://gitlab.com/oauth/token";
 /// Adding a project webhook needs it; `read_api` only reads.
 pub const SCOPE: &str = "api";
 /// Pages of 100 projects a listing reads.
@@ -93,9 +94,23 @@ pub(crate) fn needs_refresh(cred: &Credential, expires_at: Option<DateTime<Utc>>
     cred.refresh_token.is_some() && expires_at.is_some_and(|e| e - Duration::seconds(REFRESH_MARGIN_SECS) <= now)
 }
 
+/// A request to GitLab's token endpoint, with the app's client id and secret. Built here rather
+/// than by the connected-app connector: docs sync only ever talks to gitlab.com.
+fn token_call(app: &OAuthApp, form: &[(&str, &str)]) -> HttpCall {
+    let mut all = form.to_vec();
+    all.push(("client_id", &app.client_id));
+    all.push(("client_secret", &app.client_secret));
+    HttpCall::post_form(TOKEN_URL, &all).header("accept", "application/json")
+}
+
+/// Reads GitLab's token answer.
+fn read_tokens(reply: &HttpReply) -> Result<TokenSet, String> {
+    connect::standard_token("GitLab", reply)
+}
+
 pub(crate) fn refresh_call(app: &OAuthApp, cred: &Credential) -> HttpCall {
     let refresh = cred.refresh_token.clone().unwrap_or_default();
-    gitlab().token_request(app, vec![("grant_type".into(), "refresh_token".into()), ("refresh_token".into(), refresh)])
+    token_call(app, &[("grant_type", "refresh_token"), ("refresh_token", &refresh)])
 }
 
 /// Puts refreshed tokens in `cred`, keeping its other fields (the webhook secret).
@@ -108,7 +123,7 @@ pub(crate) fn apply_tokens(cred: &mut Credential, tokens: TokenSet) {
 
 /// Reads a refresh's answer. An error says what to do, for the admin.
 pub(crate) fn read_refresh(reply: &HttpReply) -> Result<TokenSet, String> {
-    gitlab().read_token(reply).map_err(|_| match reply.status {
+    read_tokens(reply).map_err(|_| match reply.status {
         0 | 429 => http_error("GitLab", reply),
         s if s >= 500 => http_error("GitLab", reply),
         _ => "GitLab no longer accepts DumbSlab's access for this folder (it was revoked, or the person who approved it lost access). Connect GitLab again and choose Reconnect.".into(),
@@ -441,17 +456,18 @@ pub fn step(db: &dyn Db, cfg: &HostConfig, j: &mut GitLabJob, replies: Vec<HttpR
     match (&mut j.kind, j.phase) {
         // Connecting.
         (Kind::Connect { code, verifier, redirect_uri, .. }, Phase::Start) => {
-            let form = vec![
-                ("grant_type".into(), "authorization_code".into()),
-                ("code".into(), code.clone()),
-                ("redirect_uri".into(), redirect_uri.clone()),
-                ("code_verifier".into(), verifier.clone()),
+            let form = [
+                ("grant_type", "authorization_code"),
+                ("code", code.as_str()),
+                ("redirect_uri", redirect_uri.as_str()),
+                ("code_verifier", verifier.as_str()),
             ];
+            let call = token_call(app, &form);
             j.phase = Phase::Working;
-            Ok(Step::Fetch(vec![gitlab().token_request(app, form)]))
+            Ok(Step::Fetch(vec![call]))
         }
         (Kind::Connect { approval, .. }, Phase::Working) => {
-            let Ok(tokens) = gitlab().read_token(&reply) else { return back(&j.base_url, Problem::Failed) };
+            let Ok(tokens) = read_tokens(&reply) else { return back(&j.base_url, Problem::Failed) };
             let expires_at = expiry(now, &tokens);
             let cred = Credential { token: tokens.access_token, refresh_token: tokens.refresh_token, ..Default::default() };
             let calls = gitlab().profile(&cred);
