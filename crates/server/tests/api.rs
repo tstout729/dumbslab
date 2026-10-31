@@ -10966,10 +10966,10 @@ mod syncs {
                 .unwrap();
         let now = chrono::Utc::now().timestamp();
         assert_eq!(claims["iss"], "Iv23liTEST");
-        assert!(
-            (now - 70..=now - 50).contains(&claims["iat"].as_i64().unwrap()) && claims["exp"].as_i64().unwrap() <= now + 600,
-            "{claims}"
-        );
+        // Backdated a minute and valid for ten (the unit test pins exact values); a slow run only
+        // moves `now` later, so the lower bound is loose.
+        let (iat, exp) = (claims["iat"].as_i64().unwrap(), claims["exp"].as_i64().unwrap());
+        assert!((now - 600..=now - 50).contains(&iat) && exp - iat == 600, "{claims}");
         assert_eq!(count(&h, "SELECT COUNT(*) FROM docs_sources WHERE secret LIKE '%ghs_%'"), 0, "tokens aren't kept");
         assert_eq!(post(&h, &doc_ids(&h)["README.md"], &mo)["title"], "Handbook");
 

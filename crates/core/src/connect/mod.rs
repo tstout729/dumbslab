@@ -1885,13 +1885,14 @@ mod tests {
         assert_eq!(html_text("unclosed <a href"), "unclosed ");
         assert_eq!(html_text("<!-- never closed"), " ");
         assert_eq!(html_text("é<b>ü</b>"), "éü");
-        // Inputs built to make naive versions quadratic finish quickly.
+        // Inputs built to make naive versions quadratic finish quickly. A quadratic version takes
+        // minutes on these; the limit leaves room for a slow, busy test machine.
         let started = std::time::Instant::now();
         html_text(&"<script>".repeat(200_000));
         html_text(&"<style>x".repeat(200_000));
         decode_entities(&"&".repeat(2_000_000));
         decode_entities(&"&amp".repeat(500_000));
-        assert!(started.elapsed() < std::time::Duration::from_secs(2), "took {:?}", started.elapsed());
+        assert!(started.elapsed() < std::time::Duration::from_secs(10), "took {:?}", started.elapsed());
         assert_eq!(html_text(&"a".repeat(100_000)).len(), 64 * 1024, "capped");
     }
 
