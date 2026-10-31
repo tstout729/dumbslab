@@ -55,19 +55,59 @@ function peopleResult(r) {
       : null);
 }
 
+/** Adding BambooHR's webhook by hand, for when DumbSlab can't add it itself. */
+function manualWebhook(s, reload) {
+  const manual = s.webhook && !s.automatic_webhook;
+  const key = input({ type: 'password', required: true, placeholder: manual ? 'Saved. Paste a new one to replace it.' : '', spellcheck: 'false' });
+  const save = button('Save private key', { variant: 'subtle', size: 'sm', type: 'submit' });
+  const form = h('form', { class: 'stack token-form', novalidate: true },
+    h('ol', { class: 'plan-list' },
+      h('li', null, 'In BambooHR, open Settings › Webhooks and add a webhook.'),
+      h('li', null, 'URL: the address below. Format: JSON.'),
+      h('li', null, 'Fields to watch: Work Email, Job Title, Department, Location, Work Phone, Reporting To and Status.'),
+      h('li', null, 'Save it, then paste its private key here.')),
+    copyField(s.webhook_url, { label: 'Webhook address' }),
+    field('Webhook private key', key),
+    h('div', null, save));
+  form.addEventListener('submit', (e) => {
+    e.preventDefault();
+    if (!key.value.trim()) {
+      key.reportValidity();
+      return;
+    }
+    busy(save, async () => {
+      await request('PUT', '/people-sync', { body: { subdomain: s.subdomain, webhook_key: key.value.trim() } });
+      toast('Private key saved. Changes in BambooHR now start a sync.');
+      reload();
+    }).catch(toastError);
+  });
+  let automatic = null;
+  if (manual) {
+    automatic = button('Let DumbSlab add the webhook instead', { variant: 'ghost', size: 'sm' });
+    automatic.addEventListener('click', () => busy(automatic, async () => {
+      const r = await request('PUT', '/people-sync', { body: { subdomain: s.subdomain, webhook_key: '' } });
+      if (r.automatic_webhook) toast('DumbSlab added the webhook in BambooHR. You can delete the one you added.');
+      else toast('DumbSlab couldn’t add the webhook. See People sync for why.', { type: 'error' });
+      reload();
+    }).catch(toastError));
+  }
+  return h('details', { class: 'small', open: !s.webhook && !!s.webhook_error },
+    h('summary', null, manual ? 'Webhook added by hand' : 'Add the webhook yourself'),
+    h('p', { class: 'muted' }, 'Only needed when DumbSlab can’t add it for you.'),
+    form,
+    automatic);
+}
+
 export async function peopleSyncSection(ctx) {
   const s = await api.get('/people-sync');
   if (!s.enabled) return off('People sync');
   const reload = () => ctx.reload();
   const subdomain = input({ required: true, value: s.subdomain || '', placeholder: 'acme', spellcheck: 'false', autocapitalize: 'off' });
   const apiKey = input({ type: 'password', required: !s.configured, placeholder: s.configured ? 'Saved. Leave empty to keep it.' : '', spellcheck: 'false' });
-  const hookKey = input({ type: 'password', placeholder: s.webhook ? 'Saved. Leave empty to keep it.' : 'Optional', spellcheck: 'false' });
   const save = button(s.configured ? 'Save' : 'Save and sync', { variant: 'primary', type: 'submit' });
   const f = h('form', { class: 'stack token-form', novalidate: true },
-    field('BambooHR company domain', subdomain, { hint: 'The acme in acme.bamboohr.com.' }),
-    field('API key', apiKey, { hint: 'In BambooHR: your name › API Keys › Add new key. Its user must be able to see employees’ work emails and job details. It’s encrypted and never shown again.' }),
-    field('Webhook private key (optional)', hookKey, { hint: frag('To sync when someone changes in BambooHR, add a webhook in BambooHR (Settings › Webhooks) that posts to the address below, and paste its private key here.') }),
-    copyField(s.webhook_url, { label: 'Webhook address' }),
+    field('BambooHR company domain', subdomain, { hint: 'The acme in acme.bamboohr.com. Pasting the address you sign in at works too.' }),
+    field('API key', apiKey, { hint: 'In BambooHR: your name › API Keys › Add new key. Its user must be able to see employees’ work emails and job details. DumbSlab checks the key with BambooHR, then adds a webhook there so changes sync on their own. It’s encrypted and never shown again.' }),
     h('div', null, save));
   f.addEventListener('submit', (e) => {
     e.preventDefault();
@@ -78,9 +118,10 @@ export async function peopleSyncSection(ctx) {
     busy(save, async () => {
       const body = { subdomain: subdomain.value.trim() };
       if (apiKey.value.trim()) body.api_key = apiKey.value.trim();
-      if (hookKey.value.trim()) body.webhook_key = hookKey.value.trim();
-      await request('PUT', '/people-sync', { body });
-      toast('People sync saved');
+      const r = await request('PUT', '/people-sync', { body });
+      if (r.webhook) toast('People sync saved. Changes in BambooHR now start a sync.');
+      else toast('People sync saved, but changes in BambooHR don’t start a sync yet. See below.', { type: 'info' });
+      if (r.notice) toast(r.notice, { type: 'info' });
       if (!s.configured) await runPeople();
       reload();
     }).catch(toastError);
@@ -94,16 +135,26 @@ export async function peopleSyncSection(ctx) {
   run.addEventListener('click', () => busy(run, async () => { await runPeople(); reload(); }).catch((e) => { toastError(e); reload(); }));
   const remove = button('Remove', { variant: 'ghost', size: 'sm' });
   remove.addEventListener('click', async () => {
-    const ok = await confirmDialog({ title: 'Remove the people sync?', message: 'DumbSlab forgets the BambooHR key. Details already synced stay on people’s profiles.', confirmLabel: 'Remove', danger: true });
+    const ok = await confirmDialog({ title: 'Remove the people sync?', message: 'DumbSlab deletes the webhook it added in BambooHR and forgets the BambooHR key. Details already synced stay on people’s profiles.', confirmLabel: 'Remove', danger: true });
     if (!ok) return;
-    busy(remove, async () => { await api.del('/people-sync'); toast('People sync removed'); reload(); }).catch(toastError);
+    busy(remove, async () => {
+      const r = await api.del('/people-sync');
+      toast('People sync removed');
+      if (r.notice) toast(r.notice, { type: 'info' });
+      reload();
+    }).catch(toastError);
   });
 
+  const automatic = s.webhook
+    ? h('span', null, icon('zap', { size: 13 }), s.automatic_webhook ? ' Syncs when BambooHR changes' : ' Syncs when BambooHR changes (webhook added by hand)')
+    : null;
   const status = s.configured
     ? panel('Status', null,
-      h('div', { class: 'token-meta' }, stateLine(s), s.webhook ? h('span', null, icon('zap', { size: 13 }), ' Webhook on') : null),
+      h('div', { class: 'token-meta' }, stateLine(s), automatic),
+      s.webhook_error ? h('p', { class: 'callout callout-warn' }, icon('alert', { size: 15 }), h('span', null, s.webhook_error)) : null,
       stateNotes(s),
       peopleResult(s.last_result),
+      manualWebhook(s, reload),
       h('div', { class: 'plan-actions' }, run, remove))
     : null;
   return frag(

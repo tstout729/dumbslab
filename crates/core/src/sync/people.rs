@@ -7,8 +7,12 @@
 //! they are. Photos are left out: BambooHR's photo links expire, and its photo download needs the
 //! API key.
 //!
+//! Saving the sync checks the API key and adds BambooHR's webhook (see [`setup`]).
+//!
 //! Docs: https://documentation.bamboohr.com/reference/list-employees,
 //! https://documentation.bamboohr.com/docs/webhooks
+
+mod setup;
 
 use std::collections::{HashMap, HashSet};
 
@@ -24,6 +28,9 @@ use crate::error::{ApiError, ApiResult};
 use crate::events::{Event, emit};
 use crate::util::{secure_eq, ts};
 use crate::{HostConfig, Outcome, Request, params};
+
+pub use setup::PeopleSyncRemoved;
+pub(crate) use setup::{HOOK_PATH, removal_job, setup_job, webhook_problem};
 
 pub const PROVIDER: &str = "bamboohr";
 pub(crate) const TABLE: &str = "people_sync";
@@ -43,17 +50,28 @@ pub(crate) fn key() -> SqlValue {
     SqlValue::Integer(1)
 }
 
-/// A BambooHR company domain: `acme` from `acme`, `acme.bamboohr.com` or its address.
+/// A BambooHR company domain: `acme` from `acme`, `acme.bamboohr.com`, any address on it
+/// (`https://acme.bamboohr.com/home`), or BambooHR's older API address
+/// (`https://api.bamboohr.com/api/gateway.php/acme/v1`).
 pub fn valid_subdomain(typed: &str) -> Result<String, String> {
-    let t = typed.trim().to_ascii_lowercase();
-    let t = t.strip_prefix("https://").unwrap_or(&t);
-    let t = t.trim_end_matches('/');
-    let t = t.strip_suffix(".bamboohr.com").unwrap_or(t);
+    let lower = typed.trim().to_ascii_lowercase();
+    let t = lower.strip_prefix("https://").or_else(|| lower.strip_prefix("http://")).unwrap_or(&lower);
+    let (host, rest) = t.split_once(['/', '?', '#']).unwrap_or((t, ""));
+    let host = host.strip_suffix(".bamboohr.com").unwrap_or(host);
+    let t = match (host, rest.strip_prefix("api/gateway.php/")) {
+        ("api", Some(gateway)) => gateway.split(['/', '?', '#']).next().unwrap_or_default(),
+        _ => host,
+    };
     let ok = (1..=63).contains(&t.len())
+        && !matches!(t, "api" | "www" | "app")
         && !t.starts_with('-')
         && !t.ends_with('-')
         && t.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
-    if ok { Ok(t.to_string()) } else { Err(format!("The company domain is the `acme` in acme.bamboohr.com; `{typed}` isn't one.")) }
+    if ok {
+        return Ok(t.to_string());
+    }
+    let shown: String = typed.trim().chars().take(100).collect();
+    Err(format!("The company domain is the `acme` in acme.bamboohr.com (the address you sign in to BambooHR at); `{shown}` isn't one."))
 }
 
 /// A BambooHR employee, as a sync uses them. `None` fields are ones the API key may not read:
@@ -106,8 +124,29 @@ enum Phase {
     Reading,
 }
 
+/// Work for BambooHR, run by the host in steps (see [`connect::step`]).
 #[derive(Clone, Debug)]
 pub struct PeopleJob {
+    work: Work,
+    /// The webhooks of the events the job records, for the host to send once it finishes.
+    effects: Vec<crate::Effect>,
+    /// The current step's, until the host says whether it committed ([`crate::connect::Job::settle`]).
+    staged: Vec<crate::Effect>,
+}
+
+#[derive(Clone, Debug)]
+enum Work {
+    /// A sync.
+    Sync(Run),
+    /// An admin saved the settings: check the key, then add BambooHR's webhook.
+    Setup(Box<setup::Setup>),
+    /// The sync was removed: delete the webhook DumbSlab added in BambooHR.
+    Remove(setup::Removal),
+}
+
+/// A sync under way.
+#[derive(Clone, Debug)]
+struct Run {
     lease: String,
     subdomain: String,
     cred: Credential,
@@ -116,13 +155,13 @@ pub struct PeopleJob {
     employees: Vec<Employee>,
     pages: usize,
     phase: Phase,
-    /// The webhooks of the event the sync records, for the host to send once it finishes.
-    effects: Vec<crate::Effect>,
-    /// The current step's, until the host says whether it committed ([`crate::connect::Job::settle`]).
-    staged: Vec<crate::Effect>,
 }
 
 impl PeopleJob {
+    fn new(work: Work) -> PeopleJob {
+        PeopleJob { work, effects: vec![], staged: vec![] }
+    }
+
     pub(crate) fn take_effects(&mut self) -> Vec<crate::Effect> {
         std::mem::take(&mut self.effects)
     }
@@ -140,7 +179,7 @@ pub(crate) fn start(db: &dyn Db, cfg: &HostConfig, base_url: &str, now: DateTime
     let row = db.one("SELECT * FROM people_sync WHERE id = 1", &[])?.ok_or_else(|| ApiError::not_found("people sync (set it up first)"))?;
     let cred = super::open(cfg, OWNER, PROVIDER, &row.str("secret"))?;
     let Some(lease) = super::claim(db, TABLE, key(), now)? else { return Ok(None) };
-    Ok(Some(Job::People(Box::new(PeopleJob {
+    Ok(Some(Job::People(Box::new(PeopleJob::new(Work::Sync(Run {
         lease,
         subdomain: row.str("subdomain"),
         cred,
@@ -149,19 +188,25 @@ pub(crate) fn start(db: &dyn Db, cfg: &HostConfig, base_url: &str, now: DateTime
         employees: vec![],
         pages: 0,
         phase: Phase::Start,
-        effects: vec![],
-        staged: vec![],
-    }))))
+    }))))))
 }
 
-fn page_call(j: &PeopleJob, after: Option<&str>) -> HttpCall {
-    let mut url =
-        format!("https://{}.bamboohr.com/api/v1/employees?fields={FIELDS}&filter%5Bstatus%5D=active&page%5Blimit%5D={PAGE}", j.subdomain);
+/// A request to BambooHR's API for a company, with the API key.
+fn api_call(call: HttpCall, key: &str) -> HttpCall {
+    // BambooHR takes the API key as the user name, with any password.
+    call.basic(key, "x").header("accept", "application/json").header("user-agent", "DumbSlab")
+}
+
+fn api_url(subdomain: &str, path: &str) -> String {
+    format!("https://{subdomain}.bamboohr.com/api/v1/{path}")
+}
+
+fn page_call(j: &Run, after: Option<&str>) -> HttpCall {
+    let mut url = api_url(&j.subdomain, &format!("employees?fields={FIELDS}&filter%5Bstatus%5D=active&page%5Blimit%5D={PAGE}"));
     if let Some(cursor) = after {
         url.push_str(&format!("&page%5Bafter%5D={}", urlencoding::encode(cursor)));
     }
-    // BambooHR takes the API key as the user name, with any password.
-    HttpCall::get(url).basic(&j.cred.token, "x").header("accept", "application/json").header("user-agent", "DumbSlab")
+    api_call(HttpCall::get(url), &j.cred.token)
 }
 
 /// A JSON value as text: BambooHR sends ids as strings or numbers.
@@ -173,15 +218,20 @@ fn text(v: &Value) -> String {
     }
 }
 
+/// Why BambooHR refused to list employees.
+fn refusal(subdomain: &str, reply: &HttpReply) -> String {
+    match reply.status {
+        401 => "BambooHR rejected the API key. Check it was copied whole, then save it again.".into(),
+        403 => "BambooHR refused: the API key's user needs access to employee information, or BambooHR paused the key after failed attempts. Try again later.".into(),
+        404 => format!("BambooHR has no company at {subdomain}.bamboohr.com. Check the company domain."),
+        _ => http_error("BambooHR", reply),
+    }
+}
+
 /// One page of employees and the cursor for the next, if there is one.
 fn read_page(subdomain: &str, reply: &HttpReply) -> Result<(Vec<Employee>, Option<String>), String> {
     if !reply.ok() {
-        return Err(match reply.status {
-            401 => "BambooHR rejected the API key. Check it was copied whole, then save it again.".into(),
-            403 => "BambooHR refused: the API key's user needs access to employee information, or BambooHR paused the key after failed attempts. Try again later.".into(),
-            404 => format!("BambooHR has no company at {subdomain}.bamboohr.com. Check the company domain."),
-            _ => http_error("BambooHR", reply),
-        });
+        return Err(refusal(subdomain, reply));
     }
     let v = reply.json();
     let Some(data) = v["data"].as_array() else {
@@ -213,8 +263,24 @@ fn read_page(subdomain: &str, reply: &HttpReply) -> Result<(Vec<Employee>, Optio
     Ok((employees, next))
 }
 
-/// Runs a people sync's next step (see [`connect::step`]).
-pub fn step(db: &dyn Db, cfg: &HostConfig, j: &mut PeopleJob, replies: Vec<HttpReply>, now: DateTime<Utc>) -> ApiResult<Step> {
+/// Runs a people job's next step (see [`connect::step`]).
+pub fn step(db: &dyn Db, cfg: &HostConfig, job: &mut PeopleJob, replies: Vec<HttpReply>, now: DateTime<Utc>) -> ApiResult<Step> {
+    let PeopleJob { work, staged, .. } = job;
+    match work {
+        Work::Sync(run) => sync_step(db, cfg, run, staged, replies, now),
+        Work::Setup(s) => setup::step(db, cfg, s, staged, replies, now),
+        Work::Remove(r) => Ok(setup::remove_step(r, replies)),
+    }
+}
+
+fn sync_step(
+    db: &dyn Db,
+    cfg: &HostConfig,
+    j: &mut Run,
+    staged: &mut Vec<crate::Effect>,
+    replies: Vec<HttpReply>,
+    now: DateTime<Utc>,
+) -> ApiResult<Step> {
     match j.phase {
         Phase::Start => {
             j.phase = Phase::Reading;
@@ -230,13 +296,13 @@ pub fn step(db: &dyn Db, cfg: &HostConfig, j: &mut PeopleJob, replies: Vec<HttpR
             j.pages += 1;
             match next {
                 Some(cursor) if j.pages < MAX_PAGES => Ok(Step::Fetch(vec![page_call(j, Some(&cursor))])),
-                more => apply(db, cfg, j, more.is_some(), now),
+                more => apply(db, cfg, j, staged, more.is_some(), now),
             }
         }
     }
 }
 
-fn fail(db: &dyn Db, j: &PeopleJob, message: &str, now: DateTime<Utc>) -> ApiResult<Step> {
+fn fail(db: &dyn Db, j: &Run, message: &str, now: DateTime<Utc>) -> ApiResult<Step> {
     super::finish(db, TABLE, key(), &j.lease, Ended { status: "failed", error: Some(message), result: None }, now)?;
     Ok(Step::Done(Finish::Fail(super::sync_failed(message))))
 }
@@ -250,7 +316,14 @@ struct Here {
     manager: Option<String>,
 }
 
-fn apply(db: &dyn Db, cfg: &HostConfig, j: &mut PeopleJob, truncated: bool, now: DateTime<Utc>) -> ApiResult<Step> {
+fn apply(
+    db: &dyn Db,
+    cfg: &HostConfig,
+    j: &mut Run,
+    staged: &mut Vec<crate::Effect>,
+    truncated: bool,
+    now: DateTime<Utc>,
+) -> ApiResult<Step> {
     if !super::holds(db, TABLE, key(), &j.lease)? {
         return Ok(Step::Done(Finish::Fail(super::sync_failed("Another sync took over before this one finished."))));
     }
@@ -350,7 +423,7 @@ fn apply(db: &dyn Db, cfg: &HostConfig, j: &mut PeopleJob, truncated: bool, now:
             .data(json!({ "matched": result.matched, "updated": result.updated, "not_found": result.not_found_count }))
             .admin_only(),
     )?;
-    j.staged.append(&mut ctx.effects);
+    staged.append(&mut ctx.effects);
     Ok(Step::Done(Finish::Fill(value)))
 }
 
@@ -425,11 +498,34 @@ mod tests {
 
     #[test]
     fn company_domains() {
-        assert_eq!(valid_subdomain(" Acme ").unwrap(), "acme");
-        assert_eq!(valid_subdomain("https://acme-co.bamboohr.com/").unwrap(), "acme-co");
-        for bad in ["", "acme.evil.test", "a b", "-x", "acme/x"] {
+        for (typed, domain) in [
+            (" Acme ", "acme"),
+            ("acme.bamboohr.com", "acme"),
+            ("https://acme-co.bamboohr.com/", "acme-co"),
+            ("HTTPS://Acme.BambooHR.com/home?tab=1#top", "acme"),
+            ("http://acme.bamboohr.com/employees/employee.php?id=4", "acme"),
+            ("acme.bamboohr.com/home", "acme"),
+            ("https://api.bamboohr.com/api/gateway.php/acme/v1/employees/directory", "acme"),
+            ("api.bamboohr.com/api/gateway.php/acme", "acme"),
+        ] {
+            assert_eq!(valid_subdomain(typed).as_deref(), Ok(domain), "{typed}");
+        }
+        for bad in [
+            "",
+            "acme.evil.test",
+            "https://evil.test/acme.bamboohr.com",
+            "acme.bamboohr.com.evil.test",
+            "a b",
+            "-x",
+            "bamboohr.com",
+            "www.bamboohr.com",
+            "https://api.bamboohr.com/",
+            "api.bamboohr.com/api/gateway.php/",
+            "ftp://acme.bamboohr.com",
+        ] {
             assert!(valid_subdomain(bad).is_err(), "{bad}");
         }
+        assert!(valid_subdomain(&"x".repeat(5000)).unwrap_err().len() < 300, "the message stays short");
     }
 
     #[test]
