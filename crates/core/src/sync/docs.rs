@@ -216,11 +216,7 @@ pub const DUPLICATE: &str = "Another source already syncs this folder into this 
 /// repository that took a name one of them still shows isn't theirs. Otherwise (either reads with
 /// a token) by name. Oldest first; `except` is left out.
 pub(crate) fn twins(db: &dyn Db, repo: &Repo, link: &Link, topic_id: &str, except: &str) -> ApiResult<Vec<Row>> {
-    let (repo_id, project_id) = match link {
-        Link::GitHubApp { repo_id, .. } => (Some(*repo_id), None),
-        Link::GitLabOAuth { project_id, .. } => (None, Some(*project_id)),
-        Link::Token => (None, None),
-    };
+    let (repo_id, project_id) = ids_of(link);
     db.query(
         "SELECT s.id, s.created_at, s.rowid AS seq FROM docs_sources s LEFT JOIN docs_source_links l ON l.source_id = s.id
          WHERE s.id != ? AND s.branch = ? AND s.folder = ? AND s.topic_id = ?
@@ -713,15 +709,73 @@ pub fn step(db: &dyn Db, cfg: &HostConfig, j: &mut DocsJob, replies: Vec<HttpRep
         },
         Phase::Minting(link) => minted(db, j, &replies, link, now),
         Phase::Refreshing => refreshed(db, cfg, j, &replies, now),
-        // Every step that writes checks again, in its own transaction, against the other sources
-        // as they are now: one that became another's twin while files were fetched (an older App
-        // source learned its repository's new name, say) writes nothing, and says why. (A GitLab
-        // app source's listing checks once it has read the project's path now.)
-        Phase::Listing if matches!(j.source.link, Link::GitLabOAuth { .. }) => listing(db, cfg, j, &replies, now),
-        Phase::Listing | Phase::Reading(_) | Phase::Images(..) if has_older_twin(db, &j.source)? => fail(db, j, DUPLICATE, now),
-        Phase::Listing => listing(db, cfg, j, &replies, now),
-        Phase::Reading(plan) => reading(db, cfg, j, plan, &replies, now),
-        Phase::Images(plan, texts) => images(db, cfg, j, plan, texts, &replies, now),
+        // Every step that writes checks again first, in its own transaction (see [`unchanged`]).
+        // (A GitLab app source's listing checks for a twin once it has read the project's path
+        // now.)
+        phase @ (Phase::Listing | Phase::Reading(_) | Phase::Images(..)) => {
+            let twin = !(matches!(phase, Phase::Listing) && matches!(j.source.link, Link::GitLabOAuth { .. }));
+            if let Some(stop) = unchanged(db, j, twin, now)? {
+                return Ok(stop);
+            }
+            match phase {
+                Phase::Listing => listing(db, cfg, j, &replies, now),
+                Phase::Reading(plan) => reading(db, cfg, j, plan, &replies, now),
+                Phase::Images(plan, texts) => images(db, cfg, j, plan, texts, &replies, now),
+                _ => unreachable!("a writing phase"),
+            }
+        }
+    }
+}
+
+/// What a sync that stopped because its source changed says (see [`unchanged`]).
+pub const CHANGED: &str = "The folder's repository, branch or topic changed while it synced (it was renamed, say), so this sync stopped without writing. Sync again to pick it up.";
+
+/// Before a step writes, in the same transaction: the source as stored now must still be the one
+/// this run started with (its repository's name and id, branch, folder and topic). If it changed
+/// meanwhile (a push or a check renamed it, say), the run writes nothing and ends, its source left
+/// pending, so the next sync starts from the source as it is. And (with `twin`) no older source
+/// may do the same work, by that identity: one that became another's twin while files were
+/// fetched (an older App source learned its repository's new name, say) writes nothing, and says
+/// why. `Some` is how the run ends.
+fn unchanged(db: &dyn Db, j: &mut DocsJob, twin: bool, now: DateTime<Utc>) -> ApiResult<Option<Step>> {
+    let Some(r) = db.one(
+        "SELECT s.repo, s.branch, s.folder, s.topic_id, l.repo_id, l.project_id FROM docs_sources s
+         LEFT JOIN docs_source_links l ON l.source_id = s.id WHERE s.id = ?",
+        &params![j.source.id.clone()],
+    )?
+    else {
+        return Ok(Some(lost()));
+    };
+    let (repo_id, project_id) = ids_of(&j.source.link);
+    let same = r.str("repo") == j.source.repo.repo
+        && r.str("branch") == j.source.repo.branch
+        && r.str("folder") == j.source.repo.folder
+        && r.str("topic_id") == j.source.topic_id
+        && r.opt_i64("repo_id") == repo_id
+        && r.opt_i64("project_id") == project_id;
+    if !same {
+        if !super::holds(db, TABLE, j.source.id.as_str().into(), &j.lease)? {
+            return Ok(Some(lost()));
+        }
+        super::mark_pending(db, TABLE, j.source.id.as_str().into(), now)?;
+        j.result.done = false;
+        let value = serde_json::to_value(&j.result).map_err(|e| ApiError::internal(e.to_string()))?;
+        let ended = Ended { status: "partial", error: Some(CHANGED), result: Some(value.clone()) };
+        super::finish(db, TABLE, j.source.id.as_str().into(), &j.lease, ended, now)?;
+        return Ok(Some(Step::Done(Finish::Fill(value))));
+    }
+    if twin && has_older_twin(db, &j.source)? {
+        return Ok(Some(fail(db, j, DUPLICATE, now)?));
+    }
+    Ok(None)
+}
+
+/// The repository's id (GitHub App) and the project's id (GitLab app) a source reads by, if any.
+fn ids_of(link: &Link) -> (Option<i64>, Option<i64>) {
+    match link {
+        Link::GitHubApp { repo_id, .. } => (Some(*repo_id), None),
+        Link::GitLabOAuth { project_id, .. } => (None, Some(*project_id)),
+        Link::Token => (None, None),
     }
 }
 
@@ -1352,9 +1406,8 @@ fn listing(db: &dyn Db, cfg: &HostConfig, j: &mut DocsJob, replies: &[HttpReply]
         d.sha = None;
     }
 
-    // Files owed a render since the repository was renamed (see [`mark_renamed`]), under its name
-    // now. Those of files no longer in the folder are dropped: a file that comes back is synced
-    // anyway.
+    // Files owed a render since the repository was renamed (see [`mark_renamed`]). Those of files
+    // no longer in the folder are dropped: a file that comes back is synced anyway.
     let mut rerender: BTreeSet<String> = db
         .query("SELECT target_id FROM docs_rerender WHERE source_id = ?", &params![source_id.clone()])?
         .iter()
@@ -1364,12 +1417,8 @@ fn listing(db: &dyn Db, cfg: &HostConfig, j: &mut DocsJob, replies: &[HttpReply]
     for gone in rerender.iter().filter(|t| !here.contains(t)) {
         db.execute("DELETE FROM docs_rerender WHERE source_id = ? AND target_id = ?", &params![source_id.clone(), gone.clone()])?;
     }
+    // (The run's name is the source's as stored now: see [`unchanged`].)
     rerender.retain(|t| here.contains(t));
-    if !rerender.is_empty()
-        && let Some(r) = db.one("SELECT repo FROM docs_sources WHERE id = ?", &params![source_id.clone()])?
-    {
-        j.source.repo.repo = r.str("repo");
-    }
 
     // Files that link to a changed path are synced again, now or in a later run.
     let dependents: Vec<String> =
