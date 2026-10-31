@@ -334,8 +334,10 @@ function reconnect(source, gitlab, reload) {
 function sourceCard(source, reload, gitlab) {
   const where = `${source.repository}${source.folder ? `/${source.folder}` : ''}`;
   const app = source.connection !== 'token';
-  // A disconnected GitHub App folder's Sync now asks GitHub again; others wait to be reconnected.
-  const run = button('Sync now', { icon: 'refresh', variant: 'subtle', size: 'sm', disabled: Boolean(source.disconnected) && source.connection !== 'github_app' });
+  // A disconnected GitHub App folder's Sync now asks GitHub again, and a signed-out GitLab app
+  // folder's tries its tokens (the answer says when only Reconnect helps); token folders wait to be
+  // fixed.
+  const run = button('Sync now', { icon: 'refresh', variant: 'subtle', size: 'sm', disabled: Boolean(source.disconnected) && !['github_app', 'gitlab_oauth'].includes(source.connection) });
   const progress = h('span', { class: 'small muted', role: 'status' });
   run.addEventListener('click', () => busy(run, async () => {
     const r = await syncAll(source, (text) => { progress.textContent = text; });

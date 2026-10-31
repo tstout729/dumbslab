@@ -922,7 +922,15 @@ fn sync_docs_source(ctx: &mut Ctx, input: SourceIdInput) -> ApiResult<Deferred<D
         }
     }
     if let Some(code) = &source.disconnected {
-        return Err(ApiError::new(409, "disconnected", github_app::disconnected_message(code)));
+        // A GitLab app folder signed out may have good tokens again (newer than the refused ones,
+        // or a renewal still landing): Sync now tries, and the outcome decides. Only a refusal of
+        // the very tokens it has asks for Reconnect.
+        let retry = code == gitlab_app::SIGNED_OUT
+            && matches!(source.link, Link::GitLabOAuth { .. })
+            && !docs::signed_out_for_good(ctx.db, &source)?;
+        if !retry {
+            return Err(ApiError::new(409, "disconnected", github_app::disconnected_message(code)));
+        }
     }
     match docs::start(ctx.db, source, &ctx.base_url, true, Utc::now())? {
         Some(job) => {

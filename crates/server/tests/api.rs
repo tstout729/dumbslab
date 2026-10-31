@@ -13695,6 +13695,106 @@ mod syncs {
     }
 
     #[test]
+    fn a_folder_signed_out_by_a_stale_refusal_heals_when_good_tokens_land() {
+        let (h, admin, lab, topic) = gitlab_setup();
+        let answer = |c: &HttpCall| lab.answer(c);
+        let lost = |c: &HttpCall| {
+            let reply = lab.answer(c);
+            if c.method == "POST" && c.url.ends_with("/projects/3/hooks") { HttpReply { status: 0, body: String::new() } } else { reply }
+        };
+        let input = json!({ "provider": "gitlab", "gitlab_connection": true, "project_id": 3, "repository": "acme/handbook", "folder": "docs", "topic_id": topic });
+        let add = |reply: &dyn Fn(&HttpCall) -> HttpReply| {
+            drive(&h, job_of(&h.call("POST", "/api/v1/docs-sources", Some(input.clone()), &admin)), reply).0
+        };
+        let renewals = |sent: &[HttpCall]| sent.iter().filter(|c| c.url == "https://gitlab.com/oauth/token").count();
+        connect_gitlab(&h, &admin, &lab);
+        assert!(matches!(add(&lost), Finish::Fail(_)));
+        let folder = filled(add(&answer))["source"]["id"].as_str().unwrap().to_string();
+        let disconnected = || source_of(&h, &admin)["disconnected"].clone();
+        let secret = lab.hooks.borrow().values().find(|h| h["url"].as_str().unwrap().ends_with(&folder)).unwrap()["token"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        db_run(&h, |db| {
+            db.execute(
+                "UPDATE docs_hook_cleanup SET expires_at = '2000-01-01T00:00:00.000Z', next_attempt_at = '2000-01-01T00:00:00.000Z'",
+                &[],
+            )
+        });
+        db_run(&h, |db| db.execute("UPDATE docs_source_links SET token_expires_at = '2000-01-01T00:00:00.000Z'", &[]));
+
+        // Cleanup A renews the folder's refresh token R; its answer is slow.
+        let mut a = background(&h.call("GET", "/api/v1/docs-sources", None, &admin)).remove(0);
+        let Ok(Step::Fetch(calls)) = step_with(&h, &mut a, vec![]).0 else { panic!("a renewal") };
+        let a_renewed: Vec<HttpReply> = calls.iter().map(answer).collect();
+        db_run(&h, |db| {
+            db.execute(
+                "UPDATE docs_source_links SET refreshing = '2000-01-01T00:00:00.000Z' || substr(refreshing, instr(refreshing, '|'))",
+                &[],
+            )
+        });
+        db_run(&h, |db| db.execute("UPDATE docs_sources SET running_until = NULL", &[]));
+        // Sync B spends R too, is refused, and signs the folder out.
+        drive(&h, job_of(&h.call("POST", &format!("/api/v1/docs-sources/{folder}/sync"), None, &admin)), &answer);
+        assert!(disconnected().is_string());
+        // A push starts sync C, which notes its own renewal of R over B's refusal.
+        let push = json!({ "object_kind": "push", "ref": "refs/heads/main" }).to_string();
+        let r = hook(&h, &format!("/hooks/docs/{folder}"), &push, &[("x-gitlab-event", "Push Hook"), ("x-gitlab-token", &secret)]);
+        let mut c = job_of(&r);
+        let Ok(Step::Fetch(calls)) = step_with(&h, &mut c, vec![]).0 else { panic!("a renewal") };
+        let c_refused: Vec<HttpReply> = calls.iter().map(answer).collect();
+        // A's answer lands: GitLab just issued those tokens, so the folder is connected again.
+        let Ok(Step::Fetch(calls)) = step_with(&h, &mut a, a_renewed).0 else { panic!("the webhooks' list") };
+        assert_eq!(disconnected(), Value::Null);
+        let Ok(Step::Fetch(calls)) = step_with(&h, &mut a, calls.iter().map(answer).collect()).0 else { panic!("deletions") };
+        assert!(matches!(step_with(&h, &mut a, calls.iter().map(answer).collect()).0, Ok(Step::Done(_))));
+        // C's refusal comes back: newer tokens are there, so it doesn't sign the folder out.
+        assert!(matches!(step_with(&h, &mut c, c_refused).0, Ok(Step::Done(Finish::Fail(_)))));
+        assert_eq!(disconnected(), Value::Null);
+        let (finish, sent, _) =
+            drive_all(&h, job_of(&h.call("POST", &format!("/api/v1/docs-sources/{folder}/sync"), None, &admin)), &answer);
+        assert_eq!((filled(finish)["created"].as_i64(), renewals(&sent)), (Some(2), 0));
+    }
+
+    #[test]
+    fn a_revoked_gitlab_folder_is_signed_out_again_and_asks_for_reconnect() {
+        let (h, admin, lab, topic) = gitlab_setup();
+        let answer = |c: &HttpCall| lab.answer(c);
+        let (folder, _) = add_gitlab_folder(&h, &admin, &lab, &topic, "docs");
+        let sync = || h.call("POST", &format!("/api/v1/docs-sources/{folder}/sync"), None, &admin);
+        let renewals = |sent: &[HttpCall]| sent.iter().filter(|c| c.url == "https://gitlab.com/oauth/token").count();
+        let disconnected = || source_of(&h, &admin)["disconnected"].clone();
+        // Signed out by a refusal of other tokens than it has: Sync now tries, GitLab accepts its
+        // tokens, and it's connected again.
+        db_run(&h, |db| {
+            db.execute(
+                "UPDATE docs_source_links SET disconnected = 'gitlab_signed_out', refreshing = '2000-01-01T00:00:00.000Z|refused|other'",
+                &[],
+            )
+        });
+        assert!(disconnected().is_string());
+        filled(drive(&h, job_of(&sync()), &answer).0);
+        assert_eq!(disconnected(), Value::Null);
+        // A renewal: the folder works.
+        db_run(&h, |db| db.execute("UPDATE docs_source_links SET token_expires_at = '2000-01-01T00:00:00.000Z'", &[]));
+        let (finish, sent, _) = drive_all(&h, job_of(&sync()), &answer);
+        assert_eq!((filled(finish)["unchanged"].as_i64(), renewals(&sent)), (Some(2), 1));
+        // The person revokes DumbSlab's access. The next request gets 401: the run fails, and the
+        // next one renews, is refused, and signs the folder out.
+        lab.grants.borrow_mut().clear();
+        let (finish, _) = drive(&h, job_of(&sync()), &answer);
+        assert!(matches!(finish, Finish::Fail(ref e) if e.message.contains("renews it")), "{finish:?}");
+        assert_eq!(disconnected(), Value::Null);
+        let (finish, sent, _) = drive_all(&h, job_of(&sync()), &answer);
+        assert!(matches!(finish, Finish::Fail(_)) && renewals(&sent) == 1);
+        assert!(disconnected().as_str().unwrap().contains("Reconnect"));
+        // Its tokens are the refused ones: Sync now says to reconnect, and tries nothing.
+        let r = sync();
+        assert_eq!((r.status, r.body["error"]["code"].as_str()), (409, Some("disconnected")), "{}", r.body);
+        assert!(r.body["error"]["message"].as_str().unwrap().contains("Reconnect"));
+    }
+
+    #[test]
     fn a_refresh_that_lands_late_keeps_its_tokens() {
         let (h, admin, lab, topic) = gitlab_setup();
         let answer = |c: &HttpCall| lab.answer(c);

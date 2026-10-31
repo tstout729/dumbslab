@@ -1059,10 +1059,13 @@ fn refreshing_mark(db: &dyn Db, source_id: &str) -> ApiResult<Option<(DateTime<U
 /// Every successful renewal of a GitLab app folder's tokens is kept here, whoever asked for it (a
 /// sync, or a cleanup pass borrowing the folder's tokens): GitLab spent the old refresh token, so
 /// the new tokens are kept if the folder still has the spent one, whether or not the asker still
-/// holds anything; only the token fields change, so newer webhook settings stay. A refusal of that
-/// same token (another renewal's, while this answer was on its way) is undone: the folder can sync
-/// again. If another renewal got there first, its tokens are newer and stay. The folder's tokens
-/// as stored now; `None` when it's gone or they can't be read.
+/// holds anything; only the token fields change, so newer webhook settings stay. If another
+/// renewal got there first, its tokens are newer and stay. The folder's tokens as stored now;
+/// `None` when it's gone or they can't be read.
+///
+/// Tokens GitLab just issued prove the approval good, so the folder is no longer signed out,
+/// whichever refusal marked it (see [`signed_out_for_good`]). That can't hide a revocation for
+/// long: the next request with these tokens gets 401 and leads to signing it out again.
 pub(crate) fn keep_renewal(
     db: &dyn Db,
     cfg: &HostConfig,
@@ -1076,18 +1079,26 @@ pub(crate) fn keep_renewal(
     if current.refresh_token.as_deref() != Some(spent) {
         return Ok(Some(current));
     }
-    let hash = crate::util::sha256_hex(spent);
     let expires_at = super::gitlab_app::expiry(now, &tokens).map(ts);
     super::gitlab_app::apply_tokens(&mut current, tokens);
     let sealed = super::seal(cfg, &owner(source_id), Provider::GitLab.id(), &current)?;
     db.execute("UPDATE docs_sources SET secret = ?, updated_at = ? WHERE id = ?", &params![sealed, ts(now), source_id])?;
-    let refused_here = refreshing_mark(db, source_id)?.is_some_and(|(_, by, h)| by == "refused" && h == hash);
     db.execute(
         "UPDATE docs_source_links SET token_expires_at = ?, refreshing = NULL,
-           disconnected = CASE WHEN ? AND disconnected = ? THEN NULL ELSE disconnected END WHERE source_id = ?",
-        &params![expires_at, refused_here, super::gitlab_app::SIGNED_OUT, source_id],
+           disconnected = CASE WHEN disconnected = ? THEN NULL ELSE disconnected END WHERE source_id = ?",
+        &params![expires_at, super::gitlab_app::SIGNED_OUT, source_id],
     )?;
     Ok(Some(current))
+}
+
+/// A GitLab app folder signed out stays so (Sync now asks for Reconnect) only when GitLab refused
+/// the very refresh token it has now, and no renewal may still land. Otherwise (newer tokens than
+/// the refused ones, a renewal under way, or nothing saying which token was refused) a sync tries
+/// with the tokens it has, and the outcome decides.
+pub(crate) fn signed_out_for_good(db: &dyn Db, source: &Source) -> ApiResult<bool> {
+    let Some(token) = source.cred.refresh_token.as_deref() else { return Ok(true) };
+    let hash = crate::util::sha256_hex(token);
+    Ok(refreshing_mark(db, &source.id)?.is_some_and(|(_, by, h)| by == "refused" && h == hash))
 }
 
 /// Whether a sync renewed (or was refused renewing) the source's stored GitLab refresh token
@@ -1266,6 +1277,22 @@ fn listing(db: &dyn Db, cfg: &HostConfig, j: &mut DocsJob, replies: &[HttpReply]
         && let Some((project, tree)) = replies.split_last()
     {
         replies = tree;
+        // GitLab refused the access token (revoked, or it ran out early): the next sync renews it,
+        // and if GitLab refuses that too, the folder is signed out.
+        if project.status == 401 || tree.iter().any(|r| r.status == 401) {
+            db.execute(
+                "UPDATE docs_source_links SET token_expires_at = ? WHERE source_id = ?",
+                &params![ts(now - chrono::Duration::days(1)), j.source.id.clone()],
+            )?;
+            return fail(db, j, "GitLab didn't accept this folder's access just now. The next sync renews it.", now);
+        }
+        // It accepted the tokens: whatever signed the folder out is over.
+        if project.ok() {
+            db.execute(
+                "UPDATE docs_source_links SET disconnected = NULL WHERE source_id = ? AND disconnected = ?",
+                &params![j.source.id.clone(), super::gitlab_app::SIGNED_OUT],
+            )?;
+        }
         if let Some(path) = j.source.repo.read_path(project).filter(|p| *p != j.source.repo.repo) {
             if !update_held(db, j, "repo = ?, updated_at = ?", params![path.clone(), ts(now)])? {
                 return Ok(lost());
