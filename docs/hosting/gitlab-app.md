@@ -51,7 +51,9 @@ The connector key must be set too. With both, Settings › Docs sync offers **Co
 - **Adding a folder records its webhook first.** In the step that commits just before it asks GitLab for the webhook, DumbSlab keeps a cleanup record. The record holds the project, the webhook's exact address (with the new folder's id), and a sealed copy of the approval's tokens. Saving the folder drops the record in the same transaction.
   - If GitLab added the webhook but its answer was lost, or the folder wasn't saved, the record stays.
   - After 10 minutes (an add may still be under way), the usual cleanup passes find the webhook by that address and delete it. They have the same waits, retries and 30-day limit.
-  - The copied tokens may still be the approval's, or the folder's it moved to, so a pass never renews them. Once they expire, it holds the admin's approval like any request, renews that the approval's way if needed, and uses it.
+  - Saving the folder takes the record in the same transaction, but only if no cleanup pass ever claimed it. A pass may already have deleted the webhook of an add that took too long. Then nothing is saved, and the admin is told to try again.
+  - The copied tokens may still be the approval's, so a pass never renews them. Once they expire, it holds the admin's approval like any request, renews that the approval's way if needed, and uses it.
+  - When the approval moves onto a folder (another try at adding one, or a reconnect), records that borrowed it borrow that folder instead, in the same transaction. A pass then holds the folder as a sync does and uses its tokens. If those need renewing, it renews them the folder's way: the refresh is noted on the folder, and new tokens are kept only if the folder still has the refresh token that was spent.
 - **Failed saves.** If saving a new folder, a reconnect, or a sync fails after GitLab added a webhook, the webhook comes off again: even when the host rolls the save back, or its transaction never starts or commits. Each job notes a webhook GitLab added before the step that saves it, so the notice a host sends for a failed step deletes it.
 
 ## Facts this relies on

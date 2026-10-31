@@ -863,6 +863,16 @@ pub fn step(db: &dyn Db, cfg: &HostConfig, j: &mut GitLabJob, replies: Vec<HttpR
             // Known from here on: if saving fails, or the host rolls this step back, it comes off
             // again (see `GitLabJob::failure_notice`).
             *hook_id = Some(hook);
+            // This folder's own cleanup record (see `record_pending_hook`) goes with the save, in
+            // its transaction, only if no cleanup pass ever claimed it: one that did may have
+            // deleted this webhook already. Then nothing is saved, and the admin tries again.
+            let mine = db.execute(
+                "DELETE FROM docs_hook_cleanup WHERE source_id = ? AND working_until IS NULL AND failures = 0",
+                &params![draft.source_id.clone()],
+            )? == 1;
+            if !mine {
+                return give_up(db, j, "Adding the folder took so long that DumbSlab took its webhook off GitLab again. Try again.");
+            }
             let mut cred = p.cred.clone();
             cred.fields.insert("webhook_secret".into(), secret.clone());
             cred.fields.insert("hook_url".into(), draft.webhook_url.clone());
@@ -886,8 +896,7 @@ pub fn step(db: &dyn Db, cfg: &HostConfig, j: &mut GitLabJob, replies: Vec<HttpR
             if !take(db, &j.user_id, claim)? {
                 return Err(ApiError::conflict("Your GitLab approval changed while the folder was being added. Try again."));
             }
-            // Saved with its webhook: nothing left behind to clean up.
-            db.execute("DELETE FROM docs_hook_cleanup WHERE source_id = ?", &params![draft.source_id.clone()])?;
+            lend_to_source(db, &j.user_id, &draft.source_id)?;
             let created = crate::ops::sync::created_value(&ctx, &draft.source_id)?;
             j.staged.append(&mut ctx.effects);
             Ok(Step::Done(Finish::Fill(created)))
@@ -950,6 +959,7 @@ fn finish_reconnect(db: &dyn Db, cfg: &HostConfig, j: &mut GitLabJob, now: DateT
     if !take(db, &j.user_id, claim)? {
         return Err(ApiError::conflict("Your GitLab approval changed while the folder was being reconnected. Try again."));
     }
+    lend_to_source(db, &j.user_id, &rejoin.source_id)?;
     let mut ctx = super::ctx(db, cfg, &j.user_id, &j.base_url, now)?;
     let repo = db
         .one("SELECT repo FROM docs_sources WHERE id = ?", &params![rejoin.source_id.clone()])?
@@ -1037,6 +1047,62 @@ pub struct Cleanup {
     borrowed_from: Option<String>,
     /// That approval, while this pass holds it (its claim) to use its tokens.
     approval: Option<(String, Pending)>,
+    /// The folder the approval moved onto since (see [`lend_to_source`]).
+    borrowed_source: Option<String>,
+    /// That folder and its lease, while this pass holds it like a sync to use its tokens.
+    source_lease: Option<(String, String)>,
+}
+
+/// An approval moved onto a folder (in the same transaction): cleanup records that borrowed its
+/// tokens now borrow that folder's instead (see [`record_pending_hook`]), so they're never left
+/// with tokens nobody can renew for them.
+fn lend_to_source(db: &dyn Db, user_id: &str, source_id: &str) -> ApiResult<()> {
+    db.execute(
+        "UPDATE docs_hook_cleanup SET borrowed_source = ? WHERE borrowed_from = ? AND borrowed_source IS NULL AND source_id != ?",
+        &params![source_id, user_id, source_id],
+    )?;
+    Ok(())
+}
+
+/// A GitLab app folder's tokens as stored, and when its access token expires.
+fn source_tokens(db: &dyn Db, cfg: &HostConfig, source_id: &str) -> ApiResult<Option<(Credential, Option<DateTime<Utc>>)>> {
+    let Some(r) = db.one(
+        "SELECT s.secret, l.token_expires_at FROM docs_sources s JOIN docs_source_links l ON l.source_id = s.id
+         WHERE s.id = ? AND l.connection = 'gitlab_oauth'",
+        &params![source_id],
+    )?
+    else {
+        return Ok(None);
+    };
+    Ok(super::open(cfg, &super::docs::owner(source_id), "gitlab", &r.str("secret"))
+        .ok()
+        .map(|cred| (cred, r.opt_str("token_expires_at").as_deref().and_then(parse_ts))))
+}
+
+/// A renewal of a folder's tokens that a cleanup pass made got its answer: GitLab spent the old
+/// refresh token, so the new tokens are kept if the folder still has the spent one (only its token
+/// fields change), as a sync keeps its own (see `docs::refreshed`). Otherwise newer ones landed
+/// meanwhile, and those are used. The folder's tokens as they are now.
+fn keep_renewed(
+    db: &dyn Db,
+    cfg: &HostConfig,
+    source_id: &str,
+    spent: &str,
+    tokens: TokenSet,
+    now: DateTime<Utc>,
+) -> ApiResult<Option<Credential>> {
+    let Some((mut stored, _)) = source_tokens(db, cfg, source_id)? else { return Ok(None) };
+    if stored.refresh_token.as_deref() == Some(spent) {
+        let expires_at = expiry(now, &tokens).map(ts);
+        apply_tokens(&mut stored, tokens);
+        let sealed = super::seal(cfg, &super::docs::owner(source_id), "gitlab", &stored)?;
+        db.execute("UPDATE docs_sources SET secret = ?, updated_at = ? WHERE id = ?", &params![sealed, ts(now), source_id])?;
+        db.execute(
+            "UPDATE docs_source_links SET token_expires_at = ?, refreshing = NULL WHERE source_id = ?",
+            &params![expires_at, source_id],
+        )?;
+    }
+    Ok(Some(stored))
 }
 
 /// How long a folder being added has to save itself before its webhook counts as left behind. An
@@ -1155,6 +1221,8 @@ pub(crate) fn resume_cleanups(db: &dyn Db, cfg: &HostConfig, base_url: &str, now
             deleting: vec![],
             borrowed_from: r.opt_str("borrowed_from"),
             approval: None,
+            borrowed_source: r.opt_str("borrowed_source"),
+            source_lease: None,
         };
         match super::open(cfg, &cleanup_owner(&source_id), "gitlab", &r.str("secret")) {
             Ok(cred) => c.cred = cred,
@@ -1232,14 +1300,21 @@ fn cleaned(removed: usize) -> ApiResult<Step> {
     Ok(Step::Done(Finish::Fill(json!({ "ok": true, "removed": removed }))))
 }
 
-/// Runs a cleanup pass's next step (see [`Cleanup`]). A pass that's done lets go of an approval it
-/// held.
+/// Runs a cleanup pass's next step (see [`Cleanup`]). A pass that's done lets go of the approval or
+/// folder it held.
 fn cleanup_step(db: &dyn Db, cfg: &HostConfig, j: &mut GitLabJob, replies: &[HttpReply], now: DateTime<Utc>) -> ApiResult<Step> {
     let step = cleanup_pass(db, cfg, j, replies, now)?;
-    if let (Step::Done(_), Kind::Cleanup(c)) = (&step, &mut j.kind)
-        && let (Some((claim, _)), Some(user)) = (c.approval.take(), c.borrowed_from.as_deref())
-    {
-        release(db, user, &claim)?;
+    if let (Step::Done(_), Kind::Cleanup(c)) = (&step, &mut j.kind) {
+        if let (Some((claim, _)), Some(user)) = (c.approval.take(), c.borrowed_from.as_deref()) {
+            release(db, user, &claim)?;
+        }
+        if let Some((source, lease)) = c.source_lease.take() {
+            db.execute(
+                "UPDATE docs_source_links SET refreshing = NULL WHERE source_id = ? AND refreshing LIKE ?",
+                &params![source.clone(), format!("%|{lease}|%")],
+            )?;
+            let_go_source(db, &source, &lease)?;
+        }
     }
     Ok(step)
 }
@@ -1268,6 +1343,36 @@ fn cleanup_pass(db: &dyn Db, cfg: &HostConfig, j: &mut GitLabJob, replies: &[Htt
             }
             if now - c.created_at > Duration::days(CLEANUP_RETENTION_DAYS) {
                 return give_up(c, &format!("DumbSlab tried for {CLEANUP_RETENTION_DAYS} days"));
+            }
+            // Borrowed tokens that expired, from an approval that moved onto a folder since: that
+            // folder's, held like a sync holds it (see `lend_to_source`), renewed its way if need
+            // be: fenced on the refresh token it spends, as a sync's renewal is.
+            if c.borrowed_from.is_some()
+                && needs_refresh(&c.cred, c.expires_at, now)
+                && let Some(source) = c.borrowed_source.clone()
+                && let Some((cred, expires_at)) = source_tokens(db, cfg, &source)?
+            {
+                let Some(lease) = hold_source(db, &source, now)? else {
+                    return back_off(db, c, "The folder whose GitLab access it borrows is syncing. Trying again later.".into(), now);
+                };
+                c.source_lease = Some((source.clone(), lease.clone()));
+                if !needs_refresh(&cred, expires_at, now) {
+                    c.cred.token = cred.token;
+                    j.phase = Phase::Working;
+                    return Ok(Step::Fetch(list_hooks_calls(&c.cred.token, c.project_id)));
+                }
+                let spent = cred.refresh_token.clone().unwrap_or_default();
+                if super::docs::renewing(db, &source, &spent, now)? {
+                    return back_off(db, c, "The folder's GitLab access is being renewed. Trying again later.".into(), now);
+                }
+                let Some(app) = app(cfg) else { return back_off(db, c, "DumbSlab's GitLab app isn't set up on this server.".into(), now) };
+                db.execute(
+                    "UPDATE docs_source_links SET refreshing = ? WHERE source_id = ?",
+                    &params![format!("{}|{lease}|{}", ts(now), crate::util::sha256_hex(&spent)), source.clone()],
+                )?;
+                c.spent = Some(spent);
+                j.phase = Phase::Refreshing;
+                return Ok(Step::Fetch(vec![refresh_call(app, &cred)]));
             }
             // Borrowed tokens that expired: the approval they came from, held like any request
             // (see `record_pending_hook`), renewed its own way if need be.
@@ -1305,6 +1410,26 @@ fn cleanup_pass(db: &dyn Db, cfg: &HostConfig, j: &mut GitLabJob, replies: &[Htt
                 c.spent = c.cred.refresh_token.clone();
                 j.phase = Phase::Refreshing;
                 return Ok(Step::Fetch(vec![refresh_call(app, &c.cred)]));
+            }
+            j.phase = Phase::Working;
+            Ok(Step::Fetch(list_hooks_calls(&c.cred.token, c.project_id)))
+        }
+        // The borrowed folder's renewal: kept in the folder if it still has the spent token; the pass
+        // uses the folder's tokens as they are then.
+        Phase::Refreshing if c.source_lease.is_some() => {
+            let (source, _) = c.source_lease.clone().expect("held");
+            let spent = c.spent.take().unwrap_or_default();
+            let tokens = match read_refresh(&reply) {
+                Ok(tokens) => tokens,
+                Err(message) => return back_off(db, c, message, now),
+            };
+            let current = keep_renewed(db, cfg, &source, &spent, tokens, now)?;
+            // This step stored only the folder's renewed tokens: a full workspace keeps it.
+            j.rotated = true;
+            let Some(current) = current else { return cleaned(0) };
+            c.cred.token = current.token;
+            if !holds_cleanup(db, c)? {
+                return cleaned(0);
             }
             j.phase = Phase::Working;
             Ok(Step::Fetch(list_hooks_calls(&c.cred.token, c.project_id)))

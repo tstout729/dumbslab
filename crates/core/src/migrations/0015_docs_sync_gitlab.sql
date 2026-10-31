@@ -33,9 +33,11 @@ CREATE TABLE IF NOT EXISTS docs_hook_cleanup (
   -- DumbSlab gives up.
   removed_by TEXT NOT NULL,
   -- A folder being added: the admin whose approval of DumbSlab's GitLab app the tokens in `secret`
-  -- were copied from. That approval (or the folder it moves to) may still use them, so a pass never
-  -- renews them: once they've expired, it holds and uses the approval instead. NULL for a removed
-  -- folder's own tokens.
+  -- were copied from. That approval may still use them, so a pass never renews them: once they've
+  -- expired, it holds and uses the approval instead. NULL for a removed folder's own tokens.
   borrowed_from TEXT,
+  -- When that approval moved onto a folder (another try at adding one, or a reconnect), that folder:
+  -- a pass holds it like a sync does and uses (and, the folder's way, renews) its tokens instead.
+  borrowed_source TEXT,
   created_at TEXT NOT NULL
 );

@@ -13288,6 +13288,82 @@ mod syncs {
     }
 
     #[test]
+    fn a_retry_before_its_cleanup_leaves_the_orphan_to_the_new_folders_tokens() {
+        let (h, admin, lab, topic) = gitlab_setup();
+        let answer = |c: &HttpCall| lab.answer(c);
+        let lost = |c: &HttpCall| {
+            let reply = lab.answer(c);
+            if c.method == "POST" && c.url == "https://gitlab.com/api/v4/projects/3/hooks" {
+                HttpReply { status: 0, body: String::new() }
+            } else {
+                reply
+            }
+        };
+        let input = json!({ "provider": "gitlab", "gitlab_connection": true, "project_id": 3, "repository": "acme/handbook", "folder": "docs", "topic_id": topic });
+        let add = |reply: &dyn Fn(&HttpCall) -> HttpReply| {
+            drive(&h, job_of(&h.call("POST", "/api/v1/docs-sources", Some(input.clone()), &admin)), reply).0
+        };
+        let renewals = |sent: &[HttpCall]| sent.iter().filter(|c| c.url == "https://gitlab.com/oauth/token").count();
+        let hooks = || lab.hooks.borrow().keys().copied().collect::<Vec<i64>>();
+        connect_gitlab(&h, &admin, &lab);
+        assert!(matches!(add(&lost), Finish::Fail(_)));
+        let orphan = hooks()[0];
+
+        // The admin tries again at once: the folder is saved, and the approval's tokens move onto
+        // it. The orphan's record borrows that folder's tokens from now on.
+        let folder = filled(add(&answer))["source"]["id"].as_str().unwrap().to_string();
+        let own = *hooks().iter().find(|id| **id != orphan).unwrap();
+        assert_eq!(count(&h, &format!("SELECT COUNT(*) FROM docs_hook_cleanup WHERE borrowed_source = '{folder}'")), 1);
+
+        // Hours later the record's copy and the folder's tokens have both expired. A pass holds the
+        // folder, renews its tokens its way (once), and deletes the orphan, leaving the folder's own.
+        db_run(&h, |db| {
+            db.execute(
+                "UPDATE docs_hook_cleanup SET expires_at = '2020-01-01T00:00:00.000Z', next_attempt_at = '2000-01-01T00:00:00.000Z'",
+                &[],
+            )
+        });
+        db_run(&h, |db| db.execute("UPDATE docs_source_links SET token_expires_at = '2020-01-01T00:00:00.000Z'", &[]));
+        let jobs = background(&h.call("GET", "/api/v1/docs-sources", None, &admin));
+        let (finish, sent, _) = drive_all(&h, jobs[0].clone(), &answer);
+        assert_eq!((filled(finish)["removed"].as_i64(), renewals(&sent)), (Some(1), 1));
+        assert_eq!(hooks(), [own]);
+        assert_eq!(count(&h, "SELECT COUNT(*) FROM docs_hook_cleanup"), 0);
+        // The folder kept its renewed tokens, and was let go: its sync works without renewing.
+        let (finish, sent, _) =
+            drive_all(&h, job_of(&h.call("POST", &format!("/api/v1/docs-sources/{folder}/sync"), None, &admin)), &answer);
+        assert_eq!(filled(finish)["created"], 2);
+        assert_eq!(renewals(&sent), 0);
+    }
+
+    #[test]
+    fn an_add_that_finishes_after_its_cleanup_saves_nothing() {
+        let (h, admin, lab, topic) = gitlab_setup();
+        let answer = |c: &HttpCall| lab.answer(c);
+        let input = json!({ "provider": "gitlab", "gitlab_connection": true, "project_id": 3, "repository": "acme/handbook", "folder": "docs", "topic_id": topic });
+        let sources = || count(&h, "SELECT COUNT(*) FROM docs_sources");
+        connect_gitlab(&h, &admin, &lab);
+        // The add finds the project and asks GitLab for the webhook, which GitLab adds.
+        let mut job = job_of(&h.call("POST", "/api/v1/docs-sources", Some(input.clone()), &admin));
+        let Ok(Step::Fetch(calls)) = step_with(&h, &mut job, vec![]).0 else { panic!("the project") };
+        let Ok(Step::Fetch(calls)) = step_with(&h, &mut job, calls.iter().map(answer).collect()).0 else { panic!("the webhook") };
+        let added: Vec<HttpReply> = calls.iter().map(answer).collect();
+        assert_eq!(lab.hooks.borrow().len(), 1);
+        // The add stalls past its grace. A pass claims its record and deletes the webhook.
+        db_run(&h, |db| db.execute("UPDATE docs_hook_cleanup SET next_attempt_at = '2000-01-01T00:00:00.000Z'", &[]));
+        let jobs = background(&h.call("GET", "/api/v1/docs-sources", None, &admin));
+        assert_eq!(filled(drive(&h, jobs[0].clone(), &answer).0)["removed"], 1);
+        assert!(lab.hooks.borrow().is_empty());
+        // The add finally finishes: it saves nothing, and says to try again.
+        let (result, _) = step_with(&h, &mut job, added);
+        assert!(matches!(result, Ok(Step::Done(Finish::Fail(ref e))) if e.message.contains("Try again")), "{result:?}");
+        assert_eq!(sources(), 0);
+        // Trying again works, with exactly one webhook.
+        filled(drive(&h, job_of(&h.call("POST", "/api/v1/docs-sources", Some(input), &admin)), &answer).0);
+        assert_eq!((sources(), lab.hooks.borrow().len(), count(&h, "SELECT COUNT(*) FROM docs_hook_cleanup")), (1, 1, 0));
+    }
+
+    #[test]
     fn a_refresh_that_lands_late_keeps_its_tokens() {
         let (h, admin, lab, topic) = gitlab_setup();
         let answer = |c: &HttpCall| lab.answer(c);
