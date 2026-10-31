@@ -23,9 +23,10 @@
 //!   gets it directly. Each workspace checks the signature again ([`hook`]) and acts only on
 //!   installations it connected: a push syncs the sources on that repository and branch, and an
 //!   uninstall, suspension or removed repository marks the affected sources disconnected (posts stay).
-//!   Those changes only trigger a read of what GitHub says the installation is now ([`CheckJob`]):
-//!   deliveries can arrive out of order or be redelivered, and GitHub may not name the
-//!   repositories a switch from all to selected left out.
+//!   Those changes only trigger a check of what GitHub says the installation is now
+//!   ([`CheckJob`]), one at a time per installation and never lost: deliveries can arrive out of
+//!   order or be redelivered, and GitHub may not name the repositories a switch from all to
+//!   selected left out.
 //! - **Registering with the directory** (hosted) is part of connecting: the job asks the host to
 //!   record the installation for this workspace ([`link_call`], which only hosts with a directory
 //!   are sent), and says so when the installation already serves as many workspaces as it may.
@@ -912,11 +913,16 @@ pub(crate) fn hook(db: &dyn Db, cfg: &HostConfig, req: &Request, base_url: &str,
                 ),
                 &params![installation, repo_id, branch],
             )?;
+            // A check that failed earlier is tried again with the next push.
+            let check = resume_check(db, installation, base_url, now)?;
             if rows.is_empty() {
-                return Ok(hook_answer("ignored"));
+                let mut out = hook_answer("ignored");
+                out.effects.extend(check.map(Effect::Background));
+                return Ok(out);
             }
             check_plan(db, cfg, now)?;
             let mut out = hook_answer("started");
+            out.effects.extend(check.map(Effect::Background));
             for r in rows {
                 let mut source = super::docs::Source::from_row(cfg, &r)?;
                 // A renamed repository keeps its id; its links follow the new name.
@@ -937,12 +943,12 @@ pub(crate) fn hook(db: &dyn Db, cfg: &HostConfig, req: &Request, base_url: &str,
             }
             Ok(out)
         }
-        // What changed is read from GitHub, by the newest check only.
+        // What changed is read from GitHub, by one check at a time (see `CheckJob`).
         Delivery::Changed { .. } => {
-            db.execute("UPDATE github_installations SET generation = generation + 1 WHERE id = ?", &params![installation])?;
-            let generation = db.scalar_i64("SELECT generation FROM github_installations WHERE id = ?", &params![installation])?;
             let mut out = hook_answer("checking");
-            out.effects.push(Effect::Background(Job::GitHubCheck(Box::new(CheckJob::new(installation, generation, base_url)))));
+            if let Some(job) = request_check(db, installation, base_url, now)? {
+                out.effects.push(Effect::Background(job));
+            }
             Ok(out)
         }
         Delivery::Ping | Delivery::Ignored => Ok(hook_answer("ignored")),
@@ -952,48 +958,80 @@ pub(crate) fn hook(db: &dyn Db, cfg: &HostConfig, req: &Request, base_url: &str,
 // ---------------------------------------------------------------------------
 // Checking an installation against GitHub
 
+/// How long one check may hold an installation: it takes at most 5 steps of 8 seconds each.
+const CHECK_LEASE_SECS: i64 = 90;
+/// Checks one may chain when changes arrive while it runs; past that the next trigger carries on.
+const MAX_CHAINED: u32 = 2;
+/// The longest wait before a failed check is tried again by anything but a new change.
+const MAX_BACKOFF_SECS: i64 = 3600;
+
 /// Brings an installation here in line with what GitHub says it is now, after GitHub reported a
-/// change. Deliveries only trigger it: they can arrive late, out of order, or redelivered (an
+/// change. Deliveries only trigger it: they can arrive late, out of order or redelivered (an
 /// operator redelivering an old suspension mustn't suspend an installation GitHub has since
-/// unsuspended), so the check reads the installation itself (`GET /app/installations/{id}`, gone
-/// when it answers 404) and, while it's active, its repositories. GitHub may not name every
-/// repository a change left out (switching from all repositories to selected ones can leave
-/// `repositories_removed` empty), so the list is read whole.
+/// unsuspended), and GitHub may not name every repository a change left out. So the check reads
+/// the installation itself (`GET /app/installations/{id}` with the App's JWT; 404 means it was
+/// uninstalled, `suspended_at` that it's suspended) and, while it's active, each repository a
+/// source here uses (`GET /repos/{owner}/{repo}` with an installation token that reads metadata:
+/// 404 means the installation can't reach it; a 301 for a renamed one is followed once). A
+/// workspace has at most 20 sources, so that's bounded, whatever the installation's size.
 ///
-/// Each change bumps the installation's `generation`, and each check carries the one it started
-/// for. Only a check whose generation is still current applies what it read: an older check that
-/// finishes late gives way to the newer change's own check, which read GitHub after that change.
+/// **One check at a time, and none lost.** Each verified change bumps the installation's
+/// `requested_gen`. A check holds the installation (`checking_until`) and starts from
+/// `start_gen = requested_gen`; a change while it runs only bumps `requested_gen`. What the check
+/// reads is at least as fresh as change `start_gen`, so it applies it even if newer changes came
+/// in, and records `applied_gen = start_gen`. If `requested_gen` moved on meanwhile, it chains one
+/// more check (a few at most). A check that fails lets go and waits a while (`next_check_at`,
+/// doubling up to an hour); the change it owed stays owed (`requested_gen > applied_gen`) and is
+/// tried again by the next change, the next push or sync of one of its sources, or Settings ›
+/// Docs sync. A check that lost its hold (it took too long) stops before asking GitHub anything
+/// more.
 ///
-/// What it applies: an uninstalled installation is forgotten and its sources wait,
-/// disconnected; a suspended one's sources wait until it's unsuspended; repositories no longer on
-/// its list stop being offered and their sources wait, and ones back on it come back. New
-/// repositories aren't offered until an admin here connects again, which checks their own account
-/// can read them. Posts are never deleted.
+/// What it applies: an uninstalled installation is forgotten and its sources wait, disconnected;
+/// a suspended one's sources wait until it's unsuspended; a source whose repository the
+/// installation can't reach waits until it can again, and the repository isn't offered meanwhile.
+/// Only a check marks sources disconnected. Posts are never deleted. New repositories aren't
+/// offered until an admin here connects again, which checks their own account can read them.
 ///
 /// Docs: https://docs.github.com/en/rest/apps/apps#get-an-installation-for-the-authenticated-app
-/// (a JWT; `suspended_at`; 200 or 404), https://docs.github.com/en/rest/apps/installations#list-repositories-accessible-to-the-app-installation
-#[derive(Clone, Debug)]
+/// (a JWT; `suspended_at`; 200 or 404), https://docs.github.com/en/rest/authentication/permissions-required-for-github-apps
+/// (`GET /repos/{owner}/{repo}` needs Metadata read, with an installation token),
+/// https://docs.github.com/en/rest/repos/repos#get-a-repository (200, 301, 403, 404)
+#[derive(Clone)]
 pub struct CheckJob {
     installation_id: i64,
-    generation: i64,
+    /// This check's hold on the installation (`checking_until`).
+    lease: String,
+    start_gen: i64,
+    chained: u32,
     base_url: String,
     phase: CheckPhase,
+    token: String,
+    /// The repositories sources here use: (id, `owner/name`), and what GitHub says of each so far
+    /// (`Some(name)`: reachable; `None`: not).
+    repos: Vec<(i64, String)>,
+    found: std::collections::BTreeMap<i64, Option<String>>,
+    /// Renamed ones to follow: (id, GitHub's address for it).
+    renamed: Vec<(i64, String)>,
     effects: Vec<Effect>,
     staged: Vec<Effect>,
+}
+
+// Holds an installation token; never print it.
+impl std::fmt::Debug for CheckJob {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "CheckJob({}, {:?})", self.installation_id, self.phase)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum CheckPhase {
     Start,
     Reading,
-    Listing,
+    Checking,
+    Following,
 }
 
 impl CheckJob {
-    pub(crate) fn new(installation_id: i64, generation: i64, base_url: &str) -> CheckJob {
-        CheckJob { installation_id, generation, base_url: base_url.into(), phase: CheckPhase::Start, effects: vec![], staged: vec![] }
-    }
-
     pub(crate) fn take_effects(&mut self) -> Vec<Effect> {
         std::mem::take(&mut self.effects)
     }
@@ -1006,22 +1044,108 @@ impl CheckJob {
     }
 }
 
-/// What GitHub says an installation is now.
-enum Now {
-    Gone,
-    Suspended,
-    /// Active, with the repositories it can see, and whether there are more than were read.
-    Active(Vec<Repository>, bool),
+/// Takes the hold on an installation for a check, if one is owed and none is running (and, unless
+/// `now_anyway`, its backoff after a failure has passed).
+fn claim_check(
+    db: &dyn Db,
+    installation: i64,
+    base_url: &str,
+    chained: u32,
+    now_anyway: bool,
+    now: DateTime<Utc>,
+) -> ApiResult<Option<Job>> {
+    let lease = format!("{} {}", ts(now + Duration::seconds(CHECK_LEASE_SECS)), crate::util::new_id());
+    let waited = if now_anyway { "" } else { " AND (next_check_at IS NULL OR next_check_at <= ?)" };
+    let mut p = params![lease.clone(), installation, ts(now)];
+    if !now_anyway {
+        p.push(ts(now).into());
+    }
+    let claimed = db.execute(
+        &format!(
+            "UPDATE github_installations SET checking_until = ? WHERE id = ? AND requested_gen > applied_gen
+               AND (checking_until IS NULL OR checking_until <= ?){waited}"
+        ),
+        &p,
+    )? > 0;
+    if !claimed {
+        return Ok(None);
+    }
+    let start_gen = db.scalar_i64("SELECT requested_gen FROM github_installations WHERE id = ?", &params![installation])?;
+    Ok(Some(Job::GitHubCheck(Box::new(CheckJob {
+        installation_id: installation,
+        lease,
+        start_gen,
+        chained,
+        base_url: base_url.into(),
+        phase: CheckPhase::Start,
+        token: String::new(),
+        repos: vec![],
+        found: Default::default(),
+        renamed: vec![],
+        effects: vec![],
+        staged: vec![],
+    }))))
+}
+
+/// GitHub reported a change to an installation (or a sync found it can't reach a repository): it's
+/// owed a check. Starts one unless one is running, which covers it.
+pub(crate) fn request_check(db: &dyn Db, installation: i64, base_url: &str, now: DateTime<Utc>) -> ApiResult<Option<Job>> {
+    db.execute("UPDATE github_installations SET requested_gen = requested_gen + 1 WHERE id = ?", &params![installation])?;
+    claim_check(db, installation, base_url, 0, true, now)
+}
+
+/// Starts a check an installation is still owed, once its wait after a failure has passed: on the
+/// next push or sync of one of its sources, and when Settings › Docs sync loads.
+pub(crate) fn resume_check(db: &dyn Db, installation: i64, base_url: &str, now: DateTime<Utc>) -> ApiResult<Option<Job>> {
+    claim_check(db, installation, base_url, 0, false, now)
+}
+
+fn holds_check(db: &dyn Db, j: &CheckJob) -> ApiResult<bool> {
+    Ok(db
+        .one("SELECT 1 AS ok FROM github_installations WHERE id = ? AND checking_until = ?", &params![j.installation_id, j.lease.clone()])?
+        .is_some())
+}
+
+/// A check that couldn't finish lets go, waits a while before anything but a new change tries
+/// again, and still owes what it was checking.
+fn check_failed(db: &dyn Db, j: &CheckJob, message: String, now: DateTime<Utc>) -> ApiResult<Step> {
+    if let Some(r) = db.one(
+        "SELECT check_failures FROM github_installations WHERE id = ? AND checking_until = ?",
+        &params![j.installation_id, j.lease.clone()],
+    )? {
+        let failures = r.i64("check_failures").clamp(0, 20) as u32;
+        let wait = (60_i64 << failures.min(10)).min(MAX_BACKOFF_SECS);
+        db.execute(
+            "UPDATE github_installations SET checking_until = NULL, check_failures = check_failures + 1, next_check_at = ? WHERE id = ? AND checking_until = ?",
+            &params![ts(now + Duration::seconds(wait)), j.installation_id, j.lease.clone()],
+        )?;
+    }
+    Ok(Step::Done(Finish::Fail(ApiError::new(400, "github_failed", message))))
+}
+
+/// A check that lost its hold (it took too long, and another took over) stops, asking GitHub
+/// nothing more.
+fn superseded() -> ApiResult<Step> {
+    Ok(Step::Done(Finish::Fill(json!({ "ok": true, "state": "superseded" }))))
+}
+
+/// The address GitHub gives for a renamed repository, if it's one of its own.
+fn moved_to(reply: &HttpReply) -> Option<String> {
+    let url = reply.json()["url"].as_str()?.to_string();
+    let id = url.strip_prefix(&format!("{API}/repositories/"))?;
+    (!id.is_empty() && id.bytes().all(|b| b.is_ascii_digit())).then_some(url)
 }
 
 /// Runs the installation check's next step (see [`crate::connect::step`]).
 pub fn check_step(db: &dyn Db, cfg: &HostConfig, j: &mut CheckJob, replies: Vec<HttpReply>, now: DateTime<Utc>) -> ApiResult<Step> {
-    let failed = |message: String| Ok(Step::Done(Finish::Fail(ApiError::new(400, "github_failed", message))));
-    let Some(app) = app(cfg) else { return failed("DumbSlab's GitHub App isn't set up on this server any more.".into()) };
+    if !holds_check(db, j)? {
+        return superseded();
+    }
+    let Some(app) = app(cfg) else { return check_failed(db, j, "DumbSlab's GitHub App isn't set up on this server any more.".into(), now) };
     match j.phase {
         CheckPhase::Start => {
             let (Ok(jwt), Ok(mint)) = (jwt(app, now), listing_token_call(app, j.installation_id, now)) else {
-                return failed(BAD_KEY.into());
+                return check_failed(db, j, BAD_KEY.into(), now);
             };
             let read = api_call(HttpCall::get(format!("{API}/app/installations/{}", j.installation_id))).bearer(&jwt);
             j.phase = CheckPhase::Reading;
@@ -1034,40 +1158,83 @@ pub fn check_step(db: &dyn Db, cfg: &HostConfig, j: &mut CheckJob, replies: Vec<
                 200 if !read.json()["suspended_at"].is_null() => apply(db, cfg, j, Now::Suspended, now),
                 200 => match read_token(&replies.get(1).cloned().unwrap_or_default(), 0) {
                     Ok(minted) => {
-                        j.phase = CheckPhase::Listing;
+                        j.token = minted.token;
+                        j.repos = db
+                            .query(
+                                "SELECT DISTINCT l.repo_id, s.repo FROM docs_source_links l JOIN docs_sources s ON s.id = l.source_id
+                                 WHERE l.connection = 'github_app' AND l.installation_id = ? ORDER BY l.repo_id",
+                                &params![j.installation_id],
+                            )?
+                            .iter()
+                            .map(|r| (r.i64("repo_id"), r.str("repo")))
+                            .collect();
+                        if j.repos.is_empty() {
+                            return apply(db, cfg, j, Now::Active, now);
+                        }
+                        j.phase = CheckPhase::Checking;
                         Ok(Step::Fetch(
-                            (1..=REPO_PAGES)
-                                .map(|page| {
-                                    api_call(HttpCall::get(format!("{API}/installation/repositories?per_page={PER_PAGE}&page={page}")))
-                                        .bearer(&minted.token)
-                                })
+                            j.repos
+                                .iter()
+                                .map(|(_, name)| api_call(HttpCall::get(format!("{API}/repos/{name}"))).bearer(&j.token))
                                 .collect(),
                         ))
                     }
-                    Err(message) => failed(message),
+                    Err(message) => check_failed(db, j, message, now),
                 },
-                _ => failed(http_error("GitHub", &read)),
+                _ => check_failed(db, j, http_error("GitHub", &read), now),
             }
         }
-        CheckPhase::Listing => match read_repositories(&replies) {
-            Ok((repos, more)) => apply(db, cfg, j, Now::Active(repos, more), now),
-            Err(message) => failed(message),
-        },
+        CheckPhase::Checking | CheckPhase::Following => {
+            let asked: Vec<i64> = match j.phase {
+                CheckPhase::Checking => j.repos.iter().map(|(id, _)| *id).collect(),
+                _ => j.renamed.iter().map(|(id, _)| *id).collect(),
+            };
+            let following = j.phase == CheckPhase::Following;
+            j.renamed.clear();
+            for (id, reply) in asked.into_iter().zip(replies.iter()) {
+                match reply.status {
+                    200 => {
+                        let name = reply.json()["full_name"].as_str().and_then(|n| super::repo::github_repo(n).ok());
+                        j.found.insert(id, Some(name.unwrap_or_default()));
+                    }
+                    404 => {
+                        j.found.insert(id, None);
+                    }
+                    301 if !following => match moved_to(reply) {
+                        Some(url) => j.renamed.push((id, url)),
+                        None => return check_failed(db, j, http_error("GitHub", reply), now),
+                    },
+                    _ => return check_failed(db, j, http_error("GitHub", reply), now),
+                }
+            }
+            if !j.renamed.is_empty() {
+                j.phase = CheckPhase::Following;
+                return Ok(Step::Fetch(j.renamed.iter().map(|(_, url)| api_call(HttpCall::get(url.clone())).bearer(&j.token)).collect()));
+            }
+            apply(db, cfg, j, Now::Active, now)
+        }
     }
 }
 
-/// Applies what GitHub said, if no newer change has come in since this check started.
+/// What GitHub says an installation is now.
+enum Now {
+    Gone,
+    Suspended,
+    /// Active; what it says of each repository is in the job.
+    Active,
+}
+
+/// Applies what the check read, records it as applied up to `start_gen`, lets go, and chains one
+/// more check if changes came in meanwhile.
 fn apply(db: &dyn Db, cfg: &HostConfig, j: &mut CheckJob, now_is: Now, now: DateTime<Utc>) -> ApiResult<Step> {
     let installation = j.installation_id;
-    let Some(row) =
-        db.one("SELECT account, connected_by, generation, suspended_at FROM github_installations WHERE id = ?", &params![installation])?
+    let Some(row) = db.one(
+        "SELECT account, connected_by, suspended_at FROM github_installations WHERE id = ? AND checking_until = ?",
+        &params![installation, j.lease.clone()],
+    )?
     else {
-        return Ok(Step::Done(Finish::Fill(json!({ "ok": true, "state": "forgotten" }))));
+        return superseded();
     };
-    if row.i64("generation") != j.generation {
-        // A newer change's check reads GitHub after it, and applies instead.
-        return Ok(Step::Done(Finish::Fill(json!({ "ok": true, "state": "superseded" }))));
-    }
     let account = row.str("account");
     let was_suspended = row.opt_str("suspended_at").is_some();
     let stamp = ts(now);
@@ -1082,7 +1249,8 @@ fn apply(db: &dyn Db, cfg: &HostConfig, j: &mut CheckJob, now_is: Now, now: Date
             db.execute("DELETE FROM github_installations WHERE id = ?", &params![installation])?;
             note(&mut ctx, "github.uninstalled", format!("DumbSlab's GitHub App was uninstalled from {account}"))?;
             ctx.effects.push(Effect::GitHubInstallation(InstallationLink { installation_id: installation, linked: false }));
-            json!({ "ok": true, "state": "uninstalled" })
+            j.staged.append(&mut ctx.effects);
+            return Ok(Step::Done(Finish::Fill(json!({ "ok": true, "state": "uninstalled" }))));
         }
         Now::Suspended => {
             if !was_suspended {
@@ -1095,7 +1263,7 @@ fn apply(db: &dyn Db, cfg: &HostConfig, j: &mut CheckJob, now_is: Now, now: Date
             disconnect(db, installation, " AND disconnected IS NULL", SUSPENDED, vec![])?;
             json!({ "ok": true, "state": "suspended" })
         }
-        Now::Active(repos, more) => {
+        Now::Active => {
             if was_suspended {
                 db.execute(
                     "UPDATE github_installations SET suspended_at = NULL, updated_at = ? WHERE id = ?",
@@ -1107,48 +1275,53 @@ fn apply(db: &dyn Db, cfg: &HostConfig, j: &mut CheckJob, now_is: Now, now: Date
                 "UPDATE docs_source_links SET disconnected = NULL WHERE connection = 'github_app' AND installation_id = ? AND disconnected = ?",
                 &params![installation, SUSPENDED],
             )?;
-            let names: std::collections::BTreeMap<i64, String> = repos.iter().map(|r| (r.id, r.full_name.clone())).collect();
             let (mut gone, mut back) = (0, 0);
-            for r in db.query("SELECT id, removed_at FROM github_repositories WHERE installation_id = ?", &params![installation])? {
-                let id = r.i64("id");
-                let removed = r.opt_str("removed_at").is_some();
-                match names.get(&id) {
+            for (id, reachable) in &j.found {
+                match reachable {
                     Some(name) => {
                         db.execute(
-                            "UPDATE github_repositories SET removed_at = NULL, full_name = ? WHERE installation_id = ? AND id = ?",
-                            &params![name.clone(), installation, id],
+                            "UPDATE github_repositories SET removed_at = NULL, full_name = CASE WHEN ? = '' THEN full_name ELSE ? END WHERE installation_id = ? AND id = ?",
+                            &params![name.clone(), name.clone(), installation, *id],
                         )?;
                         back += db.execute(
                             "UPDATE docs_source_links SET disconnected = NULL WHERE connection = 'github_app' AND installation_id = ? AND repo_id = ? AND disconnected = ?",
-                            &params![installation, id, REPOSITORY_REMOVED],
-                        )? as usize
-                            + usize::from(removed);
-                    }
-                    // Only a whole list says what's missing from it.
-                    None if !more && !removed => {
-                        db.execute(
-                            "UPDATE github_repositories SET removed_at = ? WHERE installation_id = ? AND id = ?",
-                            &params![stamp.clone(), installation, id],
+                            &params![installation, *id, REPOSITORY_REMOVED],
                         )?;
-                        disconnect(db, installation, " AND repo_id = ? AND disconnected IS NULL", REPOSITORY_REMOVED, params![id])?;
-                        gone += 1;
                     }
-                    None => {}
+                    None => {
+                        db.execute(
+                            "UPDATE github_repositories SET removed_at = COALESCE(removed_at, ?) WHERE installation_id = ? AND id = ?",
+                            &params![stamp.clone(), installation, *id],
+                        )?;
+                        gone +=
+                            disconnect(db, installation, " AND repo_id = ? AND disconnected IS NULL", REPOSITORY_REMOVED, params![*id])?;
+                    }
                 }
             }
             if gone > 0 {
                 note(
                     &mut ctx,
                     "github.repositories_removed",
-                    format!("repositories were taken out of DumbSlab's GitHub App on {account}"),
+                    format!("DumbSlab's GitHub App can't reach some repositories on {account} any more"),
                 )?;
             }
             if back > 0 {
-                note(&mut ctx, "github.repositories_added", format!("repositories came back to DumbSlab's GitHub App on {account}"))?;
+                note(&mut ctx, "github.repositories_added", format!("DumbSlab's GitHub App can reach repositories on {account} again"))?;
             }
-            json!({ "ok": true, "state": "active", "repositories": repos.len(), "removed": gone })
+            json!({ "ok": true, "state": "active", "repositories": j.found.len(), "removed": gone })
         }
     };
+    db.execute(
+        "UPDATE github_installations SET applied_gen = MAX(applied_gen, ?), checking_until = NULL, check_failures = 0, next_check_at = NULL
+         WHERE id = ? AND checking_until = ?",
+        &params![j.start_gen, installation, j.lease.clone()],
+    )?;
+    // Changes that came in meanwhile get a check of their own.
+    if j.chained < MAX_CHAINED
+        && let Some(next) = claim_check(db, installation, &j.base_url, j.chained + 1, true, now)?
+    {
+        ctx.effects.push(Effect::Background(next));
+    }
     j.staged.append(&mut ctx.effects);
     Ok(Step::Done(Finish::Fill(state)))
 }

@@ -109,7 +109,12 @@ GitHub sends every installation's events to one address, `<ROOT>/hooks/github`.
 - **Hosted:** the root domain checks the signature (`X-Hub-Signature-256`, with the webhook secret). It then sends the delivery on, unchanged, to each workspace that connected that installation. The directory keeps that list (`installation_workspaces`): a workspace is added when an admin there connects the installation, and removed when it's uninstalled. Connecting waits for the directory to add it. One installation can serve up to 100 workspaces; past that, connecting says so (`installation_full`) and pushes don't reach the extra workspace, though Sync now works. If the directory couldn't be reached, each sync asks again until it's added. Each workspace checks the signature again, and acts only on installations its own admins connected.
 - **Self-hosted:** the server is the only workspace, and gets deliveries directly.
 
-A delivery about the installation itself (uninstalled, suspended, unsuspended, new permissions, repositories added or taken out) only starts a check: the workspace reads the installation from GitHub (`GET /app/installations/{id}`; 404 means it's gone) and, while it's active, its repositories. Only the check started for the newest change applies what it read, so deliveries that arrive late, out of order or redelivered can't undo a newer change.
+A delivery about the installation itself (uninstalled, suspended, unsuspended, new permissions, repositories added or taken out) only starts a check of what GitHub says now:
+- It reads the installation (`GET /app/installations/{id}` with the App's JWT; 404 means it's gone, `suspended_at` that it's suspended).
+- While the installation is active, it reads each repository a folder here syncs (`GET /repos/{owner}/{repo}` with a metadata-only installation token; 404 means the App can't reach it). That's at most 20 requests, however many repositories the installation has.
+- One check runs at a time per installation in each workspace. A change while it runs is noted, and checked right after.
+- A check that fails waits a while (a minute, doubling up to an hour). The change it owed is checked by the next change, push, Sync now, or opening Settings › Docs sync.
+- Only a check marks folders as disconnected. A late, out-of-order or redelivered delivery can't undo a newer change, and a sync that GitHub refuses a token for (422) asks for a check instead of deciding itself.
 
 A workspace only syncs repositories its own admin's GitHub account can read in the installation. That's checked when they connect, so one workspace never gets repositories that only another workspace's admin chose.
 

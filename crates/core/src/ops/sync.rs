@@ -436,6 +436,12 @@ fn list_github_repositories(ctx: &mut Ctx, _: NoInput) -> ApiResult<GitHubReposi
     let available = connect::enabled(ctx.cfg) && github_app::app(ctx.cfg).is_some();
     let mut installations = vec![];
     let rows = ctx.db.query("SELECT * FROM github_installations ORDER BY account, id", &[])?;
+    // Checks of installations that are still owed (one failed earlier) are tried again.
+    for r in &rows {
+        if let Some(check) = github_app::resume_check(ctx.db, r.i64("id"), &ctx.base_url, ctx.now)? {
+            ctx.effects.push(Effect::Background(check));
+        }
+    }
     let people = user_refs(ctx.db, &rows.iter().map(|r| r.str("connected_by")).collect::<Vec<_>>())?;
     for r in &rows {
         let repositories = ctx
@@ -782,6 +788,12 @@ fn sync_docs_source(ctx: &mut Ctx, input: SourceIdInput) -> ApiResult<Deferred<D
     key_needed(ctx)?;
     let row = load_source_row(ctx, &input.id)?;
     let source = Source::from_row(ctx.cfg, &row)?;
+    // A check of its installation that's still owed (it failed earlier) is tried again too.
+    if let Link::GitHubApp { installation_id, .. } = source.link
+        && let Some(check) = github_app::resume_check(ctx.db, installation_id, &ctx.base_url, ctx.now)?
+    {
+        ctx.effects.push(Effect::Background(check));
+    }
     if let Some(code) = &source.disconnected {
         return Err(ApiError::new(409, "disconnected", github_app::disconnected_message(code)));
     }

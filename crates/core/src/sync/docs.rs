@@ -785,20 +785,17 @@ fn minted(db: &dyn Db, j: &mut DocsJob, replies: &[HttpReply], link: bool, now: 
     let reply = replies.first().cloned().unwrap_or_default();
     let minted = match super::github_app::read_token(&reply, repo_id) {
         Ok(m) => m,
-        Err(message) => {
-            // GitHub says the installation can't reach the repository: it waits, disconnected,
-            // until it's put back (see `github_app::CheckJob`).
-            if reply.status == 422 {
-                if !super::holds(db, TABLE, j.source.id.as_str().into(), &j.lease)? {
-                    return Ok(lost());
-                }
-                db.execute(
-                    "UPDATE docs_source_links SET disconnected = ? WHERE source_id = ? AND disconnected IS NULL",
-                    &params![super::github_app::REPOSITORY_REMOVED, j.source.id.clone()],
-                )?;
+        // GitHub says the installation can't reach the repository now. Only a check of the
+        // installation decides that (this answer may be older than a change GitHub reported since),
+        // so one is asked for; it marks the source if it's so.
+        Err(_) if reply.status == 422 => {
+            if let Some(check) = super::github_app::request_check(db, installation_id, &j.base_url, now)? {
+                j.staged.push(crate::Effect::Background(check));
             }
-            return fail(db, j, &message, now);
+            let message = "GitHub didn't let DumbSlab's App read this repository just now, so DumbSlab is checking the App's access to it. Settings shows what it finds; sync again in a moment.";
+            return fail(db, j, message, now);
         }
+        Err(message) => return fail(db, j, &message, now),
     };
     if let Some(name) = minted.full_name.filter(|n| *n != j.source.repo.repo) {
         if !update_held(db, j, "repo = ?, updated_at = ?", params![name.clone(), ts(now)])? {
