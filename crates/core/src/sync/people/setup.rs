@@ -314,6 +314,9 @@ enum Phase {
     Checking,
     /// Waiting for the old webhook's deletion and the new one.
     Adding,
+    /// The sign-in changed while BambooHR renewed it: the last step only handed over the tokens,
+    /// and this one ends the save.
+    Stopping,
 }
 
 /// An admin saving the people sync (see the module docs).
@@ -337,8 +340,9 @@ pub(crate) struct Setup {
     same_connection: bool,
     /// The workspace's tag, in the webhook's name (see [`super::cleanup`]).
     tag: String,
-    /// The replaced connection's cleanup record was made by this save, not before it.
-    old_recorded_now: bool,
+    /// The version of the replaced connection's cleanup record, when this save made it (it wasn't
+    /// there before): this save may drop it once BambooHR deleted the old webhook.
+    old_record_version: Option<i64>,
     /// The save lease.
     lease: String,
     old: Option<OldHook>,
@@ -453,7 +457,7 @@ fn begin(db: &dyn Db, cfg: &HostConfig, row: Option<&Row>, start: Start) -> ApiR
         saved_connection,
         same_connection,
         tag: super::cleanup::tag(db)?,
-        old_recorded_now: false,
+        old_record_version: None,
         lease: start.lease,
         old,
         keep,
@@ -575,14 +579,22 @@ pub(super) fn step(
             let reply = replies.into_iter().next().unwrap_or_default();
             let connection = s.saved_connection.clone().unwrap_or_default();
             match oauth::apply_refresh(db, cfg, &mut s.creds, &connection, &lease, &reply, now)? {
-                Ok(()) => {
+                oauth::Refreshed::Stored => {
                     // This step stored the renewed tokens and nothing else.
                     s.rotated = true;
                     Ok(checking(s))
                 }
-                Err(why) => fail(db, s, "refused", ApiError::new(400, "bamboohr_refused", why)),
+                // The tokens went to the retired connection's record, and nothing else was written:
+                // keep this step, and stop in the next.
+                oauth::Refreshed::HandedOver => {
+                    s.rotated = true;
+                    s.phase = Phase::Stopping;
+                    Ok(Step::Fetch(vec![]))
+                }
+                oauth::Refreshed::Refused(why) => fail(db, s, "refused", ApiError::new(400, "bamboohr_refused", why)),
             }
         }
+        Phase::Stopping => fail(db, s, "busy", ApiError::conflict(oauth::CHANGED)),
         Phase::Checking => {
             let mut replies = replies.into_iter();
             if let Err((code, message)) = read_check(&s.subdomain, s.creds.auth, &replies.next().unwrap_or_default()) {
@@ -638,6 +650,12 @@ pub(super) fn step(
         }
         Phase::Adding => {
             let (deletions, added) = replies.split_at(s.deleting.min(replies.len()));
+            s.old_deleted = deletions.iter().any(deleted);
+            // Before any write: a save that stalled past its lease may find newer work saved since,
+            // which it mustn't touch. (It only says the old webhook is gone, when BambooHR deleted it.)
+            if let Some(stop) = may_save(db, s, now)? {
+                return Ok(stop);
+            }
             if s.adding {
                 match read_created(&added.first().cloned().unwrap_or_default()) {
                     Ok((id, key)) => {
@@ -654,14 +672,16 @@ pub(super) fn step(
                     }
                 }
             }
-            s.old_deleted = deletions.iter().any(deleted);
             if s.deleting > 0 && !s.old_deleted {
                 s.notice = Some(NOT_DELETED_YET.into());
                 s.notice_code = Some("old_webhook");
             }
-            if s.old_deleted && s.old_recorded_now {
-                // Done already: the replaced credentials have nothing left to clean up.
-                super::cleanup::drop_record(db, &old_connection(s))?;
+            if s.old_deleted
+                && let Some(version) = s.old_record_version
+            {
+                // Done already: the replaced credentials have nothing left to clean up. Only the
+                // record this save made, as it made it.
+                super::cleanup::drop_record(db, &old_connection(s), version)?;
             }
             save(db, cfg, s, staged, now)
         }
@@ -761,8 +781,10 @@ fn record_old(db: &dyn Db, cfg: &HostConfig, s: &mut Setup, now: DateTime<Utc>) 
         s.notice = Some(NOT_DELETED.into());
         return Ok(());
     };
-    s.old_recorded_now = !super::cleanup::exists(db, &connection)?;
-    super::cleanup::record(db, cfg, &connection, &old.subdomain, &creds, Some(&old.id), now)
+    let fresh = !super::cleanup::exists(db, &connection)?;
+    super::cleanup::record(db, cfg, &connection, &old.subdomain, &creds, Some(&old.id), now)?;
+    s.old_record_version = if fresh { super::cleanup::version(db, &connection)? } else { None };
+    Ok(())
 }
 
 fn save(db: &dyn Db, cfg: &HostConfig, s: &mut Setup, staged: &mut Vec<crate::Effect>, now: DateTime<Utc>) -> ApiResult<Step> {

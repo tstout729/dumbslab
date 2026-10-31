@@ -220,6 +220,20 @@ pub(crate) fn renew_call(cfg: &HostConfig, subdomain: &str, base_url: &str, cred
     Ok(refresh_call(app, subdomain, &redirect_uri(cfg, base_url), refresh))
 }
 
+/// How [`apply_refresh`] ended.
+#[derive(Debug)]
+pub(crate) enum Refreshed {
+    /// The tokens are stored in the saved connection (or newer ones were, and `creds` has them).
+    Stored,
+    /// The connection retired meanwhile: the tokens went to its cleanup record. That step wrote
+    /// only those credentials, and must be kept (see
+    /// [`crate::connect::Job::wrote_only_credentials`]); whatever started the renewal stops in its
+    /// next step.
+    HandedOver,
+    /// BambooHR didn't renew them: why.
+    Refused(String),
+}
+
 /// Takes the renewed tokens into `creds`, and stores them in the saved connection, keeping the rest
 /// (a save may have stored a new webhook key meanwhile). Lets go of this request's lease either way.
 ///
@@ -228,10 +242,9 @@ pub(crate) fn renew_call(cfg: &HostConfig, subdomain: &str, base_url: &str, cred
 /// - the same connection still holds the spent refresh token: the new tokens are its, and they're
 ///   stored, lease or not;
 /// - another renewal advanced its tokens meanwhile: those are kept, and `creds` takes them;
-/// - the connection was retired (a reconnect) or removed: `Err(CHANGED)`, and the new tokens go to
-///   its cleanup record, which holds the spent refresh token (see [`super::cleanup::hand_over`]).
-///
-/// Other `Err`s say why BambooHR refused.
+/// - the connection was retired (a reconnect) or removed: [`Refreshed::HandedOver`], and the new
+///   tokens go to its cleanup record, which holds the spent refresh token (see
+///   [`super::cleanup::hand_over`]).
 pub(crate) fn apply_refresh(
     db: &dyn Db,
     cfg: &HostConfig,
@@ -240,13 +253,13 @@ pub(crate) fn apply_refresh(
     lease: &str,
     reply: &HttpReply,
     now: DateTime<Utc>,
-) -> ApiResult<Result<(), String>> {
+) -> ApiResult<Refreshed> {
     let tokens = match connect::standard_token("BambooHR", reply) {
         Ok(t) => t,
         Err(_) => {
             db.execute("UPDATE people_sync SET refreshing_until = NULL WHERE id = 1 AND refreshing_until = ?", &params![lease])?;
             let busy = reply.status == 0 || reply.status == 429 || reply.status >= 500;
-            return Ok(Err(if busy { http_error("BambooHR", reply) } else { SIGNED_OUT.into() }));
+            return Ok(Refreshed::Refused(if busy { http_error("BambooHR", reply) } else { SIGNED_OUT.into() }));
         }
     };
     let spent = creds.cred.refresh_token.clone().unwrap_or_default();
@@ -255,7 +268,7 @@ pub(crate) fn apply_refresh(
         db.one("SELECT secret, expires_at FROM people_sync WHERE id = 1 AND auth = 'oauth' AND connection = ?", &params![connection])?;
     let Some(row) = saved else {
         super::cleanup::hand_over(db, cfg, connection, &spent, creds)?;
-        return Ok(Err(CHANGED.into()));
+        return Ok(Refreshed::HandedOver);
     };
     let mut stored = crate::sync::open(cfg, OWNER, PROVIDER, &row.str("secret"))?;
     let release = "UPDATE people_sync SET refreshing_until = NULL WHERE id = 1 AND refreshing_until = ?";
@@ -265,7 +278,7 @@ pub(crate) fn apply_refresh(
         creds.cred.token = stored.token;
         creds.cred.refresh_token = stored.refresh_token;
         creds.expires_at = row.opt_str("expires_at").and_then(|s| parse_ts(&s));
-        return Ok(Ok(()));
+        return Ok(Refreshed::Stored);
     }
     stored.token = creds.cred.token.clone();
     stored.refresh_token = creds.cred.refresh_token.clone();
@@ -275,7 +288,7 @@ pub(crate) fn apply_refresh(
         &params![secret, creds.expires_at.map(ts), connection],
     )?;
     db.execute(release, &params![lease])?;
-    Ok(Ok(()))
+    Ok(Refreshed::Stored)
 }
 
 /// Another request is renewing the saved sign-in now.

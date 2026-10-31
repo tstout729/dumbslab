@@ -145,9 +145,15 @@ pub(crate) fn exists(db: &dyn Db, connection: &str) -> ApiResult<bool> {
     Ok(db.one("SELECT 1 AS ok FROM people_sync_cleanup WHERE connection = ?", &params![connection])?.is_some())
 }
 
-/// Drops a record whose work is done already.
-pub(crate) fn drop_record(db: &dyn Db, connection: &str) -> ApiResult<()> {
-    db.execute("DELETE FROM people_sync_cleanup WHERE connection = ?", &params![connection])?;
+/// The version of `connection`'s record, when there is one.
+pub(crate) fn version(db: &dyn Db, connection: &str) -> ApiResult<Option<i64>> {
+    Ok(db.one("SELECT version FROM people_sync_cleanup WHERE connection = ?", &params![connection])?.map(|r| r.i64("version")))
+}
+
+/// Drops a record whose work is done already, only at `version`: one recorded again since has new
+/// work.
+pub(crate) fn drop_record(db: &dyn Db, connection: &str, version: i64) -> ApiResult<()> {
+    db.execute("DELETE FROM people_sync_cleanup WHERE connection = ? AND version = ?", &params![connection, version])?;
     Ok(())
 }
 
@@ -523,7 +529,11 @@ fn rotate(
     let result = match &lease {
         // The live connection: retired meanwhile (its tokens went to its record), or refused because
         // another renewal spent the token first. Either way the next pass reloads.
-        Some(l) => oauth::apply_refresh(db, cfg, &mut item.creds, &item.connection, l, reply, now)?.map_err(|why| (why, true)),
+        Some(l) => match oauth::apply_refresh(db, cfg, &mut item.creds, &item.connection, l, reply, now)? {
+            oauth::Refreshed::Stored => Ok(()),
+            oauth::Refreshed::HandedOver => Err((oauth::CHANGED.to_string(), true)),
+            oauth::Refreshed::Refused(why) => Err((why, true)),
+        },
         None => match crate::connect::standard_token("BambooHR", reply) {
             Ok(tokens) => {
                 // Only this connection's record holds these: nothing else to hand them to.

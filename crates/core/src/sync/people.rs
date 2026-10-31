@@ -131,6 +131,9 @@ enum Phase {
     Start,
     /// Waiting for BambooHR to renew the sign-in; the sync holds the renewal lease.
     Renewing(String),
+    /// The sign-in changed while BambooHR renewed it: the last step only handed over the tokens,
+    /// and this one ends the sync.
+    Stopping,
     Reading,
 }
 
@@ -338,14 +341,23 @@ fn sync_step(
         }
         Phase::Renewing(lease) => {
             let reply = replies.into_iter().next().unwrap_or_default();
-            if let Err(message) = oauth::apply_refresh(db, cfg, &mut j.creds, &j.connection, &lease, &reply, now)? {
-                return fail(db, j, &message, now);
+            match oauth::apply_refresh(db, cfg, &mut j.creds, &j.connection, &lease, &reply, now)? {
+                oauth::Refreshed::Refused(message) => return fail(db, j, &message, now),
+                // The tokens went to the retired connection's record, and nothing else was written:
+                // keep this step, and stop in the next.
+                oauth::Refreshed::HandedOver => {
+                    j.rotated = true;
+                    j.phase = Phase::Stopping;
+                    return Ok(Step::Fetch(vec![]));
+                }
+                oauth::Refreshed::Stored => {}
             }
             // This step stored the renewed tokens and nothing else.
             j.rotated = true;
             j.phase = Phase::Reading;
             Ok(Step::Fetch(vec![page_call(j, None)]))
         }
+        Phase::Stopping => fail(db, j, oauth::CHANGED, now),
         Phase::Reading => {
             let reply = replies.into_iter().next().unwrap_or_default();
             let (employees, next) = match read_page(&j.subdomain, j.creds.auth, &reply) {
