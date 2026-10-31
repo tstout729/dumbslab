@@ -779,7 +779,7 @@ fn sync_docs_source(ctx: &mut Ctx, input: SourceIdInput) -> ApiResult<Deferred<D
     if let Some(code) = &source.disconnected {
         return Err(ApiError::new(409, "disconnected", github_app::disconnected_message(code)));
     }
-    match docs::start(ctx.db, source, &ctx.base_url, Utc::now())? {
+    match docs::start(ctx.db, source, &ctx.base_url, true, Utc::now())? {
         Some(job) => {
             ctx.effects.push(Effect::Connect(job));
             Ok(Deferred::Pending)

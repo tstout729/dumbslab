@@ -930,7 +930,7 @@ pub(crate) fn hook(db: &dyn Db, cfg: &HostConfig, req: &Request, base_url: &str,
                     source.repo.repo = name;
                 }
                 let id = source.id.clone();
-                match super::docs::start(db, source, base_url, now)? {
+                match super::docs::start(db, source, base_url, false, now)? {
                     Some(job) => out.effects.push(Effect::Background(job)),
                     None => super::mark_pending(db, super::docs::TABLE, SqlValue::from(id), now)?,
                 }

@@ -552,9 +552,9 @@ fn take_job(effects: &mut Vec<Effect>) -> Option<connect::Job> {
 async fn run_job(app: &Arc<App>, mut job: connect::Job) -> connect::Finish {
     let mut replies = vec![];
     for _ in 0..connect::MAX_STEPS {
-        // Who to tell if this step can't even run (the job goes with it). Like any failure
-        // notice, it's decided from the job as it is before the step.
-        let unran = job.failure_notice(&dumbslab_core::ApiError::internal("the step didn't run"));
+        // Who to tell if this step can't even run or commit (the job goes with it): decided before
+        // the step, from the job and the answers it's about to read (see `connect::unran_notice`).
+        let unran = connect::unran_notice(&mut job, &replies);
         let app2 = app.clone();
         let ran = tokio::task::spawn_blocking(move || {
             app2.store.with_tx(|db| {

@@ -1162,9 +1162,30 @@ impl Job {
         match self {
             Job::Slack(j) => j.failure_notice(error),
             Job::GitLab(j) => j.failure_notice(),
+            Job::Docs(j) => j.failure_notice(),
             _ => None,
         }
     }
+
+    /// Records what the answers to the last requests did elsewhere that a failed step must undo: a
+    /// webhook GitLab just added. Pure (no database), so hosts can call it before the step's
+    /// transaction, and a step that never starts or never commits still undoes it (see
+    /// [`unran_notice`]). The step reads the same answers again.
+    pub fn note(&mut self, replies: &[HttpReply]) {
+        match self {
+            Job::GitLab(j) => j.note(replies),
+            Job::Docs(j) => j.note(replies),
+            _ => {}
+        }
+    }
+}
+
+/// What to send if the next step (with `replies`) can't run or can't commit: hosts call this before
+/// the step's transaction and send the answer only if the transaction fails. It notes the replies
+/// first ([`Job::note`]), so a webhook GitLab added just now comes off again.
+pub fn unran_notice(job: &mut Job, replies: &[HttpReply]) -> Option<HttpCall> {
+    job.note(replies);
+    job.failure_notice(&ApiError::internal("the step didn't run"))
 }
 
 #[derive(Clone, Debug)]

@@ -125,6 +125,7 @@ function docsResult(r) {
     r.restored ? `${r.restored} restored` : null,
     r.images_uploaded ? `${plural(r.images_uploaded, 'image')} uploaded` : null,
     r.remaining ? `${r.remaining} still to sync` : null,
+    r.webhook ? `webhook: ${r.webhook}` : null,
   ].filter(Boolean);
   return frag(
     h('p', { class: 'small' }, facts.join(' · ')),
@@ -165,15 +166,16 @@ function connectionMeta(source) {
 }
 
 /**
- * A GitLab app folder that can't sync (GitLab stopped accepting its approval, or whoever approved it
- * lost access to the project): reconnect it with a new approval, perhaps another maintainer's.
- * Reconnecting also puts its webhook right.
+ * Reconnects a GitLab app folder with a new approval, perhaps another maintainer's: when it can't
+ * sync (GitLab stopped accepting its approval, or whoever approved it lost access to the project),
+ * or any time, to put its webhook right with someone else's access. Sync now already checks the
+ * webhook with the folder's own access.
  */
 function reconnect(source, gitlab, reload) {
+  if (source.connection !== 'gitlab_oauth' || !gitlab || !gitlab.available) return null;
   const stuck = source.disconnected || source.last_status === 'failed';
-  if (source.connection !== 'gitlab_oauth' || !stuck || !gitlab || !gitlab.available) return null;
-  if (!gitlab.connected) return connectLink(gitlab.connect_url, 'Connect GitLab', 'subtle');
-  const b = button(`Reconnect with ${gitlab.account}`, { variant: 'primary', size: 'sm' });
+  if (!gitlab.connected) return connectLink(gitlab.connect_url, stuck ? 'Connect GitLab' : 'Connect GitLab to reconnect', 'subtle');
+  const b = button(`Reconnect with ${gitlab.account}`, { variant: stuck ? 'primary' : 'ghost', size: 'sm' });
   b.addEventListener('click', () => busy(b, async () => {
     await api.patch(`/docs-sources/${enc(source.id)}`, { gitlab_connection: true });
     toast('Reconnected');

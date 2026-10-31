@@ -8481,4 +8481,141 @@ mod syncs {
         filled(drive(&h, background(&r)[0].clone(), &answer).0);
         assert!(lab.removed.borrow().last().unwrap().ends_with(&format!("/hooks/{new_hook}")), "the stored webhook is the new one");
     }
+
+    /// How a host's transaction for a step can fail.
+    #[derive(Clone, Copy)]
+    enum Broken {
+        /// It can't start: the step never runs.
+        Start,
+        /// It can't commit: the step runs and is rolled back.
+        Commit,
+    }
+
+    /// Runs a job like a host whose transaction for step `n` fails. The host then sends the notice
+    /// it worked out before that step (see `connect::unran_notice`), which this returns.
+    fn run_broken(h: &H, mut job: Job, answer: &dyn Fn(&HttpCall) -> HttpReply, n: usize, how: Broken) -> Option<HttpCall> {
+        let mut replies = vec![];
+        for i in 0..connect::MAX_STEPS {
+            let unran = connect::unran_notice(&mut job, &replies);
+            if i == n {
+                if let Broken::Commit = how {
+                    h.store
+                        .with_tx(|db| {
+                            let (step, _) = connect::guarded_step(db, &h.cfg, &mut job, replies.clone(), chrono::Utc::now(), |_| None);
+                            assert!(step.is_ok(), "the step itself works; only its commit fails");
+                            ((), false)
+                        })
+                        .unwrap();
+                }
+                return unran;
+            }
+            let (step, next) = h
+                .store
+                .with_tx(|db| {
+                    let (step, _) = connect::guarded_step(db, &h.cfg, &mut job, replies.clone(), chrono::Utc::now(), |_| None);
+                    let ok = step.is_ok();
+                    ((step, job.clone()), ok)
+                })
+                .unwrap();
+            job = next;
+            match step.unwrap() {
+                Step::Fetch(calls) => replies = calls.iter().map(answer).collect(),
+                Step::Done(f) => panic!("the job finished before step {n}: {f:?}"),
+            }
+        }
+        panic!("the job took more steps than a host allows");
+    }
+
+    #[test]
+    fn a_new_gitlab_webhook_comes_off_when_its_save_never_commits() {
+        let (h, admin, lab, topic) = gitlab_setup();
+        let answer = |c: &HttpCall| lab.answer(c);
+        let newest = || *lab.hooks.borrow().keys().last().unwrap();
+        let removes = |notice: Option<HttpCall>, hook: i64| {
+            let n = notice.expect("a notice");
+            assert_eq!((n.method, n.url), ("DELETE", format!("https://gitlab.com/api/v4/projects/3/hooks/{hook}")));
+        };
+
+        // Adding a folder: the step that saves it (the third) can't start, or can't commit.
+        for how in [Broken::Start, Broken::Commit] {
+            connect_gitlab(&h, &admin, &lab);
+            let input = json!({ "provider": "gitlab", "repository": "acme/handbook", "topic_id": topic, "gitlab_connection": true });
+            let r = h.call("POST", "/api/v1/docs-sources", Some(input), &admin);
+            let notice = run_broken(&h, job_of(&r), &answer, 2, how);
+            removes(notice, newest());
+            assert_eq!(count(&h, "SELECT COUNT(*) FROM docs_sources"), 0);
+        }
+
+        // Reconnecting a folder whose webhook someone deleted: the replacement comes off the same way.
+        let (source, first) = add_gitlab_folder(&h, &admin, &lab, &topic, "docs");
+        for how in [Broken::Start, Broken::Commit] {
+            lab.hooks.borrow_mut().clear();
+            // The failed attempt's hold on the folder runs out.
+            db_run(&h, |db| db.execute("UPDATE docs_sources SET running_until = NULL", &[]));
+            connect_gitlab(&h, &admin, &lab);
+            let r = h.call("PATCH", &format!("/api/v1/docs-sources/{source}"), Some(json!({ "gitlab_connection": true })), &admin);
+            assert_eq!(r.status, 200, "{}", r.body);
+            let notice = run_broken(&h, job_of(&r), &answer, 2, how);
+            removes(notice, newest());
+            let kept = db_run(&h, |db| db.one("SELECT hook_id FROM docs_source_links", &[])).unwrap().i64("hook_id");
+            assert_eq!(kept, first, "nothing saved");
+        }
+    }
+
+    #[test]
+    fn gitlab_syncs_keep_their_webhook_pointed_here() {
+        let (mut h, admin, lab, topic) = gitlab_setup();
+        let answer = |c: &HttpCall| lab.answer(c);
+        let (source, hook_id) = add_gitlab_folder(&h, &admin, &lab, &topic, "docs");
+        let secret = lab.hook_token(hook_id);
+        let puts = |sent: &[HttpCall]| sent.iter().filter(|c| c.method == "PUT").count();
+        let push = json!({ "object_kind": "push", "ref": "refs/heads/main" }).to_string();
+        let pushed = |h: &H| -> (Value, Vec<HttpCall>) {
+            let r = hook(h, &format!("/hooks/docs/{source}"), &push, &[("x-gitlab-event", "Push Hook"), ("x-gitlab-token", &secret)]);
+            assert_eq!(r.status, 200, "{}", r.body);
+            let (finish, sent) = drive(h, job_of(&r), &answer);
+            (filled(finish), sent)
+        };
+        let sync_now = |h: &H| -> (Value, Vec<HttpCall>) {
+            let r = h.call("POST", &format!("/api/v1/docs-sources/{source}/sync"), None, &admin);
+            let (finish, sent) = drive(h, job_of(&r), &answer);
+            (filled(finish), sent)
+        };
+
+        // A push leaves a webhook that points here alone; Sync now checks it anyway.
+        assert_eq!(puts(&pushed(&h).1), 0);
+        let (v, sent) = sync_now(&h);
+        assert_eq!((puts(&sent), v["webhook"].as_str()), (1, Some("checked")));
+
+        // The workspace moves: the next sync points the webhook at the new address.
+        h.cfg.base_url = Some("https://wiki.kb.test".into());
+        let (v, sent) = pushed(&h);
+        assert_eq!((puts(&sent), v["webhook"].as_str()), (1, Some("pointed at this workspace's address")));
+        assert_eq!(lab.hooks.borrow()[&hook_id]["url"], format!("https://wiki.kb.test/hooks/docs/{source}"));
+        assert_eq!(lab.hook_token(hook_id), secret, "same secret");
+        assert_eq!(puts(&pushed(&h).1), 0, "right now");
+
+        // Someone deletes it on GitLab: Sync now adds it again, within the same sync, even with an
+        // expired token to refresh and files to read.
+        lab.hooks.borrow_mut().clear();
+        lab.files.borrow_mut().insert("docs/new.md".into(), b"# New\n".to_vec());
+        db_run(&h, |db| db.execute("UPDATE docs_source_links SET token_expires_at = '2020-01-01T00:00:00.000Z'", &[]));
+        let (v, sent) = sync_now(&h);
+        assert_eq!((v["webhook"].as_str(), v["created"].as_i64()), (Some("added again"), Some(1)), "{v}");
+        assert_eq!(sent[0].url, "https://gitlab.com/oauth/token");
+        let (&again, body) = lab.hooks.borrow().iter().next().map(|(k, v)| (k, v.clone())).unwrap();
+        assert_eq!(
+            (body["url"].as_str(), body["token"].as_str()),
+            (Some(format!("https://wiki.kb.test/hooks/docs/{source}").as_str()), Some(secret.as_str()))
+        );
+        assert_eq!(db_run(&h, |db| db.one("SELECT hook_id FROM docs_source_links", &[])).unwrap().i64("hook_id"), again);
+        assert_eq!(pushed(&h).0["unchanged"], 3, "pushes arrive again");
+
+        // And if the step saving the new one never commits, it comes off again.
+        lab.hooks.borrow_mut().clear();
+        let r = h.call("POST", &format!("/api/v1/docs-sources/{source}/sync"), None, &admin);
+        let notice = run_broken(&h, job_of(&r), &answer, 2, Broken::Commit).expect("a notice");
+        let added = *lab.hooks.borrow().keys().last().unwrap();
+        assert_eq!((notice.method, notice.url), ("DELETE", format!("https://gitlab.com/api/v4/projects/3/hooks/{added}")));
+    }
 }

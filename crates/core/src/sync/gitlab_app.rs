@@ -527,6 +527,21 @@ impl GitLabJob {
     /// its storage): the webhook this job added comes off again, or GitLab would keep sending
     /// pushes for a folder that isn't here. Asked of the job as the failed step left it, which
     /// knows the webhook (see [`crate::connect::guarded_step`]).
+    /// Notes a webhook GitLab says it just added, before the step that saves it runs (see
+    /// [`crate::connect::Job::note`]).
+    pub(crate) fn note(&mut self, replies: &[HttpReply]) {
+        let Some(reply) = replies.first() else { return };
+        match (&mut self.kind, self.phase) {
+            (Kind::Create { hook_id, .. }, Phase::Finishing) => *hook_id = read_hook(reply).ok().or(*hook_id),
+            (Kind::Reconnect { added, .. }, Phase::Finishing) => *added = read_hook(reply).ok().or(*added),
+            // A folder that had no webhook: the first request added one.
+            (Kind::Reconnect { added, rejoin, .. }, Phase::Working) if rejoin.hook_id.is_none() => {
+                *added = read_hook(reply).ok().or(*added)
+            }
+            _ => {}
+        }
+    }
+
     pub(crate) fn failure_notice(&self) -> Option<HttpCall> {
         match &self.kind {
             Kind::Create { approval: Some(a), project: Some(p), hook_id: Some(hook), .. } => {
@@ -721,6 +736,7 @@ pub fn step(db: &dyn Db, cfg: &HostConfig, j: &mut GitLabJob, replies: Vec<HttpR
             *hook_id = Some(hook);
             let mut cred = p.cred.clone();
             cred.fields.insert("webhook_secret".into(), secret.clone());
+            cred.fields.insert("hook_url".into(), draft.webhook_url.clone());
             let link = super::docs::Link::GitLabOAuth { project_id: found.id, hook_id: Some(hook), token_expires_at: p.expires_at.map(ts) };
             let mut ctx = super::ctx(db, cfg, &j.user_id, &j.base_url, now)?;
             if ctx.actor.user_id != j.user_id {
@@ -808,6 +824,7 @@ fn finish_reconnect(db: &dyn Db, cfg: &HostConfig, j: &mut GitLabJob, now: DateT
     let Kind::Reconnect { claim, approval: Some(p), rejoin, added } = &j.kind else { return Err(ApiError::internal("not reconnecting")) };
     let mut cred = p.cred.clone();
     cred.fields.insert("webhook_secret".into(), rejoin.secret.clone());
+    cred.fields.insert("hook_url".into(), rejoin.webhook_url.clone());
     let sealed = super::seal(cfg, &super::docs::owner(&rejoin.source_id), "gitlab", &cred)?;
     let saved = db.execute(
         "UPDATE docs_sources SET secret = ?, running_until = NULL, updated_at = ? WHERE id = ? AND running_until = ?",

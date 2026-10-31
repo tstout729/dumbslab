@@ -25,7 +25,7 @@ use serde_json::{Value, json};
 use super::repo::{Entry, Provider, Repo};
 use super::rewrite::{self, Target};
 use super::{Ended, check_plan, hook_answer, hook_started};
-use crate::connect::{Credential, Finish, HttpReply, Job, Step};
+use crate::connect::{Credential, Finish, HttpCall, HttpReply, Job, Step};
 use crate::db::{Db, DbExt, Row, SqlValue};
 use crate::error::{ApiError, ApiResult};
 use crate::events::{Event, emit};
@@ -235,6 +235,10 @@ pub struct DocsSyncResult {
     pub done: bool,
     /// Files left out, and why (the first 100).
     pub skipped: Vec<Skipped>,
+    /// GitLab app sources: what this sync did about the project's webhook, when it looked at it:
+    /// `checked`, `pointed at this workspace's address`, `added again`, or why it couldn't.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub webhook: Option<String>,
 }
 
 impl DocsSyncResult {
@@ -324,9 +328,82 @@ pub struct DocsJob {
     effects: Vec<crate::Effect>,
     /// The current step's, until the host says whether it committed ([`crate::connect::Job::settle`]).
     staged: Vec<crate::Effect>,
+    /// Someone chose Sync now (not a push): a GitLab app source's webhook is checked too.
+    manual: bool,
+    /// GitLab app sources: the request about the project's webhook that went with the last ones;
+    /// its answer comes last.
+    hook: HookCall,
+    /// The webhook turned out to be gone: it's added again with the next requests.
+    hook_missing: bool,
+    /// A webhook GitLab added during this sync, until the step that saves it commits: if that step
+    /// fails, or never runs or commits, it comes off again ([`DocsJob::failure_notice`]).
+    added_hook: Option<i64>,
+}
+
+/// A request about a GitLab app source's webhook, sent along with a step's others.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum HookCall {
+    None,
+    /// Pointing it at the workspace's address now, with the source's secret.
+    Editing,
+    /// Adding it again.
+    Adding,
 }
 
 impl DocsJob {
+    /// Where the project's webhook should point: this workspace's address now.
+    fn hook_url(&self) -> String {
+        format!("{}/hooks/docs/{}", self.base_url, self.source.id)
+    }
+
+    /// Adds the request about a GitLab app source's webhook, if one is due, to `calls`: putting it
+    /// right when someone chose Sync now or the workspace's address changed since it was set (it
+    /// moved), and adding it again when it's gone.
+    fn with_hook(&mut self, mut calls: Vec<HttpCall>) -> Vec<HttpCall> {
+        let Link::GitLabOAuth { project_id, hook_id, .. } = self.source.link else { return calls };
+        let (url, secret, token) = (self.hook_url(), self.source.cred.field("webhook_secret").to_string(), self.source.cred.token.clone());
+        if secret.is_empty() {
+            return calls;
+        }
+        let call = match hook_id {
+            _ if self.hook_missing => {
+                self.hook_missing = false;
+                self.hook = HookCall::Adding;
+                super::gitlab_app::add_hook_call(&token, project_id, &url, &secret)
+            }
+            Some(hook) if self.manual || self.source.cred.field("hook_url") != url => {
+                self.hook = HookCall::Editing;
+                super::gitlab_app::edit_hook_call(&token, project_id, hook, &url, &secret)
+            }
+            Some(_) => return calls,
+            None => {
+                self.hook = HookCall::Adding;
+                super::gitlab_app::add_hook_call(&token, project_id, &url, &secret)
+            }
+        };
+        calls.push(call);
+        calls
+    }
+
+    /// Notes a webhook GitLab says it just added (see [`crate::connect::Job::note`]).
+    pub(crate) fn note(&mut self, replies: &[HttpReply]) {
+        if self.hook == HookCall::Adding
+            && let Some(id) = replies.last().and_then(|r| super::gitlab_app::read_hook(r).ok())
+        {
+            self.added_hook = Some(id);
+        }
+    }
+
+    /// The webhook this sync added, if the step saving it failed: it comes off again.
+    pub(crate) fn failure_notice(&self) -> Option<HttpCall> {
+        match (&self.source.link, self.added_hook) {
+            (Link::GitLabOAuth { project_id, .. }, Some(hook)) => {
+                Some(super::gitlab_app::remove_hook_call(&self.source.cred.token, *project_id, hook))
+            }
+            _ => None,
+        }
+    }
+
     pub(crate) fn take_effects(&mut self) -> Vec<crate::Effect> {
         std::mem::take(&mut self.effects)
     }
@@ -335,6 +412,8 @@ impl DocsJob {
         let staged = std::mem::take(&mut self.staged);
         if committed {
             self.effects.extend(staged);
+            // Saved with the step.
+            self.added_hook = None;
         }
     }
 }
@@ -400,8 +479,9 @@ struct Plan {
     fetching: Vec<Fetching>,
 }
 
-/// Starts a sync of `source`, unless one is running. `Ok(None)` when one is.
-pub(crate) fn start(db: &dyn Db, source: Source, base_url: &str, now: DateTime<Utc>) -> ApiResult<Option<Job>> {
+/// Starts a sync of `source`, unless one is running. `Ok(None)` when one is. `manual`: someone
+/// chose Sync now (a push didn't start it), so a GitLab app source's webhook is checked too.
+pub(crate) fn start(db: &dyn Db, source: Source, base_url: &str, manual: bool, now: DateTime<Utc>) -> ApiResult<Option<Job>> {
     let Some(lease) = super::claim(db, TABLE, source.id.as_str().into(), now)? else { return Ok(None) };
     Ok(Some(Job::Docs(Box::new(DocsJob {
         source,
@@ -411,6 +491,10 @@ pub(crate) fn start(db: &dyn Db, source: Source, base_url: &str, now: DateTime<U
         result: DocsSyncResult::default(),
         effects: vec![],
         staged: vec![],
+        manual,
+        hook: HookCall::None,
+        hook_missing: false,
+        added_hook: None,
     }))))
 }
 
@@ -447,7 +531,8 @@ pub fn step(db: &dyn Db, cfg: &HostConfig, j: &mut DocsJob, replies: Vec<HttpRep
             }
             Link::Token | Link::GitLabOAuth { .. } => {
                 j.phase = Phase::Listing;
-                Ok(Step::Fetch(j.source.repo.tree_calls(j.source.token())))
+                let calls = j.source.repo.tree_calls(j.source.token());
+                Ok(Step::Fetch(j.with_hook(calls)))
             }
         },
         Phase::Minting(link) => minted(db, j, &replies, link, now),
@@ -730,11 +815,64 @@ fn refreshed(db: &dyn Db, cfg: &HostConfig, j: &mut DocsJob, replies: &[HttpRepl
     db.execute("UPDATE docs_sources SET secret = ?, updated_at = ? WHERE id = ?", &params![sealed, ts(now), j.source.id.clone()])?;
     db.execute("UPDATE docs_source_links SET token_expires_at = ? WHERE source_id = ?", &params![expires_at, j.source.id.clone()])?;
     j.phase = Phase::Listing;
-    Ok(Step::Fetch(j.source.repo.tree_calls(j.source.token())))
+    let calls = j.source.repo.tree_calls(j.source.token());
+    Ok(Step::Fetch(j.with_hook(calls)))
+}
+
+/// Reads the answer about a GitLab app source's webhook, if one came with `replies` (last), and
+/// returns the others. A webhook pointed at the right address keeps its address with the source's
+/// credentials; one that's gone is added again with the next requests.
+fn take_hook_reply(db: &dyn Db, cfg: &HostConfig, j: &mut DocsJob, replies: &[HttpReply], now: DateTime<Utc>) -> ApiResult<Vec<HttpReply>> {
+    let mut rest = replies.to_vec();
+    let kind = std::mem::replace(&mut j.hook, HookCall::None);
+    if kind == HookCall::None {
+        return Ok(rest);
+    }
+    let reply = rest.pop().unwrap_or_default();
+    let moved = j.source.cred.field("hook_url") != j.hook_url();
+    match (kind, reply.status) {
+        (HookCall::Editing, 200..=299) => {
+            save_hook(db, cfg, j, None, now)?;
+            j.result.webhook = Some(if moved { "pointed at this workspace's address" } else { "checked" }.into());
+        }
+        (HookCall::Editing, 404) => j.hook_missing = true,
+        (HookCall::Adding, _) => match super::gitlab_app::read_hook(&reply) {
+            Ok(id) => {
+                j.added_hook = Some(id);
+                save_hook(db, cfg, j, Some(id), now)?;
+                j.result.webhook = Some("added again".into());
+            }
+            Err(message) => j.result.webhook = Some(message),
+        },
+        _ => {
+            j.result.webhook = Some(match reply.status {
+                401 | 403 => "GitLab refused to let DumbSlab manage the project's webhook. Choose Connect GitLab, then Reconnect (as a Maintainer of the project).".into(),
+                _ => crate::connect::http_error("GitLab", &reply),
+            })
+        }
+    }
+    Ok(rest)
+}
+
+/// Keeps where the webhook points (with the source's credentials) and, when it was added again,
+/// its new id.
+fn save_hook(db: &dyn Db, cfg: &HostConfig, j: &mut DocsJob, added: Option<i64>, now: DateTime<Utc>) -> ApiResult<()> {
+    j.source.cred.fields.insert("hook_url".into(), j.hook_url());
+    let sealed = super::seal(cfg, &owner(&j.source.id), j.source.repo.provider.id(), &j.source.cred)?;
+    db.execute(
+        "UPDATE docs_sources SET secret = ?, updated_at = ? WHERE id = ? AND running_until = ?",
+        &params![sealed, ts(now), j.source.id.clone(), j.lease.clone()],
+    )?;
+    if let (Some(id), Link::GitLabOAuth { hook_id, .. }) = (added, &mut j.source.link) {
+        *hook_id = Some(id);
+        db.execute("UPDATE docs_source_links SET hook_id = ? WHERE source_id = ?", &params![id, j.source.id.clone()])?;
+    }
+    Ok(())
 }
 
 /// Reads the folder's listing, works out what changed, and asks for this run's files.
 fn listing(db: &dyn Db, cfg: &HostConfig, j: &mut DocsJob, replies: &[HttpReply], now: DateTime<Utc>) -> ApiResult<Step> {
+    let replies = &take_hook_reply(db, cfg, j, replies, now)?;
     let source_id = j.source.id.clone();
     let has_token = !j.source.token().is_empty();
     let entries = match j.source.repo.read_tree(replies, has_token) {
@@ -934,9 +1072,17 @@ fn listing(db: &dyn Db, cfg: &HostConfig, j: &mut DocsJob, replies: &[HttpReply]
     j.result.remaining = todo.len().saturating_sub(DOCS_PER_RUN);
     todo.truncate(DOCS_PER_RUN);
     if todo.is_empty() {
+        // A webhook that turned out to be gone is added again first.
+        if j.hook_missing {
+            let calls = j.with_hook(vec![]);
+            j.phase = Phase::Images(plan, vec![]);
+            j.staged.append(&mut ctx.effects);
+            return Ok(Step::Fetch(calls));
+        }
         return write(&mut ctx, j, plan, vec![], vec![], now);
     }
     let calls = todo.iter().map(|w| j.source.repo.blob_call(&w.sha, j.source.token())).collect();
+    let calls = j.with_hook(calls);
     plan.batch = todo;
     j.phase = Phase::Reading(plan);
     j.staged.append(&mut ctx.effects);
@@ -958,6 +1104,7 @@ fn fallback_title(repo: &Repo, path: &str) -> String {
 
 /// Reads this run's files and asks for the images they show that aren't uploaded yet.
 fn reading(db: &dyn Db, cfg: &HostConfig, j: &mut DocsJob, mut plan: Plan, replies: &[HttpReply], now: DateTime<Utc>) -> ApiResult<Step> {
+    let replies = &take_hook_reply(db, cfg, j, replies, now)?;
     let has_token = !j.source.token().is_empty();
     let mut texts: Vec<Text> = vec![];
     for (work, reply) in plan.batch.iter().zip(replies) {
@@ -1043,6 +1190,7 @@ fn images(
     replies: &[HttpReply],
     now: DateTime<Utc>,
 ) -> ApiResult<Step> {
+    let replies = &take_hook_reply(db, cfg, j, replies, now)?;
     let has_token = !j.source.token().is_empty();
     let mut ready = vec![];
     for (f, reply) in std::mem::take(&mut plan.fetching).into_iter().zip(replies) {
@@ -1370,7 +1518,7 @@ pub(crate) fn hook(db: &dyn Db, cfg: &HostConfig, req: &Request, id: &str, base_
     }
     check_plan(db, cfg, now)?;
     let source_id = source.id.clone();
-    match start(db, source, base_url, now)? {
+    match start(db, source, base_url, false, now)? {
         Some(job) => Ok(hook_started(job)),
         None => {
             super::mark_pending(db, TABLE, SqlValue::from(source_id), now)?;
