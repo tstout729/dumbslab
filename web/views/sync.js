@@ -313,9 +313,14 @@ function githubSourceForm(github, topics, reload) {
   const more = github.installations.some((i) => i.more_repositories)
     ? h('p', { class: 'small muted' }, 'Your GitHub account can read more repositories than are listed here; the first 500 are.')
     : null;
+  const full = github.installations.filter((i) => i.forwarding === 'full').map((i) => i.account);
+  const unreachable = full.length
+    ? h('p', { class: 'small form-error' }, `Pushes from ${full.join(', ')} don’t sync by themselves here: that installation of DumbSlab’s app already serves as many workspaces as it can. Sync now still works.`)
+    : null;
   const f = h('form', { class: 'stack token-form', novalidate: true },
     field('Repository', repository, { hint: 'Repositories DumbSlab’s GitHub App can read that your GitHub account can read too. To add one, choose Connect GitHub and give the app access to it.' }),
     more,
+    unreachable,
     field('Branch', branch),
     field('Folder', folder, { hint: 'The folder whose Markdown files to sync, with its sub-folders. Leave empty for the whole repository.' }),
     field('Topic', topic, { hint: 'Posts go here; sub-folders become sub-topics with the same visibility.' }),
@@ -389,6 +394,8 @@ const connectErrors = {
   declined: () => 'GitHub didn’t allow access. Choose Connect GitHub again, and authorize DumbSlab when GitHub asks.',
   no_code: () => 'GitHub didn’t finish connecting. Choose Connect GitHub again.',
   not_yours: () => 'Your GitHub account can’t access that installation of DumbSlab’s app. Install it on an account or organization you manage, then try again.',
+  choose_installation: () => 'GitHub didn’t say which installation of DumbSlab’s app you set up, and you can reach too many to connect them all. On GitHub, open the installation (Settings › Applications › Configure) and save it; that brings you back here with it.',
+  installation_full: () => 'GitHub is connected, but that installation of DumbSlab’s app already serves as many DumbSlab workspaces as it can, so pushes won’t sync by themselves here. Sync now still works.',
   failed: () => 'Connecting GitHub didn’t work. Try again.',
 };
 

@@ -23,6 +23,12 @@
 //!   gets it directly. Each workspace checks the signature again ([`hook`]) and acts only on
 //!   installations it connected: a push syncs the sources on that repository and branch, and an
 //!   uninstall, suspension or removed repository marks the affected sources disconnected (posts stay).
+//!   Any change to an installation's repositories is checked against its current list
+//!   ([`ReposJob`]), since GitHub may not name the ones a switch from all to selected left out.
+//! - **Registering with the directory** (hosted) is part of connecting: the job asks the host to
+//!   record the installation for this workspace ([`link_call`], which only hosts with a directory
+//!   are sent), and says so when the installation already serves as many workspaces as it may.
+//!   Until it's recorded, each sync of the installation's sources asks again.
 //!
 //! **Signing in the core.** The core signs the JWT itself (RS256, PKCS#1 v1.5 with SHA-256, the
 //! pure-Rust `rsa` crate) instead of asking the host: there's one implementation for both hosts, it
@@ -31,6 +37,7 @@
 //! signing is blinded with the core's random numbers (the signature itself is deterministic). The
 //! `rsa` crate's advisory (RUSTSEC-2023-0071, the Marvin attack) concerns timing measured over many
 //! attacker-chosen operations; here the key signs only claims DumbSlab builds itself, once per sync.
+//! Signing with WebCrypto in the Worker (the host) instead would be further hardening, not a fix.
 //!
 //! Docs:
 //! - JWT: https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/generating-a-json-web-token-jwt-for-a-github-app
@@ -83,8 +90,14 @@ const MAX_PENDING: i64 = 5;
 /// Pages of 100 repositories read per installation when connecting.
 pub const REPO_PAGES: usize = 5;
 const PER_PAGE: usize = 100;
-/// Installations one connection saves when GitHub doesn't say which one was installed.
-const MAX_AT_ONCE: usize = 3;
+/// Installations one connection saves when GitHub doesn't say which one was installed; past
+/// that, the admin is asked to choose (by starting from the installation on GitHub).
+const MAX_AT_ONCE: usize = 10;
+/// Pages of 100 of a person's installations read when connecting.
+pub const INSTALLATION_PAGES: usize = 3;
+/// What a job asks the host to record an installation in its directory with (see [`link_call`]).
+/// Not a web address: hosts without a directory never send it anywhere.
+pub const DIRECTORY_LINK_URL: &str = "dumbslab:directory/github/link";
 /// Where Settings › Docs sync is.
 const SETTINGS: &str = "/settings/docs-sync";
 pub const INSTALL_PATH: &str = "/sync/github/install";
@@ -199,6 +212,14 @@ pub(crate) fn token_call(app: &GitHubApp, installation_id: i64, repo_id: i64, no
     Ok(api_call(HttpCall::post_json(url, &body)).bearer(&jwt(app, now)?))
 }
 
+/// The request for an installation token that only reads which repositories the installation
+/// can see (Metadata, which every App has).
+pub(crate) fn listing_token_call(app: &GitHubApp, installation_id: i64, now: DateTime<Utc>) -> Result<HttpCall, String> {
+    let body = json!({ "permissions": { "metadata": "read" } });
+    let url = format!("{API}/app/installations/{installation_id}/access_tokens");
+    Ok(api_call(HttpCall::post_json(url, &body)).bearer(&jwt(app, now)?))
+}
+
 /// A minted installation token, and the repository's name now (it may have been renamed).
 #[derive(Clone, PartialEq)]
 pub(crate) struct Minted {
@@ -236,6 +257,69 @@ pub(crate) fn read_token(reply: &HttpReply, repo_id: i64) -> Result<Minted, Stri
 }
 
 // ---------------------------------------------------------------------------
+// Registering with the directory (hosted DumbSlab)
+
+/// The request a job makes for the host to record, in its directory, that this workspace uses an
+/// installation, so the root domain forwards its deliveries here. Only hosts with a directory are
+/// sent it (see [`needs_link`]); the Worker answers it with the directory's answer.
+pub(crate) fn link_call(installation_id: i64) -> HttpCall {
+    HttpCall::post_json(DIRECTORY_LINK_URL, &json!({ "installation_id": installation_id, "linked": true }))
+}
+
+/// How registering an installation went.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum Forwarding {
+    Ok,
+    /// It serves as many workspaces as it may.
+    Full,
+    /// Something went wrong on the way; asked again at the next sync.
+    Retry,
+}
+
+pub(crate) fn read_link(reply: &HttpReply) -> Forwarding {
+    match reply.status {
+        200..=299 => Forwarding::Ok,
+        409 if reply.json()["error"]["code"] == "installation_full" => Forwarding::Full,
+        _ => Forwarding::Retry,
+    }
+}
+
+/// Keeps how registering went (`github_installations.forwarding`).
+pub(crate) fn record_link(db: &dyn Db, installation_id: i64, f: Forwarding) -> ApiResult<()> {
+    let value = match f {
+        Forwarding::Ok => "ok",
+        Forwarding::Full => "full",
+        Forwarding::Retry => return Ok(()),
+    };
+    db.execute("UPDATE github_installations SET forwarding = ? WHERE id = ?", &params![value, installation_id])?;
+    Ok(())
+}
+
+/// Whether a job should (again) ask the host to register the installation: hosted workspaces, until
+/// the directory has it.
+pub(crate) fn needs_link(db: &dyn Db, cfg: &HostConfig, installation_id: i64) -> ApiResult<bool> {
+    if cfg.hosting.is_none() {
+        return Ok(false);
+    }
+    let row = db.one("SELECT forwarding FROM github_installations WHERE id = ?", &params![installation_id])?;
+    Ok(row.is_some_and(|r| r.opt_str("forwarding").as_deref() != Some("ok")))
+}
+
+/// What the root domain answers GitHub once it forwarded a delivery: each workspace's (first
+/// address, its answer's status, or `None` when it couldn't be reached). Any failure fails the
+/// delivery, so GitHub's log shows it and an operator can redeliver it; that's safe, because a
+/// workspace that already handled it handles it again the same way (a push syncs or is noted, a
+/// change to an installation is applied again), and nothing remembers GitHub's delivery ids to
+/// refuse it. Returns the status, the body and the workspaces that failed (to log; their first
+/// addresses only).
+pub fn forwarded(results: &[(String, Option<u16>)]) -> (u16, Value, Vec<String>) {
+    let failed: Vec<String> =
+        results.iter().filter(|(_, status)| !status.is_some_and(|s| (200..300).contains(&s))).map(|(home, _)| home.clone()).collect();
+    let body = json!({ "ok": failed.is_empty(), "workspaces": results.len(), "delivered": results.len() - failed.len() });
+    (if failed.is_empty() { 200 } else { 502 }, body, failed)
+}
+
+// ---------------------------------------------------------------------------
 // Installing: the browser routes
 
 /// Why connecting didn't work. Only these codes go in the link back to Settings: anyone can make a
@@ -258,6 +342,11 @@ pub(crate) enum Problem {
     NoCode,
     /// The installation isn't one the person's GitHub account can access.
     NotYours,
+    /// GitHub didn't say which installation, and the person has too many to connect them all.
+    ChooseInstallation,
+    /// Connected, but the installation already serves as many workspaces as it may, so GitHub's
+    /// deliveries for it can't reach this one.
+    InstallationFull,
     Failed,
 }
 
@@ -273,6 +362,8 @@ impl Problem {
             Problem::Declined => "declined",
             Problem::NoCode => "no_code",
             Problem::NotYours => "not_yours",
+            Problem::ChooseInstallation => "choose_installation",
+            Problem::InstallationFull => "installation_full",
             Problem::Failed => "failed",
         }
     }
@@ -518,7 +609,7 @@ pub struct InstallJob {
     phase: InstallPhase,
     user_token: String,
     chosen: Vec<Installation>,
-    /// The directory links to make once the step that saved them committed.
+    /// Webhooks for the activity it records, once the step that saved them committed.
     effects: Vec<Effect>,
     staged: Vec<Effect>,
 }
@@ -536,6 +627,8 @@ enum InstallPhase {
     Exchanging,
     Installations,
     Repositories,
+    /// Hosted: waiting for the directory to record the installations.
+    Linking,
 }
 
 impl InstallJob {
@@ -569,13 +662,28 @@ pub fn install_step(db: &dyn Db, cfg: &HostConfig, j: &mut InstallJob, replies: 
             let Some(token) = v["access_token"].as_str().filter(|t| reply.ok() && !t.is_empty()) else { return back(Problem::Failed) };
             j.user_token = token.to_string();
             j.phase = InstallPhase::Installations;
-            Ok(Step::Fetch(vec![user_call(format!("{API}/user/installations?per_page={PER_PAGE}"), &j.user_token)]))
+            Ok(Step::Fetch(
+                (1..=INSTALLATION_PAGES)
+                    .map(|page| user_call(format!("{API}/user/installations?per_page={PER_PAGE}&page={page}"), &j.user_token))
+                    .collect(),
+            ))
         }
         InstallPhase::Installations => {
-            let Ok(list) = read_installations(&replies.first().cloned().unwrap_or_default()) else { return back(Problem::Failed) };
+            let mut list = vec![];
+            for r in &replies {
+                match read_installations(r) {
+                    Ok(page) => list.extend(page),
+                    Err(_) => return back(Problem::Failed),
+                }
+            }
+            let mut seen = BTreeSet::new();
+            list.retain(|i| seen.insert(i.id));
             j.chosen = match j.installation_id {
                 Some(id) => list.into_iter().filter(|i| i.id == id).collect(),
-                None => list.into_iter().take(MAX_AT_ONCE).collect(),
+                // GitHub didn't say which: all of the person's own, if there are few enough;
+                // otherwise they choose, by starting from the installation on GitHub.
+                None if list.len() <= MAX_AT_ONCE => list,
+                None => return back(Problem::ChooseInstallation),
             };
             if j.chosen.is_empty() {
                 return back(Problem::NotYours);
@@ -598,11 +706,26 @@ pub fn install_step(db: &dyn Db, cfg: &HostConfig, j: &mut InstallJob, replies: 
                 return back(Problem::NotAdmin);
             }
             let mut ctx = super::ctx(db, cfg, &j.user_id, &j.base_url, now)?;
-            for (installation, repos, more) in found {
-                save(&mut ctx, &installation, &repos, more)?;
+            for (installation, repos, more) in &found {
+                save(&mut ctx, installation, repos, *more)?;
             }
             j.staged.append(&mut ctx.effects);
+            // Hosted: connecting isn't done until the directory forwards the deliveries here.
+            if cfg.hosting.is_some() {
+                j.phase = InstallPhase::Linking;
+                return Ok(Step::Fetch(j.chosen.iter().map(|i| link_call(i.id)).collect()));
+            }
             Ok(Step::Done(Finish::Redirect(settings_url(&j.base_url, "github", Ok(())))))
+        }
+        InstallPhase::Linking => {
+            let mut full = false;
+            for (i, reply) in j.chosen.iter().zip(&replies) {
+                let f = read_link(reply);
+                record_link(db, i.id, f)?;
+                full |= f == Forwarding::Full;
+            }
+            let outcome = if full { Err(Problem::InstallationFull) } else { Ok(()) };
+            Ok(Step::Done(Finish::Redirect(settings_url(&j.base_url, "github", outcome))))
         }
     }
 }
@@ -643,7 +766,6 @@ fn save(ctx: &mut crate::registry::Ctx, i: &Installation, repos: &[Repository], 
             .data(json!({ "repositories": repos.len() }))
             .admin_only(),
     )?;
-    ctx.effects.push(Effect::GitHubInstallation(InstallationLink { installation_id: i.id, linked: true }));
     Ok(())
 }
 
@@ -881,6 +1003,7 @@ pub(crate) fn hook(db: &dyn Db, cfg: &HostConfig, req: &Request, base_url: &str,
                 disconnect(db, installation, " AND repo_id = ? AND disconnected IS NULL", REPOSITORY_REMOVED, params![*id])?;
             }
             note(&mut ctx, "github.repositories_removed", format!("repositories were taken out of DumbSlab's GitHub App on {account}"))?;
+            ctx.effects.push(Effect::Background(Job::GitHubRepos(Box::new(ReposJob::new(installation)))));
         }
         Delivery::RepositoriesAdded { repos, .. } => {
             // Only repositories the admin here could already read come back; new ones need
@@ -897,12 +1020,106 @@ pub(crate) fn hook(db: &dyn Db, cfg: &HostConfig, req: &Request, base_url: &str,
                 )?;
             }
             note(&mut ctx, "github.repositories_added", format!("repositories were added to DumbSlab's GitHub App on {account}"))?;
+            ctx.effects.push(Effect::Background(Job::GitHubRepos(Box::new(ReposJob::new(installation)))));
         }
         Delivery::Ping | Delivery::Ignored => return Ok(hook_answer("ignored")),
     }
     let mut out = hook_answer("updated");
     out.effects.append(&mut ctx.effects);
     Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// Checking an installation's repositories
+
+/// Brings an installation's repositories here in line with GitHub's list for it, after GitHub
+/// reported a change. GitHub may not name every repository a change left out (switching from all
+/// repositories to selected ones can leave `repositories_removed` empty), so the list itself is
+/// read: repositories no longer on it stop being offered and their sources wait, disconnected;
+/// ones back on it come back. New repositories aren't offered until an admin here connects
+/// again, which checks their own account can read them.
+#[derive(Clone, Debug)]
+pub struct ReposJob {
+    installation_id: i64,
+    phase: ReposPhase,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ReposPhase {
+    Start,
+    Minting,
+    Listing,
+}
+
+impl ReposJob {
+    pub(crate) fn new(installation_id: i64) -> ReposJob {
+        ReposJob { installation_id, phase: ReposPhase::Start }
+    }
+}
+
+/// Runs the repository check's next step (see [`crate::connect::step`]).
+pub fn repos_step(db: &dyn Db, cfg: &HostConfig, j: &mut ReposJob, replies: Vec<HttpReply>, now: DateTime<Utc>) -> ApiResult<Step> {
+    let failed = |message: String| Ok(Step::Done(Finish::Fail(ApiError::new(400, "github_failed", message))));
+    let Some(app) = app(cfg) else { return failed("DumbSlab's GitHub App isn't set up on this server any more.".into()) };
+    match j.phase {
+        ReposPhase::Start => match listing_token_call(app, j.installation_id, now) {
+            Ok(call) => {
+                j.phase = ReposPhase::Minting;
+                Ok(Step::Fetch(vec![call]))
+            }
+            Err(message) => failed(message),
+        },
+        ReposPhase::Minting => match read_token(&replies.first().cloned().unwrap_or_default(), 0) {
+            Ok(minted) => {
+                j.phase = ReposPhase::Listing;
+                Ok(Step::Fetch(
+                    (1..=REPO_PAGES)
+                        .map(|page| {
+                            api_call(HttpCall::get(format!("{API}/installation/repositories?per_page={PER_PAGE}&page={page}")))
+                                .bearer(&minted.token)
+                        })
+                        .collect(),
+                ))
+            }
+            Err(message) => failed(message),
+        },
+        ReposPhase::Listing => {
+            let (current, more) = match read_repositories(&replies) {
+                Ok(r) => r,
+                Err(message) => return failed(message),
+            };
+            let installation = j.installation_id;
+            let names: std::collections::BTreeMap<i64, String> = current.iter().map(|r| (r.id, r.full_name.clone())).collect();
+            let stamp = ts(now);
+            let mut gone = 0;
+            for r in db.query("SELECT id, removed_at FROM github_repositories WHERE installation_id = ?", &params![installation])? {
+                let id = r.i64("id");
+                match names.get(&id) {
+                    Some(name) => {
+                        db.execute(
+                            "UPDATE github_repositories SET removed_at = NULL, full_name = ? WHERE installation_id = ? AND id = ?",
+                            &params![name.clone(), installation, id],
+                        )?;
+                        db.execute(
+                            "UPDATE docs_source_links SET disconnected = NULL WHERE connection = 'github_app' AND installation_id = ? AND repo_id = ? AND disconnected = ?",
+                            &params![installation, id, REPOSITORY_REMOVED],
+                        )?;
+                    }
+                    // Only a whole list says what's missing from it.
+                    None if !more && r.opt_str("removed_at").is_none() => {
+                        db.execute(
+                            "UPDATE github_repositories SET removed_at = ? WHERE installation_id = ? AND id = ?",
+                            &params![stamp.clone(), installation, id],
+                        )?;
+                        disconnect(db, installation, " AND repo_id = ? AND disconnected IS NULL", REPOSITORY_REMOVED, params![id])?;
+                        gone += 1;
+                    }
+                    None => {}
+                }
+            }
+            Ok(Step::Done(Finish::Fill(json!({ "ok": true, "repositories": current.len(), "removed": gone }))))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1076,6 +1293,20 @@ mod tests {
         assert!(
             matches!(route_delivery("hook-secret", Some(&sign(&tag)), Some("push"), &tag), Routed::Answer(v) if v["status"] == "ignored")
         );
+    }
+
+    #[test]
+    fn deliveries_fail_unless_every_workspace_took_them() {
+        let all = forwarded(&[("acme".into(), Some(200)), ("beta".into(), Some(202))]);
+        assert_eq!((all.0, all.1["delivered"].as_u64(), all.2.len()), (200, Some(2), 0));
+        let some = forwarded(&[("acme".into(), Some(200)), ("beta".into(), Some(500)), ("gamma".into(), None)]);
+        assert_eq!((some.0, some.1["ok"].as_bool(), some.2), (502, Some(false), vec!["beta".to_string(), "gamma".to_string()]));
+        assert_eq!(forwarded(&[]).0, 200, "nobody to tell");
+        assert_eq!(read_link(&HttpReply { status: 200, body: "{}".into() }), Forwarding::Ok);
+        let full = json!({ "error": { "code": "installation_full", "message": "…" } }).to_string();
+        assert_eq!(read_link(&HttpReply { status: 409, body: full }), Forwarding::Full);
+        assert_eq!(read_link(&HttpReply::default()), Forwarding::Retry);
+        assert_eq!(read_link(&HttpReply { status: 409, body: "{}".into() }), Forwarding::Retry);
     }
 
     #[test]

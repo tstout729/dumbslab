@@ -100,13 +100,13 @@ All six must be set; with any missing, Connect GitHub isn't offered and docs syn
 1. In a workspace, sign in as an admin and open **Settings › Docs sync**. **Connect GitHub** should be there.
 2. Choose it, install the App on a test repository, and come back. The repository should be in the list.
 3. Add a folder, then push a change to it. The post should change within a few seconds.
-4. On the App's page, **Advanced › Recent Deliveries** shows each delivery and DumbSlab's answer. Hosted DumbSlab answers with how many workspaces it reached.
+4. On the App's page, **Advanced › Recent Deliveries** shows each delivery and DumbSlab's answer. Hosted DumbSlab answers with how many workspaces it reached. If any of them didn't take it, the answer is a 502 and the Worker's log names those workspaces (by first address). Choose **Redeliver** once they're back: workspaces that already handled it handle it again the same way.
 
 ## How deliveries reach workspaces
 
 GitHub sends every installation's events to one address, `<ROOT>/hooks/github`.
 
-- **Hosted:** the root domain checks the signature (`X-Hub-Signature-256`, with the webhook secret). It then sends the delivery on, unchanged, to each workspace that connected that installation. The directory keeps that list (`installation_workspaces`): a workspace is added when an admin there connects the installation, and removed when it's uninstalled. One installation can serve up to 20 workspaces. Each workspace checks the signature again, and acts only on installations its own admins connected.
+- **Hosted:** the root domain checks the signature (`X-Hub-Signature-256`, with the webhook secret). It then sends the delivery on, unchanged, to each workspace that connected that installation. The directory keeps that list (`installation_workspaces`): a workspace is added when an admin there connects the installation, and removed when it's uninstalled. Connecting waits for the directory to add it. One installation can serve up to 100 workspaces; past that, connecting says so (`installation_full`) and pushes don't reach the extra workspace, though Sync now works. If the directory couldn't be reached, each sync asks again until it's added. Each workspace checks the signature again, and acts only on installations its own admins connected.
 - **Self-hosted:** the server is the only workspace, and gets deliveries directly.
 
 A workspace only syncs repositories its own admin's GitHub account can read in the installation. That's checked when they connect, so one workspace never gets repositories that only another workspace's admin chose.

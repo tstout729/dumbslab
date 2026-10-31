@@ -18,7 +18,7 @@ use crate::sync::github_app;
 use crate::sync::people::{self, PeopleSyncResult};
 use crate::sync::{self, SyncState};
 use crate::util::new_secret;
-use crate::{Effect, InstallationLink, params};
+use crate::{Effect, params};
 
 /// Docs sync sources a workspace may have.
 const MAX_SOURCES: i64 = 20;
@@ -346,6 +346,11 @@ pub struct GitHubInstallation {
     pub repositories: Vec<GitHubRepository>,
     /// Their account could read more repositories there than are listed (the first 500 are).
     pub more_repositories: bool,
+    /// Whether GitHub's deliveries for it reach this workspace: `direct` (this server gets them
+    /// itself), `ok`, `pending` (each sync asks the hosted directory again until it's recorded) or
+    /// `full` (it already serves as many workspaces as it may, so pushes don't sync by themselves
+    /// here; Sync now still works).
+    pub forwarding: String,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -381,6 +386,11 @@ fn list_github_repositories(ctx: &mut Ctx, _: NoInput) -> ApiResult<GitHubReposi
             connected_at: r.str("created_at"),
             repositories,
             more_repositories: r.bool("more_repositories"),
+            forwarding: match (ctx.cfg.hosting.is_some(), r.opt_str("forwarding")) {
+                (false, _) => "direct".into(),
+                (true, Some(f)) => f,
+                (true, None) => "pending".into(),
+            },
         });
     }
     let connect_url = available.then(|| ctx.url(github_app::INSTALL_PATH));
@@ -506,8 +516,6 @@ fn create_docs_source(ctx: &mut Ctx, input: CreateDocsSourceInput) -> ApiResult<
             "INSERT INTO docs_source_links (source_id, connection, installation_id, repo_id) VALUES (?, 'github_app', ?, ?)",
             &params![id.clone(), installation_id, repo_id],
         )?;
-        // The directory may have missed this installation's link; asking again does no harm.
-        ctx.effects.push(Effect::GitHubInstallation(InstallationLink { installation_id, linked: true }));
     }
     emit(
         ctx,
