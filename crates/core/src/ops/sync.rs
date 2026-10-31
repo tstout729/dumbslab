@@ -22,6 +22,8 @@ use crate::{Effect, params};
 
 /// Docs sync sources a workspace may have.
 const MAX_SOURCES: i64 = 20;
+/// Two sources may not sync one folder into one topic.
+const ALREADY_SYNCED: &str = "that folder already syncs into that topic";
 const MAX_SECRET_CHARS: usize = 4096;
 
 pub fn ops() -> Vec<Op> {
@@ -231,7 +233,9 @@ pub struct DocsSource {
     pub connection: String,
     /// `github_app`: the App's installation that reads the repository.
     pub installation_id: Option<i64>,
-    /// Why it can't sync now, e.g. the GitHub App was uninstalled. Its posts stay. Null when it can.
+    /// Why it can't sync now, e.g. the GitHub App was uninstalled, or an older source syncs the same
+    /// folder into the same topic (a repository renamed into another's). Its posts stay. Null when
+    /// it can.
     pub disconnected: Option<String>,
     /// A token is saved (it's never shown).
     pub has_token: bool,
@@ -291,7 +295,10 @@ fn source_view(ctx: &Ctx, r: &Row) -> ApiResult<DocsSource> {
             Link::GitHubApp { installation_id, .. } => Some(installation_id),
             _ => None,
         },
-        disconnected: source.disconnected.as_deref().map(github_app::disconnected_message),
+        disconnected: match source.disconnected.as_deref() {
+            Some(code) => Some(github_app::disconnected_message(code)),
+            None => docs::has_older_twin(ctx.db, &source)?.then(|| docs::DUPLICATE.to_string()),
+        },
         has_token: !source.cred.token.is_empty(),
         webhook_url: match source.link {
             Link::Token => Some(ctx.url(&format!("/hooks/docs/{}", source.id))),
@@ -566,7 +573,12 @@ fn create_docs_source(ctx: &mut Ctx, input: CreateDocsSourceInput) -> ApiResult<
         folder: sync::checked_folder(input.folder.as_deref().unwrap_or_default())?,
         topic_id: input.topic_id.trim().to_string(),
     };
-    check_new_source(ctx, &fresh)?;
+    // (A GitLab project's id isn't known yet: the job checks it again by that too.)
+    let link = match &app {
+        Some((installation_id, (repo_id, _, _))) => Link::GitHubApp { installation_id: *installation_id, repo_id: *repo_id },
+        None => Link::Token,
+    };
+    check_new_source(ctx, &fresh, &link)?;
     // Through DumbSlab's GitLab app: GitLab must first find the project for the admin and take
     // the webhook, so a job finishes adding it (see `gitlab_app`).
     if gitlab {
@@ -594,29 +606,29 @@ fn create_docs_source(ctx: &mut Ctx, input: CreateDocsSourceInput) -> ApiResult<
     if let Some(s) = &webhook_secret {
         cred.fields.insert("webhook_secret".into(), s.clone());
     }
-    let link = match app {
-        Some((installation_id, (repo_id, _, _))) => Link::GitHubApp { installation_id, repo_id },
-        None => Link::Token,
-    };
     insert_source(ctx, &fresh, &cred, &link)?;
     let row = load_source_row(ctx, &fresh.id)?;
     Ok(Deferred::Ready(DocsSourceCreated { source: source_view(ctx, &row)?, webhook_secret }))
 }
 
 /// Refuses a source that can't be added: its topic must be one the admin can see, the workspace
-/// has room, and the folder doesn't already sync into that topic.
-fn check_new_source(ctx: &Ctx, s: &docs::NewSource) -> ApiResult<()> {
+/// has room, and the folder doesn't already sync into that topic (see [`docs::twins`]).
+fn check_new_source(ctx: &Ctx, s: &docs::NewSource, link: &Link) -> ApiResult<()> {
     load_topic(ctx, &s.topic_id)?;
     let count = ctx.db.scalar_i64("SELECT COUNT(*) FROM docs_sources", &[])?;
     if count >= MAX_SOURCES {
         return Err(ApiError::conflict(format!("a workspace can have at most {MAX_SOURCES} docs sync sources")));
     }
-    let duplicate = ctx.db.one(
-        "SELECT id FROM docs_sources WHERE provider = ? AND host = ? AND repo = ? AND branch = ? AND folder = ? AND topic_id = ?",
-        &params![s.provider.id(), s.host.clone(), s.repo.clone(), s.branch.clone(), s.folder.clone(), s.topic_id.clone()],
-    )?;
-    if duplicate.is_some() {
-        return Err(ApiError::conflict("that folder already syncs into that topic"));
+    // The same folder twice, by the repository's name or (renamed since) its id.
+    let wanted = sync::repo::Repo {
+        provider: s.provider,
+        host: s.host.clone(),
+        repo: s.repo.clone(),
+        branch: s.branch.clone(),
+        folder: s.folder.clone(),
+    };
+    if !docs::twins(ctx.db, &wanted, link, &s.topic_id, "")?.is_empty() {
+        return Err(ApiError::conflict(ALREADY_SYNCED));
     }
     Ok(())
 }
@@ -624,7 +636,7 @@ fn check_new_source(ctx: &Ctx, s: &docs::NewSource) -> ApiResult<()> {
 /// Adds a source, checked again (see [`check_new_source`]), with its credentials sealed to it and how
 /// it connects. Synced posts are written as the admin adding it.
 pub(crate) fn insert_source(ctx: &mut Ctx, s: &docs::NewSource, cred: &Credential, link: &Link) -> ApiResult<()> {
-    check_new_source(ctx, s)?;
+    check_new_source(ctx, s, link)?;
     let secret = sync::seal(ctx.cfg, &docs::owner(&s.id), s.provider.id(), cred)?;
     let now = ctx.now_s();
     ctx.db.execute(
@@ -711,8 +723,13 @@ fn update_docs_source(ctx: &mut Ctx, input: UpdateDocsSourceInput) -> ApiResult<
     } else if input.gitlab_connection == Some(true) {
         return Err(ApiError::bad_request("`gitlab_connection` is for sources read through DumbSlab's GitLab app"));
     }
-    if let Some(b) = branch {
+    if let Some(b) = branch
+        && b != source.repo.branch
+    {
         source.repo.branch = b;
+        if !docs::twins(ctx.db, &source.repo, &source.link, &source.topic_id, &source.id)?.is_empty() {
+            return Err(ApiError::conflict(ALREADY_SYNCED));
+        }
     }
     let token = secret_input(input.token, "token")?;
     // (A GitHub App source keeps no credentials, so it's always readable.)
@@ -756,7 +773,11 @@ fn reconnect_gitlab(
     if !gitlab_app::available(ctx.cfg) {
         return Err(ApiError::new(503, "gitlab_app_off", "DumbSlab's GitLab app isn't set up on this server."));
     }
-    if let Some(b) = branch {
+    if let Some(b) = branch.filter(|b| *b != source.repo.branch) {
+        let moved = sync::repo::Repo { branch: b.clone(), ..source.repo.clone() };
+        if !docs::twins(ctx.db, &moved, &source.link, &source.topic_id, &source.id)?.is_empty() {
+            return Err(ApiError::conflict(ALREADY_SYNCED));
+        }
         ctx.db.execute("UPDATE docs_sources SET branch = ? WHERE id = ?", &params![b, source.id.clone()])?;
     }
     let lease = gitlab_app::hold_source(ctx.db, &source.id, ctx.now)?
@@ -788,12 +809,16 @@ fn sync_docs_source(ctx: &mut Ctx, input: SourceIdInput) -> ApiResult<Deferred<D
     key_needed(ctx)?;
     let row = load_source_row(ctx, &input.id)?;
     let source = Source::from_row(ctx.cfg, &row)?;
+    if docs::has_older_twin(ctx.db, &source)? {
+        return Err(ApiError::new(409, "duplicate", docs::DUPLICATE));
+    }
     if let Link::GitHubApp { installation_id, .. } = source.link {
-        // Disconnected: Sync now asks GitHub again. The check is asked for in this answer (so it's
-        // kept), and decides whether the folder can sync.
+        // Disconnected: Sync now asks GitHub again (a check already owed or running covers it).
+        // The check is asked for in this answer (so it's kept), and decides whether the folder can
+        // sync.
         let known = ctx.db.one("SELECT 1 AS ok FROM github_installations WHERE id = ?", &params![installation_id])?.is_some();
         if source.disconnected.is_some() && known {
-            if let Some(check) = github_app::request_check(ctx.db, installation_id, &ctx.base_url, ctx.now)? {
+            if let Some(check) = github_app::recheck(ctx.db, installation_id, &ctx.base_url, ctx.now)? {
                 ctx.effects.push(Effect::Background(check));
             }
             let checking =

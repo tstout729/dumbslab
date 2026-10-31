@@ -903,7 +903,6 @@ pub(crate) fn hook(db: &dyn Db, cfg: &HostConfig, req: &Request, base_url: &str,
     if db.one("SELECT 1 AS ok FROM github_installations WHERE id = ?", &params![installation])?.is_none() {
         return Ok(hook_answer("ignored"));
     }
-    let stamp = ts(now);
     match delivery {
         Delivery::Push { repo_id, full_name, branch, .. } => {
             let rows = db.query(
@@ -929,10 +928,7 @@ pub(crate) fn hook(db: &dyn Db, cfg: &HostConfig, req: &Request, base_url: &str,
                 if let Ok(name) = super::repo::github_repo(&full_name)
                     && name != source.repo.repo
                 {
-                    db.execute(
-                        "UPDATE docs_sources SET repo = ?, updated_at = ? WHERE id = ?",
-                        &params![name.clone(), stamp.clone(), source.id.clone()],
-                    )?;
+                    super::docs::rename(db, &source.id, &name, now)?;
                     source.repo.repo = name;
                 }
                 let id = source.id.clone();
@@ -971,7 +967,7 @@ const MAX_BACKOFF_SECS: i64 = 3600;
 /// unsuspended), and GitHub may not name every repository a change left out. So the check reads
 /// the installation itself (`GET /app/installations/{id}` with the App's JWT; 404 means it was
 /// uninstalled, `suspended_at` that it's suspended) and, while it's active, each repository a
-/// source here uses (`GET /repos/{owner}/{repo}` with an installation token that reads metadata:
+/// source here uses (`GET /repositories/{id}` with an installation token that reads metadata:
 /// 404 means the installation can't reach it). A workspace has at most 20 sources, so that's
 /// bounded, whatever the installation's size.
 ///
@@ -991,8 +987,8 @@ const MAX_BACKOFF_SECS: i64 = 3600;
 /// in, and records `applied_gen = start_gen`. If `requested_gen` moved on meanwhile, it chains one
 /// more check (a few at most). A check that fails lets go and waits a while (`next_check_at`,
 /// doubling up to an hour); the change it owed stays owed (`requested_gen > applied_gen`) and is
-/// tried again by the next change, the next push or sync of one of its sources, or Settings ›
-/// Docs sync. A check that lost its hold (it took too long) stops before asking GitHub anything
+/// tried again by the next change, or once the wait is over by the next push or sync of one of
+/// its sources, or Settings › Docs sync (see [`recheck`]). A check that lost its hold (it took too long) stops before asking GitHub anything
 /// more.
 ///
 /// What it applies: an uninstalled installation is forgotten and its sources wait, disconnected;
@@ -1107,6 +1103,18 @@ pub(crate) fn request_check(db: &dyn Db, installation: i64, base_url: &str, now:
 /// next push or sync of one of its sources, and when Settings › Docs sync loads.
 pub(crate) fn resume_check(db: &dyn Db, installation: i64, base_url: &str, now: DateTime<Utc>) -> ApiResult<Option<Job>> {
     claim_check(db, installation, base_url, 0, false, now)
+}
+
+/// DumbSlab itself wants an installation checked (Sync now on a disconnected source, or GitHub
+/// refusing a sync's token): a check already owed or running covers it, so it's asked for only when
+/// none is. Either way it waits out the wait after a failure; only a change GitHub reports skips it.
+pub(crate) fn recheck(db: &dyn Db, installation: i64, base_url: &str, now: DateTime<Utc>) -> ApiResult<Option<Job>> {
+    db.execute(
+        "UPDATE github_installations SET requested_gen = requested_gen + 1
+         WHERE id = ? AND requested_gen <= applied_gen AND (checking_until IS NULL OR checking_until <= ?)",
+        &params![installation, ts(now)],
+    )?;
+    resume_check(db, installation, base_url, now)
 }
 
 fn holds_check(db: &dyn Db, j: &CheckJob) -> ApiResult<bool> {
@@ -1294,12 +1302,16 @@ fn apply(db: &dyn Db, cfg: &HostConfig, j: &mut CheckJob, now_is: Now, now: Date
                             &params![name.clone(), name.clone(), installation, *id],
                         )?;
                         // Renamed: its sources follow, so their links and lookups use the new name.
+                        // (One whose new name makes it another source's twin waits; see
+                        // `docs::has_older_twin`.)
                         if !name.is_empty() {
-                            db.execute(
-                                "UPDATE docs_sources SET repo = ? WHERE repo != ? AND id IN
-                                   (SELECT source_id FROM docs_source_links WHERE connection = 'github_app' AND installation_id = ? AND repo_id = ?)",
-                                &params![name.clone(), name.clone(), installation, *id],
-                            )?;
+                            for s in db.query(
+                                "SELECT s.id FROM docs_sources s JOIN docs_source_links l ON l.source_id = s.id
+                                 WHERE l.connection = 'github_app' AND l.installation_id = ? AND l.repo_id = ? AND s.repo != ?",
+                                &params![installation, *id, name.clone()],
+                            )? {
+                                super::docs::rename(db, &s.str("id"), name, now)?;
+                            }
                         }
                         back += db.execute(
                             "UPDATE docs_source_links SET disconnected = NULL WHERE connection = 'github_app' AND installation_id = ? AND repo_id = ? AND disconnected = ?",
