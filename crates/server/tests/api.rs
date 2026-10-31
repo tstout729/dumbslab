@@ -8241,7 +8241,8 @@ mod syncs {
         let created = filled(drive(&h, job_of(&r), &answer).0);
         let source = created["source"]["id"].as_str().unwrap().to_string();
         assert_eq!((created["source"]["connection"].as_str(), created["source"]["branch"].as_str()), (Some("gitlab_oauth"), Some("main")));
-        assert_eq!((created["webhook_secret"].clone(), created["source"]["webhook_url"].clone()), (Value::Null, Value::Null));
+        assert_eq!(created["webhook_secret"], Value::Null, "nothing to add by hand");
+        assert_eq!(created["source"]["webhook_url"], format!("https://kb.test/hooks/docs/{source}"), "where DumbSlab pointed it");
         let hook_body = lab.hooks.borrow()[&9].clone();
         assert_eq!(
             (hook_body["url"].as_str(), hook_body["push_events"].as_bool()),
@@ -8587,13 +8588,15 @@ mod syncs {
         let (v, sent) = sync_now(&h);
         assert_eq!((puts(&sent), v["webhook"].as_str()), (1, Some("checked")));
 
-        // The workspace moves: the next sync points the webhook at the new address.
+        // The workspace moves (this server knows its address): a push never moves the webhook;
+        // Sync now points it at the new address.
         h.cfg.base_url = Some("https://wiki.kb.test".into());
-        let (v, sent) = pushed(&h);
+        assert_eq!(puts(&pushed(&h).1), 0, "pushes leave it alone");
+        let (v, sent) = sync_now(&h);
         assert_eq!((puts(&sent), v["webhook"].as_str()), (1, Some("pointed at this workspace's address")));
         assert_eq!(lab.hooks.borrow()[&hook_id]["url"], format!("https://wiki.kb.test/hooks/docs/{source}"));
         assert_eq!(lab.hook_token(hook_id), secret, "same secret");
-        assert_eq!(puts(&pushed(&h).1), 0, "right now");
+        assert_eq!(source_of(&h, &admin)["webhook_url"], format!("https://wiki.kb.test/hooks/docs/{source}"));
 
         // Someone deletes it on GitLab: Sync now adds it again, within the same sync, even with an
         // expired token to refresh and files to read.
@@ -8617,5 +8620,116 @@ mod syncs {
         let notice = run_broken(&h, job_of(&r), &answer, 2, Broken::Commit).expect("a notice");
         let added = *lab.hooks.borrow().keys().last().unwrap();
         assert_eq!((notice.method, notice.url), ("DELETE", format!("https://gitlab.com/api/v4/projects/3/hooks/{added}")));
+    }
+
+    #[test]
+    fn a_server_that_doesnt_know_its_address_keeps_the_webhook_where_it_was_set() {
+        let (mut h, admin, lab, topic) = gitlab_setup();
+        let answer = |c: &HttpCall| lab.answer(c);
+        let (source, hook_id) = add_gitlab_folder(&h, &admin, &lab, &topic, "docs");
+        let set = format!("https://kb.test/hooks/docs/{source}");
+        let secret = lab.hook_token(hook_id);
+        // Self-hosted without --base-url: the address is whatever Host a request names.
+        h.cfg.base_url = None;
+        assert!(!h.cfg.knows_its_address());
+        let Auth::Cookie(session) = admin.clone() else { panic!("a browser session") };
+        let from = |origin: &str, method: &str, path: &str, body: Option<Value>| {
+            h.send(&Request {
+                method: method.into(),
+                path: path.into(),
+                query: String::new(),
+                headers: vec![
+                    ("content-type".into(), "application/json".into()),
+                    ("x-dumbslab-client".into(), "web".into()),
+                    ("cookie".into(), format!("dumbslab_session={session}")),
+                ],
+                body: body.map(|b| b.to_string().into_bytes()).unwrap_or_default(),
+                origin: origin.into(),
+                client_ip: None,
+            })
+        };
+
+        // Sync now through an unexpected Host (a LAN address, a proxy, DNS rebinding): the webhook
+        // is checked where it was set, with its secret, and not pointed anywhere else.
+        let r = from("http://192.168.1.20:8080", "POST", &format!("/api/v1/docs-sources/{source}/sync"), None);
+        assert_eq!(r.status, 200, "{}", r.body);
+        let (finish, sent) = drive(&h, job_of(&r), &answer);
+        assert_eq!(filled(finish)["webhook"], "checked");
+        assert!(sent.iter().filter(|c| c.method == "PUT").all(|c| c.body.as_deref().unwrap().contains(&set)), "only the address it had");
+        assert_eq!((lab.hooks.borrow()[&hook_id]["url"].as_str(), lab.hook_token(hook_id)), (Some(set.as_str()), secret.clone()));
+
+        // Gone on GitLab: added again at the address it had, not the request's.
+        lab.hooks.borrow_mut().clear();
+        let r = from("http://evil.test", "POST", &format!("/api/v1/docs-sources/{source}/sync"), None);
+        assert_eq!(filled(drive(&h, job_of(&r), &answer).0)["webhook"], "added again");
+        let (_, body) = lab.hooks.borrow().iter().next().map(|(k, v)| (*k, v.clone())).unwrap();
+        assert_eq!(body["url"].as_str(), Some(set.as_str()));
+
+        // Only Reconnect, an admin's choice, moves it, and the answer shows where.
+        connect_gitlab(&h, &admin, &lab);
+        let r = from(
+            "https://wiki.example.test",
+            "PATCH",
+            &format!("/api/v1/docs-sources/{source}"),
+            Some(json!({ "gitlab_connection": true })),
+        );
+        assert_eq!(r.status, 200, "{}", r.body);
+        let moved = filled(drive(&h, job_of(&r), &answer).0);
+        assert_eq!(moved["source"]["webhook_url"], format!("https://wiki.example.test/hooks/docs/{source}"));
+    }
+
+    /// One step of a job like a host runs it: committed when it works, rolled back when it fails.
+    /// Returns its result and, when it failed, the notice the host sends.
+    fn step_with(h: &H, job: &mut Job, replies: Vec<HttpReply>) -> (dumbslab_core::ApiResult<Step>, Option<HttpCall>) {
+        let (out, next) = h
+            .store
+            .with_tx(|db| {
+                let mut j = job.clone();
+                let (step, notice) = connect::guarded_step(db, &h.cfg, &mut j, replies, chrono::Utc::now(), |_| None);
+                let ok = step.is_ok();
+                (((step, notice), j), ok)
+            })
+            .unwrap();
+        *job = next;
+        out
+    }
+
+    #[test]
+    fn a_late_sync_never_overwrites_a_newer_webhook_repair() {
+        let (h, admin, lab, topic) = gitlab_setup();
+        let answer = |c: &HttpCall| lab.answer(c);
+        let newest = || *lab.hooks.borrow().keys().last().unwrap();
+        let (source, _) = add_gitlab_folder(&h, &admin, &lab, &topic, "docs");
+        let stored = || db_run(&h, |db| db.one("SELECT hook_id FROM docs_source_links", &[])).unwrap().i64("hook_id");
+        lab.hooks.borrow_mut().clear();
+        let sync_now = || job_of(&h.call("POST", &format!("/api/v1/docs-sources/{source}/sync"), None, &admin));
+
+        // Sync A finds the webhook gone and adds a new one...
+        let mut a = sync_now();
+        let Ok(Step::Fetch(calls)) = step_with(&h, &mut a, vec![]).0 else { panic!("the listing") };
+        let Ok(Step::Fetch(calls)) = step_with(&h, &mut a, calls.iter().map(answer).collect()).0 else {
+            panic!("files and the new webhook")
+        };
+        assert_eq!(calls.last().unwrap().method, "POST");
+        let a_replies: Vec<HttpReply> = calls.iter().map(answer).collect();
+        let a_hook = newest();
+        // ...then takes too long: its lease runs out, and sync B takes over and repairs it too.
+        db_run(&h, |db| db.execute("UPDATE docs_sources SET running_until = '2000-01-01T00:00:00.000Z x'", &[]));
+        let (finish, _) = drive(&h, sync_now(), &answer);
+        assert_eq!(filled(finish)["webhook"], "added again");
+        let b_hook = newest();
+        assert!(b_hook != a_hook);
+        assert_eq!(stored(), b_hook);
+
+        // A resumes with GitLab's answer about its webhook: it may not save it over B's, so its
+        // step fails and its webhook comes off again. B's stays, and removing the folder removes it.
+        let (result, notice) = step_with(&h, &mut a, a_replies);
+        assert!(result.is_err(), "{result:?}");
+        let notice = notice.expect("A's webhook comes off");
+        assert_eq!((notice.method, notice.url), ("DELETE", format!("https://gitlab.com/api/v4/projects/3/hooks/{a_hook}")));
+        assert_eq!(stored(), b_hook, "B's kept");
+        let r = h.call("DELETE", &format!("/api/v1/docs-sources/{source}"), None, &admin);
+        drive(&h, background(&r)[0].clone(), &answer);
+        assert_eq!(lab.removed.borrow().last().unwrap(), &format!("https://gitlab.com/api/v4/projects/3/hooks/{b_hook}"));
     }
 }

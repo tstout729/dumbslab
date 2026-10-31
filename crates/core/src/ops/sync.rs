@@ -236,7 +236,9 @@ pub struct DocsSource {
     /// A token is saved (it's never shown).
     pub has_token: bool,
     /// `token` sources: where GitHub or GitLab sends push events. Add a webhook for pushes there with
-    /// this source's secret. Null for the others: the apps' pushes arrive by themselves.
+    /// this source's secret. `gitlab_oauth` sources: where DumbSlab pointed the project's webhook
+    /// (Reconnect points it at this workspace's address). Null for `github_app` sources, whose
+    /// pushes arrive through the App.
     pub webhook_url: Option<String>,
     /// Markdown files synced as posts.
     pub synced_files: i64,
@@ -291,7 +293,11 @@ fn source_view(ctx: &Ctx, r: &Row) -> ApiResult<DocsSource> {
         },
         disconnected: source.disconnected.as_deref().map(github_app::disconnected_message),
         has_token: !source.cred.token.is_empty(),
-        webhook_url: (source.link == Link::Token).then(|| ctx.url(&format!("/hooks/docs/{}", source.id))),
+        webhook_url: match source.link {
+            Link::Token => Some(ctx.url(&format!("/hooks/docs/{}", source.id))),
+            Link::GitLabOAuth { .. } => Some(source.cred.field("hook_url").to_string()).filter(|u| !u.is_empty()),
+            Link::GitHubApp { .. } => None,
+        },
         synced_files,
         owner,
         state: unreadable(sync::state_of(r, ctx.now), readable, &source.link),

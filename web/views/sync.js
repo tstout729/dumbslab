@@ -176,11 +176,18 @@ function reconnect(source, gitlab, reload) {
   const stuck = source.disconnected || source.last_status === 'failed';
   if (!gitlab.connected) return connectLink(gitlab.connect_url, stuck ? 'Connect GitLab' : 'Connect GitLab to reconnect', 'subtle');
   const b = button(`Reconnect with ${gitlab.account}`, { variant: stuck ? 'primary' : 'ghost', size: 'sm' });
-  b.addEventListener('click', () => busy(b, async () => {
-    await api.patch(`/docs-sources/${enc(source.id)}`, { gitlab_connection: true });
-    toast('Reconnected');
-    reload();
-  }).catch(toastError));
+  b.addEventListener('click', async () => {
+    // Reconnecting points the project's webhook at this server's address as the admin reaches it:
+    // say where, since only this moves it.
+    const to = `${location.origin}/hooks/docs/${source.id}`;
+    const ok = await confirmDialog({ title: `Reconnect ${source.repository}?`, message: `DumbSlab uses ${gitlab.account}’s GitLab access for this folder from now on, and points the project’s webhook at ${to}.`, confirmLabel: 'Reconnect' });
+    if (!ok) return;
+    busy(b, async () => {
+      const r = await api.patch(`/docs-sources/${enc(source.id)}`, { gitlab_connection: true });
+      toast(r.source.webhook_url ? `Reconnected. The webhook points at ${r.source.webhook_url}` : 'Reconnected');
+      reload();
+    }).catch(toastError);
+  });
   return b;
 }
 
@@ -232,6 +239,7 @@ function sourceCard(source, reload, gitlab) {
       h('span', { class: 'badge' }, plural(source.synced_files, 'post'))),
     h('div', { class: 'app-body' },
       h('div', { class: 'token-meta' }, stateLine(source), connectionMeta(source)),
+      source.connection === 'gitlab_oauth' && source.webhook_url ? h('p', { class: 'small muted' }, 'Webhook: ', h('code', null, source.webhook_url)) : null,
       source.disconnected ? h('p', { class: 'form-error small' }, source.disconnected) : null,
       stateNotes(source),
       docsResult(source.last_result),

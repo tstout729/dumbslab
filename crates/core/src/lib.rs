@@ -71,6 +71,18 @@ pub struct HostConfig {
     pub telemetry: telemetry::Telemetry,
 }
 
+impl HostConfig {
+    /// Whether this server's public address comes from its own settings rather than from a
+    /// request: hosted DumbSlab's front Worker sets it to the workspace address it routed (only
+    /// `<address>.<root domain>`; an address the workspace moved away from is answered before the
+    /// core runs), and a self-hosted server has it when `--base-url` (`BASE_URL` on Cloudflare) is
+    /// set. Otherwise the address is the request's `Host`, which anyone can choose, so DumbSlab
+    /// never tells another service on its own to call it there (see `sync::docs`'s webhook upkeep).
+    pub fn knows_its_address(&self) -> bool {
+        self.base_url.is_some()
+    }
+}
+
 /// What a hosted workspace's plan depends on that only the host knows.
 #[derive(Clone, Debug)]
 pub struct Hosting {

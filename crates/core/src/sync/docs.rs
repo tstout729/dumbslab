@@ -338,6 +338,8 @@ pub struct DocsJob {
     /// A webhook GitLab added during this sync, until the step that saves it commits: if that step
     /// fails, or never runs or commits, it comes off again ([`DocsJob::failure_notice`]).
     added_hook: Option<i64>,
+    /// Where this sync points the webhook (see [`DocsJob::with_hook`]).
+    hook_target: String,
 }
 
 /// A request about a GitLab app source's webhook, sent along with a step's others.
@@ -356,29 +358,34 @@ impl DocsJob {
         format!("{}/hooks/docs/{}", self.base_url, self.source.id)
     }
 
-    /// Adds the request about a GitLab app source's webhook, if one is due, to `calls`: putting it
-    /// right when someone chose Sync now or the workspace's address changed since it was set (it
-    /// moved), and adding it again when it's gone.
-    fn with_hook(&mut self, mut calls: Vec<HttpCall>) -> Vec<HttpCall> {
+    /// Adds the request about a GitLab app source's webhook, if one is due, to `calls`. Only Sync
+    /// now looks after it (a push came through it, so it's there): it puts the webhook right, with
+    /// the source's secret, and adds it again if it's gone. It points it at this workspace's
+    /// address only when the server knows its address ([`HostConfig::knows_its_address`]): then a
+    /// workspace that moved fixes its webhook. Otherwise the address is the request's `Host`, which
+    /// anyone can choose, so the webhook stays where it was set; only Reconnect, an admin's
+    /// choice that shows the new address, moves it.
+    fn with_hook(&mut self, cfg: &HostConfig, mut calls: Vec<HttpCall>) -> Vec<HttpCall> {
         let Link::GitLabOAuth { project_id, hook_id, .. } = self.source.link else { return calls };
-        let (url, secret, token) = (self.hook_url(), self.source.cred.field("webhook_secret").to_string(), self.source.cred.token.clone());
-        if secret.is_empty() {
+        if !self.manual {
             return calls;
         }
+        let stored = self.source.cred.field("hook_url").to_string();
+        let target = if cfg.knows_its_address() { self.hook_url() } else { stored };
+        let (secret, token) = (self.source.cred.field("webhook_secret").to_string(), self.source.cred.token.clone());
+        if secret.is_empty() || target.is_empty() {
+            return calls;
+        }
+        self.hook_target = target.clone();
         let call = match hook_id {
-            _ if self.hook_missing => {
+            Some(hook) if !self.hook_missing => {
+                self.hook = HookCall::Editing;
+                super::gitlab_app::edit_hook_call(&token, project_id, hook, &target, &secret)
+            }
+            _ => {
                 self.hook_missing = false;
                 self.hook = HookCall::Adding;
-                super::gitlab_app::add_hook_call(&token, project_id, &url, &secret)
-            }
-            Some(hook) if self.manual || self.source.cred.field("hook_url") != url => {
-                self.hook = HookCall::Editing;
-                super::gitlab_app::edit_hook_call(&token, project_id, hook, &url, &secret)
-            }
-            Some(_) => return calls,
-            None => {
-                self.hook = HookCall::Adding;
-                super::gitlab_app::add_hook_call(&token, project_id, &url, &secret)
+                super::gitlab_app::add_hook_call(&token, project_id, &target, &secret)
             }
         };
         calls.push(call);
@@ -495,6 +502,7 @@ pub(crate) fn start(db: &dyn Db, source: Source, base_url: &str, manual: bool, n
         hook: HookCall::None,
         hook_missing: false,
         added_hook: None,
+        hook_target: String::new(),
     }))))
 }
 
@@ -532,7 +540,7 @@ pub fn step(db: &dyn Db, cfg: &HostConfig, j: &mut DocsJob, replies: Vec<HttpRep
             Link::Token | Link::GitLabOAuth { .. } => {
                 j.phase = Phase::Listing;
                 let calls = j.source.repo.tree_calls(j.source.token());
-                Ok(Step::Fetch(j.with_hook(calls)))
+                Ok(Step::Fetch(j.with_hook(cfg, calls)))
             }
         },
         Phase::Minting(link) => minted(db, j, &replies, link, now),
@@ -546,6 +554,15 @@ pub fn step(db: &dyn Db, cfg: &HostConfig, j: &mut DocsJob, replies: Vec<HttpRep
 fn fail(db: &dyn Db, j: &DocsJob, message: &str, now: DateTime<Utc>) -> ApiResult<Step> {
     super::finish(db, TABLE, j.source.id.as_str().into(), &j.lease, Ended { status: "failed", error: Some(message), result: None }, now)?;
     Ok(Step::Done(Finish::Fail(super::sync_failed(message))))
+}
+
+/// Changes the source's own row while this run still holds its lease (`set` is the SQL after
+/// `SET`; `params` its values). `false` when another sync took over: then nothing else about the
+/// source may be written either, since that sync's writes are the current ones.
+fn update_held(db: &dyn Db, j: &DocsJob, set: &str, mut params: Vec<SqlValue>) -> ApiResult<bool> {
+    params.extend(params![j.source.id.clone(), j.lease.clone()]);
+    let n = db.execute(&format!("UPDATE docs_sources SET {set} WHERE id = ? AND running_until = ?"), &params)?;
+    Ok(n == 1)
 }
 
 fn lost() -> Step {
@@ -772,6 +789,9 @@ fn minted(db: &dyn Db, j: &mut DocsJob, replies: &[HttpReply], link: bool, now: 
             // GitHub says the installation can't reach the repository: it waits, disconnected,
             // until it's put back (see `github_app::CheckJob`).
             if reply.status == 422 {
+                if !super::holds(db, TABLE, j.source.id.as_str().into(), &j.lease)? {
+                    return Ok(lost());
+                }
                 db.execute(
                     "UPDATE docs_source_links SET disconnected = ? WHERE source_id = ? AND disconnected IS NULL",
                     &params![super::github_app::REPOSITORY_REMOVED, j.source.id.clone()],
@@ -781,7 +801,9 @@ fn minted(db: &dyn Db, j: &mut DocsJob, replies: &[HttpReply], link: bool, now: 
         }
     };
     if let Some(name) = minted.full_name.filter(|n| *n != j.source.repo.repo) {
-        db.execute("UPDATE docs_sources SET repo = ?, updated_at = ? WHERE id = ?", &params![name.clone(), ts(now), j.source.id.clone()])?;
+        if !update_held(db, j, "repo = ?, updated_at = ?", params![name.clone(), ts(now)])? {
+            return Ok(lost());
+        }
         j.source.repo.repo = name;
     }
     j.source.cred.token = minted.token;
@@ -797,6 +819,9 @@ fn refreshed(db: &dyn Db, cfg: &HostConfig, j: &mut DocsJob, replies: &[HttpRepl
     let tokens = match super::gitlab_app::read_refresh(&reply) {
         Ok(t) => t,
         Err(message) => {
+            if !super::holds(db, TABLE, j.source.id.as_str().into(), &j.lease)? {
+                return Ok(lost());
+            }
             if reply.status != 0 && reply.status < 500 && reply.status != 429 {
                 db.execute(
                     "UPDATE docs_source_links SET disconnected = ? WHERE source_id = ?",
@@ -808,15 +833,14 @@ fn refreshed(db: &dyn Db, cfg: &HostConfig, j: &mut DocsJob, replies: &[HttpRepl
     };
     let expires_at = super::gitlab_app::expiry(now, &tokens).map(ts);
     super::gitlab_app::apply_tokens(&mut j.source.cred, tokens);
-    if !super::holds(db, TABLE, j.source.id.as_str().into(), &j.lease)? {
+    let sealed = super::seal(cfg, &owner(&j.source.id), j.source.repo.provider.id(), &j.source.cred)?;
+    if !update_held(db, j, "secret = ?, updated_at = ?", params![sealed, ts(now)])? {
         return Ok(lost());
     }
-    let sealed = super::seal(cfg, &owner(&j.source.id), j.source.repo.provider.id(), &j.source.cred)?;
-    db.execute("UPDATE docs_sources SET secret = ?, updated_at = ? WHERE id = ?", &params![sealed, ts(now), j.source.id.clone()])?;
     db.execute("UPDATE docs_source_links SET token_expires_at = ? WHERE source_id = ?", &params![expires_at, j.source.id.clone()])?;
     j.phase = Phase::Listing;
     let calls = j.source.repo.tree_calls(j.source.token());
-    Ok(Step::Fetch(j.with_hook(calls)))
+    Ok(Step::Fetch(j.with_hook(cfg, calls)))
 }
 
 /// Reads the answer about a GitLab app source's webhook, if one came with `replies` (last), and
@@ -829,7 +853,7 @@ fn take_hook_reply(db: &dyn Db, cfg: &HostConfig, j: &mut DocsJob, replies: &[Ht
         return Ok(rest);
     }
     let reply = rest.pop().unwrap_or_default();
-    let moved = j.source.cred.field("hook_url") != j.hook_url();
+    let moved = j.source.cred.field("hook_url") != j.hook_target;
     match (kind, reply.status) {
         (HookCall::Editing, 200..=299) => {
             save_hook(db, cfg, j, None, now)?;
@@ -855,14 +879,15 @@ fn take_hook_reply(db: &dyn Db, cfg: &HostConfig, j: &mut DocsJob, replies: &[Ht
 }
 
 /// Keeps where the webhook points (with the source's credentials) and, when it was added again,
-/// its new id.
+/// its new id. Only while this run holds its lease: a sync that took over may have put its own
+/// webhook in place, so this one fails instead, and the webhook it added comes off again (see
+/// [`DocsJob::failure_notice`]).
 fn save_hook(db: &dyn Db, cfg: &HostConfig, j: &mut DocsJob, added: Option<i64>, now: DateTime<Utc>) -> ApiResult<()> {
-    j.source.cred.fields.insert("hook_url".into(), j.hook_url());
+    j.source.cred.fields.insert("hook_url".into(), j.hook_target.clone());
     let sealed = super::seal(cfg, &owner(&j.source.id), j.source.repo.provider.id(), &j.source.cred)?;
-    db.execute(
-        "UPDATE docs_sources SET secret = ?, updated_at = ? WHERE id = ? AND running_until = ?",
-        &params![sealed, ts(now), j.source.id.clone(), j.lease.clone()],
-    )?;
+    if !update_held(db, j, "secret = ?, updated_at = ?", params![sealed, ts(now)])? {
+        return Err(super::sync_failed("Another sync of this source took over before this one finished."));
+    }
     if let (Some(id), Link::GitLabOAuth { hook_id, .. }) = (added, &mut j.source.link) {
         *hook_id = Some(id);
         db.execute("UPDATE docs_source_links SET hook_id = ? WHERE source_id = ?", &params![id, j.source.id.clone()])?;
@@ -1074,7 +1099,7 @@ fn listing(db: &dyn Db, cfg: &HostConfig, j: &mut DocsJob, replies: &[HttpReply]
     if todo.is_empty() {
         // A webhook that turned out to be gone is added again first.
         if j.hook_missing {
-            let calls = j.with_hook(vec![]);
+            let calls = j.with_hook(cfg, vec![]);
             j.phase = Phase::Images(plan, vec![]);
             j.staged.append(&mut ctx.effects);
             return Ok(Step::Fetch(calls));
@@ -1082,7 +1107,7 @@ fn listing(db: &dyn Db, cfg: &HostConfig, j: &mut DocsJob, replies: &[HttpReply]
         return write(&mut ctx, j, plan, vec![], vec![], now);
     }
     let calls = todo.iter().map(|w| j.source.repo.blob_call(&w.sha, j.source.token())).collect();
-    let calls = j.with_hook(calls);
+    let calls = j.with_hook(cfg, calls);
     plan.batch = todo;
     j.phase = Phase::Reading(plan);
     j.staged.append(&mut ctx.effects);
