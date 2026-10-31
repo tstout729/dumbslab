@@ -10191,6 +10191,71 @@ mod syncs {
     }
 
     #[test]
+    fn a_source_renamed_while_its_files_are_fetched_writes_nothing() {
+        let mut h = H::new();
+        let (admin, _) = h.setup();
+        with_key(&mut h);
+        with_app(&mut h);
+        connect_github(&h, &admin, "&installation_id=42&setup_action=install", &installer);
+        let topic = h.ok("POST", "/api/v1/topics", Some(json!({ "name": "Handbook" })), &admin)["id"].as_str().unwrap().to_string();
+        let add = |input: Value| h.ok("POST", "/api/v1/docs-sources", Some(input), &admin)["source"]["id"].as_str().unwrap().to_string();
+        // An older token folder of acme/handbook, and a newer App folder of acme/docs (repository 7).
+        add(json!({ "provider": "github", "repository": "acme/handbook", "folder": "handbook", "topic_id": topic, "token": "ghp_x" }));
+        let app =
+            add(json!({ "provider": "github", "installation_id": 42, "repository": "acme/docs", "folder": "handbook", "topic_id": topic }));
+        let repo = Repo::new(&[("README.md", b"# Handbook\n"), ("guides/setup.md", b"# Setting up\n")]);
+        // GitHub, with repository 7 under its name at the time.
+        let name = RefCell::new("acme/docs");
+        let github = |c: &HttpCall| -> HttpReply {
+            if c.url == "https://api.github.com/app/installations/42/access_tokens" {
+                let now = *name.borrow();
+                let body =
+                    json!({ "token": "ghs_x", "expires_at": "2099-01-01T00:00:00Z", "repositories": [{ "id": 7, "full_name": now }] });
+                return HttpReply { status: 201, body: body.to_string() };
+            }
+            repo.github(&HttpCall { url: c.url.replace("/repos/acme/handbook/", "/repos/acme/docs/"), ..c.clone() })
+        };
+        let posts_of = |id: &str| {
+            count(
+                &h,
+                &format!(
+                    "SELECT COUNT(*) FROM posts WHERE id IN (SELECT target_id FROM docs_items WHERE source_id = '{id}' AND kind = 'doc')"
+                ),
+            )
+        };
+        let topics = || count(&h, "SELECT COUNT(*) FROM topics");
+
+        // The App folder's sync gets its token, lists the folder, and asks for the files.
+        let mut a = job_of(&h.call("POST", &format!("/api/v1/docs-sources/{app}/sync"), None, &admin));
+        let Ok(Step::Fetch(calls)) = step_with(&h, &mut a, vec![]).0 else { panic!("a token") };
+        let Ok(Step::Fetch(calls)) = step_with(&h, &mut a, calls.iter().map(github).collect()).0 else { panic!("a listing") };
+        let Ok(Step::Fetch(calls)) = step_with(&h, &mut a, calls.iter().map(github).collect()).0 else { panic!("files to read") };
+        let files: Vec<HttpReply> = calls.iter().map(github).collect();
+        let before = topics();
+        // Meanwhile a push says repository 7 is acme/handbook now: its folder is renamed (and,
+        // with a sync running, left pending).
+        *name.borrow_mut() = "acme/handbook";
+        let push =
+            json!({ "ref": "refs/heads/main", "repository": { "id": 7, "full_name": "acme/handbook" }, "installation": { "id": 42 } });
+        assert_eq!(app_hook(&h, "push", &push, "gh-hook-secret").body["status"], "started");
+        // The run's next step finds its folder isn't the one it started with: it writes no posts
+        // or topics, and ends so the next sync starts afresh (which then finds the older twin).
+        let (result, _) = step_with(&h, &mut a, files);
+        let Ok(Step::Done(Finish::Fill(v))) = result else { panic!("an end, not {result:?}") };
+        assert_eq!((v["created"].as_i64(), v["done"].as_bool()), (Some(0), Some(false)), "{v}");
+        assert_eq!((posts_of(&app), topics()), (0, before));
+        let list = h.ok("GET", "/api/v1/docs-sources", None, &admin);
+        let s = list["items"].as_array().unwrap().iter().find(|s| s["id"] == app.as_str()).unwrap().clone();
+        assert_eq!((s["repository"].as_str(), s["pending"].as_bool()), (Some("acme/handbook"), Some(true)), "{s}");
+        assert!(s["last_error"].as_str().unwrap().contains("changed while it synced"), "{s}");
+        assert!(s["disconnected"].as_str().unwrap().contains("Another source already syncs"), "the older token folder's twin now");
+        let r = h.call("POST", &format!("/api/v1/docs-sources/{app}/sync"), None, &admin);
+        let (finish, _) = drive(&h, job_of(&r), &github);
+        assert!(matches!(finish, Finish::Fail(ref e) if e.message.contains("Another source already syncs")), "{finish:?}");
+        assert_eq!(posts_of(&app), 0);
+    }
+
+    #[test]
     fn sync_now_on_a_disconnected_source_asks_github_again() {
         let (h, admin, source) = github_with_a_source();
         let gh = GitHubNow::new();
