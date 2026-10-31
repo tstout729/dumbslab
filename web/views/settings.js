@@ -562,7 +562,11 @@ function ssoSetupNote(s) {
   const q = new URLSearchParams(location.search);
   const done = q.get('sso_setup');
   const error = q.get('sso_error');
-  if (done === 'done') return okNote(`Single sign-on is set up: people can sign in with ${s.name}. Try it from a private window before you require it.`);
+  // Once domains are allowed (say, a suggestion confirmed), it's simply set up.
+  if (done === 'done' || (done === 'domain_needed' && (s.allowed_domains || []).length)) return okNote(`Single sign-on is set up: people can sign in with ${s.name}. Try it from a private window before you require it.`);
+  if (done === 'domain_needed' && s.suggested_domain) {
+    return warnNote('Single sign-on is set up. Confirm your organization’s email domain below, so people’s first sign-ins can find their accounts here by email.');
+  }
   if (done === 'domain_needed') {
     return warnNote(`Single sign-on is set up, but ${s.name} didn’t confirm your email address’s domain. Add your organization’s email domains below, so people’s first sign-ins can find their accounts here by email.`);
   }
@@ -571,6 +575,13 @@ function ssoSetupNote(s) {
 }
 
 function ssoStatus(s) {
+  const paused = s.require_sso_paused
+    ? warnNote('“Require single sign-on” was turned off when this workspace switched Microsoft apps: some people’s accounts were linked through the old app, and must be linked again. They sign in with Microsoft (matched by verified email), or with their password and then link Microsoft in Settings › Profile. Turn it back on once they have.')
+    : null;
+  return [ssoMainStatus(s), paused];
+}
+
+function ssoMainStatus(s) {
   if (s.shared_app_missing) {
     return warnNote(`Single sign-on is off: this server doesn’t have its own ${s.name} app any more. Until it’s back, everyone can sign in with a password. To keep single sign-on on, set up your own app.`);
   }
@@ -629,8 +640,24 @@ function ssoSetupButtons(s, providers) {
     h('p', { class: 'field-hint' }, 'Sign in once with your organization’s account: a Google Workspace account, a Microsoft work or school account, or your Slack workspace’s. DumbSlab takes your organization from it. Nothing to register or paste.'));
 }
 
+/** Slack's suggested domain: Slack confirmed the admin's address, not that its domain is the organization's. */
+function ssoSuggestion(s, reload) {
+  const d = s.suggested_domain;
+  if (!d) return null;
+  const allow = button(`Allow ${d}`, { variant: 'primary', size: 'sm' });
+  allow.addEventListener('click', () => busy(allow, async () => {
+    await api.patch('/sso', { allowed_domains: [...(s.allowed_domains || []), d] });
+    toast(`People at ${d} can now be found by email`);
+    reload();
+  }).catch(toastError));
+  return h('div', { class: 'callout callout-warn', role: 'status' }, icon('alert', { size: 15 }),
+    h('div', { class: 'stack' },
+      h('span', null, `Your Slack address is at ${d}. Slack confirmed the address, but not that ${d} is your organization’s. If it is, allow it, so people’s first sign-ins can find their accounts here by email.`),
+      h('div', null, allow)));
+}
+
 /** Shared mode: what setting up found, and the toggles. */
-function ssoSharedForm(s, onSaved) {
+function ssoSharedForm(s, onSaved, reload) {
   const info = SSO_SHARED[s.provider] || { label: s.name, org: 'Organization' };
   const derived = s.provider === 'microsoft' ? s.tenant : s.provider === 'slack' ? s.team : null;
   const domains = input({ value: (s.allowed_domains || []).join(', '), spellcheck: 'false', autocapitalize: 'off', placeholder: 'acme.com' });
@@ -646,6 +673,7 @@ function ssoSharedForm(s, onSaved) {
     toast('Single sign-on saved');
   },
   h('p', { class: 'small' }, `Signs in through DumbSlab’s own ${info.label} app: nothing to register, renew or paste.`),
+  ssoSuggestion(s, reload),
   derived ? h('div', { class: 'field' }, h('span', { class: 'field-label' }, info.org), h('p', null, h('code', null, derived)),
     h('p', { class: 'field-hint' }, `Only people in this ${s.provider === 'slack' ? 'Slack workspace' : 'directory'} can sign in. To change it, set up again with another account.`)) : null,
   field('Allowed email domains', domains, { hint: domainsHint }),
@@ -745,7 +773,7 @@ async function ssoSection(ctx) {
     : h('p', { class: 'muted small' }, 'Using your own app needs a connector key on this server, to encrypt its client secret. Whoever runs the server can set CONNECTOR_KEY (or DUMBSLAB_CONNECTOR_KEY when self-hosting).');
   const ownApp = s.provider && !s.shared;
   const body = [];
-  if (s.shared && s.provider) body.push(ssoSharedForm(s, onSaved));
+  if (s.shared && s.provider) body.push(ssoSharedForm(s, onSaved, () => ctx.reload()));
   if (shared.length) {
     const buttons = ssoSetupButtons(s, shared);
     body.push(s.shared ? h('details', { class: 'sso-more' }, h('summary', null, 'Set up again, or with another provider'), buttons) : buttons);

@@ -79,7 +79,8 @@ pub struct UpdateSsoInput {
 }
 
 fn update_sso(ctx: &mut Ctx, input: UpdateSsoInput) -> ApiResult<Deferred<SsoSettings>> {
-    let mut conf = sso::load(ctx.db)?;
+    let before = sso::load(ctx.db)?;
+    let mut conf = before.clone();
     let mut secret_changed = false;
     if let Some(p) = input.provider
         && conf.provider != Some(p)
@@ -87,6 +88,7 @@ fn update_sso(ctx: &mut Ctx, input: UpdateSsoInput) -> ApiResult<Deferred<SsoSet
         // Another provider means another app: nothing of the old one carries over.
         conf.provider = Some(p);
         conf.shared = false;
+        conf.suggested_domain.clear();
         conf.issuer = p.fixed_issuer().unwrap_or_default().to_string();
         conf.tenant.clear();
         conf.team.clear();
@@ -205,6 +207,7 @@ fn update_sso(ctx: &mut Ctx, input: UpdateSsoInput) -> ApiResult<Deferred<SsoSet
     }
     if let Some(b) = input.require_sso {
         conf.require_sso = b;
+        conf.require_sso_paused = false;
     }
     if let Some(b) = input.enabled {
         conf.enabled = b;
@@ -244,10 +247,14 @@ fn update_sso(ctx: &mut Ctx, input: UpdateSsoInput) -> ApiResult<Deferred<SsoSet
             return Err(ApiError::bad_request(format!("to turn single sign-on on, also set {}", missing.join(", "))));
         }
     }
+    // Another Microsoft app can't match accounts linked by the old one's `sub`.
+    let forgotten = sso::forget_app_bound(ctx.db, &before, &mut conf)?;
     sso::save(ctx.db, &conf)?;
     let data = json!({
         "provider": conf.provider.map(Provider::as_str),
         "shared": conf.shared,
+        "links_forgotten": forgotten,
+        "require_sso_paused": conf.require_sso_paused && !before.require_sso_paused,
         "enabled": conf.enabled,
         "require_sso": conf.require_sso,
         "auto_provision": conf.auto_provision,
@@ -312,7 +319,9 @@ fn setup_sso(ctx: &mut Ctx, input: SetupSsoInput) -> ApiResult<Deferred<SetupSta
             ),
         ));
     }
-    ctx.effects.push(Effect::Connect(Job::Sso(SsoJob::setup(&ctx.base_url, &ctx.actor.user_id, &session_hash, p))));
+    // What this checked: setting up saves nothing if the settings change before the admin is back.
+    let fingerprint = sso::setup_fingerprint(ctx.cfg, p, &conf).ok_or_else(|| sso::shared_unavailable(p))?;
+    ctx.effects.push(Effect::Connect(Job::Sso(SsoJob::setup(&ctx.base_url, &ctx.actor.user_id, &session_hash, p, fingerprint))));
     Ok(Deferred::Pending)
 }
 

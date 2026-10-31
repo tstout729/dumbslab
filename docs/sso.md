@@ -18,13 +18,15 @@ DumbSlab reads your organization from the account you sign in with:
 | --- | --- | --- |
 | Google | your Google Workspace domain (the account's `hd`) | that domain |
 | Microsoft | your Microsoft Entra directory (the account's `tid`) | your email's domain, when Microsoft confirms its owner (`xms_edov`) |
-| Slack | your Slack workspace (`https://slack.com/team_id`) | your email's domain, when Slack says it's verified |
+| Slack | your Slack workspace (`https://slack.com/team_id`) | none at first: Slack confirms your address, not that its domain is your organization's. Settings suggests it, and one click allows it |
 
-Personal Google accounts and personal Microsoft accounts can't be used: they have no organization. DumbSlab never takes a free-mail domain such as gmail.com or outlook.com as an allowed domain. When it can't take a domain from your sign-in, Settings says so, and you add your email domains there.
+Personal Google accounts and personal Microsoft accounts can't be used: they have no organization. DumbSlab never allows or suggests a free-mail domain such as gmail.com, outlook.com or tutamail.com. When it can't take a domain from your sign-in, Settings says so, and you add your email domains there (or allow the one it suggests).
 
 **Microsoft approval.** Some organizations let only their administrators approve new apps. If yours does, Microsoft asks for an administrator, and DumbSlab says so. A Microsoft Entra administrator can approve DumbSlab (under Enterprise applications › Admin consent requests, when your organization uses them), or do the setup themselves if they're an admin here too.
 
 **Replacing other settings.** If single sign-on is already set up with your own app, or with another provider, Settings asks before replacing it. Accounts linked at the old provider stop signing in.
+
+**Switching apps.** You can switch between DumbSlab's app and your own at any time; linked accounts carry over. Microsoft gives each app a different `sub` for the same person, so DumbSlab links Microsoft accounts by their `oid`, which is the same for every app in your directory. Microsoft accounts linked before that (self-hosted servers that used single sign-on earlier) are linked by `sub`; each moves to its `oid` the next time that person signs in. If you switch Microsoft apps before everyone has, the links that couldn't move are forgotten, and if "Require single sign-on" is on and anyone besides admins lost a link, it's turned off and Settings says why. Those people sign in with Microsoft (matched by verified email) or with their password, and link Microsoft in Settings › Profile. Then turn "Require single sign-on" back on.
 
 **If the server loses its app.** Single sign-on turns itself off, so "Require single sign-on" never locks anyone out, and Settings says why. Everyone can sign in with a password until the app is back, or until you set up your own app.
 
@@ -57,7 +59,7 @@ Settings › Single sign-on shows it with a copy button. If the workspace's addr
 
 ## Who can sign in
 
-- **Linked accounts.** DumbSlab links each account at the provider to one person here, by the provider's issuer and its permanent ID for the account (`sub`). A linked account signs in as that person, whatever email it has later.
+- **Linked accounts.** DumbSlab links each account at the provider to one person here, by the provider's issuer and its permanent ID for the account: `sub`, or for Microsoft `oid` (its `sub` is different for every app). A linked account signs in as that person, whatever email it has later.
 - **First sign-in.** An account that isn't linked yet joins the person here with the same email only when the provider says the address is verified and its domain is one of the allowed domains. The rules for each provider are in the table below.
 - **Linking your own account.** When the provider doesn't vouch for someone's email, or their email there differs from the one here, they sign in with their password and choose Settings › Profile › "Link your … account". Linking must finish in the same browser session that started it, while it's still signed in: a link started in a session that is then signed out (or revoked) can't be finished anywhere.
 - **Auto-provisioning** is off by default. When it's on, someone whose verified email is at an allowed domain, and who has no account here, joins as a member.

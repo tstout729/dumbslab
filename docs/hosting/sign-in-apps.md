@@ -41,6 +41,8 @@ Register the app in the [Microsoft Entra admin center](https://entra.microsoft.c
 6. Under **Branding & properties**, set the publisher domain to `dumbslab.com`, and the home page and privacy links.
 7. Copy the **Application (client) ID** from the app's **Overview**.
 
+**Who's who.** DumbSlab links Microsoft accounts by `oid`, which is the same for every app in a directory, so workspaces can switch between this app and their own without losing links. Microsoft sends `oid` for the `profile` scope, which DumbSlab asks for.
+
 **Why `xms_edov`.** Microsoft's `email` claim isn't proof that the person owns the address. `xms_edov` says the domain's owner verified it. Without it, setting up still works, but admins must type in their email domains, and people link their Microsoft accounts before signing in.
 
 **Secret expiry.** Microsoft client secrets expire. Put a reminder before the date. Make a new secret, update `SSO_MICROSOFT_CLIENT_SECRET`, and then delete the old one. If the secret expires, Microsoft sign-ins fail until you replace it. Admins keep their passwords, so they can still get in.
@@ -55,7 +57,7 @@ Slack uses the one DumbSlab Slack app, which also powers Add to Slack and connec
 2. The user token scopes `openid`, `email` and `profile`. Slack asks for these in their own sign-in, separate from the bot's install.
 3. Distribution turned on (**Manage Distribution**), so people outside DumbSlab's own Slack workspace can sign in with it.
 
-Its client ID and secret are the same `SLACK_CLIENT_ID` and `SLACK_CLIENT_SECRET` as the rest of the Slack app.
+Its client ID and secret are the same `SLACK_CLIENT_ID` and `SLACK_CLIENT_SECRET` as the rest of the Slack app. Slack confirms people's addresses, not that a domain is their organization's, so setting up only suggests the admin's email domain; they allow it with one click.
 
 ## Where the values go
 

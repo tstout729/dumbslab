@@ -6,7 +6,9 @@
 //!   - **Shared mode** (Google, Microsoft and Slack): the host registered its own app with the
 //!     provider once ([`SharedApps`]), so an admin sets single sign-on up by signing in with their
 //!     organization's account (`setup_sso`). The organization comes from that ID token: Google's
-//!     hosted domain (`hd`), Microsoft's directory (`tid`) or Slack's workspace (team). If the host
+//!     hosted domain (`hd`), Microsoft's directory (`tid`) or Slack's workspace (team). An email
+//!     domain is allowed only on the provider's word that it's the organization's (`hd`,
+//!     `xms_edov`); Slack's is only suggested, for an admin to allow. If the host
 //!     later lacks the app, single sign-on is off, so "Require single sign-on" never locks anyone
 //!     out. Hosted DumbSlab sends every workspace's sign-ins back through the root domain's
 //!     `/sso/callback`, which forwards to the workspace the `state` names (`{address}.{random}`).
@@ -20,7 +22,8 @@
 //! - The ID token comes straight from the token endpoint over TLS, so (OpenID Connect Core 1.0,
 //!   3.1.3.7, step 6) its signature isn't checked. Its issuer, audience, authorized party, expiry,
 //!   issue time and nonce are.
-//! - Accounts are linked by (issuer, subject). A first sign-in attaches to an existing person by
+//! - Accounts are linked by (issuer, subject): `sub`, or Microsoft's `oid` ([`identity_key`]), so
+//!   links survive a change of app. A first sign-in attaches to an existing person by
 //!   email only when the provider vouches for the address and its domain is one of the
 //!   workspace's ([`vouched_email`]). Otherwise people link their accounts while signed in
 //!   (`link_sso`), or join on their own when the workspace turns on auto-provisioning.
@@ -43,14 +46,20 @@
 //!   is verified, and comes only with `email`
 //!   (<https://learn.microsoft.com/en-us/entra/identity-platform/optional-claims-reference>); new
 //!   multi-tenant apps drop unverified emails from tokens
-//!   (<https://learn.microsoft.com/en-us/graph/applications-authenticationbehaviors>). A directory
+//!   (<https://learn.microsoft.com/en-us/graph/applications-authenticationbehaviors>). `sub` is
+//!   pairwise, different for every app; `oid` is the same for every app in a directory and comes
+//!   with the `profile` scope
+//!   (<https://learn.microsoft.com/en-us/entra/identity-platform/id-token-claims-reference>). A directory
 //!   can require an administrator to approve a new app (AADSTS90094, or AADSTS90095 with the admin
 //!   consent workflow; <https://learn.microsoft.com/en-us/entra/identity-platform/reference-error-codes>,
 //!   <https://learn.microsoft.com/en-us/entra/identity-platform/howto-convert-app-to-be-multi-tenant>).
 //! - Slack: Sign in with Slack's issuer is `https://slack.com`, its token endpoint
 //!   `openid.connect.token`, its user scopes `openid email profile`, and its ID token names the
 //!   Slack workspace in `https://slack.com/team_id`
-//!   (<https://docs.slack.dev/authentication/sign-in-with-slack/>).
+//!   (<https://docs.slack.dev/authentication/sign-in-with-slack/>). Its `email_verified` confirms
+//!   the address, not that the domain is the organization's.
+//! - Google's and Slack's discovery documents say `"subject_types_supported": ["public"]`: every
+//!   app gets the same `sub` (OpenID Connect Core 1.0, 8). Microsoft's say `["pairwise"]`.
 
 use std::collections::BTreeMap;
 
@@ -233,8 +242,15 @@ pub struct Config {
     pub client_secret: Option<String>,
     /// Lowercase domains, e.g. `acme.com`.
     pub allowed_domains: Vec<String>,
+    /// Slack, set up by signing in: the domain of the admin's address, which Slack confirmed but
+    /// doesn't say is the organization's. Only a suggestion until an admin allows it.
+    pub suggested_domain: String,
     pub auto_provision: bool,
     pub require_sso: bool,
+    /// "Require single sign-on" was turned off for the admin when the workspace's Microsoft app
+    /// changed, because accounts linked through the old app had to be linked again (see
+    /// [`forget_app_bound`]). Cleared when an admin sets `require_sso` again.
+    pub require_sso_paused: bool,
     /// Other OIDC providers: the name on the button.
     pub label: String,
 }
@@ -368,65 +384,238 @@ fn redirect_uri(cfg: &HostConfig, conf: &Config, base_url: &str) -> String {
     }
 }
 
-/// Domains anyone can have an address at. Setting up never makes one an allowed domain: every
-/// account there could then match people here by email.
-const FREE_MAIL: &[&str] = &[
-    "gmail.com",
-    "googlemail.com",
-    "outlook.com",
-    "hotmail.com",
-    "live.com",
-    "msn.com",
-    "passport.com",
-    "yahoo.com",
-    "ymail.com",
-    "rocketmail.com",
-    "icloud.com",
-    "me.com",
-    "mac.com",
-    "aol.com",
-    "aim.com",
-    "proton.me",
-    "protonmail.com",
-    "protonmail.ch",
-    "pm.me",
-    "gmx.com",
-    "gmx.net",
-    "gmx.de",
-    "web.de",
-    "mail.com",
-    "zoho.com",
-    "zohomail.com",
-    "yandex.com",
-    "yandex.ru",
-    "mail.ru",
-    "hey.com",
-    "fastmail.com",
-    "tutanota.com",
-    "tuta.io",
-    "duck.com",
-    "qq.com",
-    "163.com",
-    "126.com",
-    "naver.com",
-    "hanmail.net",
-    "comcast.net",
-    "att.net",
-    "verizon.net",
-    "orange.fr",
-    "free.fr",
-    "t-online.de",
-    "libero.it",
-    "rediffmail.com",
-    "hushmail.com",
+/// Domains anyone can have an address at, by provider, with where each list comes from. Setting
+/// up never allows or suggests one: every account there could then match people here by email. No
+/// list is complete, so this is a backstop: setting up allows only a domain the provider vouches is
+/// the organization's (Google's `hd`, Microsoft's `xms_edov`), and Slack's is only suggested.
+const FREE_MAIL: &[&[&str]] = &[
+    // Google: gmail.com, and googlemail.com where Gmail once couldn't use its name.
+    &["gmail.com", "googlemail.com"],
+    // Microsoft: https://support.microsoft.com/en-us/outlook/premium-features-in-outlook-com-for-microsoft-365-subscribers
+    // (outlook.com, hotmail.com, live.com, msn.com); legacy passport.com and windowslive.com
+    // (https://en.wikipedia.org/wiki/Outlook.com); regional ones are caught by FREE_MAIL_BRANDS.
+    &["outlook.com", "hotmail.com", "live.com", "msn.com", "passport.com", "windowslive.com"],
+    // Yahoo: https://help.yahoo.com/kb/SLN2153.html (yahoo.com, myyahoo.com, regional yahoo.*),
+    // https://help.yahoo.com/kb/SLN3407.html (ymail.com, rocketmail.com), and y7mail.com
+    // (https://dmarc.org/2016/03/yahoo-protects-62-additional-domains-with-dmarc/).
+    &["yahoo.com", "myyahoo.com", "ymail.com", "rocketmail.com", "y7mail.com"],
+    // Apple: https://support.apple.com/en-us/118230
+    &["icloud.com", "me.com", "mac.com"],
+    // AOL.
+    &["aol.com", "aim.com"],
+    // Proton: https://proton.me/support/addresses-and-aliases
+    &["proton.me", "protonmail.com", "protonmail.ch", "pm.me"],
+    // Tuta: https://tuta.com/blog/anonymous-email
+    &["tuta.com", "tutanota.com", "tutanota.de", "tutamail.com", "tuta.io", "keemail.me"],
+    // GMX: https://www.gmx.com/mail/alias-addresses/ (gmx.com, gmx.us, gmx.co.uk, gmx.ca), and its
+    // home markets' gmx.net, gmx.de, gmx.at, gmx.ch; web.de is the same company's.
+    &["gmx.com", "gmx.us", "gmx.co.uk", "gmx.ca", "gmx.net", "gmx.de", "gmx.at", "gmx.ch", "web.de"],
+    // mail.com: the commonest of the domains on https://www.mail.com/mail/domains/
+    &[
+        "mail.com",
+        "email.com",
+        "post.com",
+        "usa.com",
+        "consultant.com",
+        "myself.com",
+        "europe.com",
+        "asia.com",
+        "dr.com",
+        "engineer.com",
+        "accountant.com",
+        "techie.com",
+        "programmer.net",
+        "musician.org",
+        "iname.com",
+        "linuxmail.org",
+        "null.net",
+        "cheerful.com",
+        "innocent.com",
+        "berlin.com",
+    ],
+    // Yandex: https://yandex.com/support/yandex-360/customers/mail/en/web/preferences/about-sender/additional-addresses
+    &["yandex.com", "yandex.ru", "ya.ru", "yandex.by", "yandex.kz", "yandex.ua"],
+    // Zoho's free personal addresses: https://www.zoho.com/mail/help/login-to-zoho.html
+    &["zohomail.com", "zohomail.in", "zoho.com"],
+    // Fastmail, every plan: https://www.fastmail.help/hc/en-us/articles/6239365719055-What-domains-can-I-use-with-Fastmail
+    &[
+        "123mail.org",
+        "150mail.com",
+        "150ml.com",
+        "16mail.com",
+        "2-mail.com",
+        "4email.net",
+        "50mail.com",
+        "airpost.net",
+        "aliencamel.com",
+        "allmail.net",
+        "bestmail.us",
+        "cluemail.com",
+        "elitemail.org",
+        "emailcorner.net",
+        "emailengine.net",
+        "emailengine.org",
+        "emailgroups.net",
+        "emailplus.org",
+        "emailuser.net",
+        "eml.cc",
+        "f-m.fm",
+        "fast-email.com",
+        "fast-mail.org",
+        "fastem.com",
+        "fastemail.us",
+        "fastemailer.com",
+        "fastest.cc",
+        "fastimap.com",
+        "fastmail.ca",
+        "fastmail.cn",
+        "fastmail.co.uk",
+        "fastmail.com",
+        "fastmail.com.au",
+        "fastmail.de",
+        "fastmail.es",
+        "fastmail.fm",
+        "fastmail.fr",
+        "fastmail.im",
+        "fastmail.in",
+        "fastmail.jp",
+        "fastmail.mx",
+        "fastmail.net",
+        "fastmail.nl",
+        "fastmail.org",
+        "fastmail.se",
+        "fastmail.to",
+        "fastmail.tw",
+        "fastmail.uk",
+        "fastmail.us",
+        "fastmailbox.net",
+        "fastmessaging.com",
+        "fea.st",
+        "fmail.co.uk",
+        "fmailbox.com",
+        "fmgirl.com",
+        "fmguy.com",
+        "foobox.com",
+        "foobox.net",
+        "ftml.net",
+        "h-mail.us",
+        "hailmail.net",
+        "imap-mail.com",
+        "imap.cc",
+        "imapmail.org",
+        "immerbox.com",
+        "immermail.com",
+        "inoutbox.com",
+        "internet-e-mail.com",
+        "internet-mail.org",
+        "internetemails.net",
+        "internetmailing.net",
+        "jetemail.net",
+        "justemail.net",
+        "letterboxes.org",
+        "lifetimeaddress.com",
+        "mail-central.com",
+        "mail-page.com",
+        "mailas.com",
+        "mailbolt.com",
+        "mailc.net",
+        "mailcan.com",
+        "mailforce.net",
+        "mailhaven.com",
+        "mailingaddress.org",
+        "mailite.com",
+        "mailmight.com",
+        "mailnew.com",
+        "mailsent.net",
+        "mailservice.ms",
+        "mailup.net",
+        "mailworks.org",
+        "mailzone.com",
+        "ml1.net",
+        "mm.st",
+        "myfastmail.com",
+        "mymacmail.com",
+        "nospammail.net",
+        "onepost.net",
+        "ownmail.net",
+        "penguinmail.com",
+        "permanentmail.com",
+        "petml.com",
+        "pobox.com",
+        "postinbox.com",
+        "postpro.net",
+        "proinbox.com",
+        "promessage.com",
+        "realemail.net",
+        "reallyfast.biz",
+        "reallyfast.info",
+        "rushpost.com",
+        "sent.as",
+        "sent.at",
+        "sent.com",
+        "siemprebox.com",
+        "siempremail.com",
+        "speedpost.net",
+        "speedymail.org",
+        "ssl-mail.com",
+        "swift-mail.com",
+        "the-fastest.net",
+        "the-quickest.com",
+        "theinternetemail.com",
+        "veribox.net",
+        "veryfast.biz",
+        "veryspeedy.net",
+        "warpmail.net",
+        "xsmail.com",
+        "yepmail.net",
+        "your-mail.com",
+    ],
+    // Others widely used for personal mail.
+    &[
+        "hey.com",
+        "duck.com",
+        "mail.ru",
+        "qq.com",
+        "163.com",
+        "126.com",
+        "naver.com",
+        "hanmail.net",
+        "comcast.net",
+        "att.net",
+        "verizon.net",
+        "orange.fr",
+        "free.fr",
+        "t-online.de",
+        "libero.it",
+        "rediffmail.com",
+        "hushmail.com",
+    ],
 ];
-/// Free-mail brands with a domain in many countries, such as `yahoo.co.uk` or `hotmail.fr`.
-const FREE_MAIL_BRANDS: &[&str] = &["gmail", "googlemail", "outlook", "hotmail", "live", "msn", "yahoo", "aol", "gmx", "yandex", "proton"];
+/// Free-mail brands with a domain in many countries, such as `yahoo.co.uk`, `hotmail.fr`,
+/// `outlook.com.br` or `gmx.es`. Microsoft and Yahoo publish no full list of theirs.
+const FREE_MAIL_BRANDS: &[&str] = &[
+    "gmail",
+    "googlemail",
+    "outlook",
+    "hotmail",
+    "live",
+    "msn",
+    "windowslive",
+    "yahoo",
+    "aol",
+    "gmx",
+    "yandex",
+    "proton",
+    "protonmail",
+    "tutanota",
+    "fastmail",
+    "zohomail",
+];
 
 /// Whether `domain` is a free-mail domain (see [`FREE_MAIL`]).
 pub fn free_mail(domain: &str) -> bool {
     let d = domain.trim().trim_end_matches('.').to_ascii_lowercase();
-    if FREE_MAIL.contains(&d.as_str()) {
+    if FREE_MAIL.iter().any(|list| list.contains(&d.as_str())) {
         return true;
     }
     // A brand under a country's suffix: `hotmail.fr`, `yahoo.co.uk`, `outlook.com.br`.
@@ -553,8 +742,18 @@ pub struct SsoSettings {
     pub client_secret_unreadable: bool,
     /// Email domains whose verified addresses may sign in to existing accounts, and join when `auto_provision` is on.
     pub allowed_domains: Vec<String>,
+    /// Slack, set up by signing in: the domain of the admin's address. Slack confirmed the
+    /// address, not that the domain is the organization's, so it isn't allowed until an admin
+    /// adds it to `allowed_domains`.
+    pub suggested_domain: Option<String>,
     pub auto_provision: bool,
     pub require_sso: bool,
+    /// "Require single sign-on" was turned off automatically when the workspace switched Microsoft
+    /// apps: accounts linked through the old app before links were by Microsoft's `oid` had to be
+    /// linked again, and those people would otherwise have had no way in. They sign in with
+    /// Microsoft (matched by verified email) or with their password and link in Settings › Profile.
+    /// Turn it back on (`require_sso: true`) once they have.
+    pub require_sso_paused: bool,
     /// Other OIDC providers: the name on the button.
     pub label: Option<String>,
     /// Register this as the redirect URI in the provider's app.
@@ -583,8 +782,10 @@ pub fn settings_view(db: &dyn Db, cfg: &HostConfig, base_url: &str, check: Optio
         client_secret_set: conf.client_secret.is_some(),
         client_secret_unreadable: secret_unreadable(cfg, &conf),
         allowed_domains: conf.allowed_domains.clone(),
+        suggested_domain: some(&conf.suggested_domain).filter(|d| !conf.domain_allowed(d)),
         auto_provision: conf.auto_provision,
         require_sso: conf.require_sso,
+        require_sso_paused: conf.require_sso_paused,
         label: some(&conf.label),
         redirect_uri: callback_url(base_url),
         linked_people: db
@@ -763,13 +964,24 @@ fn vouched_email(conf: &Config, claims: &Value) -> Result<String, Problem> {
     Ok(email)
 }
 
+/// What setting up learned about the organization's email domains from the admin's sign-in.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Domains {
+    /// The organization's own, on the provider's word: Google's hosted domain (`hd`), or the
+    /// admin's email domain when Microsoft says its owner verified it (`xms_edov`).
+    allowed: Option<String>,
+    /// Slack: the domain of the admin's address. Slack confirmed the address (`email_verified`),
+    /// not that its domain is the organization's, so an admin confirms it in Settings first.
+    suggested: Option<String>,
+}
+
 /// Setting up: reads the admin's organization from their own ID token and checks the token
 /// against it. `target` is where setting up started ([`setup_target`]). Answers with the settings
 /// for that organization (Google's hosted domain, Microsoft's directory and its issuer, Slack's
-/// workspace) and the email domain to allow, when the provider vouches for one that isn't free
-/// mail. Microsoft's directory must be in the issuer exactly, as Microsoft says multi-tenant apps
-/// check; personal Google and Microsoft accounts have no organization.
-fn setup_org(target: &Config, claims: &Value, nonce: &str, now: DateTime<Utc>) -> Result<(Config, Option<String>), Problem> {
+/// workspace) and what it learned about email domains. Free-mail domains are never allowed or
+/// suggested. Microsoft's directory must be in the issuer exactly, as Microsoft says multi-tenant
+/// apps check; personal Google and Microsoft accounts have no organization.
+fn setup_org(target: &Config, claims: &Value, nonce: &str, now: DateTime<Utc>) -> Result<(Config, Domains), Problem> {
     let mut conf = target.clone();
     let provider = conf.provider.ok_or(Problem::Failed)?;
     if provider == Provider::Microsoft {
@@ -783,25 +995,28 @@ fn setup_org(target: &Config, claims: &Value, nonce: &str, now: DateTime<Utc>) -
     } else {
         check_claims(&conf, claims, nonce, now).map_err(|_| Problem::InvalidToken)?;
     }
-    // An email domain the provider vouches for, unless anyone can have an address there.
+    // The domain of an address the provider vouches for, unless anyone can have an address there.
     let vouched_domain = |vouched: bool| {
         let email = claims["email"].as_str().filter(|_| vouched)?;
         normalize_domain(email.rsplit_once('@')?.1).filter(|d| !free_mail(d))
     };
-    let domain = match provider {
+    let domains = match provider {
         Provider::Google => {
             let hd = claims["hd"].as_str().and_then(normalize_domain).filter(|d| !free_mail(d)).ok_or(Problem::PersonalAccount)?;
             conf.allowed_domains = vec![hd.clone()];
-            Some(hd)
+            Domains { allowed: Some(hd), suggested: None }
         }
-        Provider::Microsoft => vouched_domain(truthy(&claims["xms_edov"])),
+        Provider::Microsoft => Domains { allowed: vouched_domain(truthy(&claims["xms_edov"])), suggested: None },
         Provider::Slack => {
             conf.team = claims["https://slack.com/team_id"].as_str().and_then(normalize_team).ok_or(Problem::NotInOrg)?;
-            vouched_domain(truthy(&claims["email_verified"]))
+            Domains { allowed: None, suggested: vouched_domain(truthy(&claims["email_verified"])) }
         }
         _ => return Err(Problem::Failed),
     };
-    Ok((conf, domain))
+    if identity_key(&conf, claims).is_none() {
+        return Err(Problem::InvalidToken);
+    }
+    Ok((conf, domains))
 }
 
 /// What a provider's refusal (`?error=…` on the way back) means. Microsoft says that a directory
@@ -1045,8 +1260,9 @@ enum Kind {
     /// A signed-in person linking their account (`link_sso`), from one browser session.
     Link { user_id: String, session_hash: String },
     /// An admin setting single sign-on up by signing in with the host's app (`setup_sso`), from
-    /// one browser session.
-    Setup { user_id: String, session_hash: String, provider: Provider },
+    /// one browser session. `fingerprint` is [`setup_fingerprint`] as `setup_sso` saw the settings
+    /// when it decided whether this replaces anything.
+    Setup { user_id: String, session_hash: String, provider: Provider, fingerprint: String },
     /// An admin saved the settings (`update_sso`): check the provider's discovery document.
     Check,
     /// The provider sent someone back.
@@ -1113,9 +1329,10 @@ impl SsoJob {
 
     /// Starts setting single sign-on up with the host's app for `provider`, by admin `user_id`
     /// signing in from the browser session whose token hashes to `session_hash`; fills in
-    /// `{ "authorize_url": … }`.
-    pub fn setup(base_url: &str, user_id: &str, session_hash: &str, provider: Provider) -> SsoJob {
-        SsoJob::new(base_url, Kind::Setup { user_id: user_id.into(), session_hash: session_hash.into(), provider })
+    /// `{ "authorize_url": … }`. `fingerprint` is [`setup_fingerprint`] of the settings the
+    /// operation checked: if they change before the admin is back, nothing is saved.
+    pub fn setup(base_url: &str, user_id: &str, session_hash: &str, provider: Provider, fingerprint: String) -> SsoJob {
+        SsoJob::new(base_url, Kind::Setup { user_id: user_id.into(), session_hash: session_hash.into(), provider, fingerprint })
     }
 
     /// What the job left for the host to deliver (see [`crate::connect::Job::take_effects`]).
@@ -1249,9 +1466,9 @@ fn setup_target(cfg: &HostConfig, p: Provider) -> Option<Config> {
 }
 
 /// What setting up must still match when it finishes: the host's same app, and the workspace's
-/// settings exactly as they were when it started, so it never overwrites a change made meanwhile.
-/// `None` when the host has no app for `p`.
-fn setup_fingerprint(cfg: &HostConfig, p: Provider, stored: &Config) -> Option<String> {
+/// settings exactly as they were when `setup_sso` checked them, so it never overwrites a change
+/// made meanwhile (one it didn't ask the admin to replace). `None` when the host has no app for `p`.
+pub fn setup_fingerprint(cfg: &HostConfig, p: Provider, stored: &Config) -> Option<String> {
     let app = cfg.sso_apps.get(p)?;
     let settings = serde_json::to_string(stored).unwrap_or_default();
     Some(sha256_hex(&format!("setup|{}|{}|{}", p.as_str(), app.client_id, sha256_hex(&settings))))
@@ -1373,6 +1590,11 @@ fn token_call(conf: &Config, flow: &Flow, code: &str, secret: &str) -> HttpCall 
     }
 }
 
+/// The error for setting up when the settings changed after `setup_sso` checked them.
+fn settings_changed() -> ApiError {
+    ApiError::new(409, "sso_changed", "Single sign-on settings changed after you started setting it up. Look them over, then start again.")
+}
+
 /// The error for setting up with a provider the host has no app for.
 pub fn shared_unavailable(p: Provider) -> ApiError {
     ApiError::new(
@@ -1394,21 +1616,33 @@ pub fn step(db: &dyn Db, cfg: &HostConfig, j: &mut SsoJob, replies: Vec<HttpRepl
             let r = r.clone();
             finish_step(db, cfg, j, &conf, &r, phase, reply, now)
         }
-        (Kind::Setup { provider, .. }, Phase::Start) => {
+        (Kind::Setup { provider, fingerprint, .. }, Phase::Start) => {
+            // The settings `setup_sso` checked must still be the workspace's, before the sign-in
+            // starts and again when it finishes (`callback`, `finish_step`).
             let Some(target) = setup_target(cfg, *provider) else {
                 return Ok(Step::Done(Finish::Fail(shared_unavailable(*provider))));
             };
+            if setup_fingerprint(cfg, *provider, &stored).as_ref() != Some(fingerprint) {
+                return Ok(Step::Done(Finish::Fail(settings_changed())));
+            }
             j.phase = Phase::Discovering;
             Ok(Step::Fetch(vec![HttpCall::get(discovery_url(&target.issuer)).header("accept", "application/json")]))
         }
-        (Kind::Setup { user_id, session_hash, provider }, _) => {
-            let (Some(target), Some(fingerprint)) = (setup_target(cfg, *provider), setup_fingerprint(cfg, *provider, &stored)) else {
+        (Kind::Setup { user_id, session_hash, provider, fingerprint }, _) => {
+            let (Some(target), Some(now_fingerprint)) = (setup_target(cfg, *provider), setup_fingerprint(cfg, *provider, &stored)) else {
                 return Ok(Step::Done(Finish::Fail(shared_unavailable(*provider))));
             };
+            if now_fingerprint != *fingerprint {
+                return Ok(Step::Done(Finish::Fail(settings_changed())));
+            }
             match read_discovery(&target, &reply) {
                 Ok(d) => {
-                    let purpose =
-                        Purpose { next: SETTINGS_PATH, bound: Some((user_id, session_hash)), setup: Some(*provider), fingerprint };
+                    let purpose = Purpose {
+                        next: SETTINGS_PATH,
+                        bound: Some((user_id, session_hash)),
+                        setup: Some(*provider),
+                        fingerprint: fingerprint.clone(),
+                    };
                     let (url, _) = begin(db, cfg, &target, &d, &base, purpose, now)?;
                     fill(json!({ "authorize_url": url }))
                 }
@@ -1515,7 +1749,7 @@ fn finish_step(
             };
             if r.flow.setup.is_some() {
                 return match setup_org(&target, &claims, &r.flow.nonce, now) {
-                    Ok((org, domain)) => complete_setup(db, cfg, j, r, &org, domain, &claims, now),
+                    Ok((org, domains)) => complete_setup(db, cfg, j, r, &org, domains, &claims, now),
                     Err(problem) => Ok(back(problem)),
                 };
             }
@@ -1527,10 +1761,8 @@ fn finish_step(
             // would never be trusted on its own (see `vouched_email`), so it isn't asked.
             let access = v["access_token"].as_str().filter(|t| !t.is_empty());
             let lacks_email = claims.get("email").is_none() || claims.get("email_verified").is_none();
-            let asks = lacks_email
-                && r.link_user.is_none()
-                && target.provider != Some(Provider::Microsoft)
-                && !is_linked(db, &target, claims["sub"].as_str().unwrap_or_default())?;
+            let asks =
+                lacks_email && r.link_user.is_none() && target.provider != Some(Provider::Microsoft) && !is_linked(db, &target, &claims)?;
             if let (true, Some(url), Some(access)) = (asks, r.flow.userinfo_endpoint.clone(), access) {
                 j.phase = Phase::UserInfo { claims };
                 return Ok(Step::Fetch(vec![HttpCall::get(url).bearer(access).header("accept", "application/json")]));
@@ -1550,8 +1782,10 @@ fn finish_step(
 /// Setting up checked out: saves the settings for the admin's organization (`org`, from
 /// [`setup_org`]) and links the admin's own account. The admin must still be signed in to the
 /// session that started, and still an admin; their account at the provider can't be someone
-/// else's here. `require_sso` and `auto_provision` stay as they were. Allowed domains: the one
-/// the sign-in vouched for, plus the ones already allowed when it's the same organization again.
+/// else's here. `require_sso` and `auto_provision` stay as they were, except that switching
+/// Microsoft apps may pause "Require single sign-on" ([`forget_app_bound`]). Allowed domains: the
+/// one the provider vouched for, plus the ones already allowed when it's the same organization
+/// again; Slack's is only suggested.
 #[allow(clippy::too_many_arguments)]
 fn complete_setup(
     db: &dyn Db,
@@ -1559,7 +1793,7 @@ fn complete_setup(
     j: &mut SsoJob,
     r: &Returned,
     org: &Config,
-    domain: Option<String>,
+    domains: Domains,
     claims: &Value,
     now: DateTime<Utc>,
 ) -> ApiResult<Step> {
@@ -1580,8 +1814,8 @@ fn complete_setup(
     if p.role != Role::Admin {
         return back(Problem::NotAdmin);
     }
-    let subject = claims["sub"].as_str().unwrap_or_default();
-    let owner = db.one("SELECT user_id FROM sso_identities WHERE issuer = ? AND subject = ?", &params![org.issuer.clone(), subject])?;
+    let Some(key) = identity_key(org, claims) else { return back(Problem::InvalidToken) };
+    let owner = db.one("SELECT user_id FROM sso_identities WHERE issuer = ? AND subject = ?", &params![org.issuer.clone(), key.clone()])?;
     if owner.as_ref().is_some_and(|o| o.str("user_id") != p.id) {
         return back(Problem::AlreadyLinked);
     }
@@ -1590,18 +1824,19 @@ fn complete_setup(
     let provider = org.provider.ok_or_else(|| ApiError::internal("setting up without a provider"))?;
     let same_org = before.provider == Some(provider)
         && match provider {
-            Provider::Google => domain.as_deref().is_some_and(|d| before.domain_allowed(d)),
+            Provider::Google => domains.allowed.as_deref().is_some_and(|d| before.domain_allowed(d)),
             Provider::Microsoft => before.tenant == org.tenant,
             Provider::Slack => before.team == org.team,
             _ => false,
         };
     let mut allowed_domains = if same_org { before.allowed_domains.clone() } else { vec![] };
-    if let Some(d) = &domain
+    if let Some(d) = &domains.allowed
         && !allowed_domains.contains(d)
     {
         allowed_domains.push(d.clone());
     }
-    let saved = Config {
+    let suggested_domain = domains.suggested.filter(|d| !allowed_domains.contains(d)).unwrap_or_default();
+    let mut saved = Config {
         enabled: true,
         provider: Some(provider),
         shared: true,
@@ -1611,14 +1846,17 @@ fn complete_setup(
         client_id: String::new(),
         client_secret: None,
         allowed_domains,
+        suggested_domain,
         auto_provision: before.auto_provision,
         require_sso: before.require_sso,
+        require_sso_paused: before.require_sso_paused,
         label: String::new(),
     };
+    let forgotten = forget_app_bound(db, &before, &mut saved)?;
     save(db, &saved)?;
     let newly_linked = owner.is_none();
     if newly_linked {
-        link_identity(db, &p.id, &saved, claims, now)?;
+        link_identity(db, &p.id, &saved, &key, claims, now)?;
     }
 
     let name = saved.name();
@@ -1632,8 +1870,11 @@ fn complete_setup(
         "tenant": Some(&saved.tenant).filter(|t| !t.is_empty()),
         "team": Some(&saved.team).filter(|t| !t.is_empty()),
         "allowed_domains": saved.allowed_domains,
+        "suggested_domain": Some(&saved.suggested_domain).filter(|d| !d.is_empty()),
         "replaced": before.provider.filter(|_| !same_org).map(Provider::as_str),
         "client_secret_changed": before.client_secret.is_some(),
+        "links_forgotten": forgotten,
+        "require_sso_paused": saved.require_sso_paused && !before.require_sso_paused,
     });
     emit(&mut ctx, Event::new("sso.updated", "settings", "sso", format!("set up single sign-on with {name}")).data(data).admin_only())?;
     if newly_linked {
@@ -1647,11 +1888,82 @@ fn complete_setup(
     Ok(respond(to_settings(&base, Ok(outcome))))
 }
 
+/// Microsoft accounts are linked by this prefix and their `oid`.
+const OID_PREFIX: &str = "oid:";
+
+/// What an account at the provider is linked by (with the issuer). Microsoft's `sub` is pairwise:
+/// different for every app, so switching between the workspace's own app and DumbSlab's would
+/// orphan every link. Its `oid` is the same for every app in a directory, and the issuer names the
+/// directory, so Microsoft accounts are linked by `oid` (Microsoft recommends `tid` with `oid` for
+/// exactly this: <https://learn.microsoft.com/en-us/entra/identity-platform/id-token-claims-reference>).
+/// Google's and Slack's `sub` are the same for every app: their discovery documents say
+/// `"subject_types_supported": ["public"]` (OpenID Connect Core 1.0, 8), and Google calls `sub` the
+/// account's Google ID. `None` when the token lacks it.
+fn identity_key(conf: &Config, claims: &Value) -> Option<String> {
+    match conf.provider {
+        Some(Provider::Microsoft) => claims["oid"].as_str().and_then(normalize_tenant).map(|oid| format!("{OID_PREFIX}{oid}")),
+        _ => claims["sub"].as_str().filter(|s| !s.is_empty() && s.len() <= 255).map(str::to_string),
+    }
+}
+
+/// The person an account at the provider is linked to, if any. A Microsoft account linked before
+/// links were by `oid` is found by its `sub` while the workspace signs in through the same app, and
+/// is then moved to its `oid`, so it survives the next change of app.
+fn find_linked(db: &dyn Db, conf: &Config, claims: &Value, key: &str) -> ApiResult<Option<crate::db::Row>> {
+    let sql = format!(
+        "SELECT {PERSON_COLS}, i.id AS identity_id FROM sso_identities i JOIN users u ON u.id = i.user_id WHERE i.issuer = ? AND i.subject = ?"
+    );
+    if let Some(row) = db.one(&sql, &params![conf.issuer.clone(), key])? {
+        return Ok(Some(row));
+    }
+    let sub = claims["sub"].as_str().unwrap_or_default();
+    if conf.provider != Some(Provider::Microsoft) || sub.is_empty() || sub.starts_with(OID_PREFIX) {
+        return Ok(None);
+    }
+    let old = db.one(&sql, &params![conf.issuer.clone(), sub])?;
+    if let Some(row) = &old {
+        db.execute("UPDATE sso_identities SET subject = ? WHERE id = ?", &params![key, row.str("identity_id")])?;
+    }
+    Ok(old)
+}
+
 /// Whether an account at the provider is linked to someone here already.
-fn is_linked(db: &dyn Db, conf: &Config, subject: &str) -> ApiResult<bool> {
-    let n =
-        db.scalar_i64("SELECT COUNT(*) FROM sso_identities WHERE issuer = ? AND subject = ?", &params![conf.issuer.clone(), subject])?;
-    Ok(n > 0)
+fn is_linked(db: &dyn Db, conf: &Config, claims: &Value) -> ApiResult<bool> {
+    Ok(match identity_key(conf, claims) {
+        Some(key) => find_linked(db, conf, claims, &key)?.is_some(),
+        None => false,
+    })
+}
+
+/// Which app the workspace signs in through, as far as Microsoft's `sub` is concerned.
+fn app_identity(conf: &Config) -> (Option<Provider>, &str, &str) {
+    (conf.provider, conf.issuer.as_str(), if conf.shared { "shared" } else { conf.client_id.as_str() })
+}
+
+/// Saving `after` over `before`: when the workspace now signs in through another Microsoft app,
+/// accounts still linked by their `sub` (linked before links were by `oid`, and not signed in with
+/// since) can never match anyone again. Forgets them, so a first sign-in can match people by a
+/// verified email again, or they link again. If that leaves anyone who isn't an admin needing to,
+/// and "Require single sign-on" is on, it's turned off, with a note in Settings: otherwise they'd
+/// have no way in, since their password is refused and their link is gone. Returns how many links
+/// were forgotten.
+pub fn forget_app_bound(db: &dyn Db, before: &Config, after: &mut Config) -> ApiResult<i64> {
+    if after.provider != Some(Provider::Microsoft) || after.issuer.is_empty() || app_identity(before) == app_identity(after) {
+        return Ok(0);
+    }
+    let pattern = format!("{OID_PREFIX}%");
+    let stranded = db.scalar_i64(
+        "SELECT COUNT(DISTINCT u.id) FROM sso_identities i JOIN users u ON u.id = i.user_id
+         WHERE i.issuer = ? AND i.subject NOT LIKE ? AND u.role != 'admin' AND u.is_bot = 0 AND u.deactivated_at IS NULL",
+        &params![after.issuer.clone(), pattern.clone()],
+    )?;
+    let forgotten =
+        db.execute("DELETE FROM sso_identities WHERE issuer = ? AND subject NOT LIKE ?", &params![after.issuer.clone(), pattern])?;
+    if stranded > 0 && after.require_sso {
+        after.require_sso = false;
+        after.require_sso_paused = true;
+    }
+    Ok(forgotten as i64)
 }
 
 /// Adds what the userinfo answer says to what the ID token didn't. Only an answer about the same
@@ -1734,21 +2046,14 @@ fn ctx_for<'a>(db: &'a dyn Db, cfg: &'a HostConfig, base_url: &str, p: &Person, 
     Ctx { db, actor, now, cfg, base_url: base_url.to_string(), effects: vec![] }
 }
 
-fn link_identity(db: &dyn Db, user_id: &str, conf: &Config, claims: &Value, now: DateTime<Utc>) -> ApiResult<()> {
+/// Links the account at the provider whose [`identity_key`] is `key` to `user_id`.
+fn link_identity(db: &dyn Db, user_id: &str, conf: &Config, key: &str, claims: &Value, now: DateTime<Utc>) -> ApiResult<()> {
     let shown = claims["email"].as_str().or(claims["preferred_username"].as_str()).unwrap_or_default();
     // One account per person at each issuer.
     db.execute("DELETE FROM sso_identities WHERE user_id = ? AND issuer = ?", &params![user_id, conf.issuer.clone()])?;
     db.execute(
         "INSERT INTO sso_identities (id, user_id, issuer, subject, email, created_at, last_used_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        &params![
-            crate::util::new_id(),
-            user_id,
-            conf.issuer.clone(),
-            claims["sub"].as_str().unwrap_or_default(),
-            shown.chars().take(254).collect::<String>(),
-            ts(now),
-            ts(now)
-        ],
+        &params![crate::util::new_id(), user_id, conf.issuer.clone(), key, shown.chars().take(254).collect::<String>(), ts(now), ts(now)],
     )?;
     Ok(())
 }
@@ -1787,11 +2092,8 @@ fn complete(db: &dyn Db, cfg: &HostConfig, base: &str, conf: &Config, r: &Return
     if let Err(problem) = org_check(conf, claims) {
         return Ok(back(problem));
     }
-    let subject = claims["sub"].as_str().unwrap_or_default();
-    let linked = db.one(
-        &format!("SELECT {PERSON_COLS}, i.id AS identity_id FROM sso_identities i JOIN users u ON u.id = i.user_id WHERE i.issuer = ? AND i.subject = ?"),
-        &params![conf.issuer.clone(), subject],
-    )?;
+    let Some(key) = identity_key(conf, claims) else { return Ok(back(Problem::InvalidToken)) };
+    let linked = find_linked(db, conf, claims, &key)?;
 
     if let Some(user_id) = &r.link_user {
         // The session that started linking must still be signed in as it finishes.
@@ -1810,7 +2112,7 @@ fn complete(db: &dyn Db, cfg: &HostConfig, base: &str, conf: &Config, r: &Return
             Some(row) if row.str("id") != p.id => return Ok(back(Problem::AlreadyLinked)),
             Some(_) => {}
             None => {
-                link_identity(db, &p.id, conf, claims, now)?;
+                link_identity(db, &p.id, conf, &key, claims, now)?;
                 record_link(db, cfg, base, &p, conf, Matched::Themselves, now)?;
             }
         }
@@ -1840,11 +2142,11 @@ fn complete(db: &dyn Db, cfg: &HostConfig, base: &str, conf: &Config, r: &Return
                     if other > 0 {
                         return Ok(back(Problem::EmailLinked));
                     }
-                    link_identity(db, &p.id, conf, claims, now)?;
+                    link_identity(db, &p.id, conf, &key, claims, now)?;
                     record_link(db, cfg, base, &p, conf, Matched::Email, now)?;
                     p
                 }
-                None if conf.auto_provision => provision(db, cfg, base, conf, claims, &email, now)?,
+                None if conf.auto_provision => provision(db, cfg, base, conf, (&key, claims), &email, now)?,
                 None => return Ok(back(Problem::NoAccount)),
             }
         }
@@ -1869,7 +2171,7 @@ fn provision(
     cfg: &HostConfig,
     base: &str,
     conf: &Config,
-    claims: &Value,
+    (key, claims): (&str, &Value),
     email: &str,
     now: DateTime<Utc>,
 ) -> ApiResult<Person> {
@@ -1893,7 +2195,7 @@ fn provision(
         deactivated: false,
     };
     let uid = crate::ops::users::insert_user(&ctx_for(db, cfg, base, &placeholder, now), email, &name, None, Role::Member, None, false)?;
-    link_identity(db, &uid, conf, claims, now)?;
+    link_identity(db, &uid, conf, key, claims, now)?;
     let p = find_person(db, &uid)?.ok_or_else(|| ApiError::internal("user vanished"))?;
     let mut ctx = ctx_for(db, cfg, base, &p, now);
     emit(
@@ -2123,6 +2425,18 @@ mod tests {
             "outlook.com.br",
             "icloud.com",
             "proton.me",
+            "myyahoo.com",
+            "pm.me",
+            "protonmail.ch",
+            "tutamail.com",
+            "tutanota.de",
+            "keemail.me",
+            "gmx.es",
+            "email.com",
+            "ya.ru",
+            "zohomail.com",
+            "fastmail.fm",
+            "sent.com",
         ] {
             assert!(free_mail(free), "{free}");
         }
@@ -2150,11 +2464,12 @@ mod tests {
         let now = Utc::now();
         let target = |p| setup_target(&cfg, p).unwrap();
         let org = |p, claims: Value| setup_org(&target(p), &claims, "n", now);
+        let allowed = |d: &str| Domains { allowed: Some(d.into()), suggested: None };
 
         // Google: the Workspace domain, which must be there.
         let g = "https://accounts.google.com";
-        let (c, domain) = org(Provider::Google, token(g, "google-app", json!({ "hd": "Acme.com", "email": "ada@acme.com" }))).unwrap();
-        assert_eq!((c.allowed_domains, domain.as_deref(), c.issuer.as_str()), (vec!["acme.com".to_string()], Some("acme.com"), g));
+        let (c, domains) = org(Provider::Google, token(g, "google-app", json!({ "hd": "Acme.com", "email": "ada@acme.com" }))).unwrap();
+        assert_eq!((c.allowed_domains, domains, c.issuer.as_str()), (vec!["acme.com".to_string()], allowed("acme.com"), g));
         assert_eq!(
             org(Provider::Google, token(g, "google-app", json!({ "email": "ada@gmail.com", "email_verified": true }))).unwrap_err(),
             Problem::PersonalAccount
@@ -2168,12 +2483,19 @@ mod tests {
 
         // Microsoft: the token's own directory, which its issuer must name exactly.
         let tid = "72f988bf-86f1-41af-91ab-2d7cd011db47";
+        let oid = "00000000-0000-0000-0000-00000000ada0";
         let iss = microsoft_issuer(tid);
-        let ms = |iss: &str, extra: Value| org(Provider::Microsoft, token(iss, "microsoft-app", extra));
-        let (c, domain) = ms(&iss, json!({ "tid": tid, "email": "ada@acme.com", "xms_edov": true })).unwrap();
-        assert_eq!((c.tenant.as_str(), c.issuer.as_str(), domain.as_deref()), (tid, iss.as_str(), Some("acme.com")));
-        // Without xms_edov the domain is left for the admin.
-        assert_eq!(ms(&iss, json!({ "tid": tid, "email": "ada@acme.com", "email_verified": true })).unwrap().1, None);
+        let ms = |iss: &str, extra: Value| {
+            let mut c = token(iss, "microsoft-app", extra);
+            if c.get("oid").is_none() {
+                c["oid"] = json!(oid);
+            }
+            org(Provider::Microsoft, c)
+        };
+        let (c, domains) = ms(&iss, json!({ "tid": tid, "email": "ada@acme.com", "xms_edov": true })).unwrap();
+        assert_eq!((c.tenant.as_str(), c.issuer.as_str(), domains), (tid, iss.as_str(), allowed("acme.com")));
+        // Without xms_edov the domain is left for the admin, and never suggested.
+        assert_eq!(ms(&iss, json!({ "tid": tid, "email": "ada@acme.com", "email_verified": true })).unwrap().1, Domains::default());
         let other = "00000000-0000-0000-0000-000000000001";
         assert_eq!(ms(&microsoft_issuer(other), json!({ "tid": tid })).unwrap_err(), Problem::InvalidToken, "iss names another directory");
         assert_eq!(ms(MICROSOFT_ISSUER_TEMPLATE, json!({ "tid": tid })).unwrap_err(), Problem::InvalidToken);
@@ -2181,18 +2503,50 @@ mod tests {
         assert_eq!(ms(&iss, json!({ "tid": "organizations" })).unwrap_err(), Problem::PersonalAccount);
         let consumers = microsoft_issuer(MICROSOFT_CONSUMERS);
         assert_eq!(ms(&consumers, json!({ "tid": MICROSOFT_CONSUMERS })).unwrap_err(), Problem::PersonalAccount);
+        // Accounts are linked by `oid`, so a token without one won't do.
+        assert_eq!(ms(&iss, json!({ "tid": tid, "oid": null })).unwrap_err(), Problem::InvalidToken);
 
-        // Slack: the workspace, and the domain only when Slack vouches for the address.
+        // Slack: the workspace. Slack confirms the address, not that its domain is the
+        // organization's, so the domain is only suggested.
         let s = "https://slack.com";
         let slack = |extra: Value| org(Provider::Slack, token(s, "slack-app", extra));
-        let (c, domain) = slack(json!({ "https://slack.com/team_id": "T0ACME", "email": "ada@acme.com", "email_verified": true })).unwrap();
-        assert_eq!((c.team.as_str(), domain.as_deref()), ("T0ACME", Some("acme.com")));
-        assert_eq!(slack(json!({ "https://slack.com/team_id": "T0ACME", "email": "ada@acme.com" })).unwrap().1, None);
-        assert_eq!(
-            slack(json!({ "https://slack.com/team_id": "T0ACME", "email": "ada@gmail.com", "email_verified": true })).unwrap().1,
-            None
-        );
+        let (c, domains) =
+            slack(json!({ "https://slack.com/team_id": "T0ACME", "email": "ada@acme.com", "email_verified": true })).unwrap();
+        assert_eq!((c.team.as_str(), c.allowed_domains.len()), ("T0ACME", 0));
+        assert_eq!(domains, Domains { allowed: None, suggested: Some("acme.com".into()) });
+        assert_eq!(slack(json!({ "https://slack.com/team_id": "T0ACME", "email": "ada@acme.com" })).unwrap().1, Domains::default());
         assert_eq!(slack(json!({ "email": "ada@acme.com", "email_verified": true })).unwrap_err(), Problem::NotInOrg);
+
+        // Free mail is never allowed or suggested, whoever vouches for it.
+        for email in
+            ["ada@gmail.com", "ada@tutamail.com", "ada@tutanota.de", "ada@keemail.me", "ada@pm.me", "ada@yahoo.co.uk", "ada@hotmail.fr"]
+        {
+            let slack_claims = json!({ "https://slack.com/team_id": "T0ACME", "email": email, "email_verified": true });
+            assert_eq!(slack(slack_claims).unwrap().1, Domains::default(), "{email}");
+            assert_eq!(ms(&iss, json!({ "tid": tid, "email": email, "xms_edov": true })).unwrap().1, Domains::default(), "{email}");
+        }
+    }
+
+    #[test]
+    fn microsoft_accounts_are_linked_by_oid() {
+        let ms = Config { provider: Some(Provider::Microsoft), ..Default::default() };
+        let oid = "00000000-0000-0000-0000-00000000ada0";
+        assert_eq!(identity_key(&ms, &json!({ "sub": "pairwise-sub", "oid": oid.to_uppercase() })), Some(format!("oid:{oid}")));
+        assert_eq!(identity_key(&ms, &json!({ "sub": "pairwise-sub" })), None);
+        for p in [Provider::Google, Provider::Slack, Provider::Okta] {
+            let c = Config { provider: Some(p), ..Default::default() };
+            assert_eq!(identity_key(&c, &json!({ "sub": "U123", "oid": oid })).as_deref(), Some("U123"));
+        }
+        // Only a change of Microsoft app forgets links made by the old one's `sub`.
+        let own = Config {
+            provider: Some(Provider::Microsoft),
+            issuer: "https://login.microsoftonline.com/t/v2.0".into(),
+            client_id: "own".into(),
+            ..Default::default()
+        };
+        let shared = Config { shared: true, client_id: String::new(), ..own.clone() };
+        assert_ne!(app_identity(&own), app_identity(&shared));
+        assert_eq!(app_identity(&own), app_identity(&Config { require_sso: true, ..own.clone() }));
     }
 
     #[test]

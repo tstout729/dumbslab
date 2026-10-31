@@ -3074,14 +3074,21 @@ mod sso {
         format!("{}.{}.c2lnbmF0dXJl", part(json!({ "alg": "RS256", "kid": "k1" })), part(claims.clone()))
     }
 
+    /// An ID token's claims. Microsoft links accounts by `oid`, here one per `sub` unless `extra`
+    /// gives one: like Microsoft's, the same for every app.
     fn claims(issuer: &str, sub: &str, email: &str, extra: Value) -> Value {
         let now = chrono::Utc::now().timestamp();
-        let mut c =
-            json!({ "iss": issuer, "aud": "app-id", "sub": sub, "email": email, "exp": now + 300, "iat": now, "name": "Mo Member" });
+        let mut c = json!({ "iss": issuer, "aud": "app-id", "sub": sub, "oid": oid_of(sub), "email": email, "exp": now + 300, "iat": now, "name": "Mo Member" });
         for (k, v) in extra.as_object().unwrap() {
             c[k] = v.clone();
         }
         c
+    }
+
+    /// A Microsoft object ID (a GUID) for a test account.
+    fn oid_of(name: &str) -> String {
+        let h = dumbslab_core::util::sha256_hex(name);
+        format!("{}-{}-{}-{}-{}", &h[0..8], &h[8..12], &h[12..16], &h[16..20], &h[20..32])
     }
 
     /// Where a request finally sent the browser, and the cookies it set.
@@ -4090,7 +4097,10 @@ mod sso {
             assert!(h.ok("GET", "/api/v1/sso", None, &admin)["provider"].is_null());
 
             let (landing, sent, hooks) = finish_setup(&h, &url, &admin, admin_token(provider, organization(provider)), None);
-            assert_eq!(landing.location, format!("{SETTINGS}?sso_setup=done"), "{provider}: {}", landing.error());
+            // Slack confirms the admin's address, not that its domain is the organization's: it's
+            // only suggested, until the admin allows it with one click.
+            let outcome = if provider == "slack" { "domain_needed" } else { "done" };
+            assert_eq!(landing.location, format!("{SETTINGS}?sso_setup={outcome}"), "{provider}: {}", landing.error());
             assert!(landing.session().is_none(), "setting up doesn't start another session");
             // The code went to the token endpoint with the server's own app.
             let form = query_of(&format!("?{}", sent[0].body.clone().unwrap()));
@@ -4113,6 +4123,14 @@ mod sso {
             );
             assert_eq!((s["require_sso"].as_bool(), s["auto_provision"].as_bool()), (Some(false), Some(false)));
             assert_eq!((s["client_id"].as_str(), s["client_secret_set"].as_bool()), (Some(""), Some(false)));
+            if provider == "slack" {
+                assert_eq!((s["allowed_domains"].clone(), s["suggested_domain"].as_str()), (json!([]), Some("acme.test")));
+                let v = set_up(&h, &admin, json!({ "allowed_domains": ["acme.test"] }), SLACK);
+                assert!(v["suggested_domain"].is_null(), "{v}");
+            } else {
+                assert!(s["suggested_domain"].is_null());
+            }
+            let s = h.ok("GET", "/api/v1/sso", None, &admin);
             assert_eq!(s["allowed_domains"], json!(["acme.test"]), "{provider}");
             let issuer = match provider {
                 "google" => GOOGLE.to_string(),
@@ -4213,14 +4231,30 @@ mod sso {
         assert_eq!(landing.location, format!("{SETTINGS}?sso_setup=done"));
         assert_eq!(h.ok("GET", "/api/v1/sso", None, &admin)["allowed_domains"], json!(["acme.test"]));
 
-        // A free-mail address is never an allowed domain, even when Slack vouches for it.
-        let url = start_setup(&h, &admin, json!({ "provider": "slack", "replace": true }));
-        let mut c = admin_token("slack", json!({ "https://slack.com/team_id": "T0ACME", "email_verified": true }));
-        c["email"] = json!("ada@gmail.com");
-        let landing = finish_setup(&h, &url, &admin, c, None).0;
-        assert_eq!(landing.location, format!("{SETTINGS}?sso_setup=domain_needed"));
+        // A free-mail address is never an allowed or suggested domain, whoever vouches for it.
+        for email in
+            ["ada@gmail.com", "ada@tutamail.com", "ada@tutanota.de", "ada@keemail.me", "ada@pm.me", "ada@yahoo.co.uk", "ada@fastmail.fm"]
+        {
+            for provider in ["slack", "microsoft"] {
+                let url = start_setup(&h, &admin, json!({ "provider": provider, "replace": true }));
+                let vouched = if provider == "slack" {
+                    json!({ "https://slack.com/team_id": "T0OTHER", "email_verified": true })
+                } else {
+                    json!({ "tid": "00000000-0000-0000-0000-0000000000aa", "xms_edov": true })
+                };
+                let mut c = admin_token(provider, vouched);
+                c["email"] = json!(email);
+                if provider == "microsoft" {
+                    c["iss"] = json!("https://login.microsoftonline.com/00000000-0000-0000-0000-0000000000aa/v2.0");
+                }
+                let landing = finish_setup(&h, &url, &admin, c, None).0;
+                assert_eq!(landing.location, format!("{SETTINGS}?sso_setup=domain_needed"), "{provider} {email}: {}", landing.error());
+                let s = h.ok("GET", "/api/v1/sso", None, &admin);
+                assert_eq!((s["allowed_domains"].clone(), s["suggested_domain"].clone()), (json!([]), Value::Null), "{provider} {email}");
+            }
+        }
         let s = h.ok("GET", "/api/v1/sso", None, &admin);
-        assert_eq!((s["provider"].as_str(), s["team"].as_str(), s["allowed_domains"].clone()), (Some("slack"), Some("T0ACME"), json!([])));
+        assert_eq!((s["provider"].as_str(), s["tenant"].as_str()), (Some("microsoft"), Some("00000000-0000-0000-0000-0000000000aa")));
     }
 
     #[test]
@@ -4416,6 +4450,170 @@ mod sso {
         h.cfg.sso_apps.microsoft = None;
         let r = h.call("PATCH", "/api/v1/sso", Some(json!({ "provider": "microsoft", "shared": true, "tenant": TENANT })), &admin);
         assert_eq!((r.status, r.body["error"]["code"].as_str()), (400, Some("sso_shared_unavailable")));
+    }
+
+    /// Signs in through `issuer` as `sub`, with Microsoft's `oid` and other claims in `extra`, for
+    /// the app `aud`. Returns the person signed in as, or the error code.
+    fn ms_sign_in(h: &H, aud: &str, sub: &str, email: &str, extra: Value) -> Result<String, String> {
+        let issuer = ms_issuer();
+        let s = start(h, &issuer);
+        assert_eq!(s.query["client_id"], aud);
+        let mut c = claims(&issuer, sub, email, extra);
+        c["aud"] = json!(aud);
+        let (landing, _) = come_back(h, &s, c, &tokens);
+        match landing.session() {
+            Some(session) => Ok(me(h, &session)["id"].as_str().unwrap().to_string()),
+            None => Err(landing.error()),
+        }
+    }
+
+    fn password(h: &H, email: &str) -> u16 {
+        h.call("POST", "/api/v1/auth/login", Some(json!({ "email": email, "password": "password123" })), &Auth::None).status
+    }
+
+    #[test]
+    fn microsoft_links_survive_switching_to_the_servers_app() {
+        let (mut h, admin) = workspace();
+        h.cfg.sso_apps = shared_apps();
+        let (mo_id, _) = h.user(&admin, "mo@acme.test", "Mo", "member");
+        let own = json!({ "provider": "microsoft", "tenant": TENANT, "allowed_domains": ["acme.test"], "client_id": "app-id",
+            "client_secret": "s", "enabled": true, "require_sso": true });
+        set_up(&h, &admin, own, &ms_issuer());
+        let mo_oid = oid_of("mo");
+        // Mo's first sign-in, through the workspace's own app, matches their verified email.
+        let first = ms_sign_in(&h, "app-id", "own-app-sub-mo", "mo@acme.test", json!({ "tid": TENANT, "oid": mo_oid, "xms_edov": true }));
+        assert_eq!(first, Ok(mo_id.clone()));
+
+        // The admin switches to DumbSlab's app. Microsoft gives every app its own `sub` for Mo.
+        let url = start_setup(&h, &admin, json!({ "provider": "microsoft", "replace": true }));
+        let (landing, _, _) = finish_setup(&h, &url, &admin, admin_token("microsoft", organization("microsoft")), None);
+        assert_eq!(landing.location, format!("{SETTINGS}?sso_setup=done"));
+        let s = h.ok("GET", "/api/v1/sso", None, &admin);
+        assert_eq!(
+            (s["shared"].as_bool(), s["require_sso"].as_bool(), s["require_sso_paused"].as_bool()),
+            (Some(true), Some(true), Some(false))
+        );
+        // Same `oid`, new `sub`, and no xms_edov to match an email by: still Mo.
+        let again = ms_sign_in(&h, "microsoft-app", "shared-app-sub-mo", "mo@acme.test", json!({ "tid": TENANT, "oid": mo_oid }));
+        assert_eq!(again, Ok(mo_id.clone()));
+        assert_eq!(password(&h, "mo@acme.test"), 403, "Require single sign-on is still on, and Mo isn't locked out");
+        // And back to the workspace's own app.
+        set_up(&h, &admin, json!({ "shared": false, "client_id": "app-id", "client_secret": "s" }), &ms_issuer());
+        let back = ms_sign_in(&h, "app-id", "own-app-sub-mo", "mo@acme.test", json!({ "tid": TENANT, "oid": mo_oid }));
+        assert_eq!(back, Ok(mo_id));
+        // A Microsoft token without `oid` can't be linked by it.
+        let mut c = json!({ "tid": TENANT, "xms_edov": true });
+        c["oid"] = Value::Null;
+        assert_eq!(ms_sign_in(&h, "app-id", "sub-zed", "zed@acme.test", c), Err("invalid_token".into()));
+    }
+
+    #[test]
+    fn microsoft_links_made_by_sub_move_to_oid_or_pause_require_sso() {
+        let (mut h, admin) = workspace();
+        h.cfg.sso_apps = shared_apps();
+        let (mo_id, _) = h.user(&admin, "mo@acme.test", "Mo", "member");
+        let (zed_id, _) = h.user(&admin, "zed@acme.test", "Zed", "member");
+        let (bo_id, _) = h.user(&admin, "bo@acme.test", "Bo", "member");
+        let issuer = ms_issuer();
+        let own = json!({ "provider": "microsoft", "tenant": TENANT, "allowed_domains": ["acme.test"], "client_id": "app-id",
+            "client_secret": "s", "enabled": true, "require_sso": true });
+        set_up(&h, &admin, own, &issuer);
+        // Links made before links were by `oid`: by the own app's `sub`.
+        let legacy = |user: &str, sub: &str| {
+            h.store
+                .with_tx(|db| {
+                    let r = db.execute(
+                        "INSERT INTO sso_identities (id, user_id, issuer, subject, email, created_at, last_used_at) VALUES (?, ?, ?, ?, '', '2026-01-01T00:00:00Z', NULL)",
+                        &dumbslab_core::params![format!("legacy-{sub}"), user, issuer.clone(), sub],
+                    );
+                    (r, true)
+                })
+                .unwrap()
+                .unwrap();
+        };
+        let subjects = || -> Vec<String> {
+            h.store
+                .with_tx(|db| {
+                    let rows = db.query("SELECT subject FROM sso_identities ORDER BY subject", &[]).unwrap();
+                    (rows.iter().map(|r| r.str("subject")).collect(), true)
+                })
+                .unwrap()
+        };
+        legacy(&mo_id, "own-app-sub-mo");
+        legacy(&zed_id, "own-app-sub-zed");
+        // Through the same app, Mo's old link still works, and moves to Mo's `oid`.
+        let mo = ms_sign_in(&h, "app-id", "own-app-sub-mo", "mo@acme.test", json!({ "tid": TENANT }));
+        assert_eq!(mo, Ok(mo_id.clone()));
+        assert_eq!(subjects(), vec![format!("oid:{}", oid_of("own-app-sub-mo")), "own-app-sub-zed".to_string()]);
+
+        // Switching to DumbSlab's app: Zed's link can't follow (it's by the old app's `sub`), so it's
+        // forgotten, and "Require single sign-on" is paused so Zed isn't locked out.
+        let url = start_setup(&h, &admin, json!({ "provider": "microsoft", "replace": true }));
+        finish_setup(&h, &url, &admin, admin_token("microsoft", organization("microsoft")), None);
+        let s = h.ok("GET", "/api/v1/sso", None, &admin);
+        assert_eq!(
+            (s["require_sso"].as_bool(), s["require_sso_paused"].as_bool(), s["active"].as_bool()),
+            (Some(false), Some(true), Some(true))
+        );
+        assert!(!subjects().contains(&"own-app-sub-zed".to_string()));
+        let activity = h.ok("GET", "/api/v1/activity?limit=100", None, &admin);
+        let updated = activity["items"].as_array().unwrap().iter().find(|e| e["event"] == "sso.updated").unwrap().clone();
+        assert_eq!((updated["data"]["links_forgotten"].as_i64(), updated["data"]["require_sso_paused"].as_bool()), (Some(1), Some(true)));
+        assert_eq!(password(&h, "zed@acme.test"), 200, "Zed can sign in with their password, and link again");
+        // Mo's link moved to `oid`, so it carried over.
+        let mo =
+            ms_sign_in(&h, "microsoft-app", "shared-app-sub-mo", "mo@acme.test", json!({ "tid": TENANT, "oid": oid_of("own-app-sub-mo") }));
+        assert_eq!(mo, Ok(mo_id));
+        // Zed's verified email matches again, with no old link in the way.
+        let zed = ms_sign_in(&h, "microsoft-app", "shared-app-sub-zed", "zed@acme.test", json!({ "tid": TENANT, "xms_edov": true }));
+        assert_eq!(zed, Ok(zed_id));
+        // Turning it back on clears the note.
+        let v = set_up(&h, &admin, json!({ "require_sso": true }), &issuer);
+        assert_eq!((v["require_sso"].as_bool(), v["require_sso_paused"].as_bool()), (Some(true), Some(false)));
+
+        // The same when an agent switches apps with update_sso.
+        legacy(&bo_id, "shared-app-sub-bo");
+        let v = set_up(&h, &admin, json!({ "shared": false, "client_id": "app-2", "client_secret": "s2" }), &issuer);
+        assert_eq!((v["require_sso"].as_bool(), v["require_sso_paused"].as_bool()), (Some(false), Some(true)), "{v}");
+        assert_eq!(password(&h, "bo@acme.test"), 200);
+        // Without anyone left to link again, "Require single sign-on" stays as it is.
+        set_up(&h, &admin, json!({ "require_sso": true }), &issuer);
+        let v = set_up(&h, &admin, json!({ "shared": true }), &issuer);
+        assert_eq!((v["require_sso"].as_bool(), v["require_sso_paused"].as_bool()), (Some(true), Some(false)), "{v}");
+    }
+
+    #[test]
+    fn settings_changed_before_the_sign_in_starts_are_never_overwritten() {
+        let (h, admin) = shared_workspace();
+        let t = h.ok("POST", "/api/v1/tokens", Some(json!({ "name": "agent", "scopes": ["read", "write", "admin"] })), &admin);
+        let agent = Auth::Bearer(t["token"].as_str().unwrap().to_string());
+        let changed = |finish: Finish| match finish {
+            Finish::Fail(e) => (e.status, e.code),
+            other => panic!("{other:?}"),
+        };
+        // Nothing to replace when setting up starts, so no `replace` asked; then, before the job
+        // even reads Google's discovery document, another admin sets up Microsoft.
+        let r = h.call("POST", "/api/v1/sso/setup", Some(json!({ "provider": "google" })), &admin);
+        assert_eq!(r.status, 200, "{}", r.body);
+        set_up(&h, &agent, json!({ "provider": "microsoft", "shared": true, "tenant": TENANT }), &ms_issuer());
+        let (finish, sent) = drive(&h, job_of(&r), &|_| ok(discovery(GOOGLE)));
+        assert_eq!((changed(finish), sent.len()), ((409, "sso_changed"), 0));
+        // Or while it's waiting for that document.
+        let r = h.call("POST", "/api/v1/sso/setup", Some(json!({ "provider": "google", "replace": true })), &admin);
+        let mut job = job_of(&r);
+        let first = h.store.with_tx(|db| (connect::step(db, &h.cfg, &mut job, vec![], chrono::Utc::now()), true)).unwrap().unwrap();
+        assert!(matches!(first, Step::Fetch(_)));
+        set_up(&h, &agent, json!({ "allowed_domains": ["acme.test"] }), &ms_issuer());
+        let second = h
+            .store
+            .with_tx(|db| (connect::step(db, &h.cfg, &mut job, vec![ok(discovery(GOOGLE))], chrono::Utc::now()), true))
+            .unwrap()
+            .unwrap();
+        let Step::Done(finish) = second else { panic!("done") };
+        assert_eq!(changed(finish), (409, "sso_changed"));
+        assert_eq!(count(&h, "SELECT COUNT(*) FROM sso_requests"), 0, "no sign-in was started");
+        let s = h.ok("GET", "/api/v1/sso", None, &admin);
+        assert_eq!((s["provider"].as_str(), s["allowed_domains"].clone()), (Some("microsoft"), json!(["acme.test"])));
     }
 
     #[test]
