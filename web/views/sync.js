@@ -464,7 +464,7 @@ const connectErrors = {
   declined: (app) => `${app} didn’t allow access. Choose Connect ${app} again, and authorize DumbSlab when ${app} asks.`,
   no_code: (app) => `${app} didn’t finish connecting. Choose Connect ${app} again.`,
   not_yours: () => 'Your GitHub account can’t access that installation of DumbSlab’s app. Install it on an account or organization you manage, then try again.',
-  choose_installation: () => 'GitHub didn’t say which installation of DumbSlab’s app you set up, and you can reach too many to connect them all. On GitHub, open the installation (Settings › Applications › Configure) and save it; that brings you back here with it.',
+  choose_installation: () => 'GitHub didn’t say which installation of DumbSlab’s app you set up, and you can reach too many to connect them all. On GitHub, open the app under Installed GitHub Apps in your account’s or organization’s settings, choose Configure and save; that brings you back here with it.',
   installation_full: () => 'GitHub is connected, but that installation of DumbSlab’s app already serves as many DumbSlab workspaces as it can, so pushes won’t sync by themselves here. Sync now still works.',
   failed: (app) => `Connecting ${app} didn’t work. Try again.`,
 };
