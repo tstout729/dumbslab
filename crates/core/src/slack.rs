@@ -43,31 +43,33 @@
 //! Add to Slack: https://docs.slack.dev/authentication/installing-with-oauth (redirect URLs must be
 //! https and match or be under a registered one; the code lasts ten minutes; `team` is `null` and
 //! `is_enterprise_install` true for an org-wide install), https://docs.slack.dev/reference/methods/oauth.v2.access
-//! (Basic auth preferred for the client's credentials), https://docs.slack.dev/reference/methods/auth.revoke,
-//! https://docs.slack.dev/reference/events/app_uninstalled, https://docs.slack.dev/reference/events/tokens_revoked
+//! (Basic auth preferred for the client's credentials), https://docs.slack.dev/enterprise/migrating-to-organization-wide-deployment/
+//! (an org-wide install's bot token also reaches the workspaces that installed the app themselves, so a
+//! refused org-wide install isn't revoked either), https://docs.slack.dev/reference/events/app_uninstalled, https://docs.slack.dev/reference/events/tokens_revoked
 //! (`tokens.bot` lists bot user IDs, not tokens), https://docs.slack.dev/apis/events-api/ (`authorizations` names
 //! the one installation an event is for), https://docs.slack.dev/apis/events-api/using-http-request-urls
 //! (`url_verification` names no workspace), https://docs.slack.dev/app-manifests/configuring-apps-with-app-manifests/
 //! (`https://api.slack.com/apps?new_app=1&manifest_json=…`, URL-encoded), https://docs.slack.dev/app-management/distribution
 //! (public distribution is switched on in Manage Distribution; the manifest has no field for it).
 //!
-//! Slack keeps one bot token per app and Slack workspace (its docs and SDKs model an install as
-//! one bot token per workspace; they don't spell out reinstalls), so installing the shared app for
-//! a Slack workspace another DumbSlab workspace holds is taken to hand back that workspace's token.
-//! So:
+//! Slack keeps one bot token per app and Slack workspace: every install of the shared app into a
+//! Slack workspace gets the same one (its docs and SDKs model an install as one bot token per
+//! workspace). So a revoke by one DumbSlab workspace could always reach the next one's token, and
+//! DumbSlab never revokes a shared-app token. Disconnecting forgets the token and lets go of the
+//! Slack workspace; removing the app from Slack is the Slack admin's (Slack then sends
+//! `app_uninstalled`). What keeps one Slack workspace to one DumbSlab workspace is the directory:
 //!
-//! - A token is revoked only when no other DumbSlab workspace can hold it: never when the Slack
-//!   workspace is taken; for a refused org-wide install; and on Disconnect and for the previous
-//!   Slack workspace after a switch, while this workspace still holds the claim. The claim is let
-//!   go of only once Slack has answered the revoke (`slack_releases`), so a late revoke can't kill
-//!   the token the next workspace was given. An unanswered revoke keeps the claim until it's tried
-//!   again (Disconnect, Add to Slack, or Slack's next request for that Slack workspace).
-//! - Claims carry the install's own id, and letting go names it; one install at a time goes from
-//!   claiming to saving, and one that claimed but wasn't saved puts the claim back as it was: the
-//!   connection's, or the one a token waiting to be revoked depends on. A claim is never let go
-//!   of while a token for its Slack workspace waits; only the save calls such a revoke off.
-//! - `app_uninstalled` and `tokens_revoked` are checked with `auth.test`, for the install
-//!   (`generation`) saved when they arrived: Slack's event times are whole seconds and out of order.
+//! - An install claims its Slack workspace provisionally (it runs out after 15 minutes), saves,
+//!   then confirms the claim. Only confirmed claims route, and an install acts on Slack (channel
+//!   messages, command answers, previews) only once confirmed: [`App::bot_token`] is `None` until
+//!   then. A confirmation the directory refuses (the claim ran out and another workspace took it,
+//!   or this one was deleted) makes the install forget itself. One that never ran is tried again
+//!   on the next visit to Settings › Slack and the next request from Slack.
+//! - Claims are named by the install's random id; letting go names it, and nothing ever puts back
+//!   a claim read earlier. One install at a time goes from claiming to confirming.
+//! - `app_uninstalled` and `tokens_revoked` are checked with `auth.test`, and only the install
+//!   saved when the check started is forgotten: Slack's event times are whole seconds and out of
+//!   order.
 
 mod shared_app;
 
@@ -87,12 +89,12 @@ use crate::events::{Event, emit};
 use crate::registry::{Ctx, registry};
 use crate::util::{parse_ts, secure_eq, sha256_hex, ts};
 use crate::{Effect, HostConfig, Outcome, Request, Response, WebhookDelivery, params};
+pub(crate) use shared_app::release_job;
 pub use shared_app::{
     InstallError, Routed, Shared, SharedApp, create_app_link, install_callback, install_callback_url, install_start, manifest_route, route,
     shared, shared_manifest, team_of, unknown_team,
 };
-use shared_app::{Installed, Pending, Undo, home, ours, stray};
-pub(crate) use shared_app::{add_pending, pending_teams};
+use shared_app::{Installed, home, ours, stray, unconfirmed};
 
 /// Where Slack sends the slash command.
 pub const COMMANDS_PATH: &str = "/slack/commands";
@@ -153,8 +155,12 @@ const POST_HEADER: &str = "x-dumbslab-post";
 /// The workspace's Slack app, with its secrets decrypted. Never printed.
 #[derive(Clone, Default)]
 pub struct App {
-    /// `None` when there's none, or it can't be read with the host's connector key.
+    /// The bot token to act on Slack with. `None` when there's none, when it can't be read with
+    /// the host's connector key, and for an Add to Slack install the directory hasn't confirmed:
+    /// until it has, nothing here may act on Slack.
     pub bot_token: Option<String>,
+    /// A bot token is saved (whether or not it may be used yet).
+    pub token_saved: bool,
     /// The workspace's own app's, or with the shared app the host's (while it has one).
     pub signing_secret: Option<String>,
     /// The Slack workspace the bot token belongs to, from `auth.test` or `oauth.v2.access`.
@@ -166,10 +172,17 @@ pub struct App {
     pub shared: bool,
     /// The bot scopes Slack granted the shared app.
     pub scopes: Vec<String>,
-    /// Goes up with every install (see the migration).
-    pub generation: i64,
-    /// Hosted: the id this install claimed its Slack workspace with in the directory.
-    pub claim: Option<String>,
+    /// This install's random id (see the migration).
+    pub install_id: Option<String>,
+    /// Add to Slack: the directory confirmed the install's claim (always so off hosted DumbSlab).
+    pub confirmed: bool,
+}
+
+impl App {
+    /// An Add to Slack install still waiting for the directory to confirm it.
+    pub fn confirming(&self) -> bool {
+        self.shared && !self.confirmed
+    }
 }
 
 impl fmt::Debug for App {
@@ -212,12 +225,14 @@ pub fn load(db: &dyn Db, cfg: &HostConfig) -> ApiResult<Option<App>> {
         connect::open(key(cfg)?, OWNER, kind, &sealed).ok().map(|c| c.token)
     };
     let shared = r.bool("shared");
+    let confirmed = r.bool("confirmed");
     let signing_secret = match shared {
         true => cfg.slack.signing_secret.clone().filter(|s| !s.is_empty()),
         false => open(SIGNING_SECRET, "signing_secret"),
     };
     Ok(Some(App {
-        bot_token: open(BOT_TOKEN, "bot_token"),
+        bot_token: open(BOT_TOKEN, "bot_token").filter(|_| !shared || confirmed),
+        token_saved: r.opt_str("bot_token").is_some(),
         signing_secret,
         team_id: r.opt_str("team_id"),
         team_name: r.str("team_name"),
@@ -225,14 +240,9 @@ pub fn load(db: &dyn Db, cfg: &HostConfig) -> ApiResult<Option<App>> {
         unfurls: r.bool("unfurls"),
         shared,
         scopes: r.str("scopes").split(',').filter(|s| !s.is_empty()).map(str::to_string).collect(),
-        generation: r.opt_i64("generation").unwrap_or(0),
-        claim: r.opt_str("claim"),
+        install_id: r.opt_str("install_id"),
+        confirmed,
     }))
-}
-
-/// Decrypts a secret [`seal`] made, or `None` for another key.
-fn unseal(cfg: &HostConfig, kind: &str, sealed: &str) -> Option<String> {
-    connect::open(key(cfg)?, OWNER, kind, sealed).ok().map(|c| c.token)
 }
 
 /// What an admin changes about the Slack app. Never printed.
@@ -256,12 +266,14 @@ fn save(db: &dyn Db, cfg: &HostConfig, change: &Change, team: Option<&Team>, act
     db.execute("INSERT INTO slack_app (id, updated_at) VALUES (1, ?) ON CONFLICT(id) DO NOTHING", &params![ts(now)])?;
     if let (Some(token), Some(team)) = (&change.bot_token, team) {
         db.execute(
-            "UPDATE slack_app SET bot_token = ?, team_id = ?, team_name = ?, bot_user_id = ? WHERE id = 1",
+            "UPDATE slack_app SET bot_token = ?, team_id = ?, team_name = ?, bot_user_id = ?, shared = 0, confirmed = 0, install_id = ?
+             WHERE id = 1",
             &params![
                 seal(cfg, BOT_TOKEN, token)?,
                 team.id.clone(),
                 team.name.clone(),
-                Some(team.bot_user_id.clone()).filter(|b| !b.is_empty())
+                Some(team.bot_user_id.clone()).filter(|b| !b.is_empty()),
+                crate::util::new_id()
             ],
         )?;
     }
@@ -424,7 +436,10 @@ fn run(db: &dyn Db, cfg: &HostConfig, req: &Request) -> ApiResult<Outcome> {
     }
     let base = crate::http::base_url(cfg, req);
     // The shared app serves every Slack workspace: only the one this workspace holds gets in.
-    let Some(app) = app.filter(|a| !a.shared || ours(a, path, &req.body)) else { return stray(db, cfg, &base, path, &req.body) };
+    let Some(app) = app.filter(|a| !a.shared || ours(a, path, &req.body)) else { return stray(cfg, &base, path, &req.body) };
+    if app.confirming() {
+        return unconfirmed(cfg, &app, &base, path, &req.body);
+    }
     if path == COMMANDS_PATH { command(db, &app, &base, &req.body) } else { event(db, cfg, &app, &base, &req.body, now) }
 }
 
@@ -528,10 +543,8 @@ fn event(db: &dyn Db, cfg: &HostConfig, app: &App, base: &str, body: &[u8], now:
             if app.shared && (e["type"] == "app_uninstalled" || bot_revoked) {
                 // Slack doesn't keep events in order, and its times are whole seconds: this may be
                 // about an earlier install. Ask Slack whether the saved token still works.
-                return Ok(later(
-                    Response::json(200, &json!({ "ok": true })),
-                    SlackJob::new(base, Work::Check { generation: app.generation }),
-                ));
+                let Some(install_id) = app.install_id.clone() else { return Ok(ack()) };
+                return Ok(later(Response::json(200, &json!({ "ok": true })), SlackJob::new(base, Work::Check { install_id })));
             }
             let user = e["user"].as_str().unwrap_or_default();
             if e["type"] != "link_shared" || !app.unfurls || app.bot_token.is_none() || !valid_id(user) {
@@ -922,14 +935,10 @@ pub struct SlackJob {
     effects: Vec<Effect>,
     /// Add to Slack: what Slack gave, while the directory claims its Slack workspace.
     installed: Option<Installed>,
-    /// Add to Slack: the id it claims the Slack workspace with.
-    claim: Option<String>,
-    /// Add to Slack: what undoing its claim does if it fails before saving.
-    undo: Undo,
+    /// Add to Slack: the install's random id, which names its claim.
+    install_id: Option<String>,
     /// Add to Slack: where to send the admin once the last request is answered.
     then: Option<String>,
-    /// The token being revoked.
-    pending: Option<Pending>,
     /// Requests to Slack whose outcome was unknown are tried once more.
     attempt: u8,
 }
@@ -942,20 +951,25 @@ enum Work {
     NewDraft { user: String, title: String, reply_to: String },
     /// Preview links someone shared.
     Unfurl { user: String, links: Vec<(String, String)>, target: UnfurlTarget },
-    /// An admin saved a bot token: check it with Slack, then save it with the rest of the change.
-    Save { admin: String, via: Via, change: Change },
+    /// An admin saved a bot token: check it with Slack, then save it with the rest of the change,
+    /// if the connection is still the one it was checked against (`expect`, its install id).
+    Save { admin: String, via: Via, change: Change, expect: Option<String> },
     /// An admin asked for a test message in a channel.
     Test { channel_id: String },
     /// Add to Slack: Slack sent an admin back with a code. Exchange it for the bot token, claim the
     /// Slack workspace in the directory (hosted), then save it.
     Install { admin: String, via: Via, code: String, redirect_uri: String, home: Option<String> },
-    /// Revoke the shared app's bot token waiting in `slack_releases` for this Slack workspace, and
-    /// once Slack has answered, let go of its claim (hosted). With no token waiting, let go of a
-    /// stale claim only.
-    Release { team_id: String },
+    /// Hosted: let go of a Slack workspace's claim in the directory: the install's (its id), or,
+    /// without one, this workspace's confirmed claim on a Slack workspace it no longer holds.
+    /// Shared-app tokens are never revoked: Slack gives every install of the app into a Slack
+    /// workspace the same one.
+    Release { team_id: String, install_id: Option<String> },
+    /// Hosted: ask the directory to confirm the saved install's claim, which a step that died
+    /// left unconfirmed.
+    Confirm { install_id: String },
     /// Slack said the shared app was removed or its bot token revoked: if the saved token is dead,
-    /// disconnect, but only the install (`generation`) the event arrived for.
-    Check { generation: i64 },
+    /// disconnect, but only the install the event arrived for.
+    Check { install_id: String },
 }
 
 /// The message whose links Slack asked to preview.
@@ -984,8 +998,8 @@ enum Phase {
     Exchanging,
     /// Waiting for the directory to claim the Slack workspace.
     Claiming,
-    /// Waiting for `auth.revoke`.
-    Revoking,
+    /// Waiting for the directory to confirm a claim.
+    Confirming,
     /// Waiting for the directory to undo a claim an install made, then sending the admin to
     /// [`SlackJob::then`].
     Undoing,
@@ -1006,6 +1020,7 @@ impl fmt::Debug for SlackJob {
             Work::Test { .. } => "test",
             Work::Install { .. } => "install",
             Work::Release { .. } => "release",
+            Work::Confirm { .. } => "confirm",
             Work::Check { .. } => "check",
         };
         write!(f, "SlackJob({kind}, {:?})", self.phase)
@@ -1020,22 +1035,21 @@ impl SlackJob {
             phase: Phase::Start,
             effects: vec![],
             installed: None,
-            claim: None,
-            undo: Undo::Release,
+            install_id: None,
             then: None,
-            pending: None,
             attempt: 0,
         }
     }
 
-    /// Revokes the shared app's bot token waiting for `team_id`, then lets go of its claim.
-    pub(crate) fn release(base_url: &str, team_id: &str) -> SlackJob {
-        SlackJob::new(base_url, Work::Release { team_id: team_id.to_string() })
+    /// Hosted: asks the directory to confirm the saved install's claim.
+    pub(crate) fn confirm(base_url: &str, install_id: &str) -> SlackJob {
+        SlackJob::new(base_url, Work::Confirm { install_id: install_id.to_string() })
     }
 
-    /// Checks a new bot token with Slack, then saves it with the rest of `change`.
-    pub(crate) fn save(base_url: &str, admin: &Actor, change: Change) -> SlackJob {
-        SlackJob::new(base_url, Work::Save { admin: admin.user_id.clone(), via: admin.via, change })
+    /// Checks a new bot token with Slack, then saves it with the rest of `change`, if the
+    /// connection is still the one with install id `expect` (and isn't Add to Slack's).
+    pub(crate) fn save(base_url: &str, admin: &Actor, change: Change, expect: Option<String>) -> SlackJob {
+        SlackJob::new(base_url, Work::Save { admin: admin.user_id.clone(), via: admin.via, change, expect })
     }
 
     /// Sends a test message to a channel.
@@ -1190,9 +1204,22 @@ pub fn step(db: &dyn Db, cfg: &HostConfig, job: &mut SlackJob, replies: Vec<Http
             job.phase = Phase::Checking;
             Ok(Step::Fetch(vec![auth_test(token)]))
         }
-        (Phase::Checking, Work::Save { admin, via, change }) => {
+        (Phase::Checking, Work::Save { admin, via, change, expect }) => {
             if let Some(code) = slack_error(&answer) {
                 return fail(token_refused(&code));
+            }
+            // Add to Slack may have connected meanwhile, or another token been saved: this one was
+            // checked against what was there before.
+            let there = load(db, cfg)?;
+            if there.as_ref().is_some_and(|a| a.shared) {
+                return fail(crate::ops::slack::shared_refusal());
+            }
+            if there.and_then(|a| a.install_id) != expect {
+                return fail(ApiError::new(
+                    409,
+                    "slack_changed",
+                    "Slack's settings changed while Slack checked the token. Look again, then save.",
+                ));
             }
             let v = answer.json();
             let team = Team { id: connect::s(&v["team_id"]), name: connect::s(&v["team"]), bot_user_id: connect::s(&v["user_id"]) };
@@ -1240,7 +1267,9 @@ pub fn step(db: &dyn Db, cfg: &HostConfig, job: &mut SlackJob, replies: Vec<Http
             }
         }
         // Add to Slack, and letting go of the shared app.
-        (_, Work::Install { .. } | Work::Release { .. } | Work::Check { .. }) => shared_app::step(db, cfg, job, &app, answer, now),
+        (_, Work::Install { .. } | Work::Release { .. } | Work::Confirm { .. } | Work::Check { .. }) => {
+            shared_app::step(db, cfg, job, &app, answer, now)
+        }
         (phase, _) => Err(ApiError::internal(format!("a Slack job can't continue from {phase:?}"))),
     }
 }
@@ -1476,7 +1505,7 @@ mod tests {
     #[test]
     fn jobs_never_print_secrets() {
         let change = Change { bot_token: Some("xoxb-secret".into()), signing_secret: Some("s3cret".into()), unfurls: None };
-        let job = SlackJob::new("https://kb.test", Work::Save { admin: "u".into(), via: Via::Web, change });
+        let job = SlackJob::new("https://kb.test", Work::Save { admin: "u".into(), via: Via::Web, change, expect: None });
         let app = App { bot_token: Some("xoxb-secret".into()), signing_secret: Some("s3cret".into()), ..Default::default() };
         let install = SlackJob::new(
             "https://kb.test",
@@ -1488,8 +1517,7 @@ mod tests {
                 home: None,
             },
         );
-        let mut forget = SlackJob::release("https://kb.test", "T1");
-        forget.pending = Some(Pending::new("T1", "sealed", "xoxb-secret"));
+        let forget = SlackJob::confirm("https://kb.test", "install-1");
         let host = SharedApp { signing_secret: Some("host-secret".into()), callback_url: None };
         let printed = format!("{job:?} {app:?} {install:?} {forget:?} {host:?}");
         for secret in ["xoxb-secret", "s3cret", "secret-code", "host-secret"] {

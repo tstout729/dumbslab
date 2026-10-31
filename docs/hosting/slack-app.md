@@ -77,11 +77,12 @@ In any workspace, open Settings › Slack as an admin. You should see **Add to S
 ## What to know
 
 - **One Slack workspace, one DumbSlab workspace.** The `Directory` object records which DumbSlab workspace connected each Slack workspace (the `slack_teams` table). Slack sends all requests to the root domain, and the Worker forwards each one there. Deleting a workspace with the operator API frees its Slack workspace.
-- **A Slack workspace stays claimed until its old token is revoked.** After a Disconnect, the claim goes only once Slack has answered the revoke. If Slack never answers, the workspace's admin sees **Try again** in Settings › Slack. Another workspace trying to add it meanwhile is told it's taken.
+- **DumbSlab never revokes this app's tokens.** Slack gives every install of the app in a Slack workspace the same bot token, so a revoke by one DumbSlab workspace could reach the next one's. Disconnecting stops DumbSlab from using the Slack workspace and frees it in the `Directory`; removing the app from Slack is the Slack admin's job, and Slack then tells DumbSlab (`app_uninstalled`).
+- **Claims are provisional until confirmed.** An Add to Slack claims its Slack workspace for up to 15 minutes, saves, then confirms. Only confirmed claims route, and a workspace acts on Slack only once its claim is confirmed.
 - **Changing the root domain.** Open `/slack/app-manifest.json` on the new domain and paste it into the app's **App Manifest** page. Slack may ask workspaces to reinstall the app after its link domain changes.
 - **Rotating the signing secret.** Regenerate it in Slack, then run `npx wrangler secret put SLACK_SIGNING_SECRET` and deploy. Requests fail in between.
 - **Rate limits.** Slack's May 2025 limit cut for apps outside the Marketplace covers `conversations.history` and `conversations.replies` only. DumbSlab calls neither.
-- **Enterprise Grid.** Org-wide installs are off in the manifest. If one happens anyway, DumbSlab refuses it and revokes its token.
+- **Enterprise Grid.** Org-wide installs are off in the manifest. If one happens anyway, DumbSlab refuses it without revoking: an org-wide token also reaches the org's workspaces that installed the app themselves. An org admin removes it in Slack.
 
 ## Slack Marketplace
 

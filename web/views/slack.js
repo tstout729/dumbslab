@@ -23,9 +23,10 @@ const installErrors = {
   other_session: 'Finish connecting in the browser you started in, signed in as the same admin. Click Add to Slack again.',
   declined: 'Slack didn’t allow DumbSlab. Click Add to Slack again, and choose Allow.',
   slack_error: 'Slack didn’t finish connecting. Try again.',
-  enterprise_install: 'DumbSlab connects one Slack workspace at a time, not a whole Enterprise organization. Add it to one workspace instead.',
+  enterprise_install: 'DumbSlab connects one Slack workspace at a time, not a whole Enterprise organization. An org admin can remove the org-wide install in Slack (Organization settings › Integrations › Installed apps). Then add DumbSlab to one workspace.',
   slack_team_taken: 'That Slack workspace is already connected to another DumbSlab workspace. Disconnect it there first, then try again.',
-  slack_busy: 'DumbSlab is still finishing an earlier change to Slack. Try again in a minute.',
+  slack_busy: 'Another Add to Slack for this workspace is finishing. Try again in a minute.',
+  unconfirmed: 'Slack is connected, but DumbSlab couldn’t finish checking it. Until it has, it posts nothing in Slack. Reload this page in a minute.',
   failed: 'Connecting Slack didn’t work. Try again.',
 };
 
@@ -42,27 +43,21 @@ function addPanel(s) {
     h('p', { class: 'field-hint' }, `DumbSlab asks Slack for ${s.scopes.join(', ')}: the /dumbslab command, posting in channels, link previews, and matching people by the email address Slack has confirmed.`));
 }
 
+// Slack's help on removing an app (workspace admins), and on org-wide apps (Enterprise org admins).
+const REMOVE_APP_HELP = 'https://slack.com/help/articles/360003125231-Remove-apps-and-custom-integrations-from-your-workspace';
+
 /** Connected with Add to Slack. */
 function sharedPanel(s) {
+  const status = s.confirming
+    ? h('p', { class: 'callout callout-warn', role: 'status' }, icon('alert'),
+      h('span', null, `DumbSlab is finishing connecting to ${s.slack_workspace || 'Slack'}. Until it has, it posts nothing in Slack. Reload this page in a minute.`))
+    : h('p', { class: 'callout', role: 'status' }, icon('checkCircle'),
+      h('span', null, `Connected to ${s.slack_workspace || 'Slack'} with DumbSlab’s Slack app.`));
   return panel('Connected', null,
-    h('p', { class: 'callout', role: 'status' }, icon('checkCircle'),
-      h('span', null, `Connected to ${s.slack_workspace || 'Slack'} with DumbSlab’s Slack app.`)),
+    status,
     s.install_url
       ? h('p', { class: 'field-hint' }, 'To use another Slack workspace, click Add to Slack again and pick it there. ', h('a', { href: s.install_url, 'data-native': true }, 'Add to Slack'))
       : null);
-}
-
-/** A disconnected Slack workspace's bot token isn't confirmed revoked yet: Slack didn't answer. */
-function pendingPanel(reload) {
-  const retry = button('Try again', { variant: 'subtle', size: 'sm' });
-  retry.addEventListener('click', () => busy(retry, async () => {
-    await api.del('/slack');
-    toast('Trying again');
-    setTimeout(reload, 2000);
-  }).catch(toastError));
-  return h('div', { class: 'callout callout-warn', role: 'status' }, icon('alert'),
-    h('span', null, 'Slack hasn’t confirmed that it revoked DumbSlab’s token in a Slack workspace you disconnected. Until it does, that Slack workspace can’t be added to another DumbSlab workspace. '),
-    retry);
 }
 
 /** Own app connected, and the server offers Add to Slack too. */
@@ -233,7 +228,7 @@ function channelsPanel(s, topics, reload) {
 function disconnectPanel(reload, shared) {
   const off = button('Disconnect Slack', { variant: 'subtle', size: 'sm', cls: 'text-danger' });
   const message = shared
-    ? 'DumbSlab forgets the channel list and revokes its bot token in Slack. /dumbslab and link previews stop working, and the Slack workspace can be added to another DumbSlab workspace.'
+    ? 'DumbSlab stops using this Slack workspace and forgets its token and the channel list. /dumbslab and link previews stop answering, and the Slack workspace can be added to another DumbSlab workspace. The app stays in Slack until a Slack admin removes it there.'
     : 'DumbSlab forgets the bot token, the signing secret and the channel list. /dumbslab and link previews stop working. Delete the app at api.slack.com/apps to remove it from Slack too.';
   off.addEventListener('click', async () => {
     const ok = await confirmDialog({ title: 'Disconnect Slack?', message, confirmLabel: 'Disconnect', danger: true });
@@ -244,7 +239,11 @@ function disconnectPanel(reload, shared) {
       reload();
     }).catch(toastError);
   });
-  return panel('Disconnect', null, h('div', null, off));
+  return panel('Disconnect', null, h('div', null, off),
+    shared
+      ? h('p', { class: 'field-hint' }, 'Disconnecting doesn’t remove DumbSlab’s app from Slack. A Slack admin can remove it there: ',
+        h('a', { href: REMOVE_APP_HELP, target: '_blank', rel: 'noopener noreferrer' }, 'how to remove an app'), '.')
+      : null);
 }
 
 export async function slackSection(ctx) {
@@ -268,7 +267,6 @@ export async function slackSection(ctx) {
     return frag(intro, ...notes, h('p', { class: 'callout callout-warn', role: 'alert' }, icon('alert'),
       h('span', null, 'Slack needs this server’s connector key to keep the Slack app’s secrets. Set DUMBSLAB_CONNECTOR_KEY (self-hosted) or the CONNECTOR_KEY secret (Cloudflare), then come back.')));
   }
-  if (s.pending_revoke) notes.push(pendingPanel(reload));
   const saved = s.bot_token_saved || s.signing_secret_saved || s.channels.length;
   const channels = channelsPanel(s, topics, reload);
   if (s.mode === 'shared') {

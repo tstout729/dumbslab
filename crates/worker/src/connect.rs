@@ -40,11 +40,12 @@ fn root_callback(env: &Env, origin: &str, path: &str) -> Option<String> {
 }
 
 /// Sends one request a workspace's job asked for. Calls to the directory (`slack::DIRECTORY`: Add
-/// to Slack claims and releases its Slack workspace) go to the `Directory` object, for this
-/// workspace only: the home is this object's, whatever the call says. Everything else is [`send`].
+/// to Slack claims, confirms and lets go of its Slack workspace) go to the `Directory` object, for
+/// this workspace only: the home is this object's, whatever the call says. Everything else is
+/// [`send`].
 pub async fn send_for(env: &Env, home: Option<&str>, call: &HttpCall) -> HttpReply {
     let Some(path) = call.url.strip_prefix(slack::DIRECTORY) else { return send(call).await };
-    let (Some(home), "/slack/claim" | "/slack/release") = (home, path) else { return HttpReply::default() };
+    let (Some(home), "/slack/claim" | "/slack/confirm" | "/slack/release") = (home, path) else { return HttpReply::default() };
     let mut body: serde_json::Value = call.body.as_deref().and_then(|b| serde_json::from_str(b).ok()).unwrap_or_default();
     body["home"] = serde_json::Value::from(home);
     match crate::sql::call_object(env, "DIRECTORY", "directory", Method::Post, path, Some(&body)).await {

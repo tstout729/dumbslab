@@ -58,7 +58,7 @@ struct UsageInput {
 struct SlackTeamInput {
     team_id: String,
     home: Option<String>,
-    claim: Option<String>,
+    install_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -230,15 +230,24 @@ impl DurableObject for Directory {
                     tenancy::record_risk(db, &input.customer, &input.kind.unwrap_or_default(), Utc::now()).map(|_| json!({ "ok": true }))
                 })?
             }
-            // Add to Slack: a workspace claims or lets go of a Slack workspace (from its jobs), and
-            // the root domain asks where to send a Slack workspace's commands and events.
+            // Add to Slack: a workspace claims, confirms or lets go of a Slack workspace (from its
+            // jobs), and the root domain asks where to send a Slack workspace's commands and events.
             (Method::Post, "/slack/claim") => {
                 let input: ApiResult<SlackTeamInput> = parse(&body);
                 self.run(move |db| {
                     let input = input?;
                     let home = input.home.ok_or_else(|| ApiError::bad_request("send the workspace's home"))?;
-                    let claim = input.claim.unwrap_or_default();
-                    tenancy::claim_slack_team(db, &input.team_id, &home, &claim, Utc::now()).map(|_| json!({ "ok": true }))
+                    let id = input.install_id.unwrap_or_default();
+                    tenancy::claim_slack_team(db, &input.team_id, &home, &id, Utc::now()).map(|_| json!({ "ok": true }))
+                })?
+            }
+            (Method::Post, "/slack/confirm") => {
+                let input: ApiResult<SlackTeamInput> = parse(&body);
+                self.run(move |db| {
+                    let input = input?;
+                    let home = input.home.ok_or_else(|| ApiError::bad_request("send the workspace's home"))?;
+                    let id = input.install_id.unwrap_or_default();
+                    tenancy::confirm_slack_team(db, &input.team_id, &home, &id).map(|_| json!({ "ok": true }))
                 })?
             }
             (Method::Post, "/slack/release") => {
@@ -246,8 +255,7 @@ impl DurableObject for Directory {
                 self.run(move |db| {
                     let input = input?;
                     let home = input.home.ok_or_else(|| ApiError::bad_request("send the workspace's home"))?;
-                    tenancy::release_slack_team(db, &input.team_id, &home, input.claim.as_deref(), Utc::now())
-                        .map(|_| json!({ "ok": true }))
+                    tenancy::release_slack_team(db, &input.team_id, &home, input.install_id.as_deref()).map(|_| json!({ "ok": true }))
                 })?
             }
             (Method::Post, "/slack/lookup") => {
