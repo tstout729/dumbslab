@@ -1164,11 +1164,14 @@ impl Job {
     /// step even when the host's guard would refuse it (a full workspace).
     ///
     /// A job opts in by reading each renewal's answer in a step of its own that writes only that,
-    /// and reporting it here. Connected apps' refreshes ([`save_token`]) and docs sync's GitLab
-    /// tokens could adopt it the same way.
+    /// and reporting it here: the people sync, docs sync's GitLab app folders, GitLab approvals and
+    /// GitLab webhook cleanups do. Connected apps' refreshes ([`save_token`]) could adopt it the
+    /// same way.
     pub fn wrote_only_credentials(&self) -> bool {
         match self {
             Job::People(j) => j.wrote_only_credentials(),
+            Job::Docs(j) => j.wrote_only_credentials(),
+            Job::GitLab(j) => j.wrote_only_credentials(),
             _ => false,
         }
     }

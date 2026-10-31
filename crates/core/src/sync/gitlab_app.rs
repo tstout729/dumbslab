@@ -531,6 +531,9 @@ pub struct GitLabJob {
     phase: Phase,
     effects: Vec<Effect>,
     staged: Vec<Effect>,
+    /// The last step only stored renewed tokens (see
+    /// [`crate::connect::Job::wrote_only_credentials`]).
+    rotated: bool,
 }
 
 #[derive(Clone)]
@@ -572,7 +575,15 @@ impl std::fmt::Debug for GitLabJob {
 
 impl GitLabJob {
     fn new(user_id: &str, base_url: &str, kind: Kind) -> GitLabJob {
-        GitLabJob { user_id: user_id.into(), base_url: base_url.into(), kind, phase: Phase::Start, effects: vec![], staged: vec![] }
+        GitLabJob {
+            user_id: user_id.into(),
+            base_url: base_url.into(),
+            kind,
+            phase: Phase::Start,
+            effects: vec![],
+            staged: vec![],
+            rotated: false,
+        }
     }
 
     /// Lists the projects `user_id` can maintain, with the approval `claim` holds.
@@ -589,6 +600,12 @@ impl GitLabJob {
     /// Reconnects a folder with the approval `claim` holds.
     pub(crate) fn reconnect(user_id: &str, base_url: &str, claim: String, rejoin: Rejoin) -> GitLabJob {
         GitLabJob::new(user_id, base_url, Kind::Reconnect { claim, approval: None, rejoin, added: None })
+    }
+
+    /// The step that just ran only stored renewed tokens: an approval's, or a cleanup record's (see
+    /// [`crate::connect::Job::wrote_only_credentials`]).
+    pub(crate) fn wrote_only_credentials(&self) -> bool {
+        self.rotated
     }
 
     pub(crate) fn take_effects(&mut self) -> Vec<Effect> {
@@ -688,6 +705,7 @@ fn give_up(db: &dyn Db, j: &GitLabJob, message: impl Into<String>) -> ApiResult<
 
 /// Runs a GitLab job's next step (see [`crate::connect::step`]).
 pub fn step(db: &dyn Db, cfg: &HostConfig, j: &mut GitLabJob, replies: Vec<HttpReply>, now: DateTime<Utc>) -> ApiResult<Step> {
+    j.rotated = false;
     if matches!(j.kind, Kind::Cleanup(_)) {
         return cleanup_step(db, cfg, j, &replies, now);
     }
@@ -776,10 +794,12 @@ pub fn step(db: &dyn Db, cfg: &HostConfig, j: &mut GitLabJob, replies: Vec<HttpR
             let p = approval.as_mut().expect("loaded");
             p.expires_at = expiry(now, &tokens);
             apply_tokens(&mut p.cred, tokens);
-            // GitLab has replaced the old tokens, so these are kept at once.
+            // GitLab has replaced the old tokens, so these are kept at once, in a step that stores
+            // only them: a full workspace keeps it.
             if !save_held(db, cfg, &user_id, &claim, p)? {
                 return give_up(db, j, reconnect_message());
             }
+            j.rotated = true;
             j.phase = Phase::Working;
             Ok(Step::Fetch(first_calls(&j.kind)))
         }
@@ -1166,6 +1186,8 @@ fn cleanup_step(db: &dyn Db, cfg: &HostConfig, j: &mut GitLabJob, replies: &[Htt
                             hash
                         ],
                     )? > 0;
+                    // This step stored only the renewed tokens: a full workspace keeps it.
+                    j.rotated = true;
                     if !saved || !holds_cleanup(db, c)? {
                         return cleaned(0);
                     }

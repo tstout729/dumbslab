@@ -413,6 +413,9 @@ pub struct DocsJob {
     added_hook: Option<i64>,
     /// Where this sync points the webhook (see [`DocsJob::with_hook`]).
     hook_target: String,
+    /// The last step only stored a GitLab app source's renewed tokens (see
+    /// [`crate::connect::Job::wrote_only_credentials`]).
+    rotated: bool,
 }
 
 /// Requests about a GitLab app source's webhooks, sent after a step's others: from position
@@ -438,6 +441,12 @@ enum HookCall {
 }
 
 impl DocsJob {
+    /// The step that just ran only stored renewed tokens (see
+    /// [`crate::connect::Job::wrote_only_credentials`]).
+    pub(crate) fn wrote_only_credentials(&self) -> bool {
+        self.rotated
+    }
+
     /// The requests that list the folder's files and, for a GitLab app source, read its project
     /// (by id, like the files), whose path may have changed since (see [`listing`]).
     fn listing_calls(&self) -> Vec<HttpCall> {
@@ -631,11 +640,13 @@ pub(crate) fn start(db: &dyn Db, source: Source, base_url: &str, manual: bool, n
         hook_missing: false,
         added_hook: None,
         hook_target: String::new(),
+        rotated: false,
     }))))
 }
 
 /// Runs a docs sync's next step (see [`crate::connect::step`]).
 pub fn step(db: &dyn Db, cfg: &HostConfig, j: &mut DocsJob, replies: Vec<HttpReply>, now: DateTime<Utc>) -> ApiResult<Step> {
+    j.rotated = false;
     match std::mem::replace(&mut j.phase, Phase::Start) {
         Phase::Start if has_older_twin(db, &j.source)? => fail(db, j, DUPLICATE, now),
         Phase::Start => match j.source.link {
@@ -1029,6 +1040,9 @@ fn refreshed(db: &dyn Db, cfg: &HostConfig, j: &mut DocsJob, replies: &[HttpRepl
         }
     };
     let Some(mut current) = stored else { return Ok(lost()) };
+    // From here this step writes nothing but the renewed tokens (and their expiry and marker), so
+    // a full workspace keeps it: GitLab has spent the old refresh token.
+    j.rotated = true;
     if still_spent {
         let expires_at = super::gitlab_app::expiry(now, &tokens).map(ts);
         super::gitlab_app::apply_tokens(&mut current, tokens);

@@ -10958,6 +10958,48 @@ mod syncs {
     }
 
     #[test]
+    fn a_full_workspace_keeps_renewed_gitlab_tokens() {
+        let (h, admin, lab, topic) = gitlab_setup();
+        let answer = |c: &HttpCall| lab.answer(c);
+        let (source, hook_id) = add_gitlab_folder(&h, &admin, &lab, &topic, "docs");
+        let full = |n: usize| n >= 1;
+        let renewals = |sent: &[HttpCall]| sent.iter().filter(|c| c.url == "https://gitlab.com/oauth/token").count();
+        let sync = || job_of(&h.call("POST", &format!("/api/v1/docs-sources/{source}/sync"), None, &admin));
+
+        // The workspace is full: the host refuses every step after the first. The step that stores
+        // the renewed tokens is kept anyway (GitLab spent the old refresh token); the next isn't.
+        db_run(&h, |db| db.execute("UPDATE docs_source_links SET token_expires_at = '2020-01-01T00:00:00.000Z'", &[]));
+        let (result, _, _, sent) = run_job(&h, sync(), &answer, &no_op, &full);
+        assert!(result.is_err(), "the listing step is refused: {result:?}");
+        assert_eq!(renewals(&sent), 1);
+        // With room again, the next sync uses the renewed tokens, without renewing.
+        db_run(&h, |db| db.execute("UPDATE docs_sources SET running_until = NULL", &[]));
+        let (finish, sent) = drive(&h, sync(), &answer);
+        filled(finish);
+        assert_eq!(renewals(&sent), 0);
+        assert!(sent[0].headers.contains(&("authorization".into(), format!("Bearer glo_{}", lab.issued.borrow()))), "{:?}", sent[0]);
+
+        // The same for a removed folder's webhook cleanup.
+        *lab.down.borrow_mut() = true;
+        let r = h.call("DELETE", &format!("/api/v1/docs-sources/{source}"), None, &admin);
+        drive(&h, background(&r)[0].clone(), &answer);
+        *lab.down.borrow_mut() = false;
+        db_run(&h, |db| {
+            db.execute(
+                "UPDATE docs_hook_cleanup SET expires_at = '2020-01-01T00:00:00.000Z', next_attempt_at = '2000-01-01T00:00:00.000Z'",
+                &[],
+            )
+        });
+        let pass = || background(&h.call("GET", "/api/v1/docs-sources", None, &admin)).remove(0);
+        let (result, _, _, sent) = run_job(&h, pass(), &answer, &no_op, &full);
+        assert!(result.is_err() && renewals(&sent) == 1, "{result:?}");
+        db_run(&h, |db| db.execute("UPDATE docs_hook_cleanup SET working_until = NULL", &[]));
+        let (finish, sent) = drive(&h, pass(), &answer);
+        assert_eq!((filled(finish)["removed"].as_i64(), renewals(&sent)), (Some(1), 0));
+        assert!(!lab.hooks.borrow().contains_key(&hook_id));
+    }
+
+    #[test]
     fn a_refresh_that_lands_late_keeps_its_tokens() {
         let (h, admin, lab, topic) = gitlab_setup();
         let answer = |c: &HttpCall| lab.answer(c);

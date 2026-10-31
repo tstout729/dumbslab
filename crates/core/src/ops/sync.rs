@@ -939,7 +939,7 @@ pub(crate) fn remove_sources(ctx: &mut Ctx, rows: &[Row]) -> ApiResult<()> {
                         ),
                     )
                     .admin_only()
-                    .data(json!({ "project_id": project_id, "hook_ids": hook_id.into_iter().collect::<Vec<_>>() })),
+                    .data(serde_json::json!({ "project_id": project_id, "hook_ids": hook_id.into_iter().collect::<Vec<_>>() })),
                 )?;
             }
         }
