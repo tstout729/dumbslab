@@ -62,6 +62,9 @@ pub struct HostConfig {
     pub hosting: Option<Hosting>,
     /// Connected apps (see [`connect`]): the key that encrypts credentials, and OAuth apps.
     pub connectors: connect::Connectors,
+    /// The host's own Google, Microsoft and Slack sign-in apps, so admins set up single sign-on by
+    /// signing in (see [`sso::SharedApps`]). None by default.
+    pub sso_apps: sso::SharedApps,
     /// The web app's session recordings and error reports. Off unless the host configures them.
     pub telemetry: telemetry::Telemetry,
 }

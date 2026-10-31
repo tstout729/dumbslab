@@ -2793,6 +2793,467 @@ mod connected {
         assert!(query_of(&url)["state"].starts_with("acme."));
     }
 
+    /// Zendesk at `acme.zendesk.com`, answering a global OAuth client's sign-in and the API.
+    fn zendesk(call: &HttpCall) -> HttpReply {
+        let url = call.url.as_str();
+        if url == "https://acme.zendesk.com/oauth/tokens" {
+            let body: Value = serde_json::from_str(call.body.as_deref().unwrap_or("{}")).unwrap();
+            let n = if body["grant_type"] == "refresh_token" { 2 } else { 1 };
+            HttpReply {
+                status: 201,
+                body: json!({ "access_token": format!("zd-at-{n}"), "refresh_token": format!("zd-rt-{n}"), "token_type": "bearer",
+                    "scope": "read", "expires_in": 28800, "refresh_token_expires_in": 7776000 })
+                .to_string(),
+            }
+        } else if url == "https://acme.zendesk.com/api/v2/users/me.json" {
+            ok(json!({ "user": { "id": 7, "name": "Ada", "email": "ada@acme.com", "role": "agent" } }))
+        } else if url.starts_with("https://acme.zendesk.com/api/v2/search.json") {
+            ok(json!({ "results": [{ "result_type": "ticket", "id": 12, "subject": "Printer jams", "status": "open" }] }))
+        } else if url.starts_with("https://acme.zendesk.com/api/v2/help_center/") {
+            ok(json!({ "results": [] }))
+        } else {
+            HttpReply { status: 404, body: "{}".into() }
+        }
+    }
+
+    #[test]
+    fn signing_in_with_zendesk_stays_on_the_persons_subdomain() {
+        let mut h = H::new();
+        let (admin, _) = h.setup();
+        with_key(&mut h);
+        let user_id = h.ok("GET", "/api/v1/me", None, &admin)["user"]["id"].as_str().unwrap().to_string();
+        let app = |h: &H| {
+            let list = h.ok("GET", "/api/v1/connections", None, &admin);
+            list["apps"].as_array().unwrap().iter().find(|a| a["id"] == "zendesk").unwrap().clone()
+        };
+        let start = |h: &H, body: Value| h.call("POST", "/api/v1/connections", Some(body), &admin);
+
+        // Without a global OAuth client, Zendesk takes only tokens.
+        let z = app(&h);
+        assert_eq!((z["sign_in"].as_bool(), z["sign_in_field"].is_null()), (Some(false), true));
+        assert_eq!(start(&h, json!({ "app": "zendesk", "site": "acme" })).status, 400);
+
+        h.cfg.connectors.apps.insert("zendesk".into(), OAuthApp { client_id: "zdg-dumbslab".into(), client_secret: "zsecret".into() });
+        h.cfg.connectors.apps.insert("github".into(), OAuthApp { client_id: "cid".into(), client_secret: "csecret".into() });
+        let z = app(&h);
+        assert_eq!((z["sign_in"].as_bool(), z["sign_in_field"]["key"].as_str()), (Some(true), Some("subdomain")));
+        assert_eq!(z["token_fields"][0]["key"], "subdomain", "tokens still work");
+
+        // The subdomain is required and checked strictly; nothing is recorded for a refused one.
+        for bad in [
+            json!(null),
+            json!(" "),
+            json!("evil.test#"),
+            json!("a.b"),
+            json!("acme.zendesk.com.evil.test"),
+            json!("acme.zendesk.com:8443"),
+            json!("https://acme.zendesk.com@evil.test/"),
+            json!("ácme"),
+        ] {
+            let r = start(&h, json!({ "app": "zendesk", "site": bad }));
+            assert_eq!(r.status, 400, "{bad}: {}", r.body);
+        }
+        assert_eq!(count(&h, "SELECT COUNT(*) FROM connect_requests"), 0);
+        // Apps with one sign-in for everyone refuse a site, and tokens don't take one.
+        assert_eq!(start(&h, json!({ "app": "github", "site": "acme" })).status, 400);
+        let token = json!({ "app": "zendesk", "site": "acme", "fields": { "subdomain": "acme", "email": "ada@acme.com", "token": "t" } });
+        assert_eq!(start(&h, token).status, 400);
+
+        // Signing in starts on the person's own subdomain.
+        let url = start(&h, json!({ "app": "zendesk", "site": " ACME.zendesk.com " })).body["authorize_url"].as_str().unwrap().to_string();
+        assert!(url.starts_with("https://acme.zendesk.com/oauth/authorizations/new?"), "{url}");
+        let q = query_of(&url);
+        assert_eq!(
+            (q["client_id"].as_str(), q["redirect_uri"].as_str(), q["scope"].as_str(), q["response_type"].as_str()),
+            ("zdg-dumbslab", "https://kb.test/connect/callback", "read", "code")
+        );
+        assert_eq!(q["code_challenge_method"], "S256");
+        // The subdomain stays on the server, out of the state the browser carries.
+        assert!(!q["state"].contains("acme"));
+
+        // Coming back: anything the browser adds can't move the exchange to another Zendesk.
+        let r = h.call(
+            "GET",
+            &format!("/connect/callback?code=zd-code&subdomain=evil&site=evil.test&state={}", urlencoding::encode(&q["state"])),
+            None,
+            &admin,
+        );
+        let (finish, sent) = drive(&h, job_of(&r), &zendesk);
+        assert!(matches!(&finish, Finish::Redirect(u) if u == "https://kb.test/settings/connections?connected=zendesk"), "{finish:?}");
+        assert!(sent.iter().all(|c| c.url.starts_with("https://acme.zendesk.com/")), "{sent:?}");
+        let exchange = &sent[0];
+        assert_eq!((exchange.method, exchange.url.as_str()), ("POST", "https://acme.zendesk.com/oauth/tokens"));
+        let body: Value = serde_json::from_str(exchange.body.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            (&body["grant_type"], &body["code"], &body["client_id"], &body["client_secret"], &body["scope"]),
+            (&json!("authorization_code"), &json!("zd-code"), &json!("zdg-dumbslab"), &json!("zsecret"), &json!("read"))
+        );
+        assert_eq!(body["redirect_uri"], "https://kb.test/connect/callback");
+        let verifier = body["code_verifier"].as_str().unwrap();
+        let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
+        assert_eq!(challenge, q["code_challenge"], "PKCE with the verifier kept on the server");
+        assert!(sent[1].headers.contains(&("authorization".into(), "Bearer zd-at-1".into())));
+        assert_eq!(app(&h)["connected"]["account"], "ada@acme.com (acme.zendesk.com)");
+        // The token is sealed with its subdomain.
+        let secret =
+            || h.store.with_tx(|db| (db.one("SELECT secret FROM connections", &[]).unwrap().unwrap().str("secret"), true)).unwrap();
+        assert!(!secret().contains("zd-at-1"));
+        let cred = connect::open("connector-key", &user_id, "zendesk", &secret()).unwrap();
+        assert_eq!((cred.token.as_str(), cred.refresh_token.as_deref(), cred.field("subdomain")), ("zd-at-1", Some("zd-rt-1"), "acme"));
+
+        // Searching uses the token on that subdomain; once it nearly expires, it's refreshed there first.
+        let search = || {
+            let r = h.call("GET", "/api/v1/search/connected?q=printer", None, &admin);
+            let (finish, sent) = drive(&h, job_of(&r), &zendesk);
+            (filled(&r, finish), sent)
+        };
+        let (v, sent) = search();
+        assert_eq!(v["items"][0]["url"], "https://acme.zendesk.com/agent/tickets/12", "{v}");
+        assert!(sent.iter().all(|c| c.headers.contains(&("authorization".into(), "Bearer zd-at-1".into()))));
+        let soon = dumbslab_core::util::ts(chrono::Utc::now() + chrono::Duration::minutes(1));
+        h.store.with_tx(|db| (db.execute("UPDATE connections SET expires_at = ?", &dumbslab_core::params![soon]), true)).unwrap().unwrap();
+        let (v, sent) = search();
+        assert_eq!(v["apps"][0]["ok"], true, "{v}");
+        assert_eq!(sent[0].url, "https://acme.zendesk.com/oauth/tokens");
+        let refresh: Value = serde_json::from_str(sent[0].body.as_deref().unwrap()).unwrap();
+        assert_eq!((&refresh["grant_type"], &refresh["refresh_token"]), (&json!("refresh_token"), &json!("zd-rt-1")));
+        assert!(sent[1..].iter().all(|c| c.headers.contains(&("authorization".into(), "Bearer zd-at-2".into()))));
+        assert_eq!(connect::open("connector-key", &user_id, "zendesk", &secret()).unwrap().refresh_token.as_deref(), Some("zd-rt-2"));
+
+        // Even if the saved settings named another Zendesk, the token never goes there.
+        let beta = json!({ "host": "beta.zendesk.com", "user_id": 7 }).to_string();
+        h.store.with_tx(|db| (db.execute("UPDATE connections SET settings = ?", &dumbslab_core::params![beta]), true)).unwrap().unwrap();
+        let (_, sent) = search();
+        assert!(sent.is_empty(), "{sent:?}");
+        let r = h.call(
+            "GET",
+            &format!("/api/v1/connections/preview?url={}", urlencoding::encode("https://beta.zendesk.com/agent/tickets/9")),
+            None,
+            &admin,
+        );
+        let (_, sent) = drive(&h, job_of(&r), &zendesk);
+        assert!(sent.is_empty(), "{sent:?}");
+    }
+
+    #[test]
+    fn a_zendesk_refresh_revokes_the_old_token_without_stranding_other_requests() {
+        let mut h = H::new();
+        let (admin, _) = h.setup();
+        with_key(&mut h);
+        h.cfg.connectors.apps.insert("zendesk".into(), OAuthApp { client_id: "zdg-dumbslab".into(), client_secret: "zsecret".into() });
+        let user_id = h.ok("GET", "/api/v1/me", None, &admin)["user"]["id"].as_str().unwrap().to_string();
+        let now = chrono::Utc::now;
+        // What's stored: a signed-in Zendesk connection at acme.zendesk.com.
+        let set = |token: &str, refresh: &str, expires: chrono::DateTime<chrono::Utc>| {
+            let cred = connect::Credential {
+                token: token.into(),
+                refresh_token: Some(refresh.into()),
+                fields: [("subdomain".to_string(), "acme".to_string())].into(),
+            };
+            let sealed = connect::seal("connector-key", &user_id, "zendesk", &cred).unwrap();
+            let settings = json!({ "host": "acme.zendesk.com", "user_id": 7 }).to_string();
+            let (expires, at) = (dumbslab_core::util::ts(expires), dumbslab_core::util::ts(now()));
+            h.store
+                .with_tx(|db| {
+                    db.execute("DELETE FROM connections", &[]).unwrap();
+                    (db.execute(
+                        "INSERT INTO connections (user_id, provider, account, settings, secret, expires_at, created_at, updated_at) VALUES (?, 'zendesk', 'ada@acme.com (acme.zendesk.com)', ?, ?, ?, ?, ?)",
+                        &dumbslab_core::params![user_id.clone(), settings, sealed, expires, at.clone(), at],
+                    ), true)
+                })
+                .unwrap()
+                .unwrap();
+        };
+        // Zendesk, which revokes the access token it replaces the moment it refreshes, and refuses
+        // any other with 401 invalid_token.
+        let live = std::cell::RefCell::new(("zd-at-1".to_string(), "zd-rt-1".to_string()));
+        let zendesk = |call: &HttpCall| -> HttpReply {
+            let url = call.url.as_str();
+            if url == "https://acme.zendesk.com/oauth/tokens" {
+                let body: Value = serde_json::from_str(call.body.as_deref().unwrap()).unwrap();
+                if body["refresh_token"] != live.borrow().1.as_str() {
+                    return HttpReply { status: 400, body: json!({ "error": "invalid_grant" }).to_string() };
+                }
+                let n: u32 = live.borrow().1.trim_start_matches("zd-rt-").parse().unwrap();
+                *live.borrow_mut() = (format!("zd-at-{}", n + 1), format!("zd-rt-{}", n + 1));
+                let (at, rt) = live.borrow().clone();
+                return HttpReply {
+                    status: 201,
+                    body: json!({ "access_token": at, "refresh_token": rt, "expires_in": 28800 }).to_string(),
+                };
+            }
+            let bearer = call.headers.iter().find(|(k, _)| k == "authorization").map(|(_, v)| v.clone()).unwrap_or_default();
+            if bearer != format!("Bearer {}", live.borrow().0) {
+                return HttpReply { status: 401, body: json!({ "error": "invalid_token" }).to_string() };
+            }
+            if url.contains("/api/v2/search.json") {
+                ok(json!({ "results": [{ "result_type": "ticket", "id": 12, "subject": "Printer jams", "status": "open" }] }))
+            } else if url.contains("/api/v2/tickets/9.json") {
+                ok(json!({ "ticket": { "id": 9, "subject": "Refund", "status": "open" } }))
+            } else {
+                ok(json!({ "results": [] }))
+            }
+        };
+        let revoke_to = |token: &str| live.borrow_mut().0 = token.into();
+        let search = || job_of(&h.call("GET", "/api/v1/search/connected?q=printer", None, &admin));
+        let preview = || {
+            let link = urlencoding::encode("https://acme.zendesk.com/agent/tickets/9").into_owned();
+            job_of(&h.call("GET", &format!("/api/v1/connections/preview?url={link}"), None, &admin))
+        };
+        let bearers = |calls: &[HttpCall]| -> Vec<String> {
+            calls.iter().filter_map(|c| c.headers.iter().find(|(k, _)| k == "authorization").map(|(_, v)| v.clone())).collect()
+        };
+        let answer = |calls: &[HttpCall]| -> Vec<HttpReply> { calls.iter().map(zendesk).collect() };
+        let app_error = |v: &Value| v["apps"][0]["error"].as_str().unwrap_or_default().to_string();
+
+        // 1. One request refreshes; the others, which Google Drive would let use the current token
+        // meanwhile, wait instead: the refresh revokes it.
+        set("zd-at-1", "zd-rt-1", now() + chrono::Duration::minutes(2));
+        let (mut first, mut second, mut third) = (search(), search(), preview());
+        let refreshing = fetches(step(&h, &mut first, vec![]));
+        assert_eq!(refreshing[0].url, "https://acme.zendesk.com/oauth/tokens");
+        let v = result(step(&h, &mut second, vec![]));
+        assert!(app_error(&v).contains("Try again in a moment"), "{v}");
+        assert!(result(step(&h, &mut third, vec![]))["error"].as_str().unwrap().contains("Try again in a moment"));
+        // The refresh revokes zd-at-1; the first searches with the new token.
+        let searching = fetches(step(&h, &mut first, answer(&refreshing)));
+        assert!(bearers(&searching).iter().all(|b| b == "Bearer zd-at-2"), "{searching:?}");
+        let v = result(step(&h, &mut first, answer(&searching)));
+        assert_eq!((v["apps"][0]["ok"].as_bool(), v["items"][0]["title"].as_str()), (Some(true), Some("Printer jams")), "{v}");
+
+        // 2. A search already sent with the old token when another request refreshed: refused, it
+        // tries once more with the token saved meanwhile, rather than asking to reconnect.
+        let mut late = search();
+        let sent = fetches(step(&h, &mut late, vec![]));
+        assert!(bearers(&sent).iter().all(|b| b == "Bearer zd-at-2"));
+        set("zd-at-3", "zd-rt-3", now() + chrono::Duration::hours(8));
+        revoke_to("zd-at-3");
+        let again = fetches(step(&h, &mut late, answer(&sent)));
+        assert!(!again.is_empty() && bearers(&again).iter().all(|b| b == "Bearer zd-at-3"), "{again:?}");
+        let v = result(step(&h, &mut late, answer(&again)));
+        assert_eq!(v["apps"][0]["ok"], true, "{v}");
+        // The same for a preview.
+        let mut late = preview();
+        let sent = fetches(step(&h, &mut late, vec![]));
+        set("zd-at-4", "zd-rt-4", now() + chrono::Duration::hours(8));
+        revoke_to("zd-at-4");
+        let again = fetches(step(&h, &mut late, answer(&sent)));
+        assert_eq!(bearers(&again), ["Bearer zd-at-4"]);
+        assert_eq!(result(step(&h, &mut late, answer(&again)))["preview"]["title"], "Refund");
+
+        // 3. Refused while another request is still refreshing (its new token isn't saved yet):
+        // try again in a moment, not reconnect.
+        let mut caught = search();
+        let sent = fetches(step(&h, &mut caught, vec![]));
+        let lease = format!("{} other", dumbslab_core::util::ts(now() + chrono::Duration::seconds(30)));
+        h.store
+            .with_tx(|db| (db.execute("UPDATE connections SET refreshing_until = ?", &dumbslab_core::params![lease]), true))
+            .unwrap()
+            .unwrap();
+        revoke_to("zd-at-5");
+        let v = result(step(&h, &mut caught, answer(&sent)));
+        assert!(app_error(&v).contains("Try again in a moment"), "{v}");
+
+        // 4. A refusal with nothing newer saved and nobody refreshing still asks to reconnect.
+        h.store.with_tx(|db| (db.execute("UPDATE connections SET refreshing_until = NULL", &[]), true)).unwrap().unwrap();
+        let mut refused = search();
+        let sent = fetches(step(&h, &mut refused, vec![]));
+        let v = result(step(&h, &mut refused, answer(&sent)));
+        assert!(app_error(&v).contains("Reconnect Zendesk"), "{v}");
+    }
+
+    #[test]
+    fn one_atlassian_app_keeps_both_jira_and_confluence_granted() {
+        let mut h = H::new();
+        let (admin, _) = h.setup();
+        with_key(&mut h);
+        let scope = |h: &H, app: &str| {
+            let url =
+                h.ok("POST", "/api/v1/connections", Some(json!({ "app": app })), &admin)["authorize_url"].as_str().unwrap().to_string();
+            assert!(url.starts_with("https://auth.atlassian.com/authorize?"), "{url}");
+            query_of(&url)["scope"].clone()
+        };
+        // The host's settings name one Atlassian app for both (ATLASSIAN_CLIENT_ID and _SECRET).
+        let vars: std::collections::HashMap<&str, &str> =
+            [("ATLASSIAN_CLIENT_ID", "atl"), ("ATLASSIAN_CLIENT_SECRET", "atl-secret")].into();
+        h.cfg.connectors.apps = connect::oauth_apps(|name| vars.get(name).map(|v| v.to_string()));
+        // Atlassian keeps one grant per person and app, replaced by each consent: each sign-in asks
+        // for both products' scopes, so connecting one never takes away the other's.
+        assert_eq!(scope(&h, "jira"), "read:jira-work offline_access search:confluence");
+        assert_eq!(scope(&h, "confluence"), "search:confluence offline_access read:jira-work");
+        // Separate apps ask only for their own.
+        h.cfg.connectors.apps.insert("confluence".into(), OAuthApp { client_id: "conf".into(), client_secret: "conf-secret".into() });
+        assert_eq!(scope(&h, "jira"), "read:jira-work offline_access");
+        assert_eq!(scope(&h, "confluence"), "search:confluence offline_access");
+    }
+
+    /// Atlassian, answering a sign-in and connections with personal data DumbSlab mustn't keep.
+    fn atlassian(call: &HttpCall) -> HttpReply {
+        let url = call.url.as_str();
+        if url == "https://auth.atlassian.com/oauth/token" {
+            ok(json!({ "access_token": "atl-at", "refresh_token": "atl-rt", "expires_in": 3600, "scope": "read:jira-work offline_access" }))
+        } else if url.ends_with("/oauth/token/accessible-resources") {
+            ok(json!([{ "id": "1324a887-45db-1bf4-1e99-ef0ff456d421", "url": "https://acme.atlassian.net", "name": "Acme",
+                "scopes": ["read:jira-work"], "avatarUrl": "https://x.test/a.png" }]))
+        } else if url.ends_with("/rest/api/3/myself") {
+            ok(json!({ "accountId": "5b10ac8d82e05b22cc7d4ef5", "emailAddress": "ada@acme.com", "displayName": "Ada Lovelace" }))
+        } else if url.starts_with("https://api.trello.com/1/members/me") {
+            ok(json!({ "id": "5abbe4b7ddc1b351ef961414", "username": "ada", "fullName": "Ada Lovelace" }))
+        } else {
+            HttpReply { status: 404, body: "{}".into() }
+        }
+    }
+
+    #[test]
+    fn upgrading_drops_personal_data_from_atlassian_and_trello_connections() {
+        let mut h = H::new();
+        let (admin, _) = h.setup();
+        with_key(&mut h);
+        let (lin, _) = h.user(&admin, "lin@acme.test", "Lin", "member");
+        let (bo, _) = h.user(&admin, "bo@acme.test", "Bo", "member");
+        let me = h.ok("GET", "/api/v1/me", None, &admin)["user"]["id"].as_str().unwrap().to_string();
+        // Rows as earlier versions saved them, each with its sealed credential.
+        let rows: Vec<(String, &str, &str, Value)> = vec![
+            (me.clone(), "jira", "Ada Lovelace on acme.atlassian.net", json!({ "site": "acme.atlassian.net", "cloud_id": "1324a887" })),
+            (me.clone(), "confluence", "ada@acme.com on wiki.atlassian.net", json!({ "site": "wiki.atlassian.net" })),
+            (me.clone(), "trello", "@ada", json!({ "id": "5abbe4b7ddc1b351ef961414", "username": "ada" })),
+            (me.clone(), "github", "@ada", json!({ "login": "ada", "search_in": "user:ada" })),
+            (lin.clone(), "jira", "ada@acme.com on acme.atlassian.net", json!({})),
+            (bo.clone(), "jira", "bo@acme.com on acme.atlassian.net", json!("not an object")),
+        ];
+        let mut secrets = vec![];
+        h.store
+            .with_tx(|db| {
+                for (user, app, label, settings) in &rows {
+                    let cred = connect::Credential { token: format!("{app}-token"), ..Default::default() };
+                    let sealed = connect::seal("connector-key", user, app, &cred).unwrap();
+                    secrets.push(sealed.clone());
+                    db.execute(
+                        "INSERT INTO connections (user_id, provider, account, settings, secret, created_at, updated_at) VALUES (?, ?, ?, ?, ?, '2026-10-30T00:00:00.000Z', '2026-10-30T00:00:00.000Z')",
+                        &dumbslab_core::params![user.clone(), *app, *label, settings.to_string(), sealed],
+                    )
+                    .unwrap();
+                }
+                // A row whose settings aren't JSON at all doesn't stop the upgrade.
+                db.execute("UPDATE connections SET settings = 'oops' WHERE user_id = ? AND provider = 'jira'", &dumbslab_core::params![bo.clone()]).unwrap();
+                ((), true)
+            })
+            .unwrap();
+
+        // Run the migration again, as an upgrade from before it would.
+        let sql = dumbslab_core::db::MIGRATIONS.iter().find(|m| m.contains("keep no personal data from Atlassian")).unwrap();
+        h.store.with_tx(|db| (db.execute_batch(sql), true)).unwrap().unwrap();
+
+        let after: Vec<(String, String, String)> = h
+            .store
+            .with_tx(|db| {
+                let found = rows
+                    .iter()
+                    .map(|(user, app, _, _)| {
+                        let r = db
+                            .one(
+                                "SELECT account, settings, secret FROM connections WHERE user_id = ? AND provider = ?",
+                                &dumbslab_core::params![user.clone(), *app],
+                            )
+                            .unwrap()
+                            .unwrap();
+                        (r.str("account"), r.str("settings"), r.str("secret"))
+                    })
+                    .collect();
+                (found, true)
+            })
+            .unwrap();
+        let labels: Vec<&str> = after.iter().map(|(label, _, _)| label.as_str()).collect();
+        assert_eq!(labels, ["acme.atlassian.net", "wiki.atlassian.net", "Trello", "@ada", "", ""]);
+        assert_eq!(after[0].1, json!({ "site": "acme.atlassian.net", "cloud_id": "1324a887" }).to_string(), "Jira settings stay");
+        assert_eq!(after[2].1, "{}", "Trello's member id and username go");
+        assert_eq!(after[3].1, json!({ "login": "ada", "search_in": "user:ada" }).to_string(), "other apps are untouched");
+        let kept: Vec<&String> = after.iter().map(|(_, _, secret)| secret).collect();
+        assert_eq!(kept, secrets.iter().collect::<Vec<_>>(), "credentials stay as they are");
+        // The connections still work, labeled by site.
+        let list = h.ok("GET", "/api/v1/connections", None, &admin);
+        let jira = list["apps"].as_array().unwrap().iter().find(|a| a["id"] == "jira").unwrap();
+        assert_eq!(jira["connected"]["account"], "acme.atlassian.net");
+    }
+
+    #[test]
+    fn monday_sign_in_lets_admins_install_on_the_way() {
+        let mut h = H::new();
+        let (admin, _) = h.setup();
+        with_key(&mut h);
+        h.cfg.connectors.apps.insert("monday".into(), OAuthApp { client_id: "mid".into(), client_secret: "msecret".into() });
+        let url =
+            h.ok("POST", "/api/v1/connections", Some(json!({ "app": "monday" })), &admin)["authorize_url"].as_str().unwrap().to_string();
+        assert!(url.starts_with("https://auth.monday.com/oauth2/authorize?"), "{url}");
+        let q = query_of(&url);
+        assert_eq!((q["force_install_if_needed"].as_str(), q["code_challenge_method"].as_str()), ("true", "S256"));
+    }
+
+    #[test]
+    fn atlassian_connections_keep_nothing_personal() {
+        let mut h = H::new();
+        let (admin, _) = h.setup();
+        with_key(&mut h);
+        let user_id = h.ok("GET", "/api/v1/me", None, &admin)["user"]["id"].as_str().unwrap().to_string();
+        h.cfg.connectors.apps.insert("jira".into(), OAuthApp { client_id: "atl".into(), client_secret: "atl-secret".into() });
+        // Everything stored for a connection: the row, and the credential sealed in it.
+        let stored = |h: &H, app: &str| {
+            let row = h
+                .store
+                .with_tx(|db| {
+                    let r = db
+                        .one("SELECT account, settings, secret FROM connections WHERE provider = ?", &dumbslab_core::params![app])
+                        .unwrap()
+                        .unwrap();
+                    ((r.str("account"), r.str("settings"), r.str("secret")), true)
+                })
+                .unwrap();
+            let cred = connect::open("connector-key", &user_id, app, &row.2).unwrap();
+            (row.0, row.1, format!("{} {:?} {:?}", cred.token, cred.refresh_token, cred.fields))
+        };
+        let personal = ["5b10ac8d82e05b22cc7d4ef5", "ada@acme.com", "Ada", "Lovelace", "5abbe4b7ddc1b351ef961414", "a.png"];
+
+        // Signing in to Jira: only the sites are asked for, and only the site is kept.
+        let url =
+            h.ok("POST", "/api/v1/connections", Some(json!({ "app": "jira" })), &admin)["authorize_url"].as_str().unwrap().to_string();
+        let state = query_of(&url)["state"].clone();
+        let r = h.call("GET", &format!("/connect/callback?code=c&state={}", urlencoding::encode(&state)), None, &admin);
+        let (finish, sent) = drive(&h, job_of(&r), &atlassian);
+        assert!(matches!(&finish, Finish::Redirect(u) if u.ends_with("connected=jira")), "{finish:?}");
+        assert!(!sent.iter().any(|c| c.url.ends_with("/me")), "{sent:?}");
+        let (label, settings, sealed) = stored(&h, "jira");
+        assert_eq!((label.as_str(), sealed.contains("atl-at")), ("acme.atlassian.net", true));
+        for p in personal {
+            assert!(!label.contains(p) && !settings.contains(p) && !sealed.contains(p), "{p} kept: {label} {settings} {sealed}");
+        }
+
+        // An API token: the person's answer only checks it. The email they typed stays sealed in
+        // the credential, which Basic auth needs, and nowhere else.
+        let token = json!({ "app": "confluence", "fields": { "site": "acme.atlassian.net", "email": "ada@acme.com", "token": "tok" } });
+        let r = h.call("POST", "/api/v1/connections", Some(token), &admin);
+        let (finish, _) = drive(&h, job_of(&r), &|_: &HttpCall| {
+            ok(json!({ "type": "known", "accountId": "5b10ac8d82e05b22cc7d4ef5", "email": "ada@acme.com", "displayName": "Ada Lovelace" }))
+        });
+        assert_eq!(filled(&r, finish)["connection"]["account"], "acme.atlassian.net");
+        let (label, settings, sealed) = stored(&h, "confluence");
+        assert!(sealed.contains("ada@acme.com"));
+        for p in personal {
+            assert!(!label.contains(p) && !settings.contains(p), "{p} kept: {label} {settings}");
+            assert!(p == "ada@acme.com" || !sealed.contains(p), "{p} sealed: {sealed}");
+        }
+
+        // Trello keeps no username or member id either.
+        let trello = json!({ "app": "trello", "fields": { "key": "k1", "token": "t1" } });
+        let r = h.call("POST", "/api/v1/connections", Some(trello), &admin);
+        let (finish, sent) = drive(&h, job_of(&r), &atlassian);
+        assert_eq!(sent[0].url, "https://api.trello.com/1/members/me?fields=id");
+        assert_eq!(filled(&r, finish)["connection"]["account"], "Trello");
+        let (label, settings, sealed) = stored(&h, "trello");
+        for p in personal {
+            assert!(!label.contains(p) && !settings.contains(p) && !sealed.contains(p), "{p} kept: {label} {settings} {sealed}");
+        }
+    }
+
     #[test]
     fn a_late_refresh_never_lands_on_a_replaced_connection() {
         let mut h = H::new();
@@ -3018,21 +3479,27 @@ mod sso {
 
     /// Runs a job, answering each step's requests with `answer`. Returns how it finished and every
     /// request it made.
-    fn drive(h: &H, mut job: Job, answer: &dyn Fn(&HttpCall) -> HttpReply) -> (Finish, Vec<HttpCall>) {
+    fn drive(h: &H, job: Job, answer: &dyn Fn(&HttpCall) -> HttpReply) -> (Finish, Vec<HttpCall>) {
+        let (finish, sent, _) = drive_job(h, job, answer);
+        (finish, sent)
+    }
+
+    /// Like `drive`, and also the effects the job left for the host to deliver (its webhooks).
+    fn drive_job(h: &H, mut job: Job, answer: &dyn Fn(&HttpCall) -> HttpReply) -> (Finish, Vec<HttpCall>, Vec<Effect>) {
         let mut replies = vec![];
         let mut sent = vec![];
         for _ in 0..connect::MAX_STEPS {
             let (step, next) = h
                 .store
                 .with_tx(|db| {
-                    let step = connect::step(db, &h.cfg, &mut job, replies.clone(), chrono::Utc::now());
+                    let (step, _) = connect::guarded_step(db, &h.cfg, &mut job, replies.clone(), chrono::Utc::now(), |_| None);
                     let ok = step.is_ok();
                     ((step, job.clone()), ok)
                 })
                 .unwrap();
             job = next;
             match step.unwrap() {
-                Step::Done(f) => return (f, sent),
+                Step::Done(f) => return (f, sent, job.take_effects()),
                 Step::Fetch(calls) => {
                     replies = calls.iter().map(answer).collect();
                     sent.extend(calls);
@@ -3064,14 +3531,21 @@ mod sso {
         format!("{}.{}.c2lnbmF0dXJl", part(json!({ "alg": "RS256", "kid": "k1" })), part(claims.clone()))
     }
 
+    /// An ID token's claims. Microsoft links accounts by `oid`, here one per `sub` unless `extra`
+    /// gives one: like Microsoft's, the same for every app.
     fn claims(issuer: &str, sub: &str, email: &str, extra: Value) -> Value {
         let now = chrono::Utc::now().timestamp();
-        let mut c =
-            json!({ "iss": issuer, "aud": "app-id", "sub": sub, "email": email, "exp": now + 300, "iat": now, "name": "Mo Member" });
+        let mut c = json!({ "iss": issuer, "aud": "app-id", "sub": sub, "oid": oid_of(sub), "email": email, "exp": now + 300, "iat": now, "name": "Mo Member" });
         for (k, v) in extra.as_object().unwrap() {
             c[k] = v.clone();
         }
         c
+    }
+
+    /// A Microsoft object ID (a GUID) for a test account.
+    fn oid_of(name: &str) -> String {
+        let h = dumbslab_core::util::sha256_hex(name);
+        format!("{}-{}-{}-{}-{}", &h[0..8], &h[8..12], &h[12..16], &h[16..20], &h[20..32])
     }
 
     /// Where a request finally sent the browser, and the cookies it set.
@@ -3938,6 +4412,766 @@ mod sso {
         let r = h.call("POST", "/api/v1/connections", Some(json!({ "app": "github", "fields": { "token": "ghp_x" } })), &admin);
         assert_eq!(r.effects.len(), 1);
         assert!(matches!(r.effects[0], Effect::Connect(_)));
+    }
+
+    // -----------------------------------------------------------------------
+    // Setting up with the server's own Google, Microsoft and Slack apps.
+
+    const GOOGLE: &str = "https://accounts.google.com";
+    const SLACK: &str = "https://slack.com";
+
+    fn shared_apps() -> dumbslab_core::sso::SharedApps {
+        let app = |id: &str| Some(connect::OAuthApp { client_id: format!("{id}-app"), client_secret: format!("{id}-secret") });
+        dumbslab_core::sso::SharedApps { google: app("google"), microsoft: app("microsoft"), slack: app("slack"), callback_url: None }
+    }
+
+    /// A workspace whose server has its own Google, Microsoft and Slack apps, and no connector key:
+    /// shared mode stores no secret. Its admin is ada@acme.test.
+    fn shared_workspace() -> (H, Auth) {
+        let mut h = H::new();
+        let (admin, _) = h.setup();
+        h.cfg.sso_apps = shared_apps();
+        (h, admin)
+    }
+
+    /// Microsoft's discovery document for every organization's accounts: its issuer is a template.
+    fn ms_organizations() -> Value {
+        json!({
+            "issuer": "https://login.microsoftonline.com/{tenantid}/v2.0",
+            "authorization_endpoint": "https://login.microsoftonline.com/organizations/oauth2/v2.0/authorize",
+            "token_endpoint": "https://login.microsoftonline.com/organizations/oauth2/v2.0/token",
+            "userinfo_endpoint": "https://graph.microsoft.com/oidc/userinfo",
+            "token_endpoint_auth_methods_supported": ["client_secret_post", "private_key_jwt", "client_secret_basic"],
+        })
+    }
+
+    /// Where setting up `provider` starts, and its discovery document.
+    fn setup_discovery(provider: &str) -> Value {
+        match provider {
+            "google" => discovery(GOOGLE),
+            "microsoft" => ms_organizations(),
+            _ => discovery(SLACK),
+        }
+    }
+
+    fn cookie_of(auth: &Auth) -> String {
+        match auth {
+            Auth::Cookie(c) => format!("dumbslab_session={c}"),
+            _ => unreachable!("a browser session"),
+        }
+    }
+
+    /// Starts setting up in `admin`'s browser session; returns the provider's sign-in URL.
+    fn start_setup(h: &H, admin: &Auth, body: Value) -> String {
+        let provider = body["provider"].as_str().unwrap().to_string();
+        let r = h.call("POST", "/api/v1/sso/setup", Some(body), admin);
+        assert_eq!(r.status, 200, "{}", r.body);
+        let (finish, sent) = drive(h, job_of(&r), &|_| ok(setup_discovery(&provider)));
+        let expected = match provider.as_str() {
+            "microsoft" => "https://login.microsoftonline.com/organizations/v2.0/.well-known/openid-configuration".to_string(),
+            "google" => format!("{GOOGLE}/.well-known/openid-configuration"),
+            _ => format!("{SLACK}/.well-known/openid-configuration"),
+        };
+        assert_eq!(sent[0].url, expected);
+        let Finish::Fill(v) = finish else { panic!("{finish:?}") };
+        v["authorize_url"].as_str().unwrap().to_string()
+    }
+
+    /// The provider sends `browser` back from `url` with a code (or `error`, when given), and its
+    /// token endpoint answers with an ID token with `id_claims` and the sign-in's nonce. Returns
+    /// where the browser lands, the requests the job made, and the webhooks it left.
+    fn finish_setup(h: &H, url: &str, browser: &Auth, mut id_claims: Value, error: Option<&str>) -> (Landing, Vec<HttpCall>, Vec<Effect>) {
+        let q = query_of(url);
+        if id_claims.get("nonce").is_none() {
+            id_claims["nonce"] = json!(q["nonce"]);
+        }
+        let back = match error {
+            Some(e) => format!("{e}&state={}", urlencoding::encode(&q["state"])),
+            None => format!("code=the-code&state={}", urlencoding::encode(&q["state"])),
+        };
+        let cookies = match browser {
+            Auth::Cookie(_) => vec![cookie_of(browser)],
+            _ => vec![],
+        };
+        let r = h.send(&callback_request(&back, &cookies));
+        if r.effects.is_empty() {
+            return (land(&r, None), vec![], vec![]);
+        }
+        let id = jwt(&id_claims);
+        let (finish, sent, effects) = drive_job(h, job_of(&r), &|c| tokens(c, &id));
+        (land(&r, Some(finish)), sent, effects)
+    }
+
+    /// The admin's ID token from `provider`, for the server's own app.
+    fn admin_token(provider: &str, extra: Value) -> Value {
+        let issuer = match provider {
+            "google" => GOOGLE.to_string(),
+            "microsoft" => ms_issuer(),
+            _ => SLACK.to_string(),
+        };
+        let mut c = claims(&issuer, "admin-sub", "ada@acme.test", extra);
+        c["aud"] = json!(format!("{provider}-app"));
+        c["name"] = json!("Ada Admin");
+        c
+    }
+
+    fn organization(provider: &str) -> Value {
+        match provider {
+            "google" => json!({ "hd": "acme.test", "email_verified": true }),
+            "microsoft" => json!({ "tid": TENANT, "xms_edov": true }),
+            _ => json!({ "https://slack.com/team_id": "T0ACME", "email_verified": true }),
+        }
+    }
+
+    const SETTINGS: &str = "https://kb.test/settings/sso";
+
+    #[test]
+    fn setting_up_by_signing_in_with_the_servers_own_apps() {
+        for provider in ["google", "microsoft", "slack"] {
+            let (h, admin) = shared_workspace();
+            let ada = me(&h, &admin)["id"].as_str().unwrap().to_string();
+            h.user(&admin, "mo@acme.test", "Mo", "member");
+            h.ok("POST", "/api/v1/webhooks", Some(json!({ "url": "https://hooks.test/dumbslab", "events": ["sso.*"] })), &admin);
+            let s = h.ok("GET", "/api/v1/sso", None, &admin);
+            assert_eq!((s["available"].as_bool(), s["shared_providers"].clone()), (Some(false), json!(["google", "microsoft", "slack"])));
+
+            let url = start_setup(&h, &admin, json!({ "provider": provider }));
+            let q = query_of(&url);
+            assert_eq!(
+                (q["client_id"].as_str(), q["redirect_uri"].as_str()),
+                (format!("{provider}-app").as_str(), "https://kb.test/sso/callback")
+            );
+            assert_eq!((q["scope"].as_str(), q["code_challenge_method"].as_str()), ("openid email profile", "S256"));
+            match provider {
+                "google" => assert_eq!((q["hd"].as_str(), q["prompt"].as_str()), ("*", "select_account")),
+                "microsoft" => {
+                    assert!(url.starts_with("https://login.microsoftonline.com/organizations/oauth2/v2.0/authorize?"), "{url}");
+                    assert_eq!(q["prompt"], "select_account");
+                }
+                _ => assert!(!q.contains_key("team")),
+            }
+            // Nothing changes until the admin comes back.
+            assert!(h.ok("GET", "/api/v1/sso", None, &admin)["provider"].is_null());
+
+            let (landing, sent, hooks) = finish_setup(&h, &url, &admin, admin_token(provider, organization(provider)), None);
+            // Slack confirms the admin's address, not that its domain is the organization's: it's
+            // only suggested, until the admin allows it with one click.
+            let outcome = if provider == "slack" { "domain_needed" } else { "done" };
+            assert_eq!(landing.location, format!("{SETTINGS}?sso_setup={outcome}"), "{provider}: {}", landing.error());
+            assert!(landing.session().is_none(), "setting up doesn't start another session");
+            // The code went to the token endpoint with the server's own app.
+            let form = query_of(&format!("?{}", sent[0].body.clone().unwrap()));
+            assert_eq!(form["redirect_uri"], "https://kb.test/sso/callback");
+            let basic = sent[0].headers.iter().find(|(k, _)| k == "authorization").map(|(_, v)| v.clone());
+            if provider == "slack" {
+                assert_eq!((form["client_id"].as_str(), form["client_secret"].as_str()), ("slack-app", "slack-secret"));
+            } else {
+                let expected =
+                    format!("Basic {}", base64::engine::general_purpose::STANDARD.encode(format!("{provider}-app:{provider}-secret")));
+                assert_eq!(basic.as_deref(), Some(expected.as_str()), "{provider}");
+            }
+
+            // On, for the admin's organization, with the toggles as they were.
+            let s = h.ok("GET", "/api/v1/sso", None, &admin);
+            assert_eq!(
+                (s["active"].as_bool(), s["enabled"].as_bool(), s["shared"].as_bool(), s["provider"].as_str()),
+                (Some(true), Some(true), Some(true), Some(provider)),
+                "{s}"
+            );
+            assert_eq!((s["require_sso"].as_bool(), s["auto_provision"].as_bool()), (Some(false), Some(false)));
+            assert_eq!((s["client_id"].as_str(), s["client_secret_set"].as_bool()), (Some(""), Some(false)));
+            if provider == "slack" {
+                assert_eq!((s["allowed_domains"].clone(), s["suggested_domain"].as_str()), (json!([]), Some("acme.test")));
+                let allow = json!({ "domain": "acme.test", "suggestion_id": s["suggestion_id"] });
+                let v = h.ok("POST", "/api/v1/sso/suggested-domain", Some(allow), &admin);
+                assert!(v["suggested_domain"].is_null() && v["suggestion_id"].is_null(), "{v}");
+            } else {
+                assert!(s["suggested_domain"].is_null());
+            }
+            let s = h.ok("GET", "/api/v1/sso", None, &admin);
+            assert_eq!(s["allowed_domains"], json!(["acme.test"]), "{provider}");
+            let issuer = match provider {
+                "google" => GOOGLE.to_string(),
+                "microsoft" => {
+                    assert_eq!(s["tenant"], TENANT);
+                    ms_issuer()
+                }
+                _ => {
+                    assert_eq!(s["team"], "T0ACME");
+                    SLACK.to_string()
+                }
+            };
+            assert_eq!(s["issuer"], issuer);
+            assert!(!s.to_string().contains(&format!("{provider}-secret")));
+            // The admin's own account is linked, and the admins' log and webhooks say so.
+            let linked = h.ok("GET", "/api/v1/sso/identities?user=all", None, &admin);
+            assert_eq!((linked["items"].as_array().unwrap().len(), linked["items"][0]["user"]["id"].as_str()), (1, Some(ada.as_str())));
+            assert_eq!(links_logged(&h, &admin), vec![(ada.clone(), "setup".to_string())]);
+            let events: Vec<String> = hooks
+                .iter()
+                .filter_map(|e| match e {
+                    Effect::Webhook(d) => d.headers.iter().find(|(k, _)| k == "x-dumbslab-event").map(|(_, v)| v.clone()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(events, vec!["sso.updated".to_string(), "sso.linked".to_string()], "{provider}");
+            assert_eq!(h.ok("GET", "/api/v1/auth/state", None, &Auth::None)["sso"]["url"], "https://kb.test/sso/start");
+
+            // People sign in through the same app; Microsoft's sign-ins use the directory's own issuer.
+            let s = start(&h, &issuer);
+            assert_eq!(
+                (s.query["client_id"].as_str(), s.query["redirect_uri"].as_str()),
+                (format!("{provider}-app").as_str(), "https://kb.test/sso/callback")
+            );
+            let mut c = claims(&issuer, "sub-mo", "mo@acme.test", organization(provider));
+            c["aud"] = json!(format!("{provider}-app"));
+            let (landing, _) = come_back(&h, &s, c, &tokens);
+            assert_eq!(me(&h, &landing.session().unwrap_or_else(|| panic!("{provider}: {}", landing.error())))["email"], "mo@acme.test");
+        }
+    }
+
+    #[test]
+    fn setting_up_needs_an_organization_account() {
+        let (h, admin) = shared_workspace();
+        let attempt = |provider: &str, extra: Value| {
+            let url = start_setup(&h, &admin, json!({ "provider": provider }));
+            finish_setup(&h, &url, &admin, admin_token(provider, extra), None).0
+        };
+        let nothing_saved = || assert!(h.ok("GET", "/api/v1/sso", None, &admin)["provider"].is_null());
+        // A personal Google account has no Workspace domain.
+        let landing = attempt("google", json!({ "email": "ada@gmail.com", "email_verified": true }));
+        assert_eq!(
+            (landing.location.as_str(), landing.error().as_str()),
+            (format!("{SETTINGS}?sso_error=personal_account").as_str(), "personal_account")
+        );
+        nothing_saved();
+        // Nor has a personal Microsoft account.
+        let consumers = "9188040d-6c67-4c5b-b112-36a304b66dad";
+        let mut personal = admin_token("microsoft", json!({ "tid": consumers }));
+        personal["iss"] = json!(format!("https://login.microsoftonline.com/{consumers}/v2.0"));
+        let url = start_setup(&h, &admin, json!({ "provider": "microsoft" }));
+        assert_eq!(finish_setup(&h, &url, &admin, personal, None).0.error(), "personal_account");
+        assert_eq!(attempt("microsoft", json!({})).error(), "personal_account");
+        // A token whose issuer names another directory than its `tid`.
+        let mut mixed = admin_token("microsoft", json!({ "tid": TENANT }));
+        mixed["iss"] = json!("https://login.microsoftonline.com/00000000-0000-0000-0000-000000000001/v2.0");
+        let url = start_setup(&h, &admin, json!({ "provider": "microsoft" }));
+        assert_eq!(finish_setup(&h, &url, &admin, mixed, None).0.error(), "invalid_token");
+        // Slack's token must name the Slack workspace.
+        assert_eq!(attempt("slack", json!({ "email_verified": true })).error(), "not_in_org");
+        nothing_saved();
+        // Microsoft directories that need an administrator's approval, and admins who say no.
+        for (error, code) in [
+            ("error=access_denied&error_description=AADSTS90094%3A+Admin+consent+is+required.", "admin_consent"),
+            ("error=consent_required", "admin_consent"),
+            ("error=access_denied&error_description=AADSTS65004%3A+User+declined+to+consent.", "denied"),
+            ("error=server_error&error_description=%3Cb%3Eoops%3C%2Fb%3E", "provider_error"),
+        ] {
+            let url = start_setup(&h, &admin, json!({ "provider": "microsoft" }));
+            let (landing, sent, _) = finish_setup(&h, &url, &admin, json!({}), Some(error));
+            assert_eq!((landing.error(), sent.len()), (code.to_string(), 0), "{error}");
+            assert!(!landing.location.contains("AADSTS") && !landing.location.contains("oops"), "{}", landing.location);
+        }
+        nothing_saved();
+
+        // No email domain Microsoft vouches for: set up, and the admin is told to add one.
+        let landing = attempt("microsoft", json!({ "tid": TENANT, "email_verified": true }));
+        assert_eq!(landing.location, format!("{SETTINGS}?sso_setup=domain_needed"));
+        let s = h.ok("GET", "/api/v1/sso", None, &admin);
+        assert_eq!((s["active"].as_bool(), s["tenant"].as_str(), s["allowed_domains"].clone()), (Some(true), Some(TENANT), json!([])));
+        let v = set_up(&h, &admin, json!({ "allowed_domains": ["acme.test"] }), &ms_issuer());
+        assert_eq!(
+            (v["allowed_domains"].clone(), v["shared"].as_bool(), v["check"]["ok"].as_bool()),
+            (json!(["acme.test"]), Some(true), Some(true))
+        );
+        // Setting the same directory up again keeps the domains the admin added.
+        let landing = attempt("microsoft", json!({ "tid": TENANT }));
+        assert_eq!(landing.location, format!("{SETTINGS}?sso_setup=done"));
+        assert_eq!(h.ok("GET", "/api/v1/sso", None, &admin)["allowed_domains"], json!(["acme.test"]));
+
+        // A free-mail address is never an allowed or suggested domain, whoever vouches for it.
+        for email in
+            ["ada@gmail.com", "ada@tutamail.com", "ada@tutanota.de", "ada@keemail.me", "ada@pm.me", "ada@yahoo.co.uk", "ada@fastmail.fm"]
+        {
+            for provider in ["slack", "microsoft"] {
+                let url = start_setup(&h, &admin, json!({ "provider": provider, "replace": true }));
+                let vouched = if provider == "slack" {
+                    json!({ "https://slack.com/team_id": "T0OTHER", "email_verified": true })
+                } else {
+                    json!({ "tid": "00000000-0000-0000-0000-0000000000aa", "xms_edov": true })
+                };
+                let mut c = admin_token(provider, vouched);
+                c["email"] = json!(email);
+                if provider == "microsoft" {
+                    c["iss"] = json!("https://login.microsoftonline.com/00000000-0000-0000-0000-0000000000aa/v2.0");
+                }
+                let landing = finish_setup(&h, &url, &admin, c, None).0;
+                assert_eq!(landing.location, format!("{SETTINGS}?sso_setup=domain_needed"), "{provider} {email}: {}", landing.error());
+                let s = h.ok("GET", "/api/v1/sso", None, &admin);
+                assert_eq!((s["allowed_domains"].clone(), s["suggested_domain"].clone()), (json!([]), Value::Null), "{provider} {email}");
+            }
+        }
+        let s = h.ok("GET", "/api/v1/sso", None, &admin);
+        assert_eq!((s["provider"].as_str(), s["tenant"].as_str()), (Some("microsoft"), Some("00000000-0000-0000-0000-0000000000aa")));
+    }
+
+    #[test]
+    fn only_the_admin_who_started_can_finish_setting_up() {
+        let (mut h, admin) = shared_workspace();
+        let (mo_id, mo_token) = h.user(&admin, "mo@acme.test", "Mo", "member");
+        let mo = sign_in(&h, "mo@acme.test", "password123");
+        let (bo_id, _) = h.user(&admin, "bo@acme.test", "Bo", "admin");
+        let bo = sign_in(&h, "bo@acme.test", "password123");
+        let t = h.ok("POST", "/api/v1/tokens", Some(json!({ "name": "agent", "scopes": ["read", "write", "admin"] })), &admin);
+        let admin_token_auth = Auth::Bearer(t["token"].as_str().unwrap().to_string());
+        // Admins only, from a signed-in browser, for a provider the server has an app for.
+        for auth in [&mo, &mo_token] {
+            assert_eq!(h.call("POST", "/api/v1/sso/setup", Some(json!({ "provider": "google" })), auth).status, 403);
+        }
+        let r = h.call("POST", "/api/v1/sso/setup", Some(json!({ "provider": "google" })), &admin_token_auth);
+        assert_eq!(r.status, 403, "an API token can't come back from Google: {}", r.body);
+        assert!(r.body["error"]["message"].as_str().unwrap().contains("shared: true"));
+        assert_eq!(h.call("POST", "/api/v1/sso/setup", Some(json!({ "provider": "okta" })), &admin).status, 400);
+        assert_eq!(count(&h, "SELECT COUNT(*) FROM sso_requests"), 0);
+
+        let saved = || h.ok("GET", "/api/v1/sso", None, &admin_token_auth)["provider"].as_str().map(str::to_string);
+        let google = || admin_token("google", organization("google"));
+        // Finishing in another person's browser, or another session of the admin's, or none.
+        let other = sign_in(&h, "ada@acme.test", "correct horse");
+        for browser in [&mo, &other, &Auth::None] {
+            let url = start_setup(&h, &admin, json!({ "provider": "google" }));
+            let (landing, sent, _) = finish_setup(&h, &url, browser, google(), None);
+            assert_eq!((landing.location.as_str(), sent.len()), (format!("{SETTINGS}?sso_error=other_session").as_str(), 0));
+        }
+        assert_eq!(saved(), None);
+        // A made-up or reused state.
+        let r = h.send(&callback_request("code=c&state=acme.made-up", &[cookie_of(&admin)]));
+        assert_eq!(land(&r, None).error(), "expired");
+        let url = start_setup(&h, &admin, json!({ "provider": "google" }));
+        let q = query_of(&url);
+        let back = format!("code=c&state={}", urlencoding::encode(&q["state"]));
+        assert!(!h.send(&callback_request(&back, &[cookie_of(&admin)])).effects.is_empty());
+        assert_eq!(land(&h.send(&callback_request(&back, &[cookie_of(&admin)])), None).error(), "expired");
+        // An admin who's demoted while signing in at Google (their session stays) can't finish.
+        let url = start_setup(&h, &bo, json!({ "provider": "google" }));
+        h.ok("PATCH", &format!("/api/v1/users/{bo_id}"), Some(json!({ "role": "member" })), &admin);
+        let mut c = google();
+        c["sub"] = json!("bo-sub");
+        assert_eq!(finish_setup(&h, &url, &bo, c, None).0.error(), "not_admin");
+        // Settings another admin changes meanwhile aren't overwritten.
+        let url = start_setup(&h, &admin, json!({ "provider": "google" }));
+        set_up(&h, &admin_token_auth, json!({ "provider": "slack", "shared": true, "team": "T0ACME" }), SLACK);
+        assert_eq!(finish_setup(&h, &url, &admin, google(), None).0.error(), "expired");
+        assert_eq!(saved().as_deref(), Some("slack"));
+        // Signed out after Google answered, before it's saved.
+        let url = start_setup(&h, &admin, json!({ "provider": "slack" }));
+        let q = query_of(&url);
+        let r = h.send(&callback_request(&format!("code=c&state={}", urlencoding::encode(&q["state"])), &[cookie_of(&admin)]));
+        let keep = sign_in(&h, "ada@acme.test", "correct horse");
+        assert_eq!(h.call("POST", "/api/v1/auth/logout", None, &admin).status, 200);
+        let mut c = admin_token("slack", json!({ "https://slack.com/team_id": "T0OTHER", "email_verified": true }));
+        c["nonce"] = json!(q["nonce"]);
+        let id = jwt(&c);
+        let (finish, _) = drive(&h, job_of(&r), &|call| tokens(call, &id));
+        assert_eq!(land(&r, Some(finish)).error(), "other_session");
+        assert_eq!(h.ok("GET", "/api/v1/sso", None, &keep)["team"], "T0ACME");
+        // An account at the provider that's someone else's here isn't taken over.
+        h.store
+            .with_tx(|db| {
+                let r = db.execute(
+                    "INSERT INTO sso_identities (id, user_id, issuer, subject, email, created_at, last_used_at) VALUES ('i1', ?, ?, 'admin-sub', 'mo@acme.test', '2026-01-01T00:00:00Z', NULL)",
+                    &dumbslab_core::params![mo_id.clone(), GOOGLE],
+                );
+                (r, true)
+            })
+            .unwrap()
+            .unwrap();
+        let url = start_setup(&h, &keep, json!({ "provider": "google", "replace": true }));
+        assert_eq!(finish_setup(&h, &url, &keep, google(), None).0.error(), "already_linked");
+        assert_eq!(saved().as_deref(), Some("slack"));
+        // A server without the app.
+        h.cfg.sso_apps.google = None;
+        let r = h.call("POST", "/api/v1/sso/setup", Some(json!({ "provider": "google", "replace": true })), &keep);
+        assert_eq!((r.status, r.body["error"]["code"].as_str()), (400, Some("sso_shared_unavailable")), "{}", r.body);
+    }
+
+    #[test]
+    fn setting_up_replaces_your_own_app_only_when_asked() {
+        let (mut h, admin) = workspace();
+        h.cfg.sso_apps = shared_apps();
+        h.user(&admin, "mo@acme.test", "Mo", "member");
+        okta(&h, &admin, json!({ "require_sso": true, "auto_provision": true }));
+        let r = h.call("POST", "/api/v1/sso/setup", Some(json!({ "provider": "google" })), &admin);
+        assert_eq!((r.status, r.body["error"]["code"].as_str()), (409, Some("sso_configured")), "{}", r.body);
+        assert!(r.body["error"]["message"].as_str().unwrap().contains("replace"));
+        let url = start_setup(&h, &admin, json!({ "provider": "google", "replace": true }));
+        // Okta still works until the admin is back.
+        assert_eq!(h.ok("GET", "/api/v1/auth/state", None, &Auth::None)["sso"]["name"], "Okta");
+        let (landing, _, _) = finish_setup(&h, &url, &admin, admin_token("google", organization("google")), None);
+        assert_eq!(landing.location, format!("{SETTINGS}?sso_setup=done"));
+        let s = h.ok("GET", "/api/v1/sso", None, &admin);
+        assert_eq!((s["provider"].as_str(), s["issuer"].as_str(), s["shared"].as_bool()), (Some("google"), Some(GOOGLE), Some(true)));
+        // The old app's secret is gone; the toggles stay as they were.
+        assert_eq!((s["client_secret_set"].as_bool(), s["client_id"].as_str()), (Some(false), Some("")));
+        assert_eq!((s["require_sso"].as_bool(), s["auto_provision"].as_bool()), (Some(true), Some(true)));
+        let stored: String = h
+            .store
+            .with_tx(|db| (db.one("SELECT value FROM settings WHERE key = 'sso'", &[]).unwrap().unwrap().str("value"), true))
+            .unwrap();
+        assert!(!stored.contains("client_secret\":\"") && !stored.contains("shh"), "{stored}");
+        // The same provider again needs no confirming; another one does.
+        start_setup(&h, &admin, json!({ "provider": "google" }));
+        assert_eq!(h.call("POST", "/api/v1/sso/setup", Some(json!({ "provider": "slack" })), &admin).status, 409);
+        // Going back to your own app forgets the shared one.
+        let v = set_up(&h, &admin, json!({ "shared": false, "client_id": "own-app", "client_secret": "own-secret" }), GOOGLE);
+        assert_eq!((v["shared"].as_bool(), v["client_secret_set"].as_bool(), v["active"].as_bool()), (Some(false), Some(true), Some(true)));
+    }
+
+    #[test]
+    fn losing_the_servers_app_turns_sso_off_without_locking_anyone_out() {
+        let (mut h, admin) = shared_workspace();
+        h.user(&admin, "mo@acme.test", "Mo", "member");
+        let url = start_setup(&h, &admin, json!({ "provider": "google" }));
+        finish_setup(&h, &url, &admin, admin_token("google", organization("google")), None);
+        set_up(&h, &admin, json!({ "require_sso": true }), GOOGLE);
+        let login = |h: &H| {
+            h.call("POST", "/api/v1/auth/login", Some(json!({ "email": "mo@acme.test", "password": "password123" })), &Auth::None).status
+        };
+        assert_eq!(login(&h), 403);
+
+        h.cfg.sso_apps.google = None;
+        let s = h.ok("GET", "/api/v1/sso", None, &admin);
+        assert_eq!(
+            (s["active"].as_bool(), s["enabled"].as_bool(), s["shared_app_missing"].as_bool(), s["shared_providers"].clone()),
+            (Some(false), Some(true), Some(true), json!(["microsoft", "slack"])),
+            "{s}"
+        );
+        assert_eq!(login(&h), 200, "Require SSO doesn't lock people out while SSO can't work");
+        assert!(h.ok("GET", "/api/v1/auth/state", None, &Auth::None)["sso"].is_null());
+        let r = h.call("GET", "/sso/start", None, &Auth::None);
+        assert!(r.effects.is_empty() && land(&r, None).error() == "not_configured");
+        // Saving it on says why; turning it off works.
+        let r = h.call("PATCH", "/api/v1/sso", Some(json!({ "auto_provision": false })), &admin);
+        assert_eq!(r.status, 400);
+        assert!(r.body["error"]["message"].as_str().unwrap().contains("own Google app any more"), "{}", r.body);
+        set_up(&h, &admin, json!({ "enabled": false }), GOOGLE);
+        // When the app is back, so is single sign-on.
+        h.cfg.sso_apps = shared_apps();
+        let v = set_up(&h, &admin, json!({ "enabled": true }), GOOGLE);
+        assert_eq!((v["active"].as_bool(), v["shared_app_missing"].as_bool()), (Some(true), Some(false)));
+        assert_eq!(login(&h), 403);
+    }
+
+    #[test]
+    fn agents_set_up_shared_mode_with_update_sso() {
+        let (mut h, admin) = shared_workspace();
+        h.user(&admin, "mo@acme.test", "Mo", "member");
+        let bad = |h: &H, body: Value| {
+            let r = h.call("PATCH", "/api/v1/sso", Some(body), &admin);
+            assert_eq!(r.status, 400, "{}", r.body);
+            r.body["error"]["message"].as_str().unwrap().to_string()
+        };
+        assert!(bad(&h, json!({ "provider": "okta", "shared": true, "issuer": OKTA })).contains("google"));
+        assert!(bad(&h, json!({ "provider": "slack", "shared": true, "client_id": "x" })).contains("leave out `client_id`"));
+        assert!(bad(&h, json!({ "provider": "slack", "shared": true, "enabled": true })).contains("`team`"));
+        // No connector key, so no app of your own.
+        let r = h.call(
+            "PATCH",
+            "/api/v1/sso",
+            Some(json!({ "provider": "okta", "issuer": OKTA, "client_id": "a", "client_secret": "s" })),
+            &admin,
+        );
+        assert_eq!(r.status, 503);
+
+        let body = json!({ "provider": "slack", "shared": true, "team": "T0ACME", "allowed_domains": ["acme.test"], "enabled": true });
+        let v = set_up(&h, &admin, body, SLACK);
+        assert_eq!(
+            (v["active"].as_bool(), v["shared"].as_bool(), v["check"]["ok"].as_bool(), v["client_secret_set"].as_bool()),
+            (Some(true), Some(true), Some(true), Some(false)),
+            "{v}"
+        );
+        let s = start(&h, SLACK);
+        assert_eq!((s.query["client_id"].as_str(), s.query["team"].as_str()), ("slack-app", "T0ACME"));
+        let mut c = claims(SLACK, "sub-mo", "mo@acme.test", organization("slack"));
+        c["aud"] = json!("slack-app");
+        let (landing, _) = come_back(&h, &s, c, &tokens);
+        assert!(landing.session().is_some(), "{}", landing.error());
+        // Another provider means another app: shared mode doesn't carry over unasked (and this
+        // server can't keep a secret for one of your own).
+        let r = h.call(
+            "PATCH",
+            "/api/v1/sso",
+            Some(json!({ "provider": "google", "allowed_domains": ["acme.test"], "enabled": true })),
+            &admin,
+        );
+        assert_eq!((r.status, r.body["error"]["code"].as_str()), (503, Some("sso_off")));
+        h.cfg.sso_apps.microsoft = None;
+        let r = h.call("PATCH", "/api/v1/sso", Some(json!({ "provider": "microsoft", "shared": true, "tenant": TENANT })), &admin);
+        assert_eq!((r.status, r.body["error"]["code"].as_str()), (400, Some("sso_shared_unavailable")));
+    }
+
+    /// Signs in through `issuer` as `sub`, with Microsoft's `oid` and other claims in `extra`, for
+    /// the app `aud`. Returns the person signed in as, or the error code.
+    fn ms_sign_in(h: &H, aud: &str, sub: &str, email: &str, extra: Value) -> Result<String, String> {
+        let issuer = ms_issuer();
+        let s = start(h, &issuer);
+        assert_eq!(s.query["client_id"], aud);
+        let mut c = claims(&issuer, sub, email, extra);
+        c["aud"] = json!(aud);
+        let (landing, _) = come_back(h, &s, c, &tokens);
+        match landing.session() {
+            Some(session) => Ok(me(h, &session)["id"].as_str().unwrap().to_string()),
+            None => Err(landing.error()),
+        }
+    }
+
+    fn password(h: &H, email: &str) -> u16 {
+        h.call("POST", "/api/v1/auth/login", Some(json!({ "email": email, "password": "password123" })), &Auth::None).status
+    }
+
+    #[test]
+    fn microsoft_links_survive_switching_to_the_servers_app() {
+        let (mut h, admin) = workspace();
+        h.cfg.sso_apps = shared_apps();
+        let (mo_id, _) = h.user(&admin, "mo@acme.test", "Mo", "member");
+        let own = json!({ "provider": "microsoft", "tenant": TENANT, "allowed_domains": ["acme.test"], "client_id": "app-id",
+            "client_secret": "s", "enabled": true, "require_sso": true });
+        set_up(&h, &admin, own, &ms_issuer());
+        let mo_oid = oid_of("mo");
+        // Mo's first sign-in, through the workspace's own app, matches their verified email.
+        let first = ms_sign_in(&h, "app-id", "own-app-sub-mo", "mo@acme.test", json!({ "tid": TENANT, "oid": mo_oid, "xms_edov": true }));
+        assert_eq!(first, Ok(mo_id.clone()));
+
+        // The admin switches to DumbSlab's app. Microsoft gives every app its own `sub` for Mo.
+        let url = start_setup(&h, &admin, json!({ "provider": "microsoft", "replace": true }));
+        let (landing, _, _) = finish_setup(&h, &url, &admin, admin_token("microsoft", organization("microsoft")), None);
+        assert_eq!(landing.location, format!("{SETTINGS}?sso_setup=done"));
+        let s = h.ok("GET", "/api/v1/sso", None, &admin);
+        assert_eq!(
+            (s["shared"].as_bool(), s["require_sso"].as_bool(), s["require_sso_paused"].as_bool()),
+            (Some(true), Some(true), Some(false))
+        );
+        // Same `oid`, new `sub`, and no xms_edov to match an email by: still Mo.
+        let again = ms_sign_in(&h, "microsoft-app", "shared-app-sub-mo", "mo@acme.test", json!({ "tid": TENANT, "oid": mo_oid }));
+        assert_eq!(again, Ok(mo_id.clone()));
+        assert_eq!(password(&h, "mo@acme.test"), 403, "Require single sign-on is still on, and Mo isn't locked out");
+        // And back to the workspace's own app.
+        set_up(&h, &admin, json!({ "shared": false, "client_id": "app-id", "client_secret": "s" }), &ms_issuer());
+        let back = ms_sign_in(&h, "app-id", "own-app-sub-mo", "mo@acme.test", json!({ "tid": TENANT, "oid": mo_oid }));
+        assert_eq!(back, Ok(mo_id));
+        // A Microsoft token without `oid` can't be linked by it.
+        let mut c = json!({ "tid": TENANT, "xms_edov": true });
+        c["oid"] = Value::Null;
+        assert_eq!(ms_sign_in(&h, "app-id", "sub-zed", "zed@acme.test", c), Err("invalid_token".into()));
+    }
+
+    #[test]
+    fn microsoft_links_made_by_sub_move_to_oid_or_pause_require_sso() {
+        let (mut h, admin) = workspace();
+        h.cfg.sso_apps = shared_apps();
+        let (mo_id, _) = h.user(&admin, "mo@acme.test", "Mo", "member");
+        let (zed_id, _) = h.user(&admin, "zed@acme.test", "Zed", "member");
+        let (bo_id, _) = h.user(&admin, "bo@acme.test", "Bo", "member");
+        let issuer = ms_issuer();
+        let own = json!({ "provider": "microsoft", "tenant": TENANT, "allowed_domains": ["acme.test"], "client_id": "app-id",
+            "client_secret": "s", "enabled": true, "require_sso": true });
+        set_up(&h, &admin, own, &issuer);
+        // Links made before links were by `oid`: by the own app's `sub`.
+        let legacy = |user: &str, sub: &str| {
+            h.store
+                .with_tx(|db| {
+                    let r = db.execute(
+                        "INSERT INTO sso_identities (id, user_id, issuer, subject, email, created_at, last_used_at) VALUES (?, ?, ?, ?, '', '2026-01-01T00:00:00Z', NULL)",
+                        &dumbslab_core::params![format!("legacy-{sub}"), user, issuer.clone(), sub],
+                    );
+                    (r, true)
+                })
+                .unwrap()
+                .unwrap();
+        };
+        let subjects = || -> Vec<String> {
+            h.store
+                .with_tx(|db| {
+                    let rows = db.query("SELECT subject FROM sso_identities ORDER BY subject", &[]).unwrap();
+                    (rows.iter().map(|r| r.str("subject")).collect(), true)
+                })
+                .unwrap()
+        };
+        legacy(&mo_id, "own-app-sub-mo");
+        legacy(&zed_id, "own-app-sub-zed");
+        // Through the same app, Mo's old link still works, and moves to Mo's `oid`.
+        let mo = ms_sign_in(&h, "app-id", "own-app-sub-mo", "mo@acme.test", json!({ "tid": TENANT }));
+        assert_eq!(mo, Ok(mo_id.clone()));
+        assert_eq!(subjects(), vec![format!("oid:{}", oid_of("own-app-sub-mo")), "own-app-sub-zed".to_string()]);
+
+        // Switching to DumbSlab's app: Zed's link can't follow (it's by the old app's `sub`), so it's
+        // forgotten, and "Require single sign-on" is paused so Zed isn't locked out.
+        let url = start_setup(&h, &admin, json!({ "provider": "microsoft", "replace": true }));
+        finish_setup(&h, &url, &admin, admin_token("microsoft", organization("microsoft")), None);
+        let s = h.ok("GET", "/api/v1/sso", None, &admin);
+        assert_eq!(
+            (s["require_sso"].as_bool(), s["require_sso_paused"].as_bool(), s["active"].as_bool()),
+            (Some(false), Some(true), Some(true))
+        );
+        assert!(!subjects().contains(&"own-app-sub-zed".to_string()));
+        let activity = h.ok("GET", "/api/v1/activity?limit=100", None, &admin);
+        let updated = activity["items"].as_array().unwrap().iter().find(|e| e["event"] == "sso.updated").unwrap().clone();
+        assert_eq!((updated["data"]["links_forgotten"].as_i64(), updated["data"]["require_sso_paused"].as_bool()), (Some(1), Some(true)));
+        assert_eq!(password(&h, "zed@acme.test"), 200, "Zed can sign in with their password, and link again");
+        // Mo's link moved to `oid`, so it carried over.
+        let mo =
+            ms_sign_in(&h, "microsoft-app", "shared-app-sub-mo", "mo@acme.test", json!({ "tid": TENANT, "oid": oid_of("own-app-sub-mo") }));
+        assert_eq!(mo, Ok(mo_id));
+        // Zed's verified email matches again, with no old link in the way.
+        let zed = ms_sign_in(&h, "microsoft-app", "shared-app-sub-zed", "zed@acme.test", json!({ "tid": TENANT, "xms_edov": true }));
+        assert_eq!(zed, Ok(zed_id));
+        // A form re-sending its old checkbox, or an agent's plain `require_sso: true`, can't turn it
+        // back on by accident; nor does re-sending `false` clear the note.
+        let r = h.call("PATCH", "/api/v1/sso", Some(json!({ "require_sso": true, "auto_provision": false })), &admin);
+        assert_eq!((r.status, r.body["error"]["code"].as_str()), (409, Some("sso_relink_pending")), "{}", r.body);
+        let v = set_up(&h, &admin, json!({ "require_sso": false }), &issuer);
+        assert_eq!((v["require_sso"].as_bool(), v["require_sso_paused"].as_bool()), (Some(false), Some(true)));
+        assert_eq!(password(&h, "zed@acme.test"), 200);
+        // Confirming that people linked again turns it back on and clears the note.
+        let v = set_up(&h, &admin, json!({ "require_sso": true, "relinked": true }), &issuer);
+        assert_eq!((v["require_sso"].as_bool(), v["require_sso_paused"].as_bool()), (Some(true), Some(false)));
+
+        // The same when an agent switches apps with update_sso.
+        legacy(&bo_id, "shared-app-sub-bo");
+        let v = set_up(&h, &admin, json!({ "shared": false, "client_id": "app-2", "client_secret": "s2" }), &issuer);
+        assert_eq!((v["require_sso"].as_bool(), v["require_sso_paused"].as_bool()), (Some(false), Some(true)), "{v}");
+        assert_eq!(password(&h, "bo@acme.test"), 200);
+        // Without anyone left to link again, "Require single sign-on" stays as it is.
+        set_up(&h, &admin, json!({ "require_sso": true, "relinked": true }), &issuer);
+        let v = set_up(&h, &admin, json!({ "shared": true }), &issuer);
+        assert_eq!((v["require_sso"].as_bool(), v["require_sso_paused"].as_bool()), (Some(true), Some(false)), "{v}");
+    }
+
+    #[test]
+    fn settings_changed_before_the_sign_in_starts_are_never_overwritten() {
+        let (h, admin) = shared_workspace();
+        let t = h.ok("POST", "/api/v1/tokens", Some(json!({ "name": "agent", "scopes": ["read", "write", "admin"] })), &admin);
+        let agent = Auth::Bearer(t["token"].as_str().unwrap().to_string());
+        let changed = |finish: Finish| match finish {
+            Finish::Fail(e) => (e.status, e.code),
+            other => panic!("{other:?}"),
+        };
+        // Nothing to replace when setting up starts, so no `replace` asked; then, before the job
+        // even reads Google's discovery document, another admin sets up Microsoft.
+        let r = h.call("POST", "/api/v1/sso/setup", Some(json!({ "provider": "google" })), &admin);
+        assert_eq!(r.status, 200, "{}", r.body);
+        set_up(&h, &agent, json!({ "provider": "microsoft", "shared": true, "tenant": TENANT }), &ms_issuer());
+        let (finish, sent) = drive(&h, job_of(&r), &|_| ok(discovery(GOOGLE)));
+        assert_eq!((changed(finish), sent.len()), ((409, "sso_changed"), 0));
+        // Or while it's waiting for that document.
+        let r = h.call("POST", "/api/v1/sso/setup", Some(json!({ "provider": "google", "replace": true })), &admin);
+        let mut job = job_of(&r);
+        let first = h.store.with_tx(|db| (connect::step(db, &h.cfg, &mut job, vec![], chrono::Utc::now()), true)).unwrap().unwrap();
+        assert!(matches!(first, Step::Fetch(_)));
+        set_up(&h, &agent, json!({ "allowed_domains": ["acme.test"] }), &ms_issuer());
+        let second = h
+            .store
+            .with_tx(|db| (connect::step(db, &h.cfg, &mut job, vec![ok(discovery(GOOGLE))], chrono::Utc::now()), true))
+            .unwrap()
+            .unwrap();
+        let Step::Done(finish) = second else { panic!("done") };
+        assert_eq!(changed(finish), (409, "sso_changed"));
+        assert_eq!(count(&h, "SELECT COUNT(*) FROM sso_requests"), 0, "no sign-in was started");
+        let s = h.ok("GET", "/api/v1/sso", None, &admin);
+        assert_eq!((s["provider"].as_str(), s["allowed_domains"].clone()), (Some("microsoft"), json!(["acme.test"])));
+    }
+
+    #[test]
+    fn allowing_a_suggested_domain_keeps_newer_settings() {
+        let (h, admin) = shared_workspace();
+        let (_, mo) = h.user(&admin, "mo@acme.test", "Mo", "member");
+        let slack_setup = |team: &str, replace: bool| {
+            let url = start_setup(&h, &admin, json!({ "provider": "slack", "replace": replace }));
+            let c = admin_token("slack", json!({ "https://slack.com/team_id": team, "email_verified": true }));
+            assert_eq!(finish_setup(&h, &url, &admin, c, None).0.location, format!("{SETTINGS}?sso_setup=domain_needed"));
+            let s = h.ok("GET", "/api/v1/sso", None, &admin);
+            assert_eq!(s["suggested_domain"], "acme.test");
+            s["suggestion_id"].as_str().unwrap().to_string()
+        };
+        let allow = |id: &str, auth: &Auth| {
+            h.call("POST", "/api/v1/sso/suggested-domain", Some(json!({ "domain": "acme.test", "suggestion_id": id })), auth)
+        };
+        let id = slack_setup("T0ACME", false);
+        assert_eq!(allow(&id, &mo).status, 403, "admins only");
+        // Another domain saved after the page loaded stays: the suggestion is added to the list as it is now.
+        set_up(&h, &admin, json!({ "allowed_domains": ["other.test"] }), SLACK);
+        let r = allow(&id, &admin);
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert_eq!(
+            (r.body["allowed_domains"].clone(), r.body["suggested_domain"].clone()),
+            (json!(["other.test", "acme.test"]), Value::Null)
+        );
+        let activity = h.ok("GET", "/api/v1/activity?limit=5", None, &admin).to_string();
+        assert!(activity.contains("allowed acme.test for single sign-on"), "{activity}");
+        // It's gone once allowed.
+        assert_eq!(allow(&id, &admin).body["error"]["code"], "sso_suggestion_changed");
+
+        // A tab still showing an old suggestion can't add it to a newer setup: another Slack
+        // workspace, or another provider.
+        let id = slack_setup("T0OLD", true);
+        slack_setup("T0NEW", true);
+        assert_eq!(allow(&id, &admin).body["error"]["code"], "sso_suggestion_changed");
+        let id = slack_setup("T0NEW", false);
+        let url = start_setup(&h, &admin, json!({ "provider": "google", "replace": true }));
+        let c = admin_token("google", json!({ "hd": "beta.test", "email_verified": true }));
+        finish_setup(&h, &url, &admin, c, None);
+        let r = allow(&id, &admin);
+        assert_eq!((r.status, r.body["error"]["code"].as_str()), (409, Some("sso_suggestion_changed")));
+        assert_eq!(h.ok("GET", "/api/v1/sso", None, &admin)["allowed_domains"], json!(["beta.test"]));
+    }
+
+    #[test]
+    fn company_domains_are_never_mistaken_for_free_mail() {
+        let (h, admin) = shared_workspace();
+        // Google's hosted domain is Google's word: it's the organization's.
+        let url = start_setup(&h, &admin, json!({ "provider": "google" }));
+        let landing = finish_setup(&h, &url, &admin, admin_token("google", json!({ "hd": "live.abc.de", "email_verified": true })), None).0;
+        assert_eq!(landing.location, format!("{SETTINGS}?sso_setup=done"), "{}", landing.error());
+        assert_eq!(h.ok("GET", "/api/v1/sso", None, &admin)["allowed_domains"], json!(["live.abc.de"]));
+        // Microsoft's, with xms_edov.
+        let url = start_setup(&h, &admin, json!({ "provider": "microsoft", "replace": true }));
+        let mut c = admin_token("microsoft", organization("microsoft"));
+        c["email"] = json!("ada@gmx.acme.com");
+        assert_eq!(finish_setup(&h, &url, &admin, c, None).0.location, format!("{SETTINGS}?sso_setup=done"));
+        assert_eq!(h.ok("GET", "/api/v1/sso", None, &admin)["allowed_domains"], json!(["gmx.acme.com"]));
+        // Slack's, suggested.
+        let url = start_setup(&h, &admin, json!({ "provider": "slack", "replace": true }));
+        let mut c = admin_token("slack", organization("slack"));
+        c["email"] = json!("ada@mail.acme.co.uk");
+        finish_setup(&h, &url, &admin, c, None);
+        assert_eq!(h.ok("GET", "/api/v1/sso", None, &admin)["suggested_domain"], "mail.acme.co.uk");
+    }
+
+    #[test]
+    fn hosted_sign_ins_come_back_through_the_root_domain() {
+        let mut h = H::new();
+        let (admin, _) = h.setup();
+        h.user(&admin, "mo@acme.test", "Mo", "member");
+        h.cfg.base_url = Some("https://acme.kb.test".into());
+        h.cfg.workspace = Some("acme".into());
+        h.cfg.sso_apps = dumbslab_core::sso::SharedApps { callback_url: Some("https://kb.test/sso/callback".into()), ..shared_apps() };
+        let url = start_setup(&h, &admin, json!({ "provider": "google" }));
+        let q = query_of(&url);
+        assert_eq!(q["redirect_uri"], "https://kb.test/sso/callback");
+        assert!(q["state"].starts_with("acme.") && q["state"].len() > 30, "{}", q["state"]);
+        let (landing, sent, _) = finish_setup(&h, &url, &admin, admin_token("google", organization("google")), None);
+        assert_eq!(landing.location, "https://acme.kb.test/settings/sso?sso_setup=done");
+        assert_eq!(query_of(&format!("?{}", sent[0].body.clone().unwrap()))["redirect_uri"], "https://kb.test/sso/callback");
+        // People's sign-ins too.
+        let s = start(&h, GOOGLE);
+        assert!(s.query["state"].starts_with("acme.") && s.query["redirect_uri"] == "https://kb.test/sso/callback", "{:?}", s.query);
+        let mut c = claims(GOOGLE, "sub-mo", "mo@acme.test", organization("google"));
+        c["aud"] = json!("google-app");
+        let (landing, sent) = come_back(&h, &s, c, &tokens);
+        assert_eq!(landing.location, "https://acme.kb.test/p/abc", "{}", landing.error());
+        assert_eq!(query_of(&format!("?{}", sent[0].body.clone().unwrap()))["redirect_uri"], "https://kb.test/sso/callback");
+        // Your own app keeps the workspace's own redirect URI.
+        assert_eq!(h.ok("GET", "/api/v1/sso", None, &admin)["redirect_uri"], "https://acme.kb.test/sso/callback");
     }
 }
 

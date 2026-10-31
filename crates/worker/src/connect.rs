@@ -1,10 +1,10 @@
 //! Connected apps on Cloudflare: settings from the environment, and the HTTP the core's jobs ask
 //! for (see `dumbslab_core::connect`).
 
-use std::collections::BTreeMap;
 use std::time::Duration;
 
-use dumbslab_core::connect::{self, Connectors, FETCH_TIMEOUT_SECS, HttpCall, HttpReply, MAX_REPLY_BYTES, OAuthApp};
+use dumbslab_core::connect::{self, Connectors, FETCH_TIMEOUT_SECS, HttpCall, HttpReply, MAX_REPLY_BYTES};
+use dumbslab_core::sso::SharedApps;
 use futures_util::StreamExt;
 use futures_util::future::{Either, select};
 use wasm_bindgen::JsValue;
@@ -14,29 +14,32 @@ use crate::sql::var;
 
 /// `CONNECTOR_KEY` (secret) encrypts people's credentials; `<APP>_CLIENT_ID` and the secret
 /// `<APP>_CLIENT_SECRET` (e.g. `GITHUB_CLIENT_ID`, `GOOGLE_DRIVE_CLIENT_SECRET`) let people sign in
-/// to that app. `BAMBOOHR_CLIENT_ID` and `BAMBOOHR_CLIENT_SECRET` are the people sync's Sign in
-/// with BambooHR (docs/hosting/bamboohr-app.md). Hosted workspaces send sign-ins back through the
-/// root domain, which forwards them.
+/// to that app, and `ATLASSIAN_CLIENT_ID` with `ATLASSIAN_CLIENT_SECRET` to Jira and Confluence
+/// (see [`connect::oauth_apps`]). Hosted workspaces send sign-ins back through the root domain,
+/// which forwards them.
 pub fn connectors(env: &Env, origin: &str, hosted: bool) -> Connectors {
-    let mut apps = BTreeMap::new();
-    let ids = connect::providers::ALL.iter().map(|c| c.info().id).chain([dumbslab_core::sync::people::PROVIDER]);
-    for id in ids {
-        let name = id.to_ascii_uppercase().replace('-', "_");
-        if let (Some(client_id), Some(client_secret)) = (var(env, &format!("{name}_CLIENT_ID")), var(env, &format!("{name}_CLIENT_SECRET")))
-        {
-            apps.insert(id.to_string(), OAuthApp { client_id, client_secret });
-        }
-    }
-    let callback_url = if hosted { root_callback(env, origin) } else { None };
+    let apps = connect::oauth_apps(|name| var(env, name));
+    let callback_url = if hosted { root_callback(env, origin, "/connect/callback") } else { None };
     Connectors { key: var(env, "CONNECTOR_KEY"), apps, callback_url }
 }
 
-/// `https://dumbslab.com/connect/callback` for a workspace at `https://acme.dumbslab.com`.
-fn root_callback(env: &Env, origin: &str) -> Option<String> {
+/// DumbSlab's own sign-in apps for single sign-on: the vars `SSO_GOOGLE_CLIENT_ID`,
+/// `SSO_MICROSOFT_CLIENT_ID` and `SLACK_CLIENT_ID`, and the secrets `SSO_GOOGLE_CLIENT_SECRET`,
+/// `SSO_MICROSOFT_CLIENT_SECRET` and `SLACK_CLIENT_SECRET` (see `dumbslab_core::sso::SharedApps`).
+/// Hosted workspaces send sign-ins back through the root domain's `/sso/callback`, which forwards
+/// them.
+pub fn sso_apps(env: &Env, origin: &str, hosted: bool) -> SharedApps {
+    let mut apps = SharedApps::from_vars(|name| var(env, name));
+    apps.callback_url = if hosted { root_callback(env, origin, dumbslab_core::sso::CALLBACK_PATH) } else { None };
+    apps
+}
+
+/// `https://dumbslab.com{path}` for a workspace at `https://acme.dumbslab.com`.
+fn root_callback(env: &Env, origin: &str, path: &str) -> Option<String> {
     let root = var(env, "ROOT_DOMAIN")?;
     let (scheme, rest) = origin.split_once("://")?;
     let port = rest.rsplit_once(':').map(|(_, p)| format!(":{p}")).unwrap_or_default();
-    Some(format!("{scheme}://{root}{port}/connect/callback"))
+    Some(format!("{scheme}://{root}{port}{path}"))
 }
 
 /// Sends one request a job asked for: https only, no redirects, at most
@@ -83,9 +86,9 @@ pub async fn send(call: &HttpCall) -> HttpReply {
     }
 }
 
-/// `GET <path>` on the root domain (`/connect/callback`, `/sync/bamboohr/callback`): an app sent
-/// someone back after they signed in. The `state` starts with their workspace's address; send them
-/// on to the same path at the workspace, which checks it.
+/// `GET {path}` on the root domain (`/connect/callback`, `/sso/callback`,
+/// `/sync/bamboohr/callback`): an app sent someone back after they signed in. The `state` starts
+/// with their workspace's address; send them on to the same path at the workspace, which checks it.
 pub fn root_callback_redirect(url: &Url, root: &str, path: &str) -> Result<Response> {
     let query = url.query().unwrap_or_default();
     let state = url.query_pairs().find(|(k, _)| k == "state").map(|(_, v)| v.into_owned()).unwrap_or_default();
@@ -94,7 +97,7 @@ pub fn root_callback_redirect(url: &Url, root: &str, path: &str) -> Result<Respo
         return crate::sql::error_response(
             400,
             "bad_request",
-            "That sign-in link doesn't name a workspace. Start connecting again from your workspace.",
+            "That sign-in link doesn't name a workspace. Start again from your workspace.",
         );
     }
     let port = url.port().map(|p| format!(":{p}")).unwrap_or_default();

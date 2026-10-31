@@ -33,6 +33,8 @@ static INFO: ProviderInfo = ProviderInfo {
         scope_separator: " ",
         extra: &[],
         pkce: false,
+        site: None,
+        refresh_revokes: false,
     }),
     token_fields: &[Field {
         key: "token",
@@ -168,10 +170,10 @@ impl Connector for ClickUp {
     }
 
     /// ClickUp takes only the client and the code. Its tokens don't expire, so nothing refreshes.
-    fn token_request(&self, app: &OAuthApp, form: Vec<(String, String)>) -> HttpCall {
+    fn token_request(&self, app: &OAuthApp, token_url: &str, form: Vec<(String, String)>) -> HttpCall {
         let code = form.iter().find(|(k, _)| k == "code").map(|(_, v)| v.as_str()).unwrap_or_default();
         let pairs = [("client_id", app.client_id.as_str()), ("client_secret", app.client_secret.as_str()), ("code", code)];
-        HttpCall::post_form(INFO.oauth.expect("ClickUp signs in").token_url, &pairs).header("accept", "application/json")
+        HttpCall::post_form(token_url, &pairs).header("accept", "application/json")
     }
 }
 
@@ -209,7 +211,7 @@ mod tests {
         let app = OAuthApp { client_id: "cid".into(), client_secret: "sec".into() };
         let form =
             vec![("grant_type".into(), "authorization_code".into()), ("code".into(), "c&1".into()), ("redirect_uri".into(), "x".into())];
-        let call = ClickUp.token_request(&app, form);
+        let call = ClickUp.token_request(&app, INFO.oauth.unwrap().token_url, form);
         assert_eq!(call.url, "https://api.clickup.com/api/v2/oauth/token");
         assert_eq!(call.body.as_deref(), Some("client_id=cid&client_secret=sec&code=c%261"));
         assert!(ClickUp.info().oauth.unwrap().scopes.is_empty());

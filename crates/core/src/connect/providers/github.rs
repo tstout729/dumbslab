@@ -28,6 +28,8 @@ static INFO: ProviderInfo = ProviderInfo {
         scope_separator: " ",
         extra: &[("allow_signup", "false")],
         pkce: false,
+        site: None,
+        refresh_revokes: false,
     }),
     token_fields: &[
         Field {
@@ -240,12 +242,12 @@ impl Connector for GitHub {
     }
 
     /// GitHub answers in form encoding unless asked for JSON.
-    fn token_request(&self, app: &OAuthApp, form: Vec<(String, String)>) -> HttpCall {
+    fn token_request(&self, app: &OAuthApp, token_url: &str, form: Vec<(String, String)>) -> HttpCall {
         let mut all = form;
         all.push(("client_id".into(), app.client_id.clone()));
         all.push(("client_secret".into(), app.client_secret.clone()));
         let pairs: Vec<(&str, &str)> = all.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-        HttpCall::post_form(INFO.oauth.expect("GitHub signs in").token_url, &pairs).header("accept", "application/json")
+        HttpCall::post_form(token_url, &pairs).header("accept", "application/json")
     }
 }
 

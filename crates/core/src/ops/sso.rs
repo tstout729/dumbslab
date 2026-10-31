@@ -19,11 +19,19 @@ pub fn ops() -> Vec<Op> {
     vec![
         op("sso", "get_sso", "GET", "/sso", Access::Admin, get_sso)
             .title("Single sign-on settings")
-            .desc("How people sign in with the workspace's identity provider (Google Workspace, Microsoft Entra ID, Okta, OneLogin, Slack or any OpenID Connect provider), and the `redirect_uri` to register in the provider's app. The client secret is never shown.")
+            .desc("How people sign in with the workspace's identity provider (Google Workspace, Microsoft Entra ID, Okta, OneLogin, Slack or any OpenID Connect provider). `shared_providers` lists the providers this server has its own app for, which need nothing registered (`setup_sso`, or `update_sso` with `shared`); `redirect_uri` is what to register in your own app for the others. The client secret is never shown.")
             .build(),
         op("sso", "update_sso", "PATCH", "/sso", Access::Admin, update_sso)
             .title("Set up single sign-on")
-            .desc("Set up signing in with the workspace's identity provider. Register an OpenID Connect app (web, authorization code) with the provider, with the `redirect_uri` from get_sso, then give its `client_id` and `client_secret`. `provider` fills in the issuer for `google` and `slack` (which takes its workspace `team` ID); `microsoft` takes the directory `tenant` ID; `okta`, `onelogin` and `oidc` take the `issuer` URL. A first sign-in joins an existing account only when the provider says the email is verified and its domain is in `allowed_domains`; `auto_provision` adds such people as members when nobody has their email yet. `require_sso` stops non-admins signing in with a password (admins keep theirs, in case the provider fails). Each save checks the provider's discovery document and answers with the result in `check`. Changing `provider` or `client_id` forgets the saved client secret.")
+            .desc("Set up signing in with the workspace's identity provider. For `google`, `microsoft` and `slack`, when get_sso lists them in `shared_providers`, pass `shared: true` to use this server's own app: no client ID or secret, but still Google's `allowed_domains`, Microsoft's directory `tenant` ID or Slack's workspace `team` ID (in the web app, `setup_sso` fills those in by having an admin sign in once). Otherwise register an OpenID Connect app (web, authorization code) with the provider, with the `redirect_uri` from get_sso, then give its `client_id` and `client_secret`. `provider` fills in the issuer for `google` and `slack`; `microsoft` takes the `tenant`; `okta`, `onelogin` and `oidc` take the `issuer` URL. A first sign-in joins an existing account only when the provider says the email is verified and its domain is in `allowed_domains`; `auto_provision` adds such people as members when nobody has their email yet. `require_sso` stops non-admins signing in with a password (admins keep theirs, in case the provider fails). Each save checks the provider's discovery document and answers with the result in `check`. Changing `provider`, `client_id` or `shared` forgets the saved client secret.")
+            .build(),
+        op("sso", "setup_sso", "POST", "/sso/setup", Access::Admin, setup_sso)
+            .title("Set up single sign-on by signing in")
+            .desc("Sets up single sign-on with this server's own Google, Microsoft or Slack app (one of `shared_providers` from get_sso), with nothing to register. Answers with an `authorize_url` to open in the same signed-in browser. Sign in there with your organization's account: a Google Workspace account, a Microsoft work or school account, or your Slack workspace's. DumbSlab takes your organization from it (Google's domain, Microsoft's directory, Slack's workspace), and an allowed email domain when the provider vouches for one that isn't free mail. It shows “Sign in with …” on the sign-in page, links your account, and sends you back to Settings › Single sign-on (`?sso_setup=done`, `domain_needed` when you still need to add your email domains, or `?sso_error=` a code). `require_sso` and `auto_provision` stay as they were. Replacing single sign-on set up with your own app or another provider needs `replace: true`. Only from a signed-in browser; scripts and agents use update_sso with `shared: true`.")
+            .build(),
+        op("sso", "allow_suggested_sso_domain", "POST", "/sso/suggested-domain", Access::Admin, allow_suggested_domain)
+            .title("Allow the suggested email domain")
+            .desc("Adds get_sso's `suggested_domain` to `allowed_domains`, keeping the domains already there. Slack, set up by signing in, suggests the domain of the admin's address: Slack confirmed the address, not that the domain is the organization's, so an admin confirms it here. Pass the `domain` and `suggestion_id` get_sso showed; if single sign-on changed since (another provider or workspace, or no such suggestion), it's refused, so nothing is added to settings you haven't seen.")
             .build(),
         op("sso", "list_sso_identities", "GET", "/sso/identities", Access::Read, list_identities)
             .title("Linked sign-in accounts")
@@ -50,13 +58,15 @@ fn get_sso(ctx: &mut Ctx, _: NoInput) -> ApiResult<SsoSettings> {
 pub struct UpdateSsoInput {
     /// `google`, `microsoft`, `okta`, `onelogin`, `slack` or `oidc` (any other OpenID Connect provider).
     pub provider: Option<Provider>,
+    /// Sign in through this server's own app for `google`, `microsoft` or `slack` (see `shared_providers` in get_sso), instead of one you registered: leave out `client_id` and `client_secret`. `false` goes back to your own app. Changing it forgets the saved client ID and secret.
+    pub shared: Option<bool>,
     /// Okta, OneLogin and `oidc`: the issuer URL exactly as the provider's discovery document gives it, e.g. `https://acme.okta.com` or `https://acme.onelogin.com/oidc/2`.
     pub issuer: Option<String>,
     /// Microsoft: the directory (tenant) ID, a GUID from Microsoft Entra admin center › Overview.
     pub tenant: Option<String>,
     /// Slack: the Slack workspace (its team ID, `T…`) whose members may sign in. Required for Slack.
     pub team: Option<String>,
-    /// The client (application) ID of the app registered with the provider.
+    /// The client (application) ID of the app registered with the provider. Not in shared mode.
     pub client_id: Option<String>,
     /// The app's client secret. Stored encrypted and never shown again. Empty to remove it.
     pub client_secret: Option<String>,
@@ -64,8 +74,10 @@ pub struct UpdateSsoInput {
     pub allowed_domains: Option<Vec<String>>,
     /// Add people the provider vouches for, from `allowed_domains`, as members when nobody here has their email. Off by default.
     pub auto_provision: Option<bool>,
-    /// Only admins may sign in with a password; everyone else signs in with the provider. API tokens and MCP connections keep working.
+    /// Only admins may sign in with a password; everyone else signs in with the provider. API tokens and MCP connections keep working. While it's paused (`require_sso_paused` in get_sso), turning it back on also needs `relinked: true`.
     pub require_sso: Option<bool>,
+    /// While "Require single sign-on" is paused (`require_sso_paused`), confirm that the people whose Microsoft links were forgotten have linked again. Turning `require_sso` back on then needs it; it also clears the pause note.
+    pub relinked: Option<bool>,
     /// Show "Sign in with …" on the sign-in page. Needs the provider, client ID and secret set up.
     pub enabled: Option<bool>,
     /// `oidc`: the name on the button, e.g. `Acme SSO` for "Sign in with Acme SSO".
@@ -73,13 +85,16 @@ pub struct UpdateSsoInput {
 }
 
 fn update_sso(ctx: &mut Ctx, input: UpdateSsoInput) -> ApiResult<Deferred<SsoSettings>> {
-    let mut conf = sso::load(ctx.db)?;
+    let before = sso::load(ctx.db)?;
+    let mut conf = before.clone();
     let mut secret_changed = false;
     if let Some(p) = input.provider
         && conf.provider != Some(p)
     {
         // Another provider means another app: nothing of the old one carries over.
         conf.provider = Some(p);
+        conf.shared = false;
+        conf.suggested_domain.clear();
         conf.issuer = p.fixed_issuer().unwrap_or_default().to_string();
         conf.tenant.clear();
         conf.team.clear();
@@ -88,6 +103,29 @@ fn update_sso(ctx: &mut Ctx, input: UpdateSsoInput) -> ApiResult<Deferred<SsoSet
     }
     let provider = conf.provider;
     let name = provider.map(Provider::name).unwrap_or("the provider");
+    if let Some(shared) = input.shared {
+        if shared != conf.shared {
+            // The other mode's app doesn't carry over.
+            conf.client_id.clear();
+            secret_changed |= conf.client_secret.take().is_some();
+        }
+        if shared {
+            match provider {
+                Some(p) if sso::SHARED.contains(&p) => {
+                    if ctx.cfg.sso_apps.get(p).is_none() {
+                        return Err(sso::shared_unavailable(p));
+                    }
+                }
+                _ => return Err(ApiError::bad_request("`shared` is for `google`, `microsoft` and `slack` only; choose one as `provider`")),
+            }
+        }
+        conf.shared = shared;
+    }
+    if conf.shared && (input.client_id.is_some() || input.client_secret.is_some()) {
+        return Err(ApiError::bad_request(format!(
+            "this workspace signs in through this server's own {name} app; leave out `client_id` and `client_secret`, or pass `shared: false` to use your own app"
+        )));
+    }
     if let Some(issuer) = input.issuer {
         let issuer = issuer.trim().to_string();
         match provider {
@@ -121,7 +159,7 @@ fn update_sso(ctx: &mut Ctx, input: UpdateSsoInput) -> ApiResult<Deferred<SsoSet
         if !team.is_empty() && provider != Some(Provider::Slack) {
             return Err(ApiError::bad_request("`team` is for Slack only"));
         }
-        if !team.is_empty() && !(team.starts_with('T') && team.len() <= 30 && team.chars().all(|c| c.is_ascii_alphanumeric())) {
+        if !team.is_empty() && sso::normalize_team(&team).is_none() {
             return Err(ApiError::bad_request("`team` is a Slack workspace ID like T0123ABCD"));
         }
         conf.team = team;
@@ -173,15 +211,35 @@ fn update_sso(ctx: &mut Ctx, input: UpdateSsoInput) -> ApiResult<Deferred<SsoSet
     if let Some(b) = input.auto_provision {
         conf.auto_provision = b;
     }
-    if let Some(b) = input.require_sso {
+    // Paused because people's links were forgotten: turning it back on must be meant, not a
+    // form re-sending an old checkbox.
+    if let Some(b) = input.require_sso
+        && b != conf.require_sso
+    {
+        if b && conf.require_sso_paused && input.relinked != Some(true) {
+            return Err(ApiError::new(
+                409,
+                "sso_relink_pending",
+                "\"Require single sign-on\" is paused: some people's Microsoft accounts were linked through the old app and must be linked again, or they can't get in. Once they have, pass `relinked: true` with `require_sso: true`.",
+            ));
+        }
         conf.require_sso = b;
+    }
+    if input.relinked == Some(true) {
+        conf.require_sso_paused = false;
     }
     if let Some(b) = input.enabled {
         conf.enabled = b;
     }
     if conf.enabled {
-        if !connect::enabled(ctx.cfg) {
-            return Err(sso::off());
+        match provider {
+            Some(p) if conf.shared && ctx.cfg.sso_apps.get(p).is_none() => {
+                return Err(ApiError::bad_request(format!(
+                    "this server doesn't have its own {name} app any more, so single sign-on can't be on in shared mode. Set up your own app (`shared: false` with `client_id` and `client_secret`), or turn it off (`enabled: false`)"
+                )));
+            }
+            _ if !conf.shared && !connect::enabled(ctx.cfg) => return Err(sso::off()),
+            _ => {}
         }
         let mut missing = vec![];
         if provider.is_none() {
@@ -194,21 +252,28 @@ fn update_sso(ctx: &mut Ctx, input: UpdateSsoInput) -> ApiResult<Deferred<SsoSet
             Some(Provider::Google) if conf.allowed_domains.is_empty() => missing.push("`allowed_domains` (your Google Workspace domains)"),
             _ => {}
         }
-        if conf.client_id.is_empty() {
+        if !conf.shared && conf.client_id.is_empty() {
             missing.push("`client_id`");
         }
-        if conf.client_secret.is_none() {
-            missing.push("`client_secret`");
-        } else if sso::secret_unreadable(ctx.cfg, &conf) {
-            missing.push("`client_secret` again (the saved one can't be read since the server's connector key changed)");
+        if !conf.shared {
+            if conf.client_secret.is_none() {
+                missing.push("`client_secret`");
+            } else if sso::secret_unreadable(ctx.cfg, &conf) {
+                missing.push("`client_secret` again (the saved one can't be read since the server's connector key changed)");
+            }
         }
         if !missing.is_empty() {
             return Err(ApiError::bad_request(format!("to turn single sign-on on, also set {}", missing.join(", "))));
         }
     }
+    // Another Microsoft app can't match accounts linked by the old one's `sub`.
+    let forgotten = sso::forget_app_bound(ctx.db, &before, &mut conf)?;
     sso::save(ctx.db, &conf)?;
     let data = json!({
         "provider": conf.provider.map(Provider::as_str),
+        "shared": conf.shared,
+        "links_forgotten": forgotten,
+        "require_sso_paused": conf.require_sso_paused && !before.require_sso_paused,
         "enabled": conf.enabled,
         "require_sso": conf.require_sso,
         "auto_provision": conf.auto_provision,
@@ -221,6 +286,95 @@ fn update_sso(ctx: &mut Ctx, input: UpdateSsoInput) -> ApiResult<Deferred<SsoSet
         return Ok(Deferred::Pending);
     }
     Ok(Deferred::Ready(sso::settings_view(ctx.db, ctx.cfg, &ctx.base_url, None)?))
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AllowDomainInput {
+    /// The `suggested_domain` from get_sso.
+    pub domain: String,
+    /// The `suggestion_id` from get_sso, which names the suggestion and the organization it's for.
+    pub suggestion_id: String,
+}
+
+fn allow_suggested_domain(ctx: &mut Ctx, input: AllowDomainInput) -> ApiResult<SsoSettings> {
+    let mut conf = sso::load(ctx.db)?;
+    let domain = sso::normalize_domain(&input.domain).unwrap_or_default();
+    let current = sso::suggestion_id(&conf);
+    if domain.is_empty() || domain != conf.suggested_domain || current.as_deref() != Some(input.suggestion_id.trim()) {
+        return Err(ApiError::new(
+            409,
+            "sso_suggestion_changed",
+            "Single sign-on changed since you looked, and that domain isn't suggested for it any more. Look at the settings again.",
+        ));
+    }
+    // Onto the list as it is now, so domains saved meanwhile stay.
+    if conf.allowed_domains.len() >= 50 {
+        return Err(ApiError::bad_request("list at most 50 domains"));
+    }
+    conf.allowed_domains.push(domain.clone());
+    conf.suggested_domain.clear();
+    sso::save(ctx.db, &conf)?;
+    let data =
+        json!({ "provider": conf.provider.map(Provider::as_str), "allowed_domain": domain, "allowed_domains": conf.allowed_domains });
+    emit(ctx, Event::new("sso.updated", "settings", "sso", format!("allowed {domain} for single sign-on")).data(data).admin_only())?;
+    sso::settings_view(ctx.db, ctx.cfg, &ctx.base_url, None)
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SetupSsoInput {
+    /// `google`, `microsoft` or `slack`: one of `shared_providers` from get_sso.
+    pub provider: Provider,
+    /// Replace single sign-on that's set up with your own app, or with another provider. Without it, that's refused, so nothing is replaced by accident.
+    pub replace: Option<bool>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct SetupStart {
+    /// Open this in the same signed-in browser and sign in with your organization's account. Afterwards you land on Settings › Single sign-on.
+    pub authorize_url: String,
+}
+
+fn setup_sso(ctx: &mut Ctx, input: SetupSsoInput) -> ApiResult<Deferred<SetupStart>> {
+    // The provider sends the admin back to their browser, which must still be signed in to this
+    // same session, as an admin, to finish.
+    let Some(session_hash) = ctx.actor.session_hash.clone() else {
+        return Err(ApiError::forbidden(
+            "set up single sign-on by signing in from the web app, under Settings › Single sign-on; scripts and agents use update_sso with `shared: true`",
+        ));
+    };
+    let p = input.provider;
+    if !sso::SHARED.contains(&p) {
+        return Err(ApiError::bad_request(format!(
+            "{} has an issuer per organization, so it needs your own app: set it up with update_sso",
+            p.name()
+        )));
+    }
+    if ctx.cfg.sso_apps.get(p).is_none() {
+        return Err(sso::shared_unavailable(p));
+    }
+    let conf = sso::load(ctx.db)?;
+    let replaces = match conf.provider {
+        None => false,
+        Some(current) => !(conf.shared && current == p),
+    };
+    if replaces && input.replace != Some(true) {
+        let how = if conf.shared { "this server's app" } else { "your own app" };
+        return Err(ApiError::new(
+            409,
+            "sso_configured",
+            format!(
+                "single sign-on is set up with {} ({how}). Setting it up with {} replaces that: pass `replace: true`",
+                conf.name(),
+                p.name()
+            ),
+        ));
+    }
+    // What this checked: setting up saves nothing if the settings change before the admin is back.
+    let fingerprint = sso::setup_fingerprint(ctx.cfg, p, &conf).ok_or_else(|| sso::shared_unavailable(p))?;
+    ctx.effects.push(Effect::Connect(Job::Sso(SsoJob::setup(&ctx.base_url, &ctx.actor.user_id, &session_hash, p, fingerprint))));
+    Ok(Deferred::Pending)
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
