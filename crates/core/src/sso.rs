@@ -1,14 +1,22 @@
 //! Single sign-on: people sign in to the workspace with their organization's identity provider
 //! (Google Workspace, Microsoft Entra ID, Okta, OneLogin, Slack or any OpenID Connect provider).
 //!
-//! - Admins set it up for the workspace (`get_sso` and `update_sso` in [`crate::ops::sso`]). They
-//!   register their own OIDC app with the provider; its redirect URI is the workspace's
-//!   `/sso/callback`. The client secret is encrypted with the host's connector key, and no
-//!   operation returns it. Without the key, single sign-on is off.
+//! - Admins set it up for the workspace (`get_sso`, `update_sso` and `setup_sso` in
+//!   [`crate::ops::sso`]), in one of two ways:
+//!   - **Shared mode** (Google, Microsoft and Slack): the host registered its own app with the
+//!     provider once ([`SharedApps`]), so an admin sets single sign-on up by signing in with their
+//!     organization's account (`setup_sso`). The organization comes from that ID token: Google's
+//!     hosted domain (`hd`), Microsoft's directory (`tid`) or Slack's workspace (team). If the host
+//!     later lacks the app, single sign-on is off, so "Require single sign-on" never locks anyone
+//!     out. Hosted DumbSlab sends every workspace's sign-ins back through the root domain's
+//!     `/sso/callback`, which forwards to the workspace the `state` names (`{address}.{random}`).
+//!   - **Their own app**, for any provider: they register an OIDC app whose redirect URI is the
+//!     workspace's `/sso/callback`. The client secret is encrypted with the host's connector key,
+//!     and no operation returns it. Without the key, this mode is off.
 //! - Signing in is OpenID Connect's authorization code flow with PKCE (S256), a `state` (stored
 //!   hashed, used once, within 15 minutes, by the browser that started) and a `nonce`. The core
 //!   does no I/O: each network step is a [`crate::connect::Job`] the host runs, as for connected
-//!   apps.
+//!   apps. Setting up is the same flow, bound to the admin's browser session like linking.
 //! - The ID token comes straight from the token endpoint over TLS, so (OpenID Connect Core 1.0,
 //!   3.1.3.7, step 6) its signature isn't checked. Its issuer, audience, authorized party, expiry,
 //!   issue time and nonce are.
@@ -16,6 +24,33 @@
 //!   email only when the provider vouches for the address and its domain is one of the
 //!   workspace's ([`vouched_email`]). Otherwise people link their accounts while signed in
 //!   (`link_sso`), or join on their own when the workspace turns on auto-provisioning.
+//!
+//! What the providers document, which setting up relies on:
+//! - Google: `hd` is in the ID token only for a Google Workspace or Cloud Identity account, and is
+//!   what to check to restrict sign-in to an organization; `hd=*` asks the account chooser for such
+//!   accounts; the issuer is `https://accounts.google.com` or `accounts.google.com`.
+//!   <https://developers.google.com/identity/openid-connect/openid-connect>. An app that asks only
+//!   for non-sensitive scopes (`openid email profile`) needn't go through Google's app verification;
+//!   brand verification shows its name and logo:
+//!   <https://support.google.com/cloud/answer/13463073>,
+//!   <https://developers.google.com/identity/protocols/oauth2/production-readiness/brand-verification>.
+//! - Microsoft: the `organizations` discovery document names the issuer
+//!   `https://login.microsoftonline.com/{tenantid}/v2.0`; a multi-tenant app checks that `tid` is
+//!   a GUID and that `iss` is exactly that issuer with the token's own `tid`
+//!   (<https://login.microsoftonline.com/organizations/v2.0/.well-known/openid-configuration>,
+//!   <https://learn.microsoft.com/en-us/entra/identity-platform/access-tokens>). Personal accounts'
+//!   directory is `9188040d-6c67-4c5b-b112-36a304b66dad`. `xms_edov` says the email's domain owner
+//!   is verified, and comes only with `email`
+//!   (<https://learn.microsoft.com/en-us/entra/identity-platform/optional-claims-reference>); new
+//!   multi-tenant apps drop unverified emails from tokens
+//!   (<https://learn.microsoft.com/en-us/graph/applications-authenticationbehaviors>). A directory
+//!   can require an administrator to approve a new app (AADSTS90094, or AADSTS90095 with the admin
+//!   consent workflow; <https://learn.microsoft.com/en-us/entra/identity-platform/reference-error-codes>,
+//!   <https://learn.microsoft.com/en-us/entra/identity-platform/howto-convert-app-to-be-multi-tenant>).
+//! - Slack: Sign in with Slack's issuer is `https://slack.com`, its token endpoint
+//!   `openid.connect.token`, its user scopes `openid email profile`, and its ID token names the
+//!   Slack workspace in `https://slack.com/team_id`
+//!   (<https://docs.slack.dev/authentication/sign-in-with-slack/>).
 
 use std::collections::BTreeMap;
 
@@ -28,7 +63,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::auth::{self, Actor, Role, Scopes, Via};
-use crate::connect::{self, Finish, HttpCall, HttpReply, Job, Step};
+use crate::connect::{self, Finish, HttpCall, HttpReply, Job, OAuthApp, Step};
 use crate::db::{Db, DbExt};
 use crate::error::{ApiError, ApiResult};
 use crate::events::{Event, emit};
@@ -53,6 +88,68 @@ const SCOPES: &str = "openid email profile";
 const SETTING: &str = "sso";
 /// Binds the sealed client secret to its use, apart from people's connected-app credentials.
 const SECRET_AAD: &str = "sso-client-secret";
+/// Settings › Single sign-on, where setting it up by signing in ends.
+pub const SETTINGS_PATH: &str = "/settings/sso";
+/// Microsoft's endpoints for every organization's accounts, where setting up starts: the
+/// directory isn't known until the admin signs in.
+const MICROSOFT_ORGANIZATIONS: &str = "https://login.microsoftonline.com/organizations/v2.0";
+/// The issuer `organizations`' discovery document names: a template for each directory.
+const MICROSOFT_ISSUER_TEMPLATE: &str = "https://login.microsoftonline.com/{tenantid}/v2.0";
+/// The directory of personal Microsoft accounts (`consumers`).
+const MICROSOFT_CONSUMERS: &str = "9188040d-6c67-4c5b-b112-36a304b66dad";
+
+/// The providers a host can have its own app for (shared mode). Okta, OneLogin and other OIDC
+/// providers have an issuer per organization, so each workspace registers its own app there.
+pub const SHARED: [Provider; 3] = [Provider::Google, Provider::Microsoft, Provider::Slack];
+
+/// The host's own sign-in apps, registered once with each provider so admins set up single sign-on
+/// by signing in. Cloudflare reads `SSO_GOOGLE_CLIENT_ID`, `SSO_MICROSOFT_CLIENT_ID` and
+/// `SLACK_CLIENT_ID` (vars) with the secrets `SSO_GOOGLE_CLIENT_SECRET`,
+/// `SSO_MICROSOFT_CLIENT_SECRET` and `SLACK_CLIENT_SECRET`; self-hosted servers the same names
+/// prefixed `DUMBSLAB_` ([`SharedApps::from_vars`]). Slack's is the one Slack app the host uses
+/// for everything, connected-app search included.
+#[derive(Clone, Debug, Default)]
+pub struct SharedApps {
+    pub google: Option<OAuthApp>,
+    pub microsoft: Option<OAuthApp>,
+    pub slack: Option<OAuthApp>,
+    /// Where providers send people back. Hosted DumbSlab uses the root domain's `/sso/callback`,
+    /// which forwards to the workspace named in the `state`; unset, it's the workspace's own.
+    pub callback_url: Option<String>,
+}
+
+impl SharedApps {
+    /// Reads the apps with `var`, which looks up a setting by name (the host adds any prefix). An
+    /// app needs both its client ID and its secret.
+    pub fn from_vars(var: impl Fn(&str) -> Option<String>) -> SharedApps {
+        let app = |id: &str, secret: &str| {
+            let (client_id, client_secret) = (var(id)?, var(secret)?);
+            Some(OAuthApp { client_id, client_secret })
+        };
+        SharedApps {
+            google: app("SSO_GOOGLE_CLIENT_ID", "SSO_GOOGLE_CLIENT_SECRET"),
+            microsoft: app("SSO_MICROSOFT_CLIENT_ID", "SSO_MICROSOFT_CLIENT_SECRET"),
+            slack: app("SLACK_CLIENT_ID", "SLACK_CLIENT_SECRET"),
+            callback_url: None,
+        }
+    }
+
+    /// The host's app for `p`, if it has a complete one.
+    pub fn get(&self, p: Provider) -> Option<&OAuthApp> {
+        let app = match p {
+            Provider::Google => self.google.as_ref(),
+            Provider::Microsoft => self.microsoft.as_ref(),
+            Provider::Slack => self.slack.as_ref(),
+            _ => None,
+        };
+        app.filter(|a| !a.client_id.trim().is_empty() && !a.client_secret.trim().is_empty())
+    }
+
+    /// The providers the host has an app for, in [`SHARED`]'s order.
+    pub fn providers(&self) -> Vec<Provider> {
+        SHARED.into_iter().filter(|p| self.get(*p).is_some()).collect()
+    }
+}
 
 /// An identity provider, or rather the presets that fill in its issuer and its rules.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -121,12 +218,16 @@ pub fn microsoft_issuer(tenant: &str) -> String {
 pub struct Config {
     pub enabled: bool,
     pub provider: Option<Provider>,
+    /// Signs in through the host's own app for the provider ([`SharedApps`]): no client ID or
+    /// secret is stored, and single sign-on works only while the host has that app.
+    pub shared: bool,
     /// Exactly as the provider's discovery document gives it.
     pub issuer: String,
     /// Microsoft: the directory (tenant) ID.
     pub tenant: String,
     /// Slack: only this Slack workspace's people, when set.
     pub team: String,
+    /// The workspace's own app. Empty in shared mode (see [`effective`]).
     pub client_id: String,
     /// Sealed with the connector key; never returned.
     pub client_secret: Option<String>,
@@ -143,6 +244,7 @@ impl std::fmt::Debug for Config {
         f.debug_struct("Config")
             .field("enabled", &self.enabled)
             .field("provider", &self.provider)
+            .field("shared", &self.shared)
             .field("issuer", &self.issuer)
             .field("client_id", &self.client_id)
             .finish_non_exhaustive()
@@ -159,7 +261,8 @@ impl Config {
         }
     }
 
-    /// Everything signing in needs is filled in.
+    /// Everything signing in needs is filled in. In shared mode the app is the host's, which
+    /// [`active`] checks.
     pub fn complete(&self) -> bool {
         let Some(provider) = self.provider else { return false };
         let specific = match provider {
@@ -168,13 +271,16 @@ impl Config {
             Provider::Slack => !self.team.is_empty(),
             _ => true,
         };
-        specific && !self.issuer.is_empty() && !self.client_id.is_empty() && self.client_secret.is_some()
+        let app = if self.shared { SHARED.contains(&provider) } else { !self.client_id.is_empty() && self.client_secret.is_some() };
+        specific && !self.issuer.is_empty() && app
     }
 
-    /// What a sign-in must still match when it finishes: the same app at the same provider.
+    /// What a sign-in must still match when it finishes: the same app at the same provider. Call
+    /// it on [`effective`] settings, so a shared app's client ID counts.
     fn fingerprint(&self) -> String {
         let provider = self.provider.map(Provider::as_str).unwrap_or_default();
-        sha256_hex(&format!("{provider}|{}|{}|{}|{}", self.issuer, self.client_id, self.tenant, self.team))
+        let mode = if self.shared { "|shared" } else { "" };
+        sha256_hex(&format!("{provider}|{}|{}|{}|{}{mode}", self.issuer, self.client_id, self.tenant, self.team))
     }
 
     fn domain_allowed(&self, domain: &str) -> bool {
@@ -218,14 +324,123 @@ pub fn secret_unreadable(cfg: &HostConfig, conf: &Config) -> bool {
     conf.client_secret.is_some() && connect::key(cfg).is_some() && client_secret(cfg, conf).is_none()
 }
 
-/// People can sign in with the provider now: it's on, set up, and the server can read the secret.
-/// Everything that depends on single sign-on working (the sign-in button, requiring it) checks this.
+/// The client ID and secret signing in uses: in shared mode the host's app for the provider,
+/// otherwise the workspace's own, whose secret this server must be able to read.
+fn credentials(cfg: &HostConfig, conf: &Config) -> Option<(String, String)> {
+    if conf.shared {
+        let app = cfg.sso_apps.get(conf.provider?)?;
+        return Some((app.client_id.clone(), app.client_secret.clone()));
+    }
+    Some((conf.client_id.clone(), client_secret(cfg, conf)?))
+}
+
+/// The settings as signing in uses them: in shared mode, with the host app's client ID.
+fn effective(cfg: &HostConfig, mut conf: Config) -> Config {
+    if conf.shared {
+        conf.client_id = conf.provider.and_then(|p| cfg.sso_apps.get(p)).map(|a| a.client_id.clone()).unwrap_or_default();
+    }
+    conf
+}
+
+/// Shared mode, but the host doesn't have the provider's app (any more). Single sign-on is off
+/// until it's back or an admin sets up their own app.
+pub fn shared_app_missing(cfg: &HostConfig, conf: &Config) -> bool {
+    conf.shared && conf.provider.and_then(|p| cfg.sso_apps.get(p)).is_none()
+}
+
+/// People can sign in with the provider now: it's on, set up, and the app is there (in shared mode
+/// the host's, otherwise one whose secret the server can read). Everything that depends on single
+/// sign-on working (the sign-in button, requiring it) checks this.
 pub fn active(cfg: &HostConfig, conf: &Config) -> bool {
-    conf.enabled && conf.complete() && client_secret(cfg, conf).is_some()
+    conf.enabled && conf.complete() && credentials(cfg, conf).is_some()
 }
 
 pub fn callback_url(base_url: &str) -> String {
     format!("{base_url}{CALLBACK_PATH}")
+}
+
+/// Where the provider sends people back. In shared mode on hosted DumbSlab, that's the root
+/// domain's callback (the redirect URI the host registered once); otherwise the workspace's own.
+fn redirect_uri(cfg: &HostConfig, conf: &Config, base_url: &str) -> String {
+    match &cfg.sso_apps.callback_url {
+        Some(url) if conf.shared => url.clone(),
+        _ => callback_url(base_url),
+    }
+}
+
+/// Domains anyone can have an address at. Setting up never makes one an allowed domain: every
+/// account there could then match people here by email.
+const FREE_MAIL: &[&str] = &[
+    "gmail.com",
+    "googlemail.com",
+    "outlook.com",
+    "hotmail.com",
+    "live.com",
+    "msn.com",
+    "passport.com",
+    "yahoo.com",
+    "ymail.com",
+    "rocketmail.com",
+    "icloud.com",
+    "me.com",
+    "mac.com",
+    "aol.com",
+    "aim.com",
+    "proton.me",
+    "protonmail.com",
+    "protonmail.ch",
+    "pm.me",
+    "gmx.com",
+    "gmx.net",
+    "gmx.de",
+    "web.de",
+    "mail.com",
+    "zoho.com",
+    "zohomail.com",
+    "yandex.com",
+    "yandex.ru",
+    "mail.ru",
+    "hey.com",
+    "fastmail.com",
+    "tutanota.com",
+    "tuta.io",
+    "duck.com",
+    "qq.com",
+    "163.com",
+    "126.com",
+    "naver.com",
+    "hanmail.net",
+    "comcast.net",
+    "att.net",
+    "verizon.net",
+    "orange.fr",
+    "free.fr",
+    "t-online.de",
+    "libero.it",
+    "rediffmail.com",
+    "hushmail.com",
+];
+/// Free-mail brands with a domain in many countries, such as `yahoo.co.uk` or `hotmail.fr`.
+const FREE_MAIL_BRANDS: &[&str] = &["gmail", "googlemail", "outlook", "hotmail", "live", "msn", "yahoo", "aol", "gmx", "yandex", "proton"];
+
+/// Whether `domain` is a free-mail domain (see [`FREE_MAIL`]).
+pub fn free_mail(domain: &str) -> bool {
+    let d = domain.trim().trim_end_matches('.').to_ascii_lowercase();
+    if FREE_MAIL.contains(&d.as_str()) {
+        return true;
+    }
+    // A brand under a country's suffix: `hotmail.fr`, `yahoo.co.uk`, `outlook.com.br`.
+    let Some((brand, suffix)) = d.split_once('.') else { return false };
+    let labels: Vec<&str> = suffix.split('.').collect();
+    let country = labels.len() <= 2 && labels.iter().all(|l| l.len() <= 3) && labels.last().is_some_and(|tld| tld.len() == 2);
+    country && FREE_MAIL_BRANDS.contains(&brand)
+}
+
+/// A Slack workspace (team) ID as stored: uppercase, like `T0123ABCD`. `None` when it isn't one.
+pub fn normalize_team(team: &str) -> Option<String> {
+    let team = team.trim().to_ascii_uppercase();
+    let ok = team.starts_with('T') && team.len() > 1 && team.len() <= 30 && team.chars().all(|c| c.is_ascii_alphanumeric());
+    ok.then_some(team)
 }
 
 /// What the sign-in page shows about single sign-on. Public: no secrets.
@@ -305,13 +520,24 @@ pub struct SsoCheck {
 /// The workspace's single sign-on settings. The client secret is never shown.
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 pub struct SsoSettings {
-    /// This server can encrypt a client secret (it has a connector key). Without it, single sign-on is off.
+    /// This server can encrypt a client secret (it has a connector key), so admins can use their
+    /// own app. Without it, only `shared_providers` work.
     pub available: bool,
+    /// The providers this server has its own sign-in app for (`google`, `microsoft`, `slack`).
+    /// Set any of them up by signing in once (`setup_sso`), or with `update_sso` and `shared`:
+    /// nothing to register. Empty when the server has none.
+    pub shared_providers: Vec<Provider>,
     /// People can sign in with the provider now: turned on, fully set up and available.
     pub active: bool,
     pub enabled: bool,
     /// `google`, `microsoft`, `okta`, `onelogin`, `slack` or `oidc`.
     pub provider: Option<Provider>,
+    /// Signs in through this server's own app for the provider, not one the workspace registered.
+    pub shared: bool,
+    /// Signs in through this server's own app, but the server doesn't have it any more. Single
+    /// sign-on is off (so passwords work for everyone) until it's back, or an admin sets up their
+    /// own app.
+    pub shared_app_missing: bool,
     /// The name on the sign-in button.
     pub name: String,
     pub issuer: String,
@@ -344,9 +570,12 @@ pub fn settings_view(db: &dyn Db, cfg: &HostConfig, base_url: &str, check: Optio
     let some = |s: &str| Some(s.to_string()).filter(|s| !s.is_empty());
     Ok(SsoSettings {
         available: connect::key(cfg).is_some(),
+        shared_providers: cfg.sso_apps.providers(),
         active: active(cfg, &conf),
         enabled: conf.enabled,
         provider: conf.provider,
+        shared: conf.shared,
+        shared_app_missing: shared_app_missing(cfg, &conf),
         name: conf.name(),
         tenant: some(&conf.tenant),
         team: some(&conf.team),
@@ -388,7 +617,18 @@ fn https_url(v: &Value) -> Option<String> {
     ok.then(|| url.to_string())
 }
 
-/// Reads the discovery document. Its `issuer` must be the configured one exactly (OpenID Connect
+/// The issuer the discovery document at `conf.issuer` must name. That's the issuer itself, except
+/// for Microsoft's `organizations` endpoints, where setting up starts: they name a template, filled
+/// in with each ID token's own directory (see [`setup_org`]).
+fn expected_issuer(conf: &Config) -> &str {
+    if conf.provider == Some(Provider::Microsoft) && conf.issuer == MICROSOFT_ORGANIZATIONS {
+        MICROSOFT_ISSUER_TEMPLATE
+    } else {
+        &conf.issuer
+    }
+}
+
+/// Reads the discovery document. Its `issuer` must be the expected one exactly (OpenID Connect
 /// Discovery 1.0, 4.3), and its endpoints https.
 fn read_discovery(conf: &Config, reply: &HttpReply) -> Result<Discovery, String> {
     let url = discovery_url(&conf.issuer);
@@ -401,11 +641,11 @@ fn read_discovery(conf: &Config, reply: &HttpReply) -> Result<Discovery, String>
     let Some(issuer) = v["issuer"].as_str() else {
         return Err(format!("{url} isn't an OpenID Connect discovery document."));
     };
-    if issuer != conf.issuer {
+    let expected = expected_issuer(conf);
+    if issuer != expected {
         return Err(format!(
-            "The provider names its issuer “{}”, not “{}”. They must match exactly.",
+            "The provider names its issuer “{}”, not “{expected}”. They must match exactly.",
             connect::excerpt(issuer, 200),
-            conf.issuer
         ));
     }
     let (Some(authorize), Some(token)) = (https_url(&v["authorization_endpoint"]), https_url(&v["token_endpoint"])) else {
@@ -523,6 +763,59 @@ fn vouched_email(conf: &Config, claims: &Value) -> Result<String, Problem> {
     Ok(email)
 }
 
+/// Setting up: reads the admin's organization from their own ID token and checks the token
+/// against it. `target` is where setting up started ([`setup_target`]). Answers with the settings
+/// for that organization (Google's hosted domain, Microsoft's directory and its issuer, Slack's
+/// workspace) and the email domain to allow, when the provider vouches for one that isn't free
+/// mail. Microsoft's directory must be in the issuer exactly, as Microsoft says multi-tenant apps
+/// check; personal Google and Microsoft accounts have no organization.
+fn setup_org(target: &Config, claims: &Value, nonce: &str, now: DateTime<Utc>) -> Result<(Config, Option<String>), Problem> {
+    let mut conf = target.clone();
+    let provider = conf.provider.ok_or(Problem::Failed)?;
+    if provider == Provider::Microsoft {
+        let tid = claims["tid"].as_str().unwrap_or_default();
+        let tenant = normalize_tenant(tid).filter(|t| t != MICROSOFT_CONSUMERS).ok_or(Problem::PersonalAccount)?;
+        // The token's own `tid`, exactly: `iss` must name it.
+        conf.issuer = microsoft_issuer(tid);
+        check_claims(&conf, claims, nonce, now).map_err(|_| Problem::InvalidToken)?;
+        conf.issuer = microsoft_issuer(&tenant);
+        conf.tenant = tenant;
+    } else {
+        check_claims(&conf, claims, nonce, now).map_err(|_| Problem::InvalidToken)?;
+    }
+    // An email domain the provider vouches for, unless anyone can have an address there.
+    let vouched_domain = |vouched: bool| {
+        let email = claims["email"].as_str().filter(|_| vouched)?;
+        normalize_domain(email.rsplit_once('@')?.1).filter(|d| !free_mail(d))
+    };
+    let domain = match provider {
+        Provider::Google => {
+            let hd = claims["hd"].as_str().and_then(normalize_domain).filter(|d| !free_mail(d)).ok_or(Problem::PersonalAccount)?;
+            conf.allowed_domains = vec![hd.clone()];
+            Some(hd)
+        }
+        Provider::Microsoft => vouched_domain(truthy(&claims["xms_edov"])),
+        Provider::Slack => {
+            conf.team = claims["https://slack.com/team_id"].as_str().and_then(normalize_team).ok_or(Problem::NotInOrg)?;
+            vouched_domain(truthy(&claims["email_verified"]))
+        }
+        _ => return Err(Problem::Failed),
+    };
+    Ok((conf, domain))
+}
+
+/// What a provider's refusal (`?error=…` on the way back) means. Microsoft says that a directory
+/// needs its administrator to approve the app only in `error_description`'s AADSTS code, so only
+/// that code is looked for there, to choose the message; the text itself goes nowhere.
+fn provider_refused(error: &str, description: &str) -> Problem {
+    let consent = error == "consent_required" || ["AADSTS90094", "AADSTS90095", "AADSTS65001"].iter().any(|c| description.contains(c));
+    match error {
+        _ if consent => Problem::AdminConsent,
+        "access_denied" => Problem::Denied,
+        _ => Problem::ProviderError,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Responses
 
@@ -586,12 +879,21 @@ pub enum Problem {
     OtherSession,
     /// Linking: the provider account is someone else's here.
     AlreadyLinked,
+    /// Setting up: a personal account (Google without a Workspace domain, a personal Microsoft
+    /// account), which has no organization to set up.
+    PersonalAccount,
+    /// The Microsoft directory needs an administrator to approve the app first.
+    AdminConsent,
+    /// Setting up: the person finishing isn't a workspace admin (any more).
+    NotAdmin,
+    /// Setting up: the server doesn't have its own app for that provider (any more).
+    Unavailable,
     /// Anything else.
     Failed,
 }
 
 impl Problem {
-    pub const ALL: [Problem; 16] = [
+    pub const ALL: [Problem; 20] = [
         Problem::NotConfigured,
         Problem::Expired,
         Problem::OtherBrowser,
@@ -607,6 +909,10 @@ impl Problem {
         Problem::EmailLinked,
         Problem::OtherSession,
         Problem::AlreadyLinked,
+        Problem::PersonalAccount,
+        Problem::AdminConsent,
+        Problem::NotAdmin,
+        Problem::Unavailable,
         Problem::Failed,
     ];
 
@@ -627,7 +933,30 @@ impl Problem {
             Problem::EmailLinked => "email_linked",
             Problem::OtherSession => "other_session",
             Problem::AlreadyLinked => "already_linked",
+            Problem::PersonalAccount => "personal_account",
+            Problem::AdminConsent => "admin_consent",
+            Problem::NotAdmin => "not_admin",
+            Problem::Unavailable => "unavailable",
             Problem::Failed => "failed",
+        }
+    }
+}
+
+/// How setting up by signing in went, for Settings › Single sign-on (`?sso_setup=…`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SetUp {
+    /// Set up, with an allowed email domain.
+    Done,
+    /// Set up, but no email domain could be taken from the sign-in: first sign-ins can't match
+    /// people by email until an admin adds one.
+    DomainNeeded,
+}
+
+impl SetUp {
+    pub fn code(self) -> &'static str {
+        match self {
+            SetUp::Done => "done",
+            SetUp::DomainNeeded => "domain_needed",
         }
     }
 }
@@ -648,6 +977,25 @@ fn to_profile(base_url: &str, outcome: Result<(), Problem>) -> Response {
         Err(problem) => format!("{base_url}/settings/profile?sso_error={}", problem.code()),
     };
     no_store(Response::redirect(&url))
+}
+
+/// Back to Settings › Single sign-on after setting it up by signing in.
+fn to_settings(base_url: &str, outcome: Result<SetUp, Problem>) -> Response {
+    let url = match outcome {
+        Ok(done) => format!("{base_url}{SETTINGS_PATH}?sso_setup={}", done.code()),
+        Err(problem) => format!("{base_url}{SETTINGS_PATH}?sso_error={}", problem.code()),
+    };
+    no_store(Response::redirect(&url))
+}
+
+/// Where a problem sends someone back to: the sign-in page, Settings › Profile when linking, or
+/// Settings › Single sign-on when setting up.
+fn back_to(base_url: &str, bound: bool, setup: bool, next: &str, problem: Problem) -> Response {
+    match (bound, setup) {
+        (true, true) => to_settings(base_url, Err(problem)),
+        (true, false) => to_profile(base_url, Err(problem)),
+        (false, _) => to_login(base_url, problem, next),
+    }
 }
 
 fn query_map(query: &str) -> BTreeMap<String, String> {
@@ -675,6 +1023,9 @@ struct Flow {
     userinfo_endpoint: Option<String>,
     basic_auth: bool,
     next: String,
+    /// Setting up with the host's app for this provider (`setup_sso`), not signing in or linking.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    setup: Option<Provider>,
 }
 
 /// A single sign-on job (see [`crate::connect::Job`]).
@@ -683,6 +1034,8 @@ pub struct SsoJob {
     base_url: String,
     kind: Kind,
     phase: Phase,
+    /// Webhooks for the settings change setting up made, which the host delivers when the job ends.
+    effects: Vec<Effect>,
 }
 
 #[derive(Clone)]
@@ -691,6 +1044,9 @@ enum Kind {
     SignIn { next: String },
     /// A signed-in person linking their account (`link_sso`), from one browser session.
     Link { user_id: String, session_hash: String },
+    /// An admin setting single sign-on up by signing in with the host's app (`setup_sso`), from
+    /// one browser session.
+    Setup { user_id: String, session_hash: String, provider: Provider },
     /// An admin saved the settings (`update_sso`): check the provider's discovery document.
     Check,
     /// The provider sent someone back.
@@ -701,9 +1057,9 @@ enum Kind {
 struct Returned {
     code: String,
     flow: Flow,
-    /// Linking: who.
+    /// Linking or setting up: who.
     link_user: Option<String>,
-    /// Linking: the session that started it, which must still be signed in to finish.
+    /// Linking or setting up: the session that started it, which must still be signed in to finish.
     link_session: Option<String>,
     user_agent: Option<String>,
 }
@@ -725,6 +1081,7 @@ impl std::fmt::Debug for SsoJob {
         let kind = match self.kind {
             Kind::SignIn { .. } => "sign-in",
             Kind::Link { .. } => "link",
+            Kind::Setup { .. } => "setup",
             Kind::Check => "check",
             Kind::Finish(_) => "finish",
         };
@@ -739,16 +1096,31 @@ impl std::fmt::Debug for SsoJob {
 }
 
 impl SsoJob {
+    fn new(base_url: &str, kind: Kind) -> SsoJob {
+        SsoJob { base_url: base_url.into(), kind, phase: Phase::Start, effects: vec![] }
+    }
+
     /// Checks the provider's discovery document, then fills in the settings with the result.
     pub fn check(base_url: &str) -> SsoJob {
-        SsoJob { base_url: base_url.into(), kind: Kind::Check, phase: Phase::Start }
+        SsoJob::new(base_url, Kind::Check)
     }
 
     /// Starts linking `user_id`'s account at the provider, for the browser session whose token
     /// hashes to `session_hash`; fills in `{ "authorize_url": … }`.
     pub fn link(base_url: &str, user_id: &str, session_hash: &str) -> SsoJob {
-        let kind = Kind::Link { user_id: user_id.into(), session_hash: session_hash.into() };
-        SsoJob { base_url: base_url.into(), kind, phase: Phase::Start }
+        SsoJob::new(base_url, Kind::Link { user_id: user_id.into(), session_hash: session_hash.into() })
+    }
+
+    /// Starts setting single sign-on up with the host's app for `provider`, by admin `user_id`
+    /// signing in from the browser session whose token hashes to `session_hash`; fills in
+    /// `{ "authorize_url": … }`.
+    pub fn setup(base_url: &str, user_id: &str, session_hash: &str, provider: Provider) -> SsoJob {
+        SsoJob::new(base_url, Kind::Setup { user_id: user_id.into(), session_hash: session_hash.into(), provider })
+    }
+
+    /// What the job left for the host to deliver (see [`crate::connect::Job::take_effects`]).
+    pub(crate) fn take_effects(&mut self) -> Vec<Effect> {
+        std::mem::take(&mut self.effects)
     }
 }
 
@@ -763,7 +1135,7 @@ pub fn start(db: &dyn Db, cfg: &HostConfig, req: &Request) -> Outcome {
             return Ok(crate::http::done(to_login(&base, Problem::NotConfigured, &next)));
         }
         let mut out = crate::http::done(to_login(&base, Problem::Failed, &next));
-        let job = SsoJob { base_url: base.clone(), kind: Kind::SignIn { next: next.clone() }, phase: Phase::Start };
+        let job = SsoJob::new(&base, Kind::SignIn { next: next.clone() });
         out.effects.push(Effect::Connect(Job::Sso(job)));
         Ok(out)
     };
@@ -771,9 +1143,10 @@ pub fn start(db: &dyn Db, cfg: &HostConfig, req: &Request) -> Outcome {
 }
 
 /// `GET /sso/callback`: the provider sent someone back. The sign-in must be one this browser
-/// started (or, when linking, one this very browser session started, still signed in), unused and
-/// recent, for the same app.
-/// Answers with a job that exchanges the code and signs them in.
+/// started (or, when linking or setting up, one this very browser session started, still signed
+/// in), unused and recent, for the same app. Setting up also needs the settings to be as they were
+/// when it started. Answers with a job that exchanges the code and signs them in (or links their
+/// account, or saves the settings setting up found).
 pub fn callback(db: &dyn Db, cfg: &HostConfig, req: &Request) -> Outcome {
     let base = crate::http::base_url(cfg, req);
     let query = query_map(&req.query);
@@ -790,10 +1163,8 @@ pub fn callback(db: &dyn Db, cfg: &HostConfig, req: &Request) -> Outcome {
         db.execute("DELETE FROM sso_requests WHERE state_hash = ?", &params![state_hash])?;
         let flow: Flow = serde_json::from_str(&row.str("flow")).map_err(|e| ApiError::internal(e.to_string()))?;
         let link_user = row.opt_str("user_id");
-        let back = |problem: Problem| match link_user {
-            Some(_) => redirect(to_profile(&base, Err(problem))),
-            None => redirect(to_login(&base, problem, &flow.next)),
-        };
+        let setup = flow.setup;
+        let back = |problem: Problem| redirect(back_to(&base, link_user.is_some(), setup.is_some(), &flow.next, problem));
         let started = parse_ts(&row.str("created_at")).unwrap_or(now);
         if now - started > Duration::minutes(SIGN_IN_MINUTES) {
             return Ok(back(Problem::Expired));
@@ -801,8 +1172,9 @@ pub fn callback(db: &dyn Db, cfg: &HostConfig, req: &Request) -> Outcome {
         let link_session = link_user.as_ref().map(|_| row.str("browser_hash"));
         match (&link_user, &link_session) {
             (Some(user_id), Some(expected)) => {
-                // The session that started linking, and still a live one: a link started in a
-                // session that was signed out (or stolen, then revoked) can't be finished elsewhere.
+                // The session that started linking (or setting up), and still a live one: one
+                // started in a session that was signed out (or stolen, then revoked) can't be
+                // finished elsewhere.
                 let actor = auth::authenticate(db, cfg, req, now).ok().flatten();
                 let same =
                     actor.is_some_and(|a| a.user_id == *user_id && a.session_hash.is_some_and(|h| crate::util::secure_eq(&h, expected)));
@@ -818,22 +1190,35 @@ pub fn callback(db: &dyn Db, cfg: &HostConfig, req: &Request) -> Outcome {
                 }
             }
         }
-        let conf = load(db)?;
-        if !active(cfg, &conf) {
-            return Ok(back(Problem::NotConfigured));
+        let stored = load(db)?;
+        match setup {
+            Some(p) => match setup_fingerprint(cfg, p, &stored) {
+                None => return Ok(back(Problem::Unavailable)),
+                Some(f) if f != flow.fingerprint => return Ok(back(Problem::Expired)),
+                Some(_) => {}
+            },
+            None => {
+                let conf = effective(cfg, stored);
+                if !active(cfg, &conf) {
+                    return Ok(back(Problem::NotConfigured));
+                }
+                if conf.fingerprint() != flow.fingerprint {
+                    return Ok(back(Problem::Expired));
+                }
+            }
         }
-        if conf.fingerprint() != flow.fingerprint {
-            return Ok(back(Problem::Expired));
-        }
-        // The provider's own error text never reaches the sign-in page; only what kind of failure.
+        // The provider's own error text never reaches the page; only what kind of failure.
         let code = match (query.get("code").filter(|c| !c.is_empty()), query.get("error")) {
             (Some(c), _) => c.clone(),
-            (None, Some(e)) if e == "access_denied" => return Ok(back(Problem::Denied)),
-            (None, _) => return Ok(back(Problem::ProviderError)),
+            (None, Some(e)) => {
+                let description = query.get("error_description").map(String::as_str).unwrap_or_default();
+                return Ok(back(provider_refused(e, description)));
+            }
+            (None, None) => return Ok(back(Problem::ProviderError)),
         };
         let mut out = back(Problem::Failed);
         let returned = Returned { code, flow, link_user, link_session, user_agent: req.header("user-agent").map(str::to_string) };
-        let job = SsoJob { base_url: base.clone(), kind: Kind::Finish(Box::new(returned)), phase: Phase::Start };
+        let job = SsoJob::new(&base, Kind::Finish(Box::new(returned)));
         out.effects.push(Effect::Connect(Job::Sso(job)));
         Ok(out)
     };
@@ -844,16 +1229,58 @@ fn pkce_challenge(verifier: &str) -> String {
     URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()))
 }
 
+/// Where setting up with the host's app for `p` starts, before the organization is known: the
+/// provider's own issuer (Microsoft's `organizations` endpoints) and the host's client ID. `None`
+/// when the host has no app for it.
+fn setup_target(cfg: &HostConfig, p: Provider) -> Option<Config> {
+    let app = cfg.sso_apps.get(p)?;
+    let issuer = match p {
+        Provider::Microsoft => MICROSOFT_ORGANIZATIONS,
+        _ => p.fixed_issuer()?,
+    };
+    Some(Config {
+        enabled: true,
+        provider: Some(p),
+        shared: true,
+        issuer: issuer.into(),
+        client_id: app.client_id.clone(),
+        ..Default::default()
+    })
+}
+
+/// What setting up must still match when it finishes: the host's same app, and the workspace's
+/// settings exactly as they were when it started, so it never overwrites a change made meanwhile.
+/// `None` when the host has no app for `p`.
+fn setup_fingerprint(cfg: &HostConfig, p: Provider, stored: &Config) -> Option<String> {
+    let app = cfg.sso_apps.get(p)?;
+    let settings = serde_json::to_string(stored).unwrap_or_default();
+    Some(sha256_hex(&format!("setup|{}|{}|{}", p.as_str(), app.client_id, sha256_hex(&settings))))
+}
+
+/// What a sign-in under way is for.
+struct Purpose<'a> {
+    /// Where to land afterwards.
+    next: &'a str,
+    /// Linking or setting up: (who, the hash of the browser session that started it), which alone
+    /// may finish it. Otherwise a cookie names the browser.
+    bound: Option<(&'a str, &'a str)>,
+    /// Setting up with the host's app for this provider.
+    setup: Option<Provider>,
+    /// What the settings must still match when it finishes.
+    fingerprint: String,
+}
+
 /// Records a sign-in under way and returns the provider's sign-in URL and, for a sign-in from the
-/// sign-in page, the cookie naming this browser. `link` is (who, their session's hash) when a
-/// signed-in person is linking their account: that session is what ties it to their browser.
+/// sign-in page, the cookie naming this browser. `conf` is [`effective`]. In shared mode on hosted
+/// DumbSlab the `state` starts with the workspace's address, so the root domain's callback knows
+/// where to send the browser.
 fn begin(
     db: &dyn Db,
+    cfg: &HostConfig,
     conf: &Config,
     d: &Discovery,
     base_url: &str,
-    next: &str,
-    link: Option<(&str, &str)>,
+    purpose: Purpose,
     now: DateTime<Utc>,
 ) -> ApiResult<(String, Option<String>)> {
     db.execute("DELETE FROM sso_requests WHERE created_at < ?", &params![ts(now - Duration::minutes(SIGN_IN_MINUTES))])?;
@@ -862,30 +1289,35 @@ fn begin(
         "DELETE FROM sso_requests WHERE state_hash NOT IN (SELECT state_hash FROM sso_requests ORDER BY created_at DESC LIMIT ?)",
         &params![MAX_PENDING - 1],
     )?;
-    let state = crate::util::new_secret("");
+    let random = crate::util::new_secret("");
+    let state = match (&cfg.workspace, &cfg.sso_apps.callback_url) {
+        (Some(address), Some(_)) if conf.shared => format!("{address}.{random}"),
+        _ => random,
+    };
     let nonce = crate::util::new_secret("");
     let verifier = crate::util::new_secret("") + &crate::util::new_secret("");
-    let browser = link.is_none().then(|| crate::util::new_secret(""));
-    let binding = match link {
+    let browser = purpose.bound.is_none().then(|| crate::util::new_secret(""));
+    let binding = match purpose.bound {
         Some((_, session_hash)) => session_hash.to_string(),
         None => sha256_hex(browser.as_deref().unwrap_or_default()),
     };
     let flow = Flow {
         nonce: nonce.clone(),
         verifier: verifier.clone(),
-        fingerprint: conf.fingerprint(),
-        redirect_uri: callback_url(base_url),
+        fingerprint: purpose.fingerprint,
+        redirect_uri: redirect_uri(cfg, conf, base_url),
         token_endpoint: d.token.clone(),
         userinfo_endpoint: d.userinfo.clone(),
         basic_auth: d.basic_auth,
-        next: next.to_string(),
+        next: purpose.next.to_string(),
+        setup: purpose.setup,
     };
     db.execute(
         "INSERT INTO sso_requests (state_hash, browser_hash, user_id, flow, created_at) VALUES (?, ?, ?, ?, ?)",
         &params![
             sha256_hex(&state),
             binding,
-            link.map(|(user_id, _)| user_id),
+            purpose.bound.map(|(user_id, _)| user_id),
             serde_json::to_string(&flow).map_err(|e| ApiError::internal(e.to_string()))?,
             ts(now)
         ],
@@ -903,11 +1335,16 @@ fn begin(
     match conf.provider {
         Some(Provider::Google) => {
             query.push(("prompt", "select_account".into()));
-            // A hint only: the `hd` claim is what's checked.
-            if let [domain] = conf.allowed_domains.as_slice() {
-                query.push(("hd", domain.clone()));
+            // A hint only: the `hd` claim is what's checked. Setting up asks for any Google
+            // Workspace account (`hd=*`).
+            match conf.allowed_domains.as_slice() {
+                [domain] => query.push(("hd", domain.clone())),
+                [] if flow.setup.is_some() => query.push(("hd", "*".into())),
+                _ => {}
             }
         }
+        // Setting up: let the admin pick their work account.
+        Some(Provider::Microsoft) if flow.setup.is_some() => query.push(("prompt", "select_account".into())),
         Some(Provider::Slack) if !conf.team.is_empty() => query.push(("team", conf.team.clone())),
         _ => {}
     }
@@ -936,16 +1373,47 @@ fn token_call(conf: &Config, flow: &Flow, code: &str, secret: &str) -> HttpCall 
     }
 }
 
+/// The error for setting up with a provider the host has no app for.
+pub fn shared_unavailable(p: Provider) -> ApiError {
+    ApiError::new(
+        400,
+        "sso_shared_unavailable",
+        format!("This server has no {} app of its own to sign in with. Set up your own app instead (`update_sso`).", p.name()),
+    )
+}
+
 /// Runs a single sign-on job's next step (see [`crate::connect::step`]).
 pub fn step(db: &dyn Db, cfg: &HostConfig, j: &mut SsoJob, replies: Vec<HttpReply>, now: DateTime<Utc>) -> ApiResult<Step> {
     let reply = replies.into_iter().next().unwrap_or_default();
-    let conf = load(db)?;
+    let stored = load(db)?;
+    let conf = effective(cfg, stored.clone());
     let base = j.base_url.clone();
     let phase = std::mem::replace(&mut j.phase, Phase::Start);
     match (&j.kind, phase) {
         (Kind::Finish(r), phase) => {
             let r = r.clone();
             finish_step(db, cfg, j, &conf, &r, phase, reply, now)
+        }
+        (Kind::Setup { provider, .. }, Phase::Start) => {
+            let Some(target) = setup_target(cfg, *provider) else {
+                return Ok(Step::Done(Finish::Fail(shared_unavailable(*provider))));
+            };
+            j.phase = Phase::Discovering;
+            Ok(Step::Fetch(vec![HttpCall::get(discovery_url(&target.issuer)).header("accept", "application/json")]))
+        }
+        (Kind::Setup { user_id, session_hash, provider }, _) => {
+            let (Some(target), Some(fingerprint)) = (setup_target(cfg, *provider), setup_fingerprint(cfg, *provider, &stored)) else {
+                return Ok(Step::Done(Finish::Fail(shared_unavailable(*provider))));
+            };
+            match read_discovery(&target, &reply) {
+                Ok(d) => {
+                    let purpose =
+                        Purpose { next: SETTINGS_PATH, bound: Some((user_id, session_hash)), setup: Some(*provider), fingerprint };
+                    let (url, _) = begin(db, cfg, &target, &d, &base, purpose, now)?;
+                    fill(json!({ "authorize_url": url }))
+                }
+                Err(e) => Ok(Step::Done(Finish::Fail(ApiError::new(502, "sso_unavailable", e)))),
+            }
         }
         (_, Phase::Start) => {
             let usable = match j.kind {
@@ -971,7 +1439,8 @@ pub fn step(db: &dyn Db, cfg: &HostConfig, j: &mut SsoJob, replies: Vec<HttpRepl
         }
         (Kind::SignIn { next }, _) => match read_discovery(&conf, &reply) {
             Ok(d) => {
-                let (url, browser) = begin(db, &conf, &d, &base, next, None, now)?;
+                let purpose = Purpose { next, bound: None, setup: None, fingerprint: conf.fingerprint() };
+                let (url, browser) = begin(db, cfg, &conf, &d, &base, purpose, now)?;
                 let cookie = browser_cookie(&browser.unwrap_or_default(), secure(&base));
                 Ok(respond(no_store(Response::redirect(&url)).with_header("set-cookie", cookie)))
             }
@@ -979,7 +1448,13 @@ pub fn step(db: &dyn Db, cfg: &HostConfig, j: &mut SsoJob, replies: Vec<HttpRepl
         },
         (Kind::Link { user_id, session_hash }, _) => match read_discovery(&conf, &reply) {
             Ok(d) => {
-                let (url, _) = begin(db, &conf, &d, &base, "/settings/profile", Some((user_id, session_hash)), now)?;
+                let purpose = Purpose {
+                    next: "/settings/profile",
+                    bound: Some((user_id, session_hash)),
+                    setup: None,
+                    fingerprint: conf.fingerprint(),
+                };
+                let (url, _) = begin(db, cfg, &conf, &d, &base, purpose, now)?;
                 fill(json!({ "authorize_url": url }))
             }
             Err(e) => Ok(Step::Done(Finish::Fail(ApiError::new(502, "sso_unavailable", e)))),
@@ -995,6 +1470,8 @@ fn fill(value: impl Serialize) -> ApiResult<Step> {
     Ok(Step::Done(Finish::Fill(serde_json::to_value(value).map_err(|e| ApiError::internal(e.to_string()))?)))
 }
 
+/// Finishes a sign-in, a link or setting up, once the provider sent the person back. `conf` is
+/// the workspace's [`effective`] settings.
 #[allow(clippy::too_many_arguments)]
 fn finish_step(
     db: &dyn Db,
@@ -1007,20 +1484,25 @@ fn finish_step(
     now: DateTime<Utc>,
 ) -> ApiResult<Step> {
     let base = j.base_url.clone();
-    let back = |problem: Problem| match r.link_user {
-        Some(_) => respond(to_profile(&base, Err(problem))),
-        None => respond(to_login(&base, problem, &r.flow.next)),
+    let back = |problem: Problem| respond(back_to(&base, r.link_user.is_some(), r.flow.setup.is_some(), &r.flow.next, problem));
+    // The app and settings this sign-in uses: the workspace's, unchanged since it started; or,
+    // setting up, the host's app, with the workspace's settings unchanged.
+    let target = match r.flow.setup {
+        Some(p) => match (setup_target(cfg, p), setup_fingerprint(cfg, p, &load(db)?)) {
+            (Some(t), Some(f)) if f == r.flow.fingerprint => t,
+            (Some(_), Some(_)) => return Ok(back(Problem::Expired)),
+            _ => return Ok(back(Problem::Unavailable)),
+        },
+        None if !active(cfg, conf) || conf.fingerprint() != r.flow.fingerprint => return Ok(back(Problem::Expired)),
+        None => conf.clone(),
     };
-    if !active(cfg, conf) || conf.fingerprint() != r.flow.fingerprint {
-        return Ok(back(Problem::Expired));
-    }
     match phase {
         Phase::Start | Phase::Discovering => {
-            let Some(secret) = client_secret(cfg, conf) else {
+            let Some((_, secret)) = credentials(cfg, &target) else {
                 return Ok(back(Problem::ProviderError));
             };
             j.phase = Phase::Exchanging;
-            Ok(Step::Fetch(vec![token_call(conf, &r.flow, &r.code, &secret)]))
+            Ok(Step::Fetch(vec![token_call(&target, &r.flow, &r.code, &secret)]))
         }
         Phase::Exchanging => {
             let v = reply.json();
@@ -1028,10 +1510,18 @@ fn finish_step(
             let Some(id_token) = id_token else {
                 return Ok(back(Problem::ProviderError));
             };
-            let claims = match jwt_claims(id_token).and_then(|c| check_claims(conf, &c, &r.flow.nonce, now).map(|()| c)) {
-                Ok(c) => c,
-                Err(_) => return Ok(back(Problem::InvalidToken)),
+            let Ok(claims) = jwt_claims(id_token) else {
+                return Ok(back(Problem::InvalidToken));
             };
+            if r.flow.setup.is_some() {
+                return match setup_org(&target, &claims, &r.flow.nonce, now) {
+                    Ok((org, domain)) => complete_setup(db, cfg, j, r, &org, domain, &claims, now),
+                    Err(problem) => Ok(back(problem)),
+                };
+            }
+            if check_claims(&target, &claims, &r.flow.nonce, now).is_err() {
+                return Ok(back(Problem::InvalidToken));
+            }
             // A first sign-in matches people by email, and some providers give the address, or
             // say whether it's verified, only in their userinfo answer: ask it then. Microsoft's
             // would never be trusted on its own (see `vouched_email`), so it isn't asked.
@@ -1039,22 +1529,122 @@ fn finish_step(
             let lacks_email = claims.get("email").is_none() || claims.get("email_verified").is_none();
             let asks = lacks_email
                 && r.link_user.is_none()
-                && conf.provider != Some(Provider::Microsoft)
-                && !is_linked(db, conf, claims["sub"].as_str().unwrap_or_default())?;
+                && target.provider != Some(Provider::Microsoft)
+                && !is_linked(db, &target, claims["sub"].as_str().unwrap_or_default())?;
             if let (true, Some(url), Some(access)) = (asks, r.flow.userinfo_endpoint.clone(), access) {
                 j.phase = Phase::UserInfo { claims };
                 return Ok(Step::Fetch(vec![HttpCall::get(url).bearer(access).header("accept", "application/json")]));
             }
-            complete(db, cfg, &base, conf, r, &claims, now)
+            complete(db, cfg, &base, &target, r, &claims, now)
         }
         Phase::UserInfo { mut claims } => {
             // No answer, or one that isn't JSON, adds nothing: the sign-in goes on with the ID token alone.
             if reply.ok() {
                 merge_userinfo(&mut claims, &reply.json());
             }
-            complete(db, cfg, &base, conf, r, &claims, now)
+            complete(db, cfg, &base, &target, r, &claims, now)
         }
     }
+}
+
+/// Setting up checked out: saves the settings for the admin's organization (`org`, from
+/// [`setup_org`]) and links the admin's own account. The admin must still be signed in to the
+/// session that started, and still an admin; their account at the provider can't be someone
+/// else's here. `require_sso` and `auto_provision` stay as they were. Allowed domains: the one
+/// the sign-in vouched for, plus the ones already allowed when it's the same organization again.
+#[allow(clippy::too_many_arguments)]
+fn complete_setup(
+    db: &dyn Db,
+    cfg: &HostConfig,
+    j: &mut SsoJob,
+    r: &Returned,
+    org: &Config,
+    domain: Option<String>,
+    claims: &Value,
+    now: DateTime<Utc>,
+) -> ApiResult<Step> {
+    let base = j.base_url.clone();
+    let back = |problem: Problem| Ok(respond(to_settings(&base, Err(problem))));
+    let user_id = r.link_user.clone().unwrap_or_default();
+    let live = db.scalar_i64(
+        "SELECT COUNT(*) FROM sessions WHERE token_hash = ? AND user_id = ? AND expires_at > ?",
+        &params![r.link_session.clone().unwrap_or_default(), user_id.clone(), ts(now)],
+    )? > 0;
+    if !live {
+        return back(Problem::OtherSession);
+    }
+    let Some(p) = find_person(db, &user_id)? else { return back(Problem::Failed) };
+    if let Some(problem) = refusal(&p) {
+        return back(problem);
+    }
+    if p.role != Role::Admin {
+        return back(Problem::NotAdmin);
+    }
+    let subject = claims["sub"].as_str().unwrap_or_default();
+    let owner = db.one("SELECT user_id FROM sso_identities WHERE issuer = ? AND subject = ?", &params![org.issuer.clone(), subject])?;
+    if owner.as_ref().is_some_and(|o| o.str("user_id") != p.id) {
+        return back(Problem::AlreadyLinked);
+    }
+
+    let before = load(db)?;
+    let provider = org.provider.ok_or_else(|| ApiError::internal("setting up without a provider"))?;
+    let same_org = before.provider == Some(provider)
+        && match provider {
+            Provider::Google => domain.as_deref().is_some_and(|d| before.domain_allowed(d)),
+            Provider::Microsoft => before.tenant == org.tenant,
+            Provider::Slack => before.team == org.team,
+            _ => false,
+        };
+    let mut allowed_domains = if same_org { before.allowed_domains.clone() } else { vec![] };
+    if let Some(d) = &domain
+        && !allowed_domains.contains(d)
+    {
+        allowed_domains.push(d.clone());
+    }
+    let saved = Config {
+        enabled: true,
+        provider: Some(provider),
+        shared: true,
+        issuer: org.issuer.clone(),
+        tenant: org.tenant.clone(),
+        team: org.team.clone(),
+        client_id: String::new(),
+        client_secret: None,
+        allowed_domains,
+        auto_provision: before.auto_provision,
+        require_sso: before.require_sso,
+        label: String::new(),
+    };
+    save(db, &saved)?;
+    let newly_linked = owner.is_none();
+    if newly_linked {
+        link_identity(db, &p.id, &saved, claims, now)?;
+    }
+
+    let name = saved.name();
+    let mut ctx = ctx_for(db, cfg, &base, &p, now);
+    let data = json!({
+        "provider": provider.as_str(),
+        "shared": true,
+        "enabled": true,
+        "require_sso": saved.require_sso,
+        "auto_provision": saved.auto_provision,
+        "tenant": Some(&saved.tenant).filter(|t| !t.is_empty()),
+        "team": Some(&saved.team).filter(|t| !t.is_empty()),
+        "allowed_domains": saved.allowed_domains,
+        "replaced": before.provider.filter(|_| !same_org).map(Provider::as_str),
+        "client_secret_changed": before.client_secret.is_some(),
+    });
+    emit(&mut ctx, Event::new("sso.updated", "settings", "sso", format!("set up single sign-on with {name}")).data(data).admin_only())?;
+    if newly_linked {
+        let data = json!({ "issuer": saved.issuer, "matched_by": "setup" });
+        let summary = format!("linked their {name} account while setting up single sign-on");
+        emit(&mut ctx, Event::new("sso.linked", "user", &p.id, summary).data(data).admin_only())?;
+    }
+    // Unlike a sign-in's, a settings change goes to webhooks, as `update_sso`'s does.
+    j.effects.extend(ctx.effects);
+    let outcome = if saved.allowed_domains.is_empty() { SetUp::DomainNeeded } else { SetUp::Done };
+    Ok(respond(to_settings(&base, Ok(outcome))))
 }
 
 /// Whether an account at the provider is linked to someone here already.
@@ -1458,12 +2048,179 @@ mod tests {
             userinfo_endpoint: None,
             basic_auth: true,
             next: "/".into(),
+            setup: Some(Provider::Google),
         };
         let returned = Returned { code: "the-code".into(), flow, link_user: None, link_session: None, user_agent: None };
-        let job = SsoJob { base_url: "https://kb.test".into(), kind: Kind::Finish(Box::new(returned)), phase: Phase::Exchanging };
+        let mut job = SsoJob::new("https://kb.test", Kind::Finish(Box::new(returned)));
+        job.phase = Phase::Exchanging;
         let printed = format!("{job:?}");
         for secret in ["the-nonce", "the-verifier", "the-code"] {
             assert!(!printed.contains(secret), "{printed}");
         }
+    }
+
+    fn shared_apps() -> HostConfig {
+        let app = |id: &str| Some(OAuthApp { client_id: format!("{id}-app"), client_secret: format!("{id}-secret") });
+        HostConfig {
+            sso_apps: SharedApps { google: app("google"), microsoft: app("microsoft"), slack: app("slack"), callback_url: None },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn shared_apps_come_from_the_hosts_settings() {
+        let vars: BTreeMap<&str, &str> = [
+            ("SSO_GOOGLE_CLIENT_ID", "g-id"),
+            ("SSO_GOOGLE_CLIENT_SECRET", "g-secret"),
+            // Half an app is no app.
+            ("SSO_MICROSOFT_CLIENT_ID", "m-id"),
+            ("SLACK_CLIENT_ID", "s-id"),
+            ("SLACK_CLIENT_SECRET", "s-secret"),
+        ]
+        .into();
+        let apps = SharedApps::from_vars(|k| vars.get(k).map(|v| v.to_string()));
+        assert_eq!(apps.providers(), vec![Provider::Google, Provider::Slack]);
+        assert_eq!(apps.get(Provider::Google).map(|a| a.client_id.as_str()), Some("g-id"));
+        assert!(apps.get(Provider::Okta).is_none());
+        assert!(!format!("{apps:?}").contains("g-secret"), "{apps:?}");
+    }
+
+    #[test]
+    fn shared_mode_needs_the_hosts_app() {
+        let cfg = shared_apps();
+        let conf = Config {
+            enabled: true,
+            provider: Some(Provider::Slack),
+            shared: true,
+            issuer: "https://slack.com".into(),
+            team: "T0ACME".into(),
+            ..Default::default()
+        };
+        assert!(conf.complete() && active(&cfg, &conf));
+        assert_eq!(credentials(&cfg, &conf), Some(("slack-app".into(), "slack-secret".into())));
+        assert_eq!(effective(&cfg, conf.clone()).client_id, "slack-app");
+        // The host loses the app: single sign-on is off, and says why.
+        let without = HostConfig::default();
+        assert!(!active(&without, &conf) && shared_app_missing(&without, &conf));
+        // Only Google, Microsoft and Slack have shared apps.
+        let okta = Config { provider: Some(Provider::Okta), issuer: "https://acme.okta.com".into(), ..conf.clone() };
+        assert!(!okta.complete());
+        // The shared app's client ID is part of what a sign-in must still match.
+        let mut other = shared_apps();
+        other.sso_apps.slack.as_mut().unwrap().client_id = "another-app".into();
+        assert_ne!(effective(&cfg, conf.clone()).fingerprint(), effective(&other, conf).fingerprint());
+    }
+
+    #[test]
+    fn free_mail_domains_are_never_derived() {
+        for free in [
+            "gmail.com",
+            "GoogleMail.com",
+            "outlook.com",
+            "hotmail.co.uk",
+            "yahoo.co.jp",
+            "live.fr",
+            "outlook.com.br",
+            "icloud.com",
+            "proton.me",
+        ] {
+            assert!(free_mail(free), "{free}");
+        }
+        for org in ["acme.com", "live.acmecorp.com", "gmail-tools.io", "outlook.acme.com", "yahoo.example.org"] {
+            assert!(!free_mail(org), "{org}");
+        }
+        assert_eq!(normalize_team(" t0acme ").as_deref(), Some("T0ACME"));
+        for bad in ["", "T", "U0ACME", "T0 ACME"] {
+            assert!(normalize_team(bad).is_none(), "{bad}");
+        }
+    }
+
+    fn token(iss: &str, aud: &str, extra: Value) -> Value {
+        let t = Utc::now().timestamp();
+        let mut c = json!({ "iss": iss, "aud": aud, "sub": "admin-sub", "exp": t + 300, "iat": t, "nonce": "n" });
+        for (k, v) in extra.as_object().unwrap() {
+            c[k] = v.clone();
+        }
+        c
+    }
+
+    #[test]
+    fn setting_up_reads_the_organization_from_the_admins_token() {
+        let cfg = shared_apps();
+        let now = Utc::now();
+        let target = |p| setup_target(&cfg, p).unwrap();
+        let org = |p, claims: Value| setup_org(&target(p), &claims, "n", now);
+
+        // Google: the Workspace domain, which must be there.
+        let g = "https://accounts.google.com";
+        let (c, domain) = org(Provider::Google, token(g, "google-app", json!({ "hd": "Acme.com", "email": "ada@acme.com" }))).unwrap();
+        assert_eq!((c.allowed_domains, domain.as_deref(), c.issuer.as_str()), (vec!["acme.com".to_string()], Some("acme.com"), g));
+        assert_eq!(
+            org(Provider::Google, token(g, "google-app", json!({ "email": "ada@gmail.com", "email_verified": true }))).unwrap_err(),
+            Problem::PersonalAccount
+        );
+        assert_eq!(org(Provider::Google, token(g, "google-app", json!({ "hd": "gmail.com" }))).unwrap_err(), Problem::PersonalAccount);
+        // The usual checks: another app's token, another sign-in's.
+        assert_eq!(org(Provider::Google, token(g, "someone-elses", json!({ "hd": "acme.com" }))).unwrap_err(), Problem::InvalidToken);
+        let mut replayed = token(g, "google-app", json!({ "hd": "acme.com" }));
+        replayed["nonce"] = json!("other");
+        assert_eq!(org(Provider::Google, replayed).unwrap_err(), Problem::InvalidToken);
+
+        // Microsoft: the token's own directory, which its issuer must name exactly.
+        let tid = "72f988bf-86f1-41af-91ab-2d7cd011db47";
+        let iss = microsoft_issuer(tid);
+        let ms = |iss: &str, extra: Value| org(Provider::Microsoft, token(iss, "microsoft-app", extra));
+        let (c, domain) = ms(&iss, json!({ "tid": tid, "email": "ada@acme.com", "xms_edov": true })).unwrap();
+        assert_eq!((c.tenant.as_str(), c.issuer.as_str(), domain.as_deref()), (tid, iss.as_str(), Some("acme.com")));
+        // Without xms_edov the domain is left for the admin.
+        assert_eq!(ms(&iss, json!({ "tid": tid, "email": "ada@acme.com", "email_verified": true })).unwrap().1, None);
+        let other = "00000000-0000-0000-0000-000000000001";
+        assert_eq!(ms(&microsoft_issuer(other), json!({ "tid": tid })).unwrap_err(), Problem::InvalidToken, "iss names another directory");
+        assert_eq!(ms(MICROSOFT_ISSUER_TEMPLATE, json!({ "tid": tid })).unwrap_err(), Problem::InvalidToken);
+        assert_eq!(ms(&iss, json!({})).unwrap_err(), Problem::PersonalAccount, "no directory");
+        assert_eq!(ms(&iss, json!({ "tid": "organizations" })).unwrap_err(), Problem::PersonalAccount);
+        let consumers = microsoft_issuer(MICROSOFT_CONSUMERS);
+        assert_eq!(ms(&consumers, json!({ "tid": MICROSOFT_CONSUMERS })).unwrap_err(), Problem::PersonalAccount);
+
+        // Slack: the workspace, and the domain only when Slack vouches for the address.
+        let s = "https://slack.com";
+        let slack = |extra: Value| org(Provider::Slack, token(s, "slack-app", extra));
+        let (c, domain) = slack(json!({ "https://slack.com/team_id": "T0ACME", "email": "ada@acme.com", "email_verified": true })).unwrap();
+        assert_eq!((c.team.as_str(), domain.as_deref()), ("T0ACME", Some("acme.com")));
+        assert_eq!(slack(json!({ "https://slack.com/team_id": "T0ACME", "email": "ada@acme.com" })).unwrap().1, None);
+        assert_eq!(
+            slack(json!({ "https://slack.com/team_id": "T0ACME", "email": "ada@gmail.com", "email_verified": true })).unwrap().1,
+            None
+        );
+        assert_eq!(slack(json!({ "email": "ada@acme.com", "email_verified": true })).unwrap_err(), Problem::NotInOrg);
+    }
+
+    #[test]
+    fn microsofts_organizations_discovery_names_a_template() {
+        let cfg = shared_apps();
+        let target = setup_target(&cfg, Provider::Microsoft).unwrap();
+        let doc = |issuer: &str| HttpReply {
+            status: 200,
+            body: json!({
+                "issuer": issuer,
+                "authorization_endpoint": "https://login.microsoftonline.com/organizations/oauth2/v2.0/authorize",
+                "token_endpoint": "https://login.microsoftonline.com/organizations/oauth2/v2.0/token",
+            })
+            .to_string(),
+        };
+        assert!(read_discovery(&target, &doc(MICROSOFT_ISSUER_TEMPLATE)).is_ok());
+        assert!(read_discovery(&target, &doc(MICROSOFT_ORGANIZATIONS)).is_err());
+        // Only setting up accepts the template: a directory's own settings need its own issuer.
+        let tenant = Config { issuer: microsoft_issuer("72f988bf-86f1-41af-91ab-2d7cd011db47"), ..target };
+        assert!(read_discovery(&tenant, &doc(MICROSOFT_ISSUER_TEMPLATE)).is_err());
+    }
+
+    #[test]
+    fn provider_refusals_are_codes() {
+        assert_eq!(provider_refused("access_denied", "AADSTS65004: User declined to consent"), Problem::Denied);
+        assert_eq!(provider_refused("access_denied", "AADSTS90094: Admin consent is required"), Problem::AdminConsent);
+        assert_eq!(provider_refused("invalid_request", "AADSTS90095: needs approval"), Problem::AdminConsent);
+        assert_eq!(provider_refused("consent_required", ""), Problem::AdminConsent);
+        assert_eq!(provider_refused("server_error", ""), Problem::ProviderError);
     }
 }

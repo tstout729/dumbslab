@@ -952,26 +952,30 @@ impl Job {
     }
 
     /// What the job's operations left for the host to deliver once it finishes: a draft started
-    /// from Slack, and posts a docs sync wrote, have webhooks to send. Events a sign-in records send
-    /// no webhooks, and connected apps' jobs record none. Hosts deliver them when the job ends,
-    /// also when a step failed: a sync's committed steps keep theirs (see [`Job::settle`]).
+    /// from Slack, posts a docs sync wrote, and single sign-on an admin set up by signing in have
+    /// webhooks to send. Events a sign-in records send no webhooks, and connected apps' jobs record
+    /// none. Hosts deliver them when the job ends, also when a step failed: a sync's committed
+    /// steps keep theirs (see [`Job::settle`]).
     pub fn take_effects(&mut self) -> Vec<crate::Effect> {
         match self {
             Job::Slack(j) => j.take_effects(),
             Job::Docs(j) => j.take_effects(),
             Job::People(j) => j.take_effects(),
+            Job::Sso(j) => j.take_effects(),
             _ => vec![],
         }
     }
 
     /// After each step, whether it was kept. A sync's committed steps keep their effects for the
     /// host to deliver when the job ends, however it ends; a rolled-back step's go with it. A
-    /// Slack job keeps its effects only if it finishes, as it always has. [`guarded_step`] calls this.
+    /// Slack job, and single sign-on's setting up, keep their effects only if the step that made
+    /// them is kept. [`guarded_step`] calls this.
     pub fn settle(&mut self, committed: bool) {
         match self {
             Job::Docs(j) => j.settle(committed),
             Job::People(j) => j.settle(committed),
             Job::Slack(j) if !committed => drop(j.take_effects()),
+            Job::Sso(j) if !committed => drop(j.take_effects()),
             _ => {}
         }
     }

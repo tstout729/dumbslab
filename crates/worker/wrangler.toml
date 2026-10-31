@@ -76,6 +76,11 @@ FREE_TOTAL_WRITES_PER_DAY = "1000000"
 FREE_TOTAL_STORAGE_MB = "4096"
 # Connected apps (docs/connected-apps.md): the CONNECTOR_KEY secret turns them on; `<APP>_CLIENT_ID`
 # here and the `<APP>_CLIENT_SECRET` secret let people sign in to that app, e.g. GITHUB_CLIENT_ID.
+# Single sign-on with DumbSlab's own apps (docs/hosting/sign-in-apps.md): each client ID here, and
+# its secret with `npx wrangler secret put SSO_GOOGLE_CLIENT_SECRET` (or SSO_MICROSOFT_CLIENT_SECRET).
+# Slack's is the Slack app's SLACK_CLIENT_ID and SLACK_CLIENT_SECRET. Empty turns a provider off.
+SSO_GOOGLE_CLIENT_ID = ""
+SSO_MICROSOFT_CLIENT_ID = ""
 STRIPE_PRICE_ID = ""
 # Optional: the customer portal settings scripts/stripe-setup.sh made (bpc_…).
 STRIPE_PORTAL_CONFIG = ""

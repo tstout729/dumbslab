@@ -526,29 +526,142 @@ function ssoCheckNote(check) {
     : h('p', { class: 'callout callout-warn', role: 'alert' }, icon('alert', { size: 15 }), h('span', null, `The provider’s settings don’t check out: ${check.error}`));
 }
 
-function ssoStatus(s) {
-  if (s.client_secret_unreadable) {
-    return h('p', { class: 'callout callout-warn', role: 'alert' }, icon('alert', { size: 15 }),
-      h('span', null, 'Single sign-on is off: the saved client secret can’t be read, because the server’s connector key changed. Enter the client secret again and save. Until then everyone can sign in with a password.'));
+// The providers this server can have its own app for: admins set them up by signing in once.
+const SSO_SHARED = {
+  google: { label: 'Google', org: 'Google Workspace domain' },
+  microsoft: { label: 'Microsoft', org: 'Microsoft directory (tenant) ID' },
+  slack: { label: 'Slack', org: 'Slack workspace ID' },
+};
+
+// What `?sso_error=` means after setting up by signing in. Codes only: the server never puts the
+// provider's own words in the address.
+const SSO_SETUP_ERRORS = {
+  personal_account: 'Sign in with your organization’s account, not a personal one: a Google Workspace account, or a Microsoft work or school account.',
+  admin_consent: 'Your Microsoft organization lets only its administrators approve new apps. Ask a Microsoft Entra administrator to approve DumbSlab (Enterprise applications › Admin consent requests), or to set this up here themselves.',
+  not_admin: 'Only workspace admins can set up single sign-on.',
+  unavailable: 'This server can’t sign in with that provider’s app any more. Use your own app instead.',
+  other_session: 'Finish setting up in the same signed-in browser you started in, then try again.',
+  expired: 'That sign-in took too long, was already used, or the settings changed meanwhile. Try again.',
+  not_in_org: 'That account didn’t say which organization it belongs to. Sign in with your organization’s account.',
+  already_linked: 'That account is already linked to someone else here. Unlink it under Linked accounts, then try again.',
+  denied: 'You didn’t finish signing in.',
+  provider_error: 'The provider couldn’t sign you in. Try again in a minute.',
+  invalid_token: 'The provider’s answer didn’t check out. Try again.',
+};
+
+function okNote(text) {
+  return h('p', { class: 'callout', role: 'status' }, icon('check', { size: 15 }), h('span', null, text));
+}
+
+function warnNote(text) {
+  return h('p', { class: 'callout callout-warn', role: 'alert' }, icon('alert', { size: 15 }), h('span', null, text));
+}
+
+/** How setting up by signing in went, from the address the provider sent the admin back to. */
+function ssoSetupNote(s) {
+  const q = new URLSearchParams(location.search);
+  const done = q.get('sso_setup');
+  const error = q.get('sso_error');
+  if (done === 'done') return okNote(`Single sign-on is set up: people can sign in with ${s.name}. Try it from a private window before you require it.`);
+  if (done === 'domain_needed') {
+    return warnNote(`Single sign-on is set up, but ${s.name} didn’t confirm your email address’s domain. Add your organization’s email domains below, so people’s first sign-ins can find their accounts here by email.`);
   }
-  if (s.active) return h('p', { class: 'callout', role: 'status' }, icon('check', { size: 15 }), h('span', null, `People can sign in with ${s.name}.${s.require_sso ? ' Only admins can sign in with a password.' : ''}`));
+  if (error) return warnNote(`${Object.hasOwn(SSO_SETUP_ERRORS, error) ? SSO_SETUP_ERRORS[error] : 'Setting up single sign-on didn’t work. Try again.'} Nothing changed.`);
+  return null;
+}
+
+function ssoStatus(s) {
+  if (s.shared_app_missing) {
+    return warnNote(`Single sign-on is off: this server doesn’t have its own ${s.name} app any more. Until it’s back, everyone can sign in with a password. To keep single sign-on on, set up your own app.`);
+  }
+  if (s.client_secret_unreadable) {
+    return warnNote('Single sign-on is off: the saved client secret can’t be read, because the server’s connector key changed. Enter the client secret again and save. Until then everyone can sign in with a password.');
+  }
+  if (s.active) return okNote(`People can sign in with ${s.name}.${s.require_sso ? ' Only admins can sign in with a password.' : ''}`);
   if (s.enabled) return h('p', { class: 'callout callout-warn' }, icon('alert', { size: 15 }), h('span', null, 'Single sign-on is on but not finished: fill in everything below.'));
   return h('p', { class: 'muted small' }, 'Single sign-on is off. Everyone signs in with a password.');
 }
 
-async function ssoSection(ctx) {
-  const s = await api.get('/sso');
-  if (!s.available) {
-    return h('section', { class: 'panel' }, emptyState({ iconName: 'lock', title: 'Single sign-on isn’t available on this server',
-      body: 'It needs a connector key to encrypt the client secret. Whoever runs the server can set CONNECTOR_KEY (or DUMBSLAB_CONNECTOR_KEY when self-hosting).' }));
-  }
-  const status = h('div', { class: 'stack' }, ssoStatus(s));
+function splitDomains(value) {
+  return value.split(/[\s,]+/).map((d) => d.trim()).filter(Boolean);
+}
+
+/** The sign-in toggles every setup has. */
+function ssoToggles(s) {
+  const enabled = checkbox('Show “Sign in with …” on the sign-in page', { checked: s.enabled });
+  const autoProvision = checkbox('Add new people automatically: verified addresses at the allowed domains join as members', { checked: s.auto_provision });
+  const requireSso = checkbox('Require single sign-on: only admins can sign in with a password', { checked: s.require_sso });
+  const fieldset = h('fieldset', { class: 'field fieldset' }, h('legend', { class: 'field-label' }, 'Sign-in'), h('div', { class: 'stack' }, enabled, autoProvision, requireSso),
+    h('p', { class: 'field-hint' }, 'API tokens and MCP connections keep working either way. Admins keep their password in case the provider is down.'));
+  const values = () => ({
+    enabled: enabled.querySelector('input').checked,
+    auto_provision: autoProvision.querySelector('input').checked,
+    require_sso: requireSso.querySelector('input').checked,
+  });
+  return { fieldset, values };
+}
+
+/** "Set up with Google / Microsoft / Slack": sign in once, nothing to register. */
+function ssoSetupButtons(s, providers) {
+  const buttons = providers.map((p) => {
+    const label = SSO_SHARED[p].label;
+    const b = button(`Set up with ${label}`, { icon: 'external', variant: s.provider ? 'subtle' : 'primary' });
+    b.addEventListener('click', async () => {
+      const replaces = Boolean(s.provider) && !(s.shared && s.provider === p);
+      if (replaces) {
+        const ok = await confirmDialog({
+          title: `Replace single sign-on with ${label}?`,
+          message: `This workspace signs in with ${s.name}${s.shared ? '' : ' through your own app'}. Once you sign in with ${label}, that replaces it, and accounts linked at ${s.name} stop signing in here.`,
+          confirmLabel: 'Replace',
+          danger: true,
+        });
+        if (!ok) return;
+      }
+      busy(b, async () => {
+        const started = await api.post('/sso/setup', replaces ? { provider: p, replace: true } : { provider: p });
+        location.assign(started.authorize_url);
+      }).catch(toastError);
+    });
+    return b;
+  });
+  return h('div', { class: 'stack' },
+    h('div', { class: 'row gap-sm wrap' }, buttons),
+    h('p', { class: 'field-hint' }, 'Sign in once with your organization’s account: a Google Workspace account, a Microsoft work or school account, or your Slack workspace’s. DumbSlab takes your organization from it. Nothing to register or paste.'));
+}
+
+/** Shared mode: what setting up found, and the toggles. */
+function ssoSharedForm(s, onSaved) {
+  const info = SSO_SHARED[s.provider] || { label: s.name, org: 'Organization' };
+  const derived = s.provider === 'microsoft' ? s.tenant : s.provider === 'slack' ? s.team : null;
+  const domains = input({ value: (s.allowed_domains || []).join(', '), spellcheck: 'false', autocapitalize: 'off', placeholder: 'acme.com' });
+  const toggles = ssoToggles(s);
+  const checks = h('div', { class: 'stack' });
+  const domainsHint = s.provider === 'google'
+    ? 'Your Google Workspace domains, separated by commas. Only accounts in them can sign in.'
+    : 'Separated by commas. A first sign-in finds someone here by email only when the provider says it’s verified and it’s at one of these.';
+  return form(async () => {
+    const saved = await api.patch('/sso', { allowed_domains: splitDomains(domains.value), ...toggles.values() });
+    checks.replaceChildren(...[ssoCheckNote(saved.check)].filter(Boolean));
+    onSaved(saved);
+    toast('Single sign-on saved');
+  },
+  h('p', { class: 'small' }, `Signs in through DumbSlab’s own ${info.label} app: nothing to register, renew or paste.`),
+  derived ? h('div', { class: 'field' }, h('span', { class: 'field-label' }, info.org), h('p', null, h('code', null, derived)),
+    h('p', { class: 'field-hint' }, `Only people in this ${s.provider === 'slack' ? 'Slack workspace' : 'directory'} can sign in. To change it, set up again with another account.`)) : null,
+  field('Allowed email domains', domains, { hint: domainsHint }),
+  toggles.fieldset,
+  checks,
+  h('div', null, button('Save single sign-on', { variant: 'primary', type: 'submit' })));
+}
+
+/** Your own app: any provider, with its client ID and secret. */
+function ssoOwnForm(s, onSaved) {
   const provider = select([
-    { value: '', label: 'Choose a provider', selected: !s.provider, disabled: true },
-    ...Object.entries(SSO_PROVIDERS).map(([value, p]) => ({ value, label: p.label, selected: s.provider === value })),
+    { value: '', label: 'Choose a provider', selected: !s.provider || s.shared, disabled: true },
+    ...Object.entries(SSO_PROVIDERS).map(([value, p]) => ({ value, label: p.label, selected: !s.shared && s.provider === value })),
   ]);
   const help = h('span');
-  const issuer = input({ type: 'url', value: s.issuer || '', spellcheck: 'false', autocapitalize: 'off' });
+  const issuer = input({ type: 'url', value: s.shared ? '' : s.issuer || '', spellcheck: 'false', autocapitalize: 'off' });
   const tenant = input({ value: s.tenant || '', spellcheck: 'false', placeholder: '72f988bf-86f1-41af-91ab-2d7cd011db47' });
   const team = input({ value: s.team || '', spellcheck: 'false', placeholder: 'Like T0123ABCD' });
   const label = input({ value: s.label || '', maxlength: '40', placeholder: 'SSO' });
@@ -556,9 +669,7 @@ async function ssoSection(ctx) {
   const secretHint = (x) => (x.client_secret_unreadable ? 'Enter it again: the saved one can’t be read.' : x.client_secret_set ? 'Saved. Leave empty to keep it.' : '');
   const clientSecret = input({ type: 'password', autocomplete: 'new-password', placeholder: secretHint(s) });
   const domains = input({ value: (s.allowed_domains || []).join(', '), spellcheck: 'false', autocapitalize: 'off', placeholder: 'acme.com' });
-  const enabled = checkbox('Show “Sign in with …” on the sign-in page', { checked: s.enabled });
-  const autoProvision = checkbox('Add new people automatically: verified addresses at the allowed domains join as members', { checked: s.auto_provision });
-  const requireSso = checkbox('Require single sign-on: only admins can sign in with a password', { checked: s.require_sso });
+  const toggles = ssoToggles(s);
   const issuerField = field('Issuer URL', issuer, { hint: 'Exactly as the provider names it, https and all.' });
   const tenantField = field('Directory (tenant) ID', tenant, { hint: 'Microsoft Entra admin center › Overview. Only this directory’s accounts can sign in.' });
   const teamField = field('Slack workspace ID', team, { hint: 'Only people in this Slack workspace can sign in. It’s in Slack’s address in a browser: app.slack.com/client/T…' });
@@ -581,21 +692,18 @@ async function ssoSection(ctx) {
   provider.addEventListener('change', show);
   show();
   const checks = h('div', { class: 'stack' });
-  const f = form(async () => {
+  return form(async () => {
     const p = provider.value;
     if (!p) {
       toast('Choose a provider.', { type: 'error' });
       provider.focus();
       return;
     }
-    const body = {
-      provider: p,
-      client_id: clientId.value.trim(),
-      allowed_domains: domains.value.split(/[\s,]+/).map((d) => d.trim()).filter(Boolean),
-      enabled: enabled.querySelector('input').checked,
-      auto_provision: autoProvision.querySelector('input').checked,
-      require_sso: requireSso.querySelector('input').checked,
-    };
+    if (s.shared) {
+      const ok = await confirmDialog({ title: 'Use your own app instead?', message: `This workspace signs in through DumbSlab’s own ${s.name} app. Saving switches it to the app you registered.`, confirmLabel: 'Switch' });
+      if (!ok) return;
+    }
+    const body = { provider: p, shared: false, client_id: clientId.value.trim(), allowed_domains: splitDomains(domains.value), ...toggles.values() };
     if (['okta', 'onelogin', 'oidc'].includes(p)) body.issuer = issuer.value.trim();
     if (p === 'microsoft' && tenant.value.trim()) body.tenant = tenant.value.trim();
     if (p === 'slack') body.team = team.value.trim();
@@ -604,10 +712,8 @@ async function ssoSection(ctx) {
     const saved = await api.patch('/sso', body);
     clientSecret.value = '';
     clientSecret.placeholder = secretHint(saved);
-    status.replaceChildren(ssoStatus(saved));
     checks.replaceChildren(...[ssoCheckNote(saved.check)].filter(Boolean));
-    // The sign-in page's button follows the new settings.
-    state.auth.sso = saved.active ? { name: saved.name, url: `${location.origin}/sso/start`, required: saved.require_sso } : null;
+    onSaved(saved);
     toast('Single sign-on saved');
   },
   field('Provider', provider, { hint: help }),
@@ -616,10 +722,43 @@ async function ssoSection(ctx) {
     h('p', { class: 'field-hint' }, 'Register this in the provider’s app. It changes if the workspace’s address does.')),
   h('div', { class: 'grid-2' }, field('Client ID', clientId), field('Client secret', clientSecret, { hint: 'Stored encrypted and never shown again.' })),
   domainsField,
-  h('fieldset', { class: 'field fieldset' }, h('legend', { class: 'field-label' }, 'Sign-in'), h('div', { class: 'stack' }, enabled, autoProvision, requireSso),
-    h('p', { class: 'field-hint' }, 'API tokens and MCP connections keep working either way. Admins keep their password in case the provider is down.')),
+  toggles.fieldset,
   checks,
   h('div', null, button('Save single sign-on', { variant: 'primary', type: 'submit' })));
+}
+
+async function ssoSection(ctx) {
+  const s = await api.get('/sso');
+  const shared = (s.shared_providers || []).filter((p) => Object.hasOwn(SSO_SHARED, p));
+  if (!s.available && !shared.length && !s.shared) {
+    return h('section', { class: 'panel' }, emptyState({ iconName: 'lock', title: 'Single sign-on isn’t available on this server',
+      body: 'Whoever runs the server can add DumbSlab’s own Google, Microsoft or Slack sign-in apps, or a connector key (CONNECTOR_KEY, or DUMBSLAB_CONNECTOR_KEY when self-hosting) for apps you register yourself.' }));
+  }
+  const status = h('div', { class: 'stack' }, ssoStatus(s));
+  const onSaved = (saved) => {
+    status.replaceChildren(ssoStatus(saved));
+    // The sign-in page's button follows the new settings.
+    state.auth.sso = saved.active ? { name: saved.name, url: `${location.origin}/sso/start`, required: saved.require_sso } : null;
+  };
+  const own = s.available
+    ? ssoOwnForm(s, onSaved)
+    : h('p', { class: 'muted small' }, 'Using your own app needs a connector key on this server, to encrypt its client secret. Whoever runs the server can set CONNECTOR_KEY (or DUMBSLAB_CONNECTOR_KEY when self-hosting).');
+  const ownApp = s.provider && !s.shared;
+  const body = [];
+  if (s.shared && s.provider) body.push(ssoSharedForm(s, onSaved));
+  if (shared.length) {
+    const buttons = ssoSetupButtons(s, shared);
+    body.push(s.shared ? h('details', { class: 'sso-more' }, h('summary', null, 'Set up again, or with another provider'), buttons) : buttons);
+    body.push(h('details', { class: 'sso-more', open: ownApp || undefined },
+      h('summary', null, 'Use your own app'),
+      h('p', { class: 'field-hint' }, 'For Okta, OneLogin and other OpenID Connect providers, or an app you registered with Google, Microsoft or Slack yourself.'),
+      own));
+  } else {
+    body.push(own);
+  }
+  const description = shared.length
+    ? 'People sign in with your organization’s identity provider. Set it up by signing in once with Google, Microsoft or Slack, or use your own app for any provider.'
+    : 'People sign in with your organization’s identity provider. You register an app with the provider and paste its details here.';
 
   const linked = await api.get('/sso/identities', { user: 'all' });
   const reload = () => ctx.reload();
@@ -642,7 +781,7 @@ async function ssoSection(ctx) {
       unlink);
   };
   return frag(
-    panel('Single sign-on', 'People sign in with your organization’s identity provider. You register an app with the provider and paste its details here.', status, f),
+    panel('Single sign-on', description, status, ssoSetupNote(s), ...body),
     panel('Linked accounts', 'Accounts at the provider that sign in as people here.',
       linked.items.length ? h('ul', { class: 'people-list' }, linked.items.map(row)) : h('p', { class: 'muted small' }, 'Nobody has signed in with single sign-on yet.')));
 }

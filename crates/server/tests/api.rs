@@ -3022,21 +3022,27 @@ mod sso {
 
     /// Runs a job, answering each step's requests with `answer`. Returns how it finished and every
     /// request it made.
-    fn drive(h: &H, mut job: Job, answer: &dyn Fn(&HttpCall) -> HttpReply) -> (Finish, Vec<HttpCall>) {
+    fn drive(h: &H, job: Job, answer: &dyn Fn(&HttpCall) -> HttpReply) -> (Finish, Vec<HttpCall>) {
+        let (finish, sent, _) = drive_job(h, job, answer);
+        (finish, sent)
+    }
+
+    /// Like `drive`, and also the effects the job left for the host to deliver (its webhooks).
+    fn drive_job(h: &H, mut job: Job, answer: &dyn Fn(&HttpCall) -> HttpReply) -> (Finish, Vec<HttpCall>, Vec<Effect>) {
         let mut replies = vec![];
         let mut sent = vec![];
         for _ in 0..connect::MAX_STEPS {
             let (step, next) = h
                 .store
                 .with_tx(|db| {
-                    let step = connect::step(db, &h.cfg, &mut job, replies.clone(), chrono::Utc::now());
+                    let (step, _) = connect::guarded_step(db, &h.cfg, &mut job, replies.clone(), chrono::Utc::now(), |_| None);
                     let ok = step.is_ok();
                     ((step, job.clone()), ok)
                 })
                 .unwrap();
             job = next;
             match step.unwrap() {
-                Step::Done(f) => return (f, sent),
+                Step::Done(f) => return (f, sent, job.take_effects()),
                 Step::Fetch(calls) => {
                     replies = calls.iter().map(answer).collect();
                     sent.extend(calls);
@@ -3942,6 +3948,501 @@ mod sso {
         let r = h.call("POST", "/api/v1/connections", Some(json!({ "app": "github", "fields": { "token": "ghp_x" } })), &admin);
         assert_eq!(r.effects.len(), 1);
         assert!(matches!(r.effects[0], Effect::Connect(_)));
+    }
+
+    // -----------------------------------------------------------------------
+    // Setting up with the server's own Google, Microsoft and Slack apps.
+
+    const GOOGLE: &str = "https://accounts.google.com";
+    const SLACK: &str = "https://slack.com";
+
+    fn shared_apps() -> dumbslab_core::sso::SharedApps {
+        let app = |id: &str| Some(connect::OAuthApp { client_id: format!("{id}-app"), client_secret: format!("{id}-secret") });
+        dumbslab_core::sso::SharedApps { google: app("google"), microsoft: app("microsoft"), slack: app("slack"), callback_url: None }
+    }
+
+    /// A workspace whose server has its own Google, Microsoft and Slack apps, and no connector key:
+    /// shared mode stores no secret. Its admin is ada@acme.test.
+    fn shared_workspace() -> (H, Auth) {
+        let mut h = H::new();
+        let (admin, _) = h.setup();
+        h.cfg.sso_apps = shared_apps();
+        (h, admin)
+    }
+
+    /// Microsoft's discovery document for every organization's accounts: its issuer is a template.
+    fn ms_organizations() -> Value {
+        json!({
+            "issuer": "https://login.microsoftonline.com/{tenantid}/v2.0",
+            "authorization_endpoint": "https://login.microsoftonline.com/organizations/oauth2/v2.0/authorize",
+            "token_endpoint": "https://login.microsoftonline.com/organizations/oauth2/v2.0/token",
+            "userinfo_endpoint": "https://graph.microsoft.com/oidc/userinfo",
+            "token_endpoint_auth_methods_supported": ["client_secret_post", "private_key_jwt", "client_secret_basic"],
+        })
+    }
+
+    /// Where setting up `provider` starts, and its discovery document.
+    fn setup_discovery(provider: &str) -> Value {
+        match provider {
+            "google" => discovery(GOOGLE),
+            "microsoft" => ms_organizations(),
+            _ => discovery(SLACK),
+        }
+    }
+
+    fn cookie_of(auth: &Auth) -> String {
+        match auth {
+            Auth::Cookie(c) => format!("dumbslab_session={c}"),
+            _ => unreachable!("a browser session"),
+        }
+    }
+
+    /// Starts setting up in `admin`'s browser session; returns the provider's sign-in URL.
+    fn start_setup(h: &H, admin: &Auth, body: Value) -> String {
+        let provider = body["provider"].as_str().unwrap().to_string();
+        let r = h.call("POST", "/api/v1/sso/setup", Some(body), admin);
+        assert_eq!(r.status, 200, "{}", r.body);
+        let (finish, sent) = drive(h, job_of(&r), &|_| ok(setup_discovery(&provider)));
+        let expected = match provider.as_str() {
+            "microsoft" => "https://login.microsoftonline.com/organizations/v2.0/.well-known/openid-configuration".to_string(),
+            "google" => format!("{GOOGLE}/.well-known/openid-configuration"),
+            _ => format!("{SLACK}/.well-known/openid-configuration"),
+        };
+        assert_eq!(sent[0].url, expected);
+        let Finish::Fill(v) = finish else { panic!("{finish:?}") };
+        v["authorize_url"].as_str().unwrap().to_string()
+    }
+
+    /// The provider sends `browser` back from `url` with a code (or `error`, when given), and its
+    /// token endpoint answers with an ID token with `id_claims` and the sign-in's nonce. Returns
+    /// where the browser lands, the requests the job made, and the webhooks it left.
+    fn finish_setup(h: &H, url: &str, browser: &Auth, mut id_claims: Value, error: Option<&str>) -> (Landing, Vec<HttpCall>, Vec<Effect>) {
+        let q = query_of(url);
+        if id_claims.get("nonce").is_none() {
+            id_claims["nonce"] = json!(q["nonce"]);
+        }
+        let back = match error {
+            Some(e) => format!("{e}&state={}", urlencoding::encode(&q["state"])),
+            None => format!("code=the-code&state={}", urlencoding::encode(&q["state"])),
+        };
+        let cookies = match browser {
+            Auth::Cookie(_) => vec![cookie_of(browser)],
+            _ => vec![],
+        };
+        let r = h.send(&callback_request(&back, &cookies));
+        if r.effects.is_empty() {
+            return (land(&r, None), vec![], vec![]);
+        }
+        let id = jwt(&id_claims);
+        let (finish, sent, effects) = drive_job(h, job_of(&r), &|c| tokens(c, &id));
+        (land(&r, Some(finish)), sent, effects)
+    }
+
+    /// The admin's ID token from `provider`, for the server's own app.
+    fn admin_token(provider: &str, extra: Value) -> Value {
+        let issuer = match provider {
+            "google" => GOOGLE.to_string(),
+            "microsoft" => ms_issuer(),
+            _ => SLACK.to_string(),
+        };
+        let mut c = claims(&issuer, "admin-sub", "ada@acme.test", extra);
+        c["aud"] = json!(format!("{provider}-app"));
+        c["name"] = json!("Ada Admin");
+        c
+    }
+
+    fn organization(provider: &str) -> Value {
+        match provider {
+            "google" => json!({ "hd": "acme.test", "email_verified": true }),
+            "microsoft" => json!({ "tid": TENANT, "xms_edov": true }),
+            _ => json!({ "https://slack.com/team_id": "T0ACME", "email_verified": true }),
+        }
+    }
+
+    const SETTINGS: &str = "https://kb.test/settings/sso";
+
+    #[test]
+    fn setting_up_by_signing_in_with_the_servers_own_apps() {
+        for provider in ["google", "microsoft", "slack"] {
+            let (h, admin) = shared_workspace();
+            let ada = me(&h, &admin)["id"].as_str().unwrap().to_string();
+            h.user(&admin, "mo@acme.test", "Mo", "member");
+            h.ok("POST", "/api/v1/webhooks", Some(json!({ "url": "https://hooks.test/dumbslab", "events": ["sso.*"] })), &admin);
+            let s = h.ok("GET", "/api/v1/sso", None, &admin);
+            assert_eq!((s["available"].as_bool(), s["shared_providers"].clone()), (Some(false), json!(["google", "microsoft", "slack"])));
+
+            let url = start_setup(&h, &admin, json!({ "provider": provider }));
+            let q = query_of(&url);
+            assert_eq!(
+                (q["client_id"].as_str(), q["redirect_uri"].as_str()),
+                (format!("{provider}-app").as_str(), "https://kb.test/sso/callback")
+            );
+            assert_eq!((q["scope"].as_str(), q["code_challenge_method"].as_str()), ("openid email profile", "S256"));
+            match provider {
+                "google" => assert_eq!((q["hd"].as_str(), q["prompt"].as_str()), ("*", "select_account")),
+                "microsoft" => {
+                    assert!(url.starts_with("https://login.microsoftonline.com/organizations/oauth2/v2.0/authorize?"), "{url}");
+                    assert_eq!(q["prompt"], "select_account");
+                }
+                _ => assert!(!q.contains_key("team")),
+            }
+            // Nothing changes until the admin comes back.
+            assert!(h.ok("GET", "/api/v1/sso", None, &admin)["provider"].is_null());
+
+            let (landing, sent, hooks) = finish_setup(&h, &url, &admin, admin_token(provider, organization(provider)), None);
+            assert_eq!(landing.location, format!("{SETTINGS}?sso_setup=done"), "{provider}: {}", landing.error());
+            assert!(landing.session().is_none(), "setting up doesn't start another session");
+            // The code went to the token endpoint with the server's own app.
+            let form = query_of(&format!("?{}", sent[0].body.clone().unwrap()));
+            assert_eq!(form["redirect_uri"], "https://kb.test/sso/callback");
+            let basic = sent[0].headers.iter().find(|(k, _)| k == "authorization").map(|(_, v)| v.clone());
+            if provider == "slack" {
+                assert_eq!((form["client_id"].as_str(), form["client_secret"].as_str()), ("slack-app", "slack-secret"));
+            } else {
+                let expected =
+                    format!("Basic {}", base64::engine::general_purpose::STANDARD.encode(format!("{provider}-app:{provider}-secret")));
+                assert_eq!(basic.as_deref(), Some(expected.as_str()), "{provider}");
+            }
+
+            // On, for the admin's organization, with the toggles as they were.
+            let s = h.ok("GET", "/api/v1/sso", None, &admin);
+            assert_eq!(
+                (s["active"].as_bool(), s["enabled"].as_bool(), s["shared"].as_bool(), s["provider"].as_str()),
+                (Some(true), Some(true), Some(true), Some(provider)),
+                "{s}"
+            );
+            assert_eq!((s["require_sso"].as_bool(), s["auto_provision"].as_bool()), (Some(false), Some(false)));
+            assert_eq!((s["client_id"].as_str(), s["client_secret_set"].as_bool()), (Some(""), Some(false)));
+            assert_eq!(s["allowed_domains"], json!(["acme.test"]), "{provider}");
+            let issuer = match provider {
+                "google" => GOOGLE.to_string(),
+                "microsoft" => {
+                    assert_eq!(s["tenant"], TENANT);
+                    ms_issuer()
+                }
+                _ => {
+                    assert_eq!(s["team"], "T0ACME");
+                    SLACK.to_string()
+                }
+            };
+            assert_eq!(s["issuer"], issuer);
+            assert!(!s.to_string().contains(&format!("{provider}-secret")));
+            // The admin's own account is linked, and the admins' log and webhooks say so.
+            let linked = h.ok("GET", "/api/v1/sso/identities?user=all", None, &admin);
+            assert_eq!((linked["items"].as_array().unwrap().len(), linked["items"][0]["user"]["id"].as_str()), (1, Some(ada.as_str())));
+            assert_eq!(links_logged(&h, &admin), vec![(ada.clone(), "setup".to_string())]);
+            let events: Vec<String> = hooks
+                .iter()
+                .filter_map(|e| match e {
+                    Effect::Webhook(d) => d.headers.iter().find(|(k, _)| k == "x-dumbslab-event").map(|(_, v)| v.clone()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(events, vec!["sso.updated".to_string(), "sso.linked".to_string()], "{provider}");
+            assert_eq!(h.ok("GET", "/api/v1/auth/state", None, &Auth::None)["sso"]["url"], "https://kb.test/sso/start");
+
+            // People sign in through the same app; Microsoft's sign-ins use the directory's own issuer.
+            let s = start(&h, &issuer);
+            assert_eq!(
+                (s.query["client_id"].as_str(), s.query["redirect_uri"].as_str()),
+                (format!("{provider}-app").as_str(), "https://kb.test/sso/callback")
+            );
+            let mut c = claims(&issuer, "sub-mo", "mo@acme.test", organization(provider));
+            c["aud"] = json!(format!("{provider}-app"));
+            let (landing, _) = come_back(&h, &s, c, &tokens);
+            assert_eq!(me(&h, &landing.session().unwrap_or_else(|| panic!("{provider}: {}", landing.error())))["email"], "mo@acme.test");
+        }
+    }
+
+    #[test]
+    fn setting_up_needs_an_organization_account() {
+        let (h, admin) = shared_workspace();
+        let attempt = |provider: &str, extra: Value| {
+            let url = start_setup(&h, &admin, json!({ "provider": provider }));
+            finish_setup(&h, &url, &admin, admin_token(provider, extra), None).0
+        };
+        let nothing_saved = || assert!(h.ok("GET", "/api/v1/sso", None, &admin)["provider"].is_null());
+        // A personal Google account has no Workspace domain.
+        let landing = attempt("google", json!({ "email": "ada@gmail.com", "email_verified": true }));
+        assert_eq!(
+            (landing.location.as_str(), landing.error().as_str()),
+            (format!("{SETTINGS}?sso_error=personal_account").as_str(), "personal_account")
+        );
+        nothing_saved();
+        // Nor has a personal Microsoft account.
+        let consumers = "9188040d-6c67-4c5b-b112-36a304b66dad";
+        let mut personal = admin_token("microsoft", json!({ "tid": consumers }));
+        personal["iss"] = json!(format!("https://login.microsoftonline.com/{consumers}/v2.0"));
+        let url = start_setup(&h, &admin, json!({ "provider": "microsoft" }));
+        assert_eq!(finish_setup(&h, &url, &admin, personal, None).0.error(), "personal_account");
+        assert_eq!(attempt("microsoft", json!({})).error(), "personal_account");
+        // A token whose issuer names another directory than its `tid`.
+        let mut mixed = admin_token("microsoft", json!({ "tid": TENANT }));
+        mixed["iss"] = json!("https://login.microsoftonline.com/00000000-0000-0000-0000-000000000001/v2.0");
+        let url = start_setup(&h, &admin, json!({ "provider": "microsoft" }));
+        assert_eq!(finish_setup(&h, &url, &admin, mixed, None).0.error(), "invalid_token");
+        // Slack's token must name the Slack workspace.
+        assert_eq!(attempt("slack", json!({ "email_verified": true })).error(), "not_in_org");
+        nothing_saved();
+        // Microsoft directories that need an administrator's approval, and admins who say no.
+        for (error, code) in [
+            ("error=access_denied&error_description=AADSTS90094%3A+Admin+consent+is+required.", "admin_consent"),
+            ("error=consent_required", "admin_consent"),
+            ("error=access_denied&error_description=AADSTS65004%3A+User+declined+to+consent.", "denied"),
+            ("error=server_error&error_description=%3Cb%3Eoops%3C%2Fb%3E", "provider_error"),
+        ] {
+            let url = start_setup(&h, &admin, json!({ "provider": "microsoft" }));
+            let (landing, sent, _) = finish_setup(&h, &url, &admin, json!({}), Some(error));
+            assert_eq!((landing.error(), sent.len()), (code.to_string(), 0), "{error}");
+            assert!(!landing.location.contains("AADSTS") && !landing.location.contains("oops"), "{}", landing.location);
+        }
+        nothing_saved();
+
+        // No email domain Microsoft vouches for: set up, and the admin is told to add one.
+        let landing = attempt("microsoft", json!({ "tid": TENANT, "email_verified": true }));
+        assert_eq!(landing.location, format!("{SETTINGS}?sso_setup=domain_needed"));
+        let s = h.ok("GET", "/api/v1/sso", None, &admin);
+        assert_eq!((s["active"].as_bool(), s["tenant"].as_str(), s["allowed_domains"].clone()), (Some(true), Some(TENANT), json!([])));
+        let v = set_up(&h, &admin, json!({ "allowed_domains": ["acme.test"] }), &ms_issuer());
+        assert_eq!(
+            (v["allowed_domains"].clone(), v["shared"].as_bool(), v["check"]["ok"].as_bool()),
+            (json!(["acme.test"]), Some(true), Some(true))
+        );
+        // Setting the same directory up again keeps the domains the admin added.
+        let landing = attempt("microsoft", json!({ "tid": TENANT }));
+        assert_eq!(landing.location, format!("{SETTINGS}?sso_setup=done"));
+        assert_eq!(h.ok("GET", "/api/v1/sso", None, &admin)["allowed_domains"], json!(["acme.test"]));
+
+        // A free-mail address is never an allowed domain, even when Slack vouches for it.
+        let url = start_setup(&h, &admin, json!({ "provider": "slack", "replace": true }));
+        let mut c = admin_token("slack", json!({ "https://slack.com/team_id": "T0ACME", "email_verified": true }));
+        c["email"] = json!("ada@gmail.com");
+        let landing = finish_setup(&h, &url, &admin, c, None).0;
+        assert_eq!(landing.location, format!("{SETTINGS}?sso_setup=domain_needed"));
+        let s = h.ok("GET", "/api/v1/sso", None, &admin);
+        assert_eq!((s["provider"].as_str(), s["team"].as_str(), s["allowed_domains"].clone()), (Some("slack"), Some("T0ACME"), json!([])));
+    }
+
+    #[test]
+    fn only_the_admin_who_started_can_finish_setting_up() {
+        let (mut h, admin) = shared_workspace();
+        let (mo_id, mo_token) = h.user(&admin, "mo@acme.test", "Mo", "member");
+        let mo = sign_in(&h, "mo@acme.test", "password123");
+        let (bo_id, _) = h.user(&admin, "bo@acme.test", "Bo", "admin");
+        let bo = sign_in(&h, "bo@acme.test", "password123");
+        let t = h.ok("POST", "/api/v1/tokens", Some(json!({ "name": "agent", "scopes": ["read", "write", "admin"] })), &admin);
+        let admin_token_auth = Auth::Bearer(t["token"].as_str().unwrap().to_string());
+        // Admins only, from a signed-in browser, for a provider the server has an app for.
+        for auth in [&mo, &mo_token] {
+            assert_eq!(h.call("POST", "/api/v1/sso/setup", Some(json!({ "provider": "google" })), auth).status, 403);
+        }
+        let r = h.call("POST", "/api/v1/sso/setup", Some(json!({ "provider": "google" })), &admin_token_auth);
+        assert_eq!(r.status, 403, "an API token can't come back from Google: {}", r.body);
+        assert!(r.body["error"]["message"].as_str().unwrap().contains("shared: true"));
+        assert_eq!(h.call("POST", "/api/v1/sso/setup", Some(json!({ "provider": "okta" })), &admin).status, 400);
+        assert_eq!(count(&h, "SELECT COUNT(*) FROM sso_requests"), 0);
+
+        let saved = || h.ok("GET", "/api/v1/sso", None, &admin_token_auth)["provider"].as_str().map(str::to_string);
+        let google = || admin_token("google", organization("google"));
+        // Finishing in another person's browser, or another session of the admin's, or none.
+        let other = sign_in(&h, "ada@acme.test", "correct horse");
+        for browser in [&mo, &other, &Auth::None] {
+            let url = start_setup(&h, &admin, json!({ "provider": "google" }));
+            let (landing, sent, _) = finish_setup(&h, &url, browser, google(), None);
+            assert_eq!((landing.location.as_str(), sent.len()), (format!("{SETTINGS}?sso_error=other_session").as_str(), 0));
+        }
+        assert_eq!(saved(), None);
+        // A made-up or reused state.
+        let r = h.send(&callback_request("code=c&state=acme.made-up", &[cookie_of(&admin)]));
+        assert_eq!(land(&r, None).error(), "expired");
+        let url = start_setup(&h, &admin, json!({ "provider": "google" }));
+        let q = query_of(&url);
+        let back = format!("code=c&state={}", urlencoding::encode(&q["state"]));
+        assert!(!h.send(&callback_request(&back, &[cookie_of(&admin)])).effects.is_empty());
+        assert_eq!(land(&h.send(&callback_request(&back, &[cookie_of(&admin)])), None).error(), "expired");
+        // An admin who's demoted while signing in at Google (their session stays) can't finish.
+        let url = start_setup(&h, &bo, json!({ "provider": "google" }));
+        h.ok("PATCH", &format!("/api/v1/users/{bo_id}"), Some(json!({ "role": "member" })), &admin);
+        let mut c = google();
+        c["sub"] = json!("bo-sub");
+        assert_eq!(finish_setup(&h, &url, &bo, c, None).0.error(), "not_admin");
+        // Settings another admin changes meanwhile aren't overwritten.
+        let url = start_setup(&h, &admin, json!({ "provider": "google" }));
+        set_up(&h, &admin_token_auth, json!({ "provider": "slack", "shared": true, "team": "T0ACME" }), SLACK);
+        assert_eq!(finish_setup(&h, &url, &admin, google(), None).0.error(), "expired");
+        assert_eq!(saved().as_deref(), Some("slack"));
+        // Signed out after Google answered, before it's saved.
+        let url = start_setup(&h, &admin, json!({ "provider": "slack" }));
+        let q = query_of(&url);
+        let r = h.send(&callback_request(&format!("code=c&state={}", urlencoding::encode(&q["state"])), &[cookie_of(&admin)]));
+        let keep = sign_in(&h, "ada@acme.test", "correct horse");
+        assert_eq!(h.call("POST", "/api/v1/auth/logout", None, &admin).status, 200);
+        let mut c = admin_token("slack", json!({ "https://slack.com/team_id": "T0OTHER", "email_verified": true }));
+        c["nonce"] = json!(q["nonce"]);
+        let id = jwt(&c);
+        let (finish, _) = drive(&h, job_of(&r), &|call| tokens(call, &id));
+        assert_eq!(land(&r, Some(finish)).error(), "other_session");
+        assert_eq!(h.ok("GET", "/api/v1/sso", None, &keep)["team"], "T0ACME");
+        // An account at the provider that's someone else's here isn't taken over.
+        h.store
+            .with_tx(|db| {
+                let r = db.execute(
+                    "INSERT INTO sso_identities (id, user_id, issuer, subject, email, created_at, last_used_at) VALUES ('i1', ?, ?, 'admin-sub', 'mo@acme.test', '2026-01-01T00:00:00Z', NULL)",
+                    &dumbslab_core::params![mo_id.clone(), GOOGLE],
+                );
+                (r, true)
+            })
+            .unwrap()
+            .unwrap();
+        let url = start_setup(&h, &keep, json!({ "provider": "google", "replace": true }));
+        assert_eq!(finish_setup(&h, &url, &keep, google(), None).0.error(), "already_linked");
+        assert_eq!(saved().as_deref(), Some("slack"));
+        // A server without the app.
+        h.cfg.sso_apps.google = None;
+        let r = h.call("POST", "/api/v1/sso/setup", Some(json!({ "provider": "google", "replace": true })), &keep);
+        assert_eq!((r.status, r.body["error"]["code"].as_str()), (400, Some("sso_shared_unavailable")), "{}", r.body);
+    }
+
+    #[test]
+    fn setting_up_replaces_your_own_app_only_when_asked() {
+        let (mut h, admin) = workspace();
+        h.cfg.sso_apps = shared_apps();
+        h.user(&admin, "mo@acme.test", "Mo", "member");
+        okta(&h, &admin, json!({ "require_sso": true, "auto_provision": true }));
+        let r = h.call("POST", "/api/v1/sso/setup", Some(json!({ "provider": "google" })), &admin);
+        assert_eq!((r.status, r.body["error"]["code"].as_str()), (409, Some("sso_configured")), "{}", r.body);
+        assert!(r.body["error"]["message"].as_str().unwrap().contains("replace"));
+        let url = start_setup(&h, &admin, json!({ "provider": "google", "replace": true }));
+        // Okta still works until the admin is back.
+        assert_eq!(h.ok("GET", "/api/v1/auth/state", None, &Auth::None)["sso"]["name"], "Okta");
+        let (landing, _, _) = finish_setup(&h, &url, &admin, admin_token("google", organization("google")), None);
+        assert_eq!(landing.location, format!("{SETTINGS}?sso_setup=done"));
+        let s = h.ok("GET", "/api/v1/sso", None, &admin);
+        assert_eq!((s["provider"].as_str(), s["issuer"].as_str(), s["shared"].as_bool()), (Some("google"), Some(GOOGLE), Some(true)));
+        // The old app's secret is gone; the toggles stay as they were.
+        assert_eq!((s["client_secret_set"].as_bool(), s["client_id"].as_str()), (Some(false), Some("")));
+        assert_eq!((s["require_sso"].as_bool(), s["auto_provision"].as_bool()), (Some(true), Some(true)));
+        let stored: String = h
+            .store
+            .with_tx(|db| (db.one("SELECT value FROM settings WHERE key = 'sso'", &[]).unwrap().unwrap().str("value"), true))
+            .unwrap();
+        assert!(!stored.contains("client_secret\":\"") && !stored.contains("shh"), "{stored}");
+        // The same provider again needs no confirming; another one does.
+        start_setup(&h, &admin, json!({ "provider": "google" }));
+        assert_eq!(h.call("POST", "/api/v1/sso/setup", Some(json!({ "provider": "slack" })), &admin).status, 409);
+        // Going back to your own app forgets the shared one.
+        let v = set_up(&h, &admin, json!({ "shared": false, "client_id": "own-app", "client_secret": "own-secret" }), GOOGLE);
+        assert_eq!((v["shared"].as_bool(), v["client_secret_set"].as_bool(), v["active"].as_bool()), (Some(false), Some(true), Some(true)));
+    }
+
+    #[test]
+    fn losing_the_servers_app_turns_sso_off_without_locking_anyone_out() {
+        let (mut h, admin) = shared_workspace();
+        h.user(&admin, "mo@acme.test", "Mo", "member");
+        let url = start_setup(&h, &admin, json!({ "provider": "google" }));
+        finish_setup(&h, &url, &admin, admin_token("google", organization("google")), None);
+        set_up(&h, &admin, json!({ "require_sso": true }), GOOGLE);
+        let login = |h: &H| {
+            h.call("POST", "/api/v1/auth/login", Some(json!({ "email": "mo@acme.test", "password": "password123" })), &Auth::None).status
+        };
+        assert_eq!(login(&h), 403);
+
+        h.cfg.sso_apps.google = None;
+        let s = h.ok("GET", "/api/v1/sso", None, &admin);
+        assert_eq!(
+            (s["active"].as_bool(), s["enabled"].as_bool(), s["shared_app_missing"].as_bool(), s["shared_providers"].clone()),
+            (Some(false), Some(true), Some(true), json!(["microsoft", "slack"])),
+            "{s}"
+        );
+        assert_eq!(login(&h), 200, "Require SSO doesn't lock people out while SSO can't work");
+        assert!(h.ok("GET", "/api/v1/auth/state", None, &Auth::None)["sso"].is_null());
+        let r = h.call("GET", "/sso/start", None, &Auth::None);
+        assert!(r.effects.is_empty() && land(&r, None).error() == "not_configured");
+        // Saving it on says why; turning it off works.
+        let r = h.call("PATCH", "/api/v1/sso", Some(json!({ "auto_provision": false })), &admin);
+        assert_eq!(r.status, 400);
+        assert!(r.body["error"]["message"].as_str().unwrap().contains("own Google app any more"), "{}", r.body);
+        set_up(&h, &admin, json!({ "enabled": false }), GOOGLE);
+        // When the app is back, so is single sign-on.
+        h.cfg.sso_apps = shared_apps();
+        let v = set_up(&h, &admin, json!({ "enabled": true }), GOOGLE);
+        assert_eq!((v["active"].as_bool(), v["shared_app_missing"].as_bool()), (Some(true), Some(false)));
+        assert_eq!(login(&h), 403);
+    }
+
+    #[test]
+    fn agents_set_up_shared_mode_with_update_sso() {
+        let (mut h, admin) = shared_workspace();
+        h.user(&admin, "mo@acme.test", "Mo", "member");
+        let bad = |h: &H, body: Value| {
+            let r = h.call("PATCH", "/api/v1/sso", Some(body), &admin);
+            assert_eq!(r.status, 400, "{}", r.body);
+            r.body["error"]["message"].as_str().unwrap().to_string()
+        };
+        assert!(bad(&h, json!({ "provider": "okta", "shared": true, "issuer": OKTA })).contains("google"));
+        assert!(bad(&h, json!({ "provider": "slack", "shared": true, "client_id": "x" })).contains("leave out `client_id`"));
+        assert!(bad(&h, json!({ "provider": "slack", "shared": true, "enabled": true })).contains("`team`"));
+        // No connector key, so no app of your own.
+        let r = h.call(
+            "PATCH",
+            "/api/v1/sso",
+            Some(json!({ "provider": "okta", "issuer": OKTA, "client_id": "a", "client_secret": "s" })),
+            &admin,
+        );
+        assert_eq!(r.status, 503);
+
+        let body = json!({ "provider": "slack", "shared": true, "team": "T0ACME", "allowed_domains": ["acme.test"], "enabled": true });
+        let v = set_up(&h, &admin, body, SLACK);
+        assert_eq!(
+            (v["active"].as_bool(), v["shared"].as_bool(), v["check"]["ok"].as_bool(), v["client_secret_set"].as_bool()),
+            (Some(true), Some(true), Some(true), Some(false)),
+            "{v}"
+        );
+        let s = start(&h, SLACK);
+        assert_eq!((s.query["client_id"].as_str(), s.query["team"].as_str()), ("slack-app", "T0ACME"));
+        let mut c = claims(SLACK, "sub-mo", "mo@acme.test", organization("slack"));
+        c["aud"] = json!("slack-app");
+        let (landing, _) = come_back(&h, &s, c, &tokens);
+        assert!(landing.session().is_some(), "{}", landing.error());
+        // Another provider means another app: shared mode doesn't carry over unasked (and this
+        // server can't keep a secret for one of your own).
+        let r = h.call(
+            "PATCH",
+            "/api/v1/sso",
+            Some(json!({ "provider": "google", "allowed_domains": ["acme.test"], "enabled": true })),
+            &admin,
+        );
+        assert_eq!((r.status, r.body["error"]["code"].as_str()), (503, Some("sso_off")));
+        h.cfg.sso_apps.microsoft = None;
+        let r = h.call("PATCH", "/api/v1/sso", Some(json!({ "provider": "microsoft", "shared": true, "tenant": TENANT })), &admin);
+        assert_eq!((r.status, r.body["error"]["code"].as_str()), (400, Some("sso_shared_unavailable")));
+    }
+
+    #[test]
+    fn hosted_sign_ins_come_back_through_the_root_domain() {
+        let mut h = H::new();
+        let (admin, _) = h.setup();
+        h.user(&admin, "mo@acme.test", "Mo", "member");
+        h.cfg.base_url = Some("https://acme.kb.test".into());
+        h.cfg.workspace = Some("acme".into());
+        h.cfg.sso_apps = dumbslab_core::sso::SharedApps { callback_url: Some("https://kb.test/sso/callback".into()), ..shared_apps() };
+        let url = start_setup(&h, &admin, json!({ "provider": "google" }));
+        let q = query_of(&url);
+        assert_eq!(q["redirect_uri"], "https://kb.test/sso/callback");
+        assert!(q["state"].starts_with("acme.") && q["state"].len() > 30, "{}", q["state"]);
+        let (landing, sent, _) = finish_setup(&h, &url, &admin, admin_token("google", organization("google")), None);
+        assert_eq!(landing.location, "https://acme.kb.test/settings/sso?sso_setup=done");
+        assert_eq!(query_of(&format!("?{}", sent[0].body.clone().unwrap()))["redirect_uri"], "https://kb.test/sso/callback");
+        // People's sign-ins too.
+        let s = start(&h, GOOGLE);
+        assert!(s.query["state"].starts_with("acme.") && s.query["redirect_uri"] == "https://kb.test/sso/callback", "{:?}", s.query);
+        let mut c = claims(GOOGLE, "sub-mo", "mo@acme.test", organization("google"));
+        c["aud"] = json!("google-app");
+        let (landing, sent) = come_back(&h, &s, c, &tokens);
+        assert_eq!(landing.location, "https://acme.kb.test/p/abc", "{}", landing.error());
+        assert_eq!(query_of(&format!("?{}", sent[0].body.clone().unwrap()))["redirect_uri"], "https://kb.test/sso/callback");
+        // Your own app keeps the workspace's own redirect URI.
+        assert_eq!(h.ok("GET", "/api/v1/sso", None, &admin)["redirect_uri"], "https://acme.kb.test/sso/callback");
     }
 }
 

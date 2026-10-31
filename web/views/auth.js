@@ -99,6 +99,10 @@ export function ssoMessage(code, name) {
     email_linked: `Your email address is linked to a different ${p} account here. Ask a workspace admin to unlink it.`,
     other_session: 'Finish linking in the same signed-in browser you started in. Start again from Settings › Profile.',
     already_linked: `That ${p} account is already linked to someone else here.`,
+    admin_consent: `Your organization needs an administrator to approve DumbSlab in ${p} before you can sign in with it. Ask your IT admin, or sign in with your password.`,
+    personal_account: `Use your organization’s ${p} account, not a personal one.`,
+    not_admin: 'Only workspace admins can set up single sign-on.',
+    unavailable: 'Signing in with that provider isn’t available on this server any more.',
   };
   return Object.hasOwn(messages, code) ? messages[code] : `Signing in with ${p} didn’t work. Try again or use your password.`;
 }
