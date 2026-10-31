@@ -503,7 +503,8 @@ function githubSourceForm(github, topics, reload) {
     }
     const picked = picks.get(repository.value);
     busy(submit, async () => {
-      const body = { provider: 'github', installation_id: picked.installation.installation_id, repository: picked.repo.full_name, branch: branch.value.trim(), folder: folder.value.trim(), topic_id: topic.value };
+      // The repository's id decides which one is added; its name is for reading.
+      const body = { provider: 'github', installation_id: picked.installation.installation_id, repository_id: picked.repo.id, repository: picked.repo.full_name, branch: branch.value.trim(), folder: folder.value.trim(), topic_id: topic.value };
       await firstSync(await api.post('/docs-sources', body), progress, reload);
     }).catch(toastError);
   });

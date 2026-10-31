@@ -17,9 +17,6 @@ CREATE TABLE IF NOT EXISTS docs_source_links (
   -- Why the source can't sync now (the App was uninstalled or suspended, or the repository taken
   -- out of it), as a code; NULL when it can. Its posts stay either way.
   disconnected TEXT,
-  -- 1 once the repository was renamed (it keeps its id) and its source followed: the next sync
-  -- renders every file again, since links out of the folder name the repository.
-  renamed INTEGER NOT NULL DEFAULT 0,
   -- `gitlab_oauth`: the project's id, the webhook DumbSlab added to it, and when the access token in
   -- the source's `secret` expires (it's refreshed during a sync, under the sync's lease).
   project_id INTEGER,
@@ -31,6 +28,16 @@ CREATE TABLE IF NOT EXISTS docs_source_links (
   refreshing TEXT
 );
 CREATE INDEX IF NOT EXISTS docs_source_links_installation ON docs_source_links(installation_id, repo_id);
+
+-- Synced files owed a render though they haven't changed: the repository was renamed (it keeps its
+-- id), and links out of the folder name it. By post, so a file that moves keeps its row. A row
+-- goes once its post is written under the source's name then. `docs_items.sha` keeps the last
+-- synced blob meanwhile, which is how a file that moves is found.
+CREATE TABLE IF NOT EXISTS docs_rerender (
+  source_id TEXT NOT NULL REFERENCES docs_sources(id) ON DELETE CASCADE,
+  target_id TEXT NOT NULL,
+  PRIMARY KEY (source_id, target_id)
+);
 
 -- Connect GitHub or GitLab under way: a hashed, single-use state, bound to the admin's browser
 -- session (see `sync::github_app::begin`). Kept 15 minutes.
