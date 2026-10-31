@@ -23,19 +23,23 @@
 //!   company is gone), or after [`RETENTION_DAYS`]. Either way it says so in the activity log, with
 //!   the company and the webhook ids it knows, so an admin can delete them by hand, and drops the
 //!   credentials.
-//! - The live connection's record is worked with the saved credentials themselves, renewed through
-//!   the sync's renewal lease, never with a copy: a copy's renewal would spend the refresh token the
-//!   sync needs. Every renewal of a sign-in hands its new tokens to the records holding the old
-//!   refresh token ([`hand_over`]).
+//! - The live connection's record is worked with the saved credentials themselves: they're renewed
+//!   only the sync's way (its renewal lease, and [`oauth::apply_refresh`] into the saved sync), and
+//!   the pass uses the saved access token. It never renews its copy of them. Only a retired
+//!   connection's copy is renewed here, and nothing else uses that (a reconnect waits for renewals
+//!   under way). A renewal that ends after its connection retired hands its new tokens to the
+//!   retired connection's record ([`hand_over`]).
 //! - Passes wait while a save is under way, and decide what to delete against the live webhook as it
 //!   is then, so they never delete a webhook a save is adding.
 //! - A record's version goes up whenever a save or a removal records its connection again. A pass
 //!   ends, backs off or gives up on a record only at the version it began with; otherwise it lets
 //!   go, and leaves the new work to the next pass.
-//! - A renewal that finds the connection changed meanwhile (a reconnect) isn't a refusal: its tokens
-//!   went to the record, and the pass goes on with them. BambooHR refusing to renew a retired
-//!   connection's copy ends the record only the second time: a renewal still under way when it
-//!   retired may hand over new tokens meanwhile.
+//! - A renewal of the live connection that finds it retired meanwhile isn't a refusal: its tokens
+//!   went to the record, and the next pass reloads. Nor is a refusal of the live connection's
+//!   renewal (another renewal may have spent the token): the pass tries again later, and the sync
+//!   says if the sign-in is dead. BambooHR refusing to renew a retired connection's copy ends the
+//!   record only the second time, and only while the record still holds the refresh token that was
+//!   refused: a renewal still under way when it retired may hand over new tokens meanwhile.
 //!
 //! A pass takes at most four steps: renew, list, delete, done.
 
@@ -453,21 +457,29 @@ fn renewed(
     };
     match result {
         Ok(()) => Ok(list(item)),
-        // A reconnect retired the connection while BambooHR renewed it: the new tokens went to its
-        // record (handed over), and they work. Go on with them.
-        Err(why) if why == oauth::CHANGED => {
-            item.live = false;
-            Ok(list(item))
-        }
-        Err(why) if transient => later(db, cfg, c, staged, item, &why, now).map(|_| vec![]),
-        // A retired connection's copy: a renewal still under way when it retired may yet hand over
-        // new tokens, so only a second refusal ends it.
-        Err(why) if lease.is_none() && !item.refused => {
-            let refused = "UPDATE people_sync_cleanup SET refused = 1 WHERE connection = ? AND version = ?";
-            db.execute(refused, &params![item.connection.clone(), item.version])?;
+        // The live connection: retired meanwhile (its tokens went to its record), or refused because
+        // another renewal spent the token first. The next pass reloads.
+        Err(why) if lease.is_some() || transient => later(db, cfg, c, staged, item, &why, now).map(|_| vec![]),
+        Err(why) => {
+            // A retired connection's copy. Only while the record still holds the refresh token that
+            // was refused: a renewal still under way when it retired may have handed over new tokens.
+            let used = item.creds.cred.refresh_token.as_deref().map(sha256_hex);
+            let same = db.one(
+                "SELECT 1 AS ok FROM people_sync_cleanup WHERE connection = ? AND working_until = ? AND refresh_hash IS ?",
+                &params![item.connection.clone(), c.lease.clone(), used],
+            )?;
+            if same.is_none() {
+                item.state = State::Done;
+                return let_go(db, c, item).map(|_| vec![]);
+            }
+            if item.refused {
+                return give_up(db, cfg, c, staged, item, "BambooHR refused to renew the sign-in", now).map(|_| vec![]);
+            }
+            // The first refusal waits: such a renewal may yet hand over new tokens.
+            let refused = "UPDATE people_sync_cleanup SET refused = 1 WHERE connection = ? AND version = ? AND working_until = ?";
+            db.execute(refused, &params![item.connection.clone(), item.version, c.lease.clone()])?;
             later(db, cfg, c, staged, item, &why, now).map(|_| vec![])
         }
-        Err(_) => give_up(db, cfg, c, staged, item, "BambooHR refused to renew the sign-in", now).map(|_| vec![]),
     }
 }
 
@@ -539,9 +551,12 @@ fn deleted(
 /// meanwhile (new work for the next pass). `false` then.
 fn done(db: &dyn Db, c: &Cleanup, item: &mut Item) -> ApiResult<bool> {
     item.state = State::Done;
-    let dropped = db
-        .execute("DELETE FROM people_sync_cleanup WHERE connection = ? AND version = ?", &params![item.connection.clone(), item.version])?
-        > 0;
+    // Only the record this pass took: not one recorded again since (its version went up), nor one
+    // deleted and recorded anew (its version starts over, but this pass doesn't hold it).
+    let dropped = db.execute(
+        "DELETE FROM people_sync_cleanup WHERE connection = ? AND version = ? AND working_until = ?",
+        &params![item.connection.clone(), item.version, c.lease.clone()],
+    )? > 0;
     if !dropped {
         let_go(db, c, item)?;
     }

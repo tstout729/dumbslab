@@ -33,7 +33,7 @@ You come back to Settings › People sync. DumbSlab checks it can read employees
 
 - You need to see employees' work email and job information in BambooHR, and to be allowed to add webhooks. The sync reads what you can see.
 - The sign-in link works once, for 15 minutes, for the admin who started it, in the same browser.
-- BambooHR's access token lasts an hour. DumbSlab renews it with the refresh token before it runs out. Only one request renews it at a time.
+- BambooHR's access token lasts an hour. DumbSlab renews it with the refresh token before it runs out. Only one request renews it at a time, and the new tokens are stored only while the saved sign-in still holds the refresh token they replaced, so a slow renewal never loses them or overwrites newer ones.
 - To sync from another company, sign in again for it. Choosing **Sign in with BambooHR again** also replaces the saved sign-in.
 
 If it doesn't work, Settings says why. The link back carries only a short code, such as `declined` or `no_access`.

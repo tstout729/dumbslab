@@ -220,11 +220,18 @@ pub(crate) fn renew_call(cfg: &HostConfig, subdomain: &str, base_url: &str, cred
     Ok(refresh_call(app, subdomain, &redirect_uri(cfg, base_url), refresh))
 }
 
-/// Takes the renewed tokens into `creds`, and saves them into the stored credentials (keeping the
-/// rest: a save may have stored a new webhook key meanwhile). Lets go of the lease either way.
-/// `Err` says why BambooHR refused, or that the request lost the lease: new credentials or another
-/// company were saved meanwhile, so whatever started this must stop. The renewed tokens then go to
-/// the cleanup records that hold the spent refresh token (see [`super::cleanup::hand_over`]).
+/// Takes the renewed tokens into `creds`, and stores them in the saved connection, keeping the rest
+/// (a save may have stored a new webhook key meanwhile). Lets go of this request's lease either way.
+///
+/// The fence is the refresh token this renewal spent, not the lease: a renewal can outlive its
+/// lease (a stalled host) while another takes over with the same refresh token and is refused. So:
+/// - the same connection still holds the spent refresh token: the new tokens are its, and they're
+///   stored, lease or not;
+/// - another renewal advanced its tokens meanwhile: those are kept, and `creds` takes them;
+/// - the connection was retired (a reconnect) or removed: `Err(CHANGED)`, and the new tokens go to
+///   its cleanup record, which holds the spent refresh token (see [`super::cleanup::hand_over`]).
+///
+/// Other `Err`s say why BambooHR refused.
 pub(crate) fn apply_refresh(
     db: &dyn Db,
     cfg: &HostConfig,
@@ -244,25 +251,30 @@ pub(crate) fn apply_refresh(
     };
     let spent = creds.cred.refresh_token.clone().unwrap_or_default();
     creds.take(tokens, now);
-    // Cleanup records holding the same sign-in follow it: BambooHR may have spent their refresh token.
-    super::cleanup::hand_over(db, cfg, &spent, creds)?;
-    // Only into the same connection, while this request still holds the lease: a new sign-in or API
-    // key replaces the tokens.
-    let Some(row) = db.one(
-        "SELECT secret FROM people_sync WHERE id = 1 AND auth = 'oauth' AND connection = ? AND refreshing_until = ?",
-        &params![connection, lease],
-    )?
-    else {
+    let saved =
+        db.one("SELECT secret, expires_at FROM people_sync WHERE id = 1 AND auth = 'oauth' AND connection = ?", &params![connection])?;
+    let Some(row) = saved else {
+        super::cleanup::hand_over(db, cfg, &spent, creds)?;
         return Ok(Err(CHANGED.into()));
     };
     let mut stored = crate::sync::open(cfg, OWNER, PROVIDER, &row.str("secret"))?;
+    let release = "UPDATE people_sync SET refreshing_until = NULL WHERE id = 1 AND refreshing_until = ?";
+    if spent.is_empty() || stored.refresh_token.as_deref() != Some(spent.as_str()) {
+        // Another renewal advanced the tokens: keep its, and use them.
+        db.execute(release, &params![lease])?;
+        creds.cred.token = stored.token;
+        creds.cred.refresh_token = stored.refresh_token;
+        creds.expires_at = row.opt_str("expires_at").and_then(|s| parse_ts(&s));
+        return Ok(Ok(()));
+    }
     stored.token = creds.cred.token.clone();
     stored.refresh_token = creds.cred.refresh_token.clone();
     let secret = crate::sync::seal(cfg, OWNER, PROVIDER, &stored)?;
     db.execute(
-        "UPDATE people_sync SET secret = ?, expires_at = ?, refreshing_until = NULL WHERE id = 1 AND connection = ? AND refreshing_until = ?",
-        &params![secret, creds.expires_at.map(ts), connection, lease],
+        "UPDATE people_sync SET secret = ?, expires_at = ? WHERE id = 1 AND connection = ?",
+        &params![secret, creds.expires_at.map(ts), connection],
     )?;
+    db.execute(release, &params![lease])?;
     Ok(Ok(()))
 }
 
