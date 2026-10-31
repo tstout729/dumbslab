@@ -184,7 +184,7 @@ pub const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0008_sso.sql"),
     include_str!("migrations/0009_slack.sql"),
     include_str!("migrations/0010_sync.sql"),
-    // 0011 (Slack's shared app) is reserved for another change; this goes after it once both are in.
+    // Listed last. When main gains a migration first, this one takes the next free number and stays last.
     include_str!("migrations/0012_docs_sync_apps.sql"),
 ];
 
