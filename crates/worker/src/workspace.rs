@@ -496,6 +496,7 @@ impl DurableObject for Workspace {
             workspace: workspace.clone(),
             hosting,
             connectors: crate::connect::connectors(&self.env, &origin, multi),
+            sso_apps: crate::connect::sso_apps(&self.env, &origin, multi),
             // Session recordings and browser error reports; off unless these are set.
             telemetry: Telemetry::new(
                 var(&self.env, "QUILL_HOST").as_deref(),
