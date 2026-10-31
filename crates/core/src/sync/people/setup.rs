@@ -241,8 +241,17 @@ pub(crate) fn claim_save(db: &dyn Db, now: DateTime<Utc>) -> ApiResult<Option<St
     Ok(claimed.then_some(lease))
 }
 
-fn holds_save(db: &dyn Db, lease: &str) -> ApiResult<bool> {
-    Ok(db.one("SELECT 1 AS ok FROM settings WHERE key = ? AND value = ?", &params![SAVING, lease])?.is_some())
+/// This save still holds its lease, and it hasn't run out: a save that stalled past it may find the
+/// sync removed (removing it ends the lease) or changed.
+fn holds_save(db: &dyn Db, lease: &str, now: DateTime<Utc>) -> ApiResult<bool> {
+    let held = db.one("SELECT 1 AS ok FROM settings WHERE key = ? AND value = ? AND value > ?", &params![SAVING, lease, ts(now)])?;
+    Ok(held.is_some())
+}
+
+/// Ends any save lease, so a save that stalled past it can't go on: removing the sync does this.
+pub(crate) fn end_saves(db: &dyn Db) -> ApiResult<()> {
+    db.execute("DELETE FROM settings WHERE key = ?", &params![SAVING])?;
+    Ok(())
 }
 
 fn release_save(db: &dyn Db, lease: &str) -> ApiResult<()> {
@@ -353,6 +362,14 @@ pub(crate) struct Setup {
     old_deleted: bool,
     /// A sign-in: finish by sending the browser back to Settings, with a code when it failed.
     sign_in: bool,
+    /// The last step wrote only renewed credentials.
+    rotated: bool,
+}
+
+impl Setup {
+    pub(super) fn rotated(&self) -> bool {
+        self.rotated
+    }
 }
 
 /// What a save starts from.
@@ -451,6 +468,7 @@ fn begin(db: &dyn Db, cfg: &HostConfig, row: Option<&Row>, start: Start) -> ApiR
         notice: None,
         notice_code: None,
         old_deleted: false,
+        rotated: false,
     }))))))
 }
 
@@ -512,6 +530,7 @@ pub(super) fn step(
     replies: Vec<HttpReply>,
     now: DateTime<Utc>,
 ) -> ApiResult<Step> {
+    s.rotated = false;
     match s.phase.clone() {
         Phase::Start => {
             if let Some(code) = s.code.take() {
@@ -556,7 +575,11 @@ pub(super) fn step(
             let reply = replies.into_iter().next().unwrap_or_default();
             let connection = s.saved_connection.clone().unwrap_or_default();
             match oauth::apply_refresh(db, cfg, &mut s.creds, &connection, &lease, &reply, now)? {
-                Ok(()) => Ok(checking(s)),
+                Ok(()) => {
+                    // This step stored the renewed tokens and nothing else.
+                    s.rotated = true;
+                    Ok(checking(s))
+                }
                 Err(why) => fail(db, s, "refused", ApiError::new(400, "bamboohr_refused", why)),
             }
         }
@@ -577,7 +600,7 @@ pub(super) fn step(
                 s.creds.cred.fields.remove("webhook_key");
             }
             // Nothing in BambooHR changes unless this admin may still save.
-            if let Some(stop) = may_save(db, s)? {
+            if let Some(stop) = may_save(db, s, now)? {
                 return Ok(stop);
             }
             let mut calls = s.old.as_ref().map(|o| o.delete_calls(&s.subdomain, &s.creds, now)).unwrap_or_default();
@@ -674,7 +697,7 @@ fn fail(db: &dyn Db, s: &Setup, code: &str, error: ApiError) -> ApiResult<Step> 
 /// only if this one took longer), and its admin still is one. `Some` is how it stops otherwise.
 /// A stop after BambooHR deleted the old webhook says so in Settings; the webhook this save added
 /// stays recorded for the cleanup.
-fn may_save(db: &dyn Db, s: &Setup) -> ApiResult<Option<Step>> {
+fn may_save(db: &dyn Db, s: &Setup, now: DateTime<Utc>) -> ApiResult<Option<Step>> {
     let stop = |code: &str, error: ApiError| -> ApiResult<Option<Step>> {
         if s.old_deleted
             && let Some(old) = &s.old
@@ -686,7 +709,7 @@ fn may_save(db: &dyn Db, s: &Setup) -> ApiResult<Option<Step>> {
             false => Step::Done(Finish::Fail(error)),
         }))
     };
-    if !holds_save(db, &s.lease)? {
+    if !holds_save(db, &s.lease, now)? {
         return stop("busy", busy());
     }
     if crate::model::actor_for_user(db, &s.admin)?.is_none_or(|a| a.role != Role::Admin) {
@@ -744,7 +767,7 @@ fn record_old(db: &dyn Db, cfg: &HostConfig, s: &mut Setup, now: DateTime<Utc>) 
 
 fn save(db: &dyn Db, cfg: &HostConfig, s: &mut Setup, staged: &mut Vec<crate::Effect>, now: DateTime<Utc>) -> ApiResult<Step> {
     // Checked again: the admin may have lost the role while BambooHR answered.
-    if let Some(stop) = may_save(db, s)? {
+    if let Some(stop) = may_save(db, s, now)? {
         return Ok(stop);
     }
     let Some(mut actor) = crate::model::actor_for_user(db, &s.admin)? else {

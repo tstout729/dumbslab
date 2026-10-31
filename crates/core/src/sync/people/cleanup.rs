@@ -41,7 +41,11 @@
 //!   record only the second time, and only while the record still holds the refresh token that was
 //!   refused: a renewal still under way when it retired may hand over new tokens meanwhile.
 //!
-//! A pass takes at most four steps: renew, list, delete, done.
+//! A pass takes at most four steps: renew, list, delete, done. Renewals go out on their own, and the
+//! step that reads their answers stores only the renewed credentials, nothing else: such a step is
+//! kept even when a full workspace refuses others ([`crate::connect::Job::wrote_only_credentials`]),
+//! because BambooHR has already spent the old refresh token. What a failed renewal leads to is done
+//! in the next step.
 
 use chrono::{DateTime, Duration, Utc};
 use serde_json::json;
@@ -211,6 +215,10 @@ fn save_creds(db: &dyn Db, cfg: &HostConfig, connection: &str, creds: &Creds) ->
 enum State {
     /// Waiting for BambooHR to renew the sign-in: the live connection's renewal lease, if it is that.
     Renewing(Option<String>),
+    /// Credentials good: the list is asked for with the next batch.
+    Ready,
+    /// The renewal failed (why; whether it may simply be tried again): dealt with in the next step.
+    Failed(String, bool),
     /// Waiting for the list of webhooks.
     Listing,
     /// Waiting for this many deletions.
@@ -256,11 +264,21 @@ pub(crate) struct Cleanup {
     /// The connection whose fate the answer reports: removing the sync waits for its pass.
     watch: Option<String>,
     phase: Phase,
+    /// The last step wrote only renewed credentials.
+    pub(super) rotated: bool,
 }
 
 /// A cleanup pass. `watch`: answer like `remove_people_sync`, about that connection's record.
 pub(crate) fn cleanup_job(base_url: &str, watch: Option<String>) -> Job {
-    let c = Cleanup { base_url: base_url.to_string(), lease: String::new(), tag: String::new(), items: vec![], watch, phase: Phase::Start };
+    let c = Cleanup {
+        base_url: base_url.to_string(),
+        lease: String::new(),
+        tag: String::new(),
+        items: vec![],
+        watch,
+        phase: Phase::Start,
+        rotated: false,
+    };
     Job::People(Box::new(PeopleJob::new(Work::Cleanup(c))))
 }
 
@@ -321,6 +339,7 @@ pub(super) fn step(
     replies: Vec<HttpReply>,
     now: DateTime<Utc>,
 ) -> ApiResult<Step> {
+    c.rotated = false;
     let mut calls = vec![];
     if c.phase == Phase::Start {
         c.phase = Phase::Working;
@@ -377,19 +396,43 @@ pub(super) fn step(
             }
             c.items.push(item);
         }
+        // Renewals go out on their own; the others wait for them.
+        if calls.is_empty() {
+            calls = ask_lists(db, c)?;
+        }
+    } else if c.items.iter().any(|i| matches!(i.state, State::Renewing(_))) {
+        // The renewals' answers, and nothing else: only renewed credentials are written.
+        let mut replies = replies.into_iter();
+        for item in c.items.iter_mut() {
+            if let State::Renewing(lease) = item.state.clone() {
+                item.state = match rotate(db, cfg, item, lease, &replies.next().unwrap_or_default(), now)? {
+                    Ok(()) => State::Ready,
+                    Err((why, retry)) => State::Failed(why, retry),
+                };
+            }
+        }
+        c.rotated = true;
+        calls = ask_lists(db, c)?;
+        // Failed renewals are dealt with in a step of their own when no list is asked for.
+        if calls.is_empty() && c.items.iter().any(|i| matches!(i.state, State::Failed(..))) {
+            return Ok(Step::Fetch(vec![]));
+        }
     } else {
         let mut replies = replies.into_iter();
         let mut items = std::mem::take(&mut c.items);
         for item in items.iter_mut() {
             let next = match item.state.clone() {
-                State::Renewing(lease) => renewed(db, cfg, c, staged, item, lease, &replies.next().unwrap_or_default(), now)?,
+                State::Failed(why, retry) => {
+                    renewal_failed(db, cfg, c, staged, item, &why, retry, now)?;
+                    vec![]
+                }
                 State::Listing => listed(db, cfg, c, staged, item, &replies.next().unwrap_or_default(), now)?,
                 State::Deleting(n) => {
                     let answers: Vec<HttpReply> = (0..n).map(|_| replies.next().unwrap_or_default()).collect();
                     deleted(db, cfg, c, staged, item, &answers, now)?;
                     vec![]
                 }
-                State::Done => vec![],
+                State::Renewing(_) | State::Ready | State::Done => vec![],
             };
             calls.extend(next);
         }
@@ -401,7 +444,17 @@ pub(super) fn step(
     Ok(Step::Fetch(calls))
 }
 
-/// An item's first request: a renewal when its sign-in is about to expire, otherwise the list.
+/// Asks for the lists of the items whose credentials are good.
+fn ask_lists(db: &dyn Db, c: &mut Cleanup) -> ApiResult<Vec<HttpCall>> {
+    let mut calls = vec![];
+    for item in c.items.iter_mut().filter(|i| i.state == State::Ready) {
+        calls.push(listing(db, item)?);
+    }
+    Ok(calls)
+}
+
+/// An item's first request: a renewal when its sign-in is about to expire. Otherwise it's ready
+/// for its list.
 fn first_call(
     db: &dyn Db,
     cfg: &HostConfig,
@@ -412,7 +465,13 @@ fn first_call(
 ) -> ApiResult<Option<HttpCall>> {
     if !item.creds.needs_refresh(now) {
         item.fresh = item.creds.auth == Auth::ApiKey || item.creds.expires_at.is_none_or(|e| e > now);
-        return listing(db, item).map(Some);
+        item.state = State::Ready;
+        return Ok(None);
+    }
+    // The host's BambooHR app is missing (for now, maybe): keep the record, and try again later.
+    if oauth::app(cfg).is_none() {
+        later(db, cfg, c, staged, item, "this server has no BambooHR app to renew the sign-in with", now)?;
+        return Ok(None);
     }
     let lease = match item.live {
         // The saved sign-in: renewed through its own lease, never with a copy.
@@ -423,7 +482,8 @@ fn first_call(
             }
             Renewal::UseCurrent(creds) => {
                 item.creds = creds;
-                return listing(db, item).map(Some);
+                item.state = State::Ready;
+                return Ok(None);
             }
             Renewal::Wait | Renewal::Changed => {
                 later(db, cfg, c, staged, item, "the sign-in was being renewed or changed", now)?;
@@ -437,6 +497,7 @@ fn first_call(
             item.state = State::Renewing(lease);
             Ok(Some(call))
         }
+        // No refresh token: nothing can ever renew these.
         Err(why) => {
             if let Some(l) = &lease {
                 db.execute("UPDATE people_sync SET refreshing_until = NULL WHERE id = 1 AND refreshing_until = ?", &params![l.clone()])?;
@@ -447,20 +508,22 @@ fn first_call(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn renewed(
+/// Stores a renewal's tokens: the live connection's in the saved sync (see
+/// [`oauth::apply_refresh`]), a retired one's in its record. Writes nothing else. `Err` says why
+/// it failed, and whether it may simply be tried again.
+fn rotate(
     db: &dyn Db,
     cfg: &HostConfig,
-    c: &Cleanup,
-    staged: &mut Vec<crate::Effect>,
     item: &mut Item,
     lease: Option<String>,
     reply: &HttpReply,
     now: DateTime<Utc>,
-) -> ApiResult<Vec<HttpCall>> {
+) -> ApiResult<Result<(), (String, bool)>> {
     let transient = reply.status == 0 || reply.status == 429 || reply.status >= 500;
     let result = match &lease {
-        Some(l) => oauth::apply_refresh(db, cfg, &mut item.creds, &item.connection, l, reply, now)?,
+        // The live connection: retired meanwhile (its tokens went to its record), or refused because
+        // another renewal spent the token first. Either way the next pass reloads.
+        Some(l) => oauth::apply_refresh(db, cfg, &mut item.creds, &item.connection, l, reply, now)?.map_err(|why| (why, true)),
         None => match crate::connect::standard_token("BambooHR", reply) {
             Ok(tokens) => {
                 // Only this connection's record holds these: nothing else to hand them to.
@@ -468,38 +531,49 @@ fn renewed(
                 save_creds(db, cfg, &item.connection, &item.creds)?;
                 Ok(())
             }
-            Err(why) => Err(why),
+            Err(why) => Err((why, transient)),
         },
     };
-    match result {
-        Ok(()) => {
-            item.fresh = true;
-            Ok(vec![listing(db, item)?])
-        }
-        // The live connection: retired meanwhile (its tokens went to its record), or refused because
-        // another renewal spent the token first. The next pass reloads.
-        Err(why) if lease.is_some() || transient => later(db, cfg, c, staged, item, &why, now).map(|_| vec![]),
-        Err(why) => {
-            // A retired connection's copy. Only while the record still holds the refresh token that
-            // was refused: a renewal still under way when it retired may have handed over new tokens.
-            let used = item.creds.cred.refresh_token.as_deref().map(sha256_hex);
-            let same = db.one(
-                "SELECT 1 AS ok FROM people_sync_cleanup WHERE connection = ? AND working_until = ? AND refresh_hash IS ?",
-                &params![item.connection.clone(), c.lease.clone(), used],
-            )?;
-            if same.is_none() {
-                item.state = State::Done;
-                return let_go(db, c, item).map(|_| vec![]);
-            }
-            if item.refused {
-                return give_up(db, cfg, c, staged, item, "BambooHR refused to renew the sign-in", now).map(|_| vec![]);
-            }
-            // The first refusal waits: such a renewal may yet hand over new tokens.
-            let refused = "UPDATE people_sync_cleanup SET refused = 1 WHERE connection = ? AND version = ? AND working_until = ?";
-            db.execute(refused, &params![item.connection.clone(), item.version, c.lease.clone()])?;
-            later(db, cfg, c, staged, item, &why, now).map(|_| vec![])
-        }
+    if result.is_ok() {
+        item.fresh = true;
     }
+    Ok(result)
+}
+
+/// What a failed renewal leads to: try again later, or, for a retired connection's copy that
+/// BambooHR refused twice, give up.
+#[allow(clippy::too_many_arguments)]
+fn renewal_failed(
+    db: &dyn Db,
+    cfg: &HostConfig,
+    c: &Cleanup,
+    staged: &mut Vec<crate::Effect>,
+    item: &mut Item,
+    why: &str,
+    retry: bool,
+    now: DateTime<Utc>,
+) -> ApiResult<()> {
+    if retry {
+        return later(db, cfg, c, staged, item, why, now);
+    }
+    // Only while the record still holds the refresh token that was refused: a renewal still under
+    // way when it retired may have handed over new tokens.
+    let used = item.creds.cred.refresh_token.as_deref().map(sha256_hex);
+    let same = db.one(
+        "SELECT 1 AS ok FROM people_sync_cleanup WHERE connection = ? AND working_until = ? AND refresh_hash IS ?",
+        &params![item.connection.clone(), c.lease.clone(), used],
+    )?;
+    if same.is_none() {
+        item.state = State::Done;
+        return let_go(db, c, item);
+    }
+    if item.refused {
+        return give_up(db, cfg, c, staged, item, "BambooHR refused to renew the sign-in", now);
+    }
+    // The first refusal waits: such a renewal may yet hand over new tokens.
+    let refused = "UPDATE people_sync_cleanup SET refused = 1 WHERE connection = ? AND version = ? AND working_until = ?";
+    db.execute(refused, &params![item.connection.clone(), item.version, c.lease.clone()])?;
+    later(db, cfg, c, staged, item, why, now)
 }
 
 fn listed(

@@ -33,7 +33,7 @@ You come back to Settings › People sync. DumbSlab checks it can read employees
 
 - You need to see employees' work email and job information in BambooHR, and to be allowed to add webhooks. The sync reads what you can see.
 - The sign-in link works once, for 15 minutes, for the admin who started it, in the same browser.
-- BambooHR's access token lasts an hour. DumbSlab renews it with the refresh token before it runs out. Only one request renews it at a time, and the new tokens are stored only while the saved sign-in still holds the refresh token they replaced, so a slow renewal never loses them or overwrites newer ones.
+- BambooHR's access token lasts an hour. DumbSlab renews it with the refresh token before it runs out. Only one request renews it at a time, and the new tokens are stored only while the saved sign-in still holds the refresh token they replaced, so a slow renewal never loses them or overwrites newer ones. They're stored even when a hosted workspace is full: BambooHR has already spent the old refresh token by then.
 - To sync from another company, sign in again for it. Choosing **Sign in with BambooHR again** also replaces the saved sign-in.
 
 If it doesn't work, Settings says why. The link back carries only a short code, such as `declined` or `no_access`.
@@ -70,7 +70,7 @@ DumbSlab still cleans these webhooks up. It doesn't rely on remembering each web
 - Before a save changes anything in BambooHR, DumbSlab keeps the credentials it's about to use and the ones it replaces (encrypted, refresh token included). Removing the sync keeps its credentials too.
 - A cleanup pass lists the webhooks each set of credentials can see, and deletes every one with the workspace's tag that posts to `/hooks/people`, except the live one. Then it forgets those credentials.
 - Passes run after saves, sign-ins and syncs, when Settings › People sync opens, and when a webhook DumbSlab doesn't recognize calls. So an orphaned webhook prompts its own deletion, even after the sync was removed.
-- After a failed pass DumbSlab waits before the next: a minute, then twice as long each time, up to a day. Timeouts, rate limits (429) and BambooHR errors (5xx) never make it give up.
+- After a failed pass DumbSlab waits before the next: a minute, then twice as long each time, up to a day. Timeouts, rate limits (429), BambooHR errors (5xx) and a server missing its BambooHR app for a while never make it give up.
 - It gives up only when the credentials are dead (BambooHR refuses fresh credentials with 401 or 403, or the company is gone; for an old sign-in, BambooHR refuses to renew it twice in a row, since a renewal still under way may hand over new tokens), or after 30 days. Then it says so in the activity log for admins, with the company and the webhook ids it knows, so someone can delete them in BambooHR by hand. It forgets the credentials.
 
 Settings › People sync says when old webhooks are still being cleaned up. After signing in, it says when the webhook it replaced is still to be deleted (the `people_sync_notice=old_webhook` code).

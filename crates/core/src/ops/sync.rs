@@ -223,6 +223,8 @@ fn remove_people_sync(ctx: &mut Ctx, _: NoInput) -> ApiResult<Deferred<PeopleSyn
         return Err(ApiError::conflict(people::RENEWING));
     }
     ctx.db.execute("DELETE FROM people_sync WHERE id = 1", &[])?;
+    // A save that stalled past its lease can't bring the sync back.
+    people::end_saves(ctx.db)?;
     emit(ctx, Event::new("people_sync.removed", "people_sync", "1", "removed the people sync").admin_only())?;
     // Then the host deletes the webhook DumbSlab added in BambooHR, kept as a cleanup record (with
     // the credentials that may delete it) until it's gone. The sync is gone either way.

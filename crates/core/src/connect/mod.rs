@@ -1143,6 +1143,23 @@ impl Job {
         }
     }
 
+    /// The step that just ran wrote nothing but renewed credentials: UPDATEs of rows that already
+    /// existed, setting their sealed tokens, expiry and renewal lease after the app renewed them. It
+    /// inserted nothing and recorded no event, so it can't grow storage meaningfully. And it must not
+    /// be rolled back: the app has already spent the old refresh token, so a rollback would leave
+    /// only a dead one, and the person would have to sign in again. [`guarded_step`] keeps such a
+    /// step even when the host's guard would refuse it (a full workspace).
+    ///
+    /// A job opts in by reading each renewal's answer in a step of its own that writes only that,
+    /// and reporting it here. Connected apps' refreshes ([`save_token`]) and docs sync's GitLab
+    /// tokens could adopt it the same way.
+    pub fn wrote_only_credentials(&self) -> bool {
+        match self {
+            Job::People(j) => j.wrote_only_credentials(),
+            _ => false,
+        }
+    }
+
     /// A request to send when a step failed with `error` and was rolled back (or the host couldn't
     /// run it), for someone waiting elsewhere: a Slack command's answer. Hosts send it once, best
     /// effort. `None` for jobs whose failure answers the request itself.
@@ -1500,7 +1517,9 @@ pub fn guarded_step(
     // Only Slack's jobs have notices; the others needn't be copied.
     let before = matches!(job, Job::Slack(_)).then(|| job.clone());
     let mut result = step(db, cfg, job, replies, now);
+    // A step that only stored renewed credentials is kept: see [`Job::wrote_only_credentials`].
     if result.is_ok()
+        && !job.wrote_only_credentials()
         && let Some(refused) = guard(db)
     {
         result = Err(refused);

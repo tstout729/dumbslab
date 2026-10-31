@@ -38,7 +38,7 @@ pub(crate) use cleanup::{cleanup_job, due as cleanup_due, record_removed, waitin
 pub(crate) use oauth::{API_KEYS_REFUSED, Auth, RENEWING, app as sign_in_app, hosted, renewing, start_sign_in};
 pub use oauth::{CALLBACK_PATH, SCOPES, callback};
 pub use setup::PeopleSyncRemoved;
-pub(crate) use setup::{HOOK_PATH, NOT_DELETED, busy, saving, setup_job, webhook_problem};
+pub(crate) use setup::{HOOK_PATH, NOT_DELETED, busy, end_saves, saving, setup_job, webhook_problem};
 
 pub const PROVIDER: &str = "bamboohr";
 pub(crate) const TABLE: &str = "people_sync";
@@ -169,11 +169,23 @@ struct Run {
     /// Pages this sync may read: one fewer when it renewed the sign-in first.
     max_pages: usize,
     phase: Phase,
+    /// The last step wrote only renewed credentials.
+    rotated: bool,
 }
 
 impl PeopleJob {
     fn new(work: Work) -> PeopleJob {
         PeopleJob { work, effects: vec![], staged: vec![] }
+    }
+
+    /// The step that just ran wrote only renewed credentials (see
+    /// [`crate::connect::Job::wrote_only_credentials`]).
+    pub(crate) fn wrote_only_credentials(&self) -> bool {
+        match &self.work {
+            Work::Sync(r) => r.rotated,
+            Work::Setup(s) => s.rotated(),
+            Work::Cleanup(c) => c.rotated,
+        }
     }
 
     pub(crate) fn take_effects(&mut self) -> Vec<crate::Effect> {
@@ -207,6 +219,7 @@ pub(crate) fn start(db: &dyn Db, cfg: &HostConfig, base_url: &str, now: DateTime
         pages: 0,
         max_pages: MAX_PAGES,
         phase: Phase::Start,
+        rotated: false,
     }))))))
 }
 
@@ -297,6 +310,7 @@ fn sync_step(
     replies: Vec<HttpReply>,
     now: DateTime<Utc>,
 ) -> ApiResult<Step> {
+    j.rotated = false;
     match j.phase.clone() {
         Phase::Start => {
             if j.creds.needs_refresh(now) {
@@ -327,6 +341,8 @@ fn sync_step(
             if let Err(message) = oauth::apply_refresh(db, cfg, &mut j.creds, &j.connection, &lease, &reply, now)? {
                 return fail(db, j, &message, now);
             }
+            // This step stored the renewed tokens and nothing else.
+            j.rotated = true;
             j.phase = Phase::Reading;
             Ok(Step::Fetch(vec![page_call(j, None)]))
         }
