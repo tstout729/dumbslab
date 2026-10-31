@@ -13585,6 +13585,60 @@ mod syncs {
     }
 
     #[test]
+    fn a_pass_that_listed_before_the_hold_ends_lists_again() {
+        let (h, admin, lab, topic) = gitlab_setup();
+        let answer = |c: &HttpCall| lab.answer(c);
+        let slow = |c: &HttpCall| {
+            if c.method == "POST" && c.url.ends_with("/projects/3/hooks") {
+                HttpReply { status: 0, body: String::new() }
+            } else {
+                lab.answer(c)
+            }
+        };
+        let input = json!({ "provider": "gitlab", "gitlab_connection": true, "project_id": 3, "repository": "acme/handbook", "folder": "docs", "topic_id": topic });
+        let add = |reply: &dyn Fn(&HttpCall) -> HttpReply| {
+            drive(&h, job_of(&h.call("POST", "/api/v1/docs-sources", Some(input.clone()), &admin)), reply).0
+        };
+        let records = || count(&h, "SELECT COUNT(*) FROM docs_hook_cleanup");
+        let pass = || background(&h.call("GET", "/api/v1/docs-sources", None, &admin)).remove(0);
+        connect_gitlab(&h, &admin, &lab);
+        assert!(matches!(add(&slow), Finish::Fail(_)));
+        let pending = db_run(&h, |db| db.one("SELECT source_id FROM docs_hook_cleanup", &[])).unwrap().str("source_id");
+        let folder = filled(add(&answer))["source"]["id"].as_str().unwrap().to_string();
+        let r = h.call("DELETE", &format!("/api/v1/docs-sources/{folder}"), None, &admin);
+        filled(drive(&h, background(&r)[0].clone(), &answer).0);
+        assert_eq!(records(), 1);
+
+        // The hold ends a moment from now. A pass asks for the list just before it ends...
+        let soon = dumbslab_core::util::ts(chrono::Utc::now() + chrono::Duration::milliseconds(400));
+        db_run(&h, |db| {
+            db.execute(
+                "UPDATE docs_hook_cleanup SET hold_until = ?, next_attempt_at = '2000-01-01T00:00:00.000Z'",
+                &dumbslab_core::params![soon.clone()],
+            )
+        });
+        let mut job = pass();
+        let Ok(Step::Fetch(calls)) = step_with(&h, &mut job, vec![]).0 else { panic!("a listing") };
+        let listed: Vec<HttpReply> = calls.iter().map(answer).collect();
+        // ...and the add's webhook appears after that listing, while the pass finishes only after
+        // the hold ended. It found nothing, but it keeps the record: what it read was from before.
+        let token = format!("Bearer glo_{}", lab.issued.borrow());
+        let url = format!("https://kb.test/hooks/docs/{pending}");
+        answer(
+            &connect::HttpCall::post_json("https://gitlab.com/api/v4/projects/3/hooks", &json!({ "url": url, "token": "x" }))
+                .header("authorization", token),
+        );
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        let Ok(Step::Done(Finish::Fill(v))) = step_with(&h, &mut job, listed).0 else { panic!("an end") };
+        assert_eq!(v["removed"], 0);
+        assert_eq!(records(), 1, "kept: it listed before the hold ended");
+        // The next pass lists again, now after the hold: it takes the webhook off, and is done.
+        assert_eq!(filled(drive(&h, pass(), &answer).0)["removed"], 1);
+        assert!(lab.hooks.borrow().is_empty());
+        assert_eq!(records(), 0);
+    }
+
+    #[test]
     fn a_refresh_that_lands_late_keeps_its_tokens() {
         let (h, admin, lab, topic) = gitlab_setup();
         let answer = |c: &HttpCall| lab.answer(c);

@@ -1058,9 +1058,17 @@ pub struct Cleanup {
     deleting_extra: Vec<(i64, i64)>,
     /// Not done before then, whatever a pass finds (see `docs_hook_cleanup.hold_until`).
     hold_until: Option<DateTime<Utc>>,
+    /// When this pass asked for the webhooks' list: what it found is as of then, at the earliest.
+    listed_at: Option<DateTime<Utc>>,
 }
 
 impl Cleanup {
+    /// Asks for the webhooks' list (see [`Cleanup::list_calls`]), noting when.
+    fn listing(&mut self, now: DateTime<Utc>) -> Vec<HttpCall> {
+        self.listed_at = Some(now);
+        self.list_calls()
+    }
+
     /// The requests that list the webhooks of its project, then of the others it took over.
     fn list_calls(&self) -> Vec<HttpCall> {
         let mut calls = list_hooks_calls(&self.cred.token, self.project_id);
@@ -1287,6 +1295,7 @@ pub(crate) fn resume_cleanups(db: &dyn Db, cfg: &HostConfig, base_url: &str, now
             extra_projects: vec![],
             deleting_extra: vec![],
             hold_until: r.opt_str("hold_until").as_deref().and_then(parse_ts),
+            listed_at: None,
         };
         match super::open(cfg, &cleanup_owner(&source_id), "gitlab", &r.str("secret")) {
             Ok(cred) => {
@@ -1368,9 +1377,11 @@ fn cleaned(removed: usize) -> ApiResult<Step> {
 }
 
 /// A pass found nothing more to delete: the record is done, unless webhooks of adds it took over
-/// may still appear (`hold_until`). Then it lets go, and the first pass after that decides.
+/// may still appear (`hold_until`) after this pass asked for the list (however late it finishes).
+/// Then it lets go, and the first pass that lists after that decides.
 fn done(db: &dyn Db, c: &Cleanup, removed: usize, now: DateTime<Utc>) -> ApiResult<Step> {
-    match c.hold_until.filter(|until| *until > now) {
+    let listed = c.listed_at.unwrap_or(now);
+    match c.hold_until.filter(|until| *until > listed) {
         Some(until) => db.execute(
             "UPDATE docs_hook_cleanup SET working_until = NULL, known_ids = '', next_attempt_at = ? WHERE source_id = ? AND working_until = ?",
             &params![ts(until), c.source_id.clone(), c.lease.clone()],
@@ -1442,7 +1453,7 @@ fn cleanup_pass(db: &dyn Db, cfg: &HostConfig, j: &mut GitLabJob, replies: &[Htt
                 if !needs_refresh(&cred, expires_at, now) {
                     c.cred.token = cred.token;
                     j.phase = Phase::Working;
-                    return Ok(Step::Fetch(c.list_calls()));
+                    return Ok(Step::Fetch(c.listing(now)));
                 }
                 let spent = cred.refresh_token.clone().unwrap_or_default();
                 if super::docs::renewing(db, &source, &spent, now)? {
@@ -1486,7 +1497,7 @@ fn cleanup_pass(db: &dyn Db, cfg: &HostConfig, j: &mut GitLabJob, replies: &[Htt
                     }
                 }
                 j.phase = Phase::Working;
-                return Ok(Step::Fetch(c.list_calls()));
+                return Ok(Step::Fetch(c.listing(now)));
             }
             if needs_refresh(&c.cred, c.expires_at, now) {
                 let Some(app) = app(cfg) else { return back_off(db, c, "DumbSlab's GitLab app isn't set up on this server.".into(), now) };
@@ -1495,7 +1506,7 @@ fn cleanup_pass(db: &dyn Db, cfg: &HostConfig, j: &mut GitLabJob, replies: &[Htt
                 return Ok(Step::Fetch(vec![refresh_call(app, &c.cred)]));
             }
             j.phase = Phase::Working;
-            Ok(Step::Fetch(c.list_calls()))
+            Ok(Step::Fetch(c.listing(now)))
         }
         // The borrowed folder's renewal: kept in the folder if it still has the spent token; the pass
         // uses the folder's tokens as they are then.
@@ -1515,7 +1526,7 @@ fn cleanup_pass(db: &dyn Db, cfg: &HostConfig, j: &mut GitLabJob, replies: &[Htt
                 return cleaned(0);
             }
             j.phase = Phase::Working;
-            Ok(Step::Fetch(c.list_calls()))
+            Ok(Step::Fetch(c.listing(now)))
         }
         // The approval's renewal: kept in the approval, as any request would (`save_held`); the
         // pass uses the new access token.
@@ -1540,7 +1551,7 @@ fn cleanup_pass(db: &dyn Db, cfg: &HostConfig, j: &mut GitLabJob, replies: &[Htt
                 return cleaned(0);
             }
             j.phase = Phase::Working;
-            Ok(Step::Fetch(c.list_calls()))
+            Ok(Step::Fetch(c.listing(now)))
         }
         Phase::Refreshing => {
             let hash = crate::util::sha256_hex(&c.spent.take().unwrap_or_default());
@@ -1567,7 +1578,7 @@ fn cleanup_pass(db: &dyn Db, cfg: &HostConfig, j: &mut GitLabJob, replies: &[Htt
                         return cleaned(0);
                     }
                     j.phase = Phase::Working;
-                    Ok(Step::Fetch(c.list_calls()))
+                    Ok(Step::Fetch(c.listing(now)))
                 }
                 Err(message) => {
                     if !holds_cleanup(db, c)? {
