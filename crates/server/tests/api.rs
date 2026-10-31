@@ -13520,6 +13520,67 @@ mod syncs {
         let jobs = background(&r);
         assert_eq!(filled(drive(&h, jobs[0].clone(), &answer).0)["removed"], 3);
         assert!(lab.hooks.borrow().is_empty(), "{:?}", lab.hooks.borrow());
+        // Kept until the orphans' grace is over (a webhook they asked for may still appear); then
+        // a pass finds nothing left, and it's done.
+        assert_eq!(records(), 1);
+        db_run(&h, |db| {
+            db.execute(
+                "UPDATE docs_hook_cleanup SET hold_until = '2000-01-01T00:00:00.000Z', next_attempt_at = '2000-01-01T00:00:00.000Z'",
+                &[],
+            )
+        });
+        let jobs = background(&h.call("GET", "/api/v1/docs-sources", None, &admin));
+        assert_eq!(filled(drive(&h, jobs[0].clone(), &answer).0)["removed"], 0);
+        assert_eq!(records(), 0);
+    }
+
+    #[test]
+    fn a_late_webhook_of_an_add_is_still_taken_off_after_its_folder_goes() {
+        let (h, admin, lab, topic) = gitlab_setup();
+        let answer = |c: &HttpCall| lab.answer(c);
+        // The webhook request times out while GitLab is still adding it: no webhook yet.
+        let slow = |c: &HttpCall| {
+            if c.method == "POST" && c.url.ends_with("/projects/3/hooks") {
+                HttpReply { status: 0, body: String::new() }
+            } else {
+                lab.answer(c)
+            }
+        };
+        let input = json!({ "provider": "gitlab", "gitlab_connection": true, "project_id": 3, "repository": "acme/handbook", "folder": "docs", "topic_id": topic });
+        let add = |reply: &dyn Fn(&HttpCall) -> HttpReply| {
+            drive(&h, job_of(&h.call("POST", "/api/v1/docs-sources", Some(input.clone()), &admin)), reply).0
+        };
+        let records = || count(&h, "SELECT COUNT(*) FROM docs_hook_cleanup");
+        connect_gitlab(&h, &admin, &lab);
+        assert!(matches!(add(&slow), Finish::Fail(_)));
+        let pending = db_run(&h, |db| db.one("SELECT source_id FROM docs_hook_cleanup", &[])).unwrap().str("source_id");
+        // The retry succeeds, and the admin removes that folder within the first add's grace. The
+        // removal pass takes the folder's webhook off at once, finds nothing else yet, and keeps the
+        // record until that grace is over.
+        let folder = filled(add(&answer))["source"]["id"].as_str().unwrap().to_string();
+        let r = h.call("DELETE", &format!("/api/v1/docs-sources/{folder}"), None, &admin);
+        assert_eq!(filled(drive(&h, background(&r)[0].clone(), &answer).0)["removed"], 1);
+        assert!(lab.hooks.borrow().is_empty());
+        assert_eq!(records(), 1, "held for the first add's grace");
+        assert!(background(&h.call("GET", "/api/v1/docs-sources", None, &admin)).is_empty(), "not due before then");
+        // GitLab finishes adding the first webhook.
+        let token = format!("Bearer glo_{}", lab.issued.borrow());
+        let url = format!("https://kb.test/hooks/docs/{pending}");
+        answer(
+            &connect::HttpCall::post_json("https://gitlab.com/api/v4/projects/3/hooks", &json!({ "url": url, "token": "x" }))
+                .header("authorization", token),
+        );
+        assert_eq!(lab.hooks.borrow().len(), 1);
+        // Once the grace is over, a pass takes it off, and then the record is done.
+        db_run(&h, |db| {
+            db.execute(
+                "UPDATE docs_hook_cleanup SET hold_until = '2000-01-01T00:00:00.000Z', next_attempt_at = '2000-01-01T00:00:00.000Z'",
+                &[],
+            )
+        });
+        let jobs = background(&h.call("GET", "/api/v1/docs-sources", None, &admin));
+        assert_eq!(filled(drive(&h, jobs[0].clone(), &answer).0)["removed"], 1);
+        assert!(lab.hooks.borrow().is_empty());
         assert_eq!(records(), 0);
     }
 

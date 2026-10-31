@@ -39,5 +39,9 @@ CREATE TABLE IF NOT EXISTS docs_hook_cleanup (
   -- When that approval moved onto a folder (another try at adding one, or a reconnect), that folder:
   -- a pass holds it like a sync does and uses (and, the folder's way, renews) its tokens instead.
   borrowed_source TEXT,
+  -- A removed folder's record that took over records of adds still in their grace (see
+  -- `sync::gitlab_app::record_cleanup`): a webhook one of those asked for may still appear until
+  -- then, so a pass doesn't drop the record before it, even when it finds nothing left.
+  hold_until TEXT,
   created_at TEXT NOT NULL
 );

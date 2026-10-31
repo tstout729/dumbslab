@@ -1056,6 +1056,8 @@ pub struct Cleanup {
     extra_projects: Vec<i64>,
     /// The webhooks on those projects this pass is deleting: (project, webhook).
     deleting_extra: Vec<(i64, i64)>,
+    /// Not done before then, whatever a pass finds (see `docs_hook_cleanup.hold_until`).
+    hold_until: Option<DateTime<Utc>>,
 }
 
 impl Cleanup {
@@ -1204,11 +1206,15 @@ pub(crate) fn record_cleanup(
     // folder that's gone. (One whose tokens can't be read stays, and falls back to the admin's
     // approval.)
     let mut extra: BTreeSet<i64> = BTreeSet::new();
-    for d in ctx
-        .db
-        .query("SELECT source_id, project_id, secret FROM docs_hook_cleanup WHERE borrowed_source = ?", &params![source.id.clone()])?
-    {
+    // Their grace too: a webhook one of those adds asked for may still appear until then.
+    let mut hold: Option<DateTime<Utc>> = None;
+    for d in ctx.db.query(
+        "SELECT source_id, project_id, secret, created_at FROM docs_hook_cleanup WHERE borrowed_source = ?",
+        &params![source.id.clone()],
+    )? {
         let Ok(theirs) = super::open(ctx.cfg, &cleanup_owner(&d.str("source_id")), "gitlab", &d.str("secret")) else { continue };
+        let grace = parse_ts(&d.str("created_at")).map(|at| at + Duration::seconds(PENDING_GRACE_SECS));
+        hold = hold.max(grace.filter(|g| *g > ctx.now));
         addresses.extend(hook_addresses(&theirs, None).into_iter().filter(|a| !addresses.contains(a)).collect::<Vec<_>>());
         if d.i64("project_id") != project_id {
             extra.insert(d.i64("project_id"));
@@ -1222,11 +1228,12 @@ pub(crate) fn record_cleanup(
     let secret = super::seal(ctx.cfg, &cleanup_owner(&source.id), "gitlab", &cred)?;
     // (A record left from adding it, if any, gives way to this one: these are the folder's own.)
     ctx.db.execute(
-        "INSERT INTO docs_hook_cleanup (source_id, project_id, repo, known_ids, secret, expires_at, refresh_hash, removed_by, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        "INSERT INTO docs_hook_cleanup (source_id, project_id, repo, known_ids, secret, expires_at, refresh_hash, removed_by, hold_until, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(source_id) DO UPDATE SET project_id = excluded.project_id, repo = excluded.repo, known_ids = excluded.known_ids,
            secret = excluded.secret, expires_at = excluded.expires_at, refresh_hash = excluded.refresh_hash, refused = 0, failures = 0,
-           next_attempt_at = NULL, removed_by = excluded.removed_by, borrowed_from = NULL, created_at = excluded.created_at",
+           next_attempt_at = NULL, removed_by = excluded.removed_by, borrowed_from = NULL, hold_until = excluded.hold_until,
+           created_at = excluded.created_at",
         &params![
             source.id.clone(),
             project_id,
@@ -1236,6 +1243,7 @@ pub(crate) fn record_cleanup(
             expires_at,
             cred.refresh_token.as_deref().map(crate::util::sha256_hex),
             ctx.actor.user_id.clone(),
+            hold.map(ts),
             ctx.now_s()
         ],
     )?;
@@ -1278,6 +1286,7 @@ pub(crate) fn resume_cleanups(db: &dyn Db, cfg: &HostConfig, base_url: &str, now
             source_lease: None,
             extra_projects: vec![],
             deleting_extra: vec![],
+            hold_until: r.opt_str("hold_until").as_deref().and_then(parse_ts),
         };
         match super::open(cfg, &cleanup_owner(&source_id), "gitlab", &r.str("secret")) {
             Ok(cred) => {
@@ -1356,6 +1365,22 @@ fn back_off(db: &dyn Db, c: &Cleanup, message: String, now: DateTime<Utc>) -> Ap
 
 fn cleaned(removed: usize) -> ApiResult<Step> {
     Ok(Step::Done(Finish::Fill(json!({ "ok": true, "removed": removed }))))
+}
+
+/// A pass found nothing more to delete: the record is done, unless webhooks of adds it took over
+/// may still appear (`hold_until`). Then it lets go, and the first pass after that decides.
+fn done(db: &dyn Db, c: &Cleanup, removed: usize, now: DateTime<Utc>) -> ApiResult<Step> {
+    match c.hold_until.filter(|until| *until > now) {
+        Some(until) => db.execute(
+            "UPDATE docs_hook_cleanup SET working_until = NULL, known_ids = '', next_attempt_at = ? WHERE source_id = ? AND working_until = ?",
+            &params![ts(until), c.source_id.clone(), c.lease.clone()],
+        )?,
+        None => db.execute(
+            "DELETE FROM docs_hook_cleanup WHERE source_id = ? AND working_until = ?",
+            &params![c.source_id.clone(), c.lease.clone()],
+        )?,
+    };
+    cleaned(removed)
 }
 
 /// Runs a cleanup pass's next step (see [`Cleanup`]). A pass that's done lets go of the approval or
@@ -1600,11 +1625,7 @@ fn cleanup_pass(db: &dyn Db, cfg: &HostConfig, j: &mut GitLabJob, replies: &[Htt
                 }
             }
             if ids.is_empty() && extra.is_empty() {
-                db.execute(
-                    "DELETE FROM docs_hook_cleanup WHERE source_id = ? AND working_until = ?",
-                    &params![c.source_id.clone(), c.lease.clone()],
-                )?;
-                return cleaned(0);
+                return done(db, c, 0, now);
             }
             c.deleting = ids;
             c.deleting_extra = extra;
@@ -1621,11 +1642,7 @@ fn cleanup_pass(db: &dyn Db, cfg: &HostConfig, j: &mut GitLabJob, replies: &[Htt
             let left: Vec<(i64, u16)> = deleting.iter().map(|id| (*id, statuses.next().unwrap_or(0))).filter(|(_, s)| failed(s)).collect();
             let left_extra: Vec<u16> = extra.iter().map(|_| statuses.next().unwrap_or(0)).filter(failed).collect();
             if left.is_empty() && left_extra.is_empty() {
-                db.execute(
-                    "DELETE FROM docs_hook_cleanup WHERE source_id = ? AND working_until = ?",
-                    &params![c.source_id.clone(), c.lease.clone()],
-                )?;
-                return cleaned(deleting.len() + extra.len());
+                return done(db, c, deleting.len() + extra.len(), now);
             }
             c.known = left.iter().map(|(id, _)| *id).collect();
             if left.iter().map(|(_, s)| s).chain(&left_extra).any(|s| matches!(s, 401 | 403)) {
