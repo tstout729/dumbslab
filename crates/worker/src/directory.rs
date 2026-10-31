@@ -255,13 +255,14 @@ impl DurableObject for Directory {
                 self.run(move |db| {
                     let input = input?;
                     let home = input.home.ok_or_else(|| ApiError::bad_request("send the workspace's home"))?;
-                    tenancy::release_slack_team(db, &input.team_id, &home, input.install_id.as_deref()).map(|_| json!({ "ok": true }))
+                    let id = input.install_id.unwrap_or_default();
+                    tenancy::release_slack_team(db, &input.team_id, &home, &id).map(|_| json!({ "ok": true }))
                 })?
             }
             (Method::Post, "/slack/lookup") => {
                 let input: ApiResult<SlackTeamInput> = parse(&body);
                 self.run(move |db| match tenancy::slack_team_home(db, &input?.team_id)? {
-                    Some((home, address)) => Ok(json!({ "home": home, "address": address })),
+                    Some((home, address, install_id)) => Ok(json!({ "home": home, "address": address, "install_id": install_id })),
                     None => Err(ApiError::not_found("a workspace for that Slack workspace")),
                 })?
             }

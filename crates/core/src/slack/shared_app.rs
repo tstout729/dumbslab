@@ -400,13 +400,13 @@ fn test_call(token: &str) -> HttpCall {
 }
 
 /// A call to hosted DumbSlab's directory (see [`DIRECTORY`]).
-fn directory_call(path: &str, team_id: &str, home: &str, install_id: Option<&str>) -> HttpCall {
+pub(super) fn directory_call(path: &str, team_id: &str, home: &str, install_id: Option<&str>) -> HttpCall {
     HttpCall::post_json(format!("{DIRECTORY}{path}"), &json!({ "team_id": team_id, "home": home, "install_id": install_id }))
 }
 
 /// The directory said a claim isn't this install's (any more): 409, or 404 when the workspace
 /// itself is gone.
-fn refused_claim(reply: &HttpReply) -> bool {
+pub(super) fn refused_claim(reply: &HttpReply) -> bool {
     matches!(reply.status, 404 | 409)
 }
 
@@ -442,10 +442,12 @@ fn unlock(db: &dyn Db, job: &SlackJob) -> ApiResult<()> {
 // ---------------------------------------------------------------------------
 // Saving
 
-/// Saves what Add to Slack gave, as the admin who did it, replacing whatever app was connected;
-/// another Slack workspace's channels go with it. Off hosted DumbSlab it's confirmed at once;
-/// hosted, it acts on nothing until the directory confirms its claim. Returns the previous Add to
-/// Slack install's Slack workspace and id, when it was another one: its claim is let go of.
+/// Saves what Add to Slack gave, as the admin who did it. Adding the Slack workspace this
+/// workspace's install holds already updates that install in place (its id, claim and channels
+/// stay). Anything else replaces whatever app was connected, and another Slack workspace's channels
+/// go with it. Off hosted DumbSlab it's confirmed at once; hosted, it acts on nothing until the
+/// directory confirms its claim. Returns the previous Add to Slack install's Slack workspace and
+/// id, when it was another one: that claim waits in `slack_releases` to be let go of.
 fn save_install(
     db: &dyn Db,
     cfg: &HostConfig,
@@ -454,16 +456,34 @@ fn save_install(
     now: DateTime<Utc>,
 ) -> ApiResult<Option<(String, String)>> {
     let old = load(db, cfg)?;
+    let admin = match &job.work {
+        Work::Install { admin, .. } => admin.clone(),
+        _ => String::new(),
+    };
+    let confirmed = home(cfg).is_none();
+    if job.in_place {
+        db.execute(
+            "UPDATE slack_app SET bot_token = ?, team_name = ?, bot_user_id = ?, scopes = ?, confirmed = ?, updated_by = ?, updated_at = ?
+             WHERE id = 1 AND shared = 1 AND install_id = ?",
+            &params![
+                seal(cfg, BOT_TOKEN, &inst.token)?,
+                inst.team_name.clone(),
+                Some(inst.bot_user_id.clone()).filter(|b| !b.is_empty()),
+                inst.scopes.join(","),
+                confirmed,
+                admin,
+                ts(now),
+                job.install_id.clone()
+            ],
+        )?;
+        return Ok(None);
+    }
     let moved_on = old.as_ref().and_then(|a| a.team_id.as_deref()).is_some_and(|t| t != inst.team_id);
     db.execute("INSERT INTO slack_app (id, updated_at) VALUES (1, ?) ON CONFLICT(id) DO NOTHING", &params![ts(now)])?;
     if moved_on {
         // Channel IDs belong to one Slack workspace.
         db.execute("DELETE FROM slack_channels", &[])?;
     }
-    let admin = match &job.work {
-        Work::Install { admin, .. } => admin.clone(),
-        _ => String::new(),
-    };
     db.execute(
         "UPDATE slack_app SET bot_token = ?, signing_secret = NULL, team_id = ?, team_name = ?, bot_user_id = ?, scopes = ?, shared = 1,
            install_id = ?, confirmed = ?, updated_by = ?, updated_at = ? WHERE id = 1",
@@ -474,12 +494,22 @@ fn save_install(
             Some(inst.bot_user_id.clone()).filter(|b| !b.is_empty()),
             inst.scopes.join(","),
             job.install_id.clone(),
-            home(cfg).is_none(),
+            confirmed,
             admin,
             ts(now)
         ],
     )?;
-    Ok(old.filter(|a| a.shared && moved_on).and_then(|a| Some((a.team_id?, a.install_id?))))
+    // The previous install, for another Slack workspace: nothing acts on it from now on, and its
+    // claim is let go of, by its id.
+    let previous =
+        old.filter(|a| a.shared && a.team_id.as_deref() != Some(inst.team_id.as_str())).and_then(|a| Some((a.team_id?, a.install_id?)));
+    match previous {
+        Some((team, id)) if home(cfg).is_some() => {
+            queue_release(db, &team, &id, now)?;
+            Ok(Some((team, id)))
+        }
+        _ => Ok(None),
+    }
 }
 
 /// Records that Slack is connected, as `actor`.
@@ -497,9 +527,12 @@ fn record_install(db: &dyn Db, cfg: &HostConfig, job: &mut SlackJob, app: &App, 
 }
 
 /// The directory confirmed install `install_id`: it may act on Slack now. `false` when that
-/// install isn't the one saved any more.
+/// install isn't the one saved any more, or was confirmed already.
 fn mark_confirmed(db: &dyn Db, cfg: &HostConfig, job: &mut SlackJob, install_id: &str, now: DateTime<Utc>) -> ApiResult<bool> {
-    let n = db.execute("UPDATE slack_app SET confirmed = 1 WHERE id = 1 AND shared = 1 AND install_id = ?", &params![install_id])?;
+    let n = db.execute(
+        "UPDATE slack_app SET confirmed = 1 WHERE id = 1 AND shared = 1 AND install_id = ? AND confirmed = 0",
+        &params![install_id],
+    )?;
     if n == 0 {
         return Ok(false);
     }
@@ -516,7 +549,7 @@ fn mark_confirmed(db: &dyn Db, cfg: &HostConfig, job: &mut SlackJob, install_id:
 
 /// Forgets install `install_id` (and the channels), if it's still the one saved: its claim isn't
 /// its own any more. `false` when another install replaced it meanwhile.
-fn forget_install(db: &dyn Db, install_id: &str) -> ApiResult<bool> {
+pub(super) fn forget_install(db: &dyn Db, install_id: &str) -> ApiResult<bool> {
     let n = db.execute("DELETE FROM slack_app WHERE id = 1 AND shared = 1 AND install_id = ?", &params![install_id])?;
     if n > 0 {
         db.execute("DELETE FROM slack_channels", &[])?;
@@ -524,9 +557,32 @@ fn forget_install(db: &dyn Db, install_id: &str) -> ApiResult<bool> {
     Ok(n > 0)
 }
 
-/// A job that lets go of a claim (see [`Work::Release`]).
-pub(crate) fn release_job(base_url: &str, team_id: &str, install_id: Option<String>) -> SlackJob {
-    SlackJob::new(base_url, Work::Release { team_id: team_id.to_string(), install_id })
+/// Hosted: a claim to let go of, by its exact install, until the directory has.
+pub(crate) fn queue_release(db: &dyn Db, team_id: &str, install_id: &str, now: DateTime<Utc>) -> ApiResult<()> {
+    db.execute(
+        "INSERT INTO slack_releases (team_id, install_id, created_at) VALUES (?, ?, ?) ON CONFLICT(team_id, install_id) DO NOTHING",
+        &params![team_id, install_id, ts(now)],
+    )?;
+    Ok(())
+}
+
+/// The claims waiting to be let go of: (Slack workspace, install).
+pub(crate) fn queued_releases(db: &dyn Db) -> ApiResult<Vec<(String, String)>> {
+    Ok(db
+        .query("SELECT team_id, install_id FROM slack_releases ORDER BY created_at", &[])?
+        .iter()
+        .map(|r| (r.str("team_id"), r.str("install_id")))
+        .collect())
+}
+
+fn released(db: &dyn Db, team_id: &str, install_id: &str) -> ApiResult<()> {
+    db.execute("DELETE FROM slack_releases WHERE team_id = ? AND install_id = ?", &params![team_id, install_id])?;
+    Ok(())
+}
+
+/// A job that lets go of a claim, by its exact install (see [`Work::Release`]).
+pub(crate) fn release_job(base_url: &str, team_id: &str, install_id: &str) -> SlackJob {
+    SlackJob::new(base_url, Work::Release { team_id: team_id.to_string(), install_id: install_id.to_string() })
 }
 
 /// The Slack workspace a request from Slack is for: a command's `team_id`; for an event, the
@@ -547,9 +603,14 @@ pub fn team_of(path: &str, body: &[u8]) -> Option<String> {
     Some(team.trim().to_string()).filter(|t| valid_id(t))
 }
 
-/// With the shared app, whether a request is for the Slack workspace this workspace holds. Only
-/// Slack's own URL and certificate checks may name none.
-pub(super) fn ours(app: &App, path: &str, body: &[u8]) -> bool {
+/// With the shared app, whether a request is for the install this workspace holds: its Slack
+/// workspace and, hosted, the install whose claim the root routed it by. Only Slack's own URL and
+/// certificate checks may name no Slack workspace.
+pub(super) fn ours(app: &App, path: &str, body: &[u8], routed: Option<&str>) -> bool {
+    // Routed by another install's claim (an earlier one of this workspace's): not this install's.
+    if routed.is_some_and(|r| app.install_id.as_deref() != Some(r)) {
+        return false;
+    }
     match team_of(path, body) {
         Some(team) => app.team_id.as_deref() == Some(team.as_str()),
         None if path == COMMANDS_PATH => form(body).get("ssl_check").map(|v| v.trim()) == Some("1"),
@@ -626,15 +687,15 @@ fn still_admin(db: &dyn Db, user_id: &str, via: Via) -> ApiResult<Option<Actor>>
 }
 
 /// The directory call that undoes an install's claim: its own, by its id. Nothing is ever put
-/// back: an install either confirms its claim or lets go of it. `None` before it claimed anything,
-/// and off hosted DumbSlab.
+/// back. `None` before it claimed anything, for an install updated in place (its claim was there
+/// before it), and off hosted DumbSlab.
 pub(super) fn undo_claim(job: &SlackJob) -> Option<HttpCall> {
     let (Work::Install { home: Some(home), .. }, Some(inst), Some(id)) = (&job.work, &job.installed, &job.install_id) else { return None };
-    Some(directory_call("/slack/release", &inst.team_id, home, Some(id)))
+    (!job.in_place).then(|| directory_call("/slack/release", &inst.team_id, home, Some(id)))
 }
 
-/// Lets go of the install's claim, then sends the admin to Settings with `error`. The lock goes
-/// once the directory has answered.
+/// Lets go of the install's claim (if it's its own), then sends the admin to Settings with
+/// `error`. The lock goes too.
 fn undo(db: &dyn Db, job: &mut SlackJob, error: InstallError) -> ApiResult<Step> {
     let base = job.base_url.clone();
     let Some(call) = undo_claim(job) else {
@@ -646,10 +707,18 @@ fn undo(db: &dyn Db, job: &mut SlackJob, error: InstallError) -> ApiResult<Step>
     Ok(Step::Fetch(vec![call]))
 }
 
-/// Runs Add to Slack's job, and the ones that let go of a claim, confirm one, and check a token
-/// Slack says was revoked (see [`super::step`]).
-pub(super) fn step(db: &dyn Db, cfg: &HostConfig, job: &mut SlackJob, app: &App, answer: HttpReply, now: DateTime<Utc>) -> ApiResult<Step> {
+/// Runs Add to Slack's job, and the ones that let go of a claim, confirm one, check a token Slack
+/// says was revoked, and send channel messages (see [`super::step`]).
+pub(super) fn step(
+    db: &dyn Db,
+    cfg: &HostConfig,
+    job: &mut SlackJob,
+    app: &App,
+    replies: &[HttpReply],
+    now: DateTime<Utc>,
+) -> ApiResult<Step> {
     let ok = || fill(json!({ "ok": true }));
+    let answer = replies.first().cloned().unwrap_or_default();
     match (job.phase, job.work.clone()) {
         // Add to Slack: exchange the code; hosted, claim the Slack workspace, save, confirm.
         (Phase::Start, Work::Install { code, redirect_uri, .. }) => {
@@ -674,7 +743,11 @@ pub(super) fn step(db: &dyn Db, cfg: &HostConfig, job: &mut SlackJob, app: &App,
             };
             // The admin may have lost the role while Slack answered.
             let Some(actor) = still_admin(db, &admin, via)? else { return to_settings(&base, Err(InstallError::NotAdmin)) };
-            let install_id = crate::util::new_id();
+            // Adding the Slack workspace this workspace's install holds: Slack gave the same token,
+            // so it's that install, updated in place (if the directory still says it's its claim).
+            let held = app.install_id.clone().filter(|_| app.shared && app.team_id.as_deref() == Some(inst.team_id.as_str()));
+            job.in_place = held.is_some();
+            let install_id = held.unwrap_or_else(crate::util::new_id);
             job.install_id = Some(install_id.clone());
             let Some(home) = home else {
                 save_install(db, cfg, job, &inst, now)?;
@@ -688,7 +761,8 @@ pub(super) fn step(db: &dyn Db, cfg: &HostConfig, job: &mut SlackJob, app: &App,
                 return to_settings(&base, Err(InstallError::Busy));
             }
             // One Slack workspace belongs to one DumbSlab workspace: the directory says whether this
-            // one may have it, provisionally until the install is saved and confirms it.
+            // one may have it, provisionally until the install is saved and confirms it. Claiming
+            // again for an install that holds it changes nothing.
             let call = directory_call("/slack/claim", &inst.team_id, &home, Some(&install_id));
             job.installed = Some(inst);
             job.phase = Phase::Claiming;
@@ -702,12 +776,16 @@ pub(super) fn step(db: &dyn Db, cfg: &HostConfig, job: &mut SlackJob, app: &App,
             };
             match answer.status {
                 200 => {}
-                // Nothing was claimed. That Slack workspace is the other DumbSlab workspace's.
+                // Another DumbSlab workspace has that Slack workspace. Updating in place, this
+                // workspace's install has lost its claim: it acts on that Slack workspace no more.
                 409 => {
+                    if job.in_place {
+                        forget_install(db, &install_id)?;
+                    }
                     unlock(db, job)?;
                     return to_settings(&base, Err(InstallError::TeamTaken));
                 }
-                // The claim may or may not have been made: let go of it.
+                // The claim may or may not have been made: let go of it (if it's this install's own).
                 _ => return undo(db, job, InstallError::Failed),
             }
             if still_admin(db, &admin, via)?.is_none() {
@@ -718,27 +796,35 @@ pub(super) fn step(db: &dyn Db, cfg: &HostConfig, job: &mut SlackJob, app: &App,
                 return undo(db, job, InstallError::Busy);
             }
             // A failure from here to the save (refused, rolled back) lets go of the claim too: see
-            // `failure_notice`. Saved, it acts on nothing until the directory confirms it.
-            if let Some((team, previous)) = save_install(db, cfg, job, &inst, now)? {
-                job.effects.push(Effect::Background(connect::Job::Slack(release_job(&base, &team, Some(previous)))));
+            // `failure_notice`. Saved, it acts on nothing until the directory confirms it. The
+            // previous Slack workspace, which nothing acts on any more, is let go of meanwhile.
+            let previous = save_install(db, cfg, job, &inst, now)?;
+            let mut calls = vec![directory_call("/slack/confirm", &inst.team_id, &home, Some(&install_id))];
+            if let Some((team, id)) = &previous {
+                calls.push(directory_call("/slack/release", team, &home, Some(id)));
             }
+            job.releasing = previous;
             job.phase = Phase::Confirming;
-            Ok(Step::Fetch(vec![directory_call("/slack/confirm", &inst.team_id, &home, Some(&install_id))]))
+            Ok(Step::Fetch(calls))
         }
         (Phase::Confirming, Work::Install { .. }) => {
             let base = job.base_url.clone();
-            let (Some(inst), Some(install_id)) = (job.installed.clone(), job.install_id.clone()) else {
-                unlock(db, job)?;
+            unlock(db, job)?;
+            // The previous Slack workspace's claim, let go of alongside: done, unless the directory
+            // didn't answer (then it's let go of later, from `slack_releases`).
+            if let (Some(release), Some((team, id))) = (replies.get(1), job.releasing.take())
+                && release.status == 200
+            {
+                released(db, &team, &id)?;
+            }
+            let (Some(_), Some(install_id)) = (job.installed.clone(), job.install_id.clone()) else {
                 return to_settings(&base, Err(InstallError::Failed));
             };
-            unlock(db, job)?;
             if answer.status == 200 {
-                if mark_confirmed(db, cfg, job, &install_id, now)? {
-                    return to_settings(&base, Ok(()));
-                }
-                // Replaced meanwhile (a disconnect, say): the claim it just confirmed isn't used.
-                job.effects.push(Effect::Background(connect::Job::Slack(release_job(&base, &inst.team_id, Some(install_id)))));
-                return to_settings(&base, Err(InstallError::Failed));
+                // Replaced meanwhile (a disconnect, say): someone else lets go of its claim.
+                mark_confirmed(db, cfg, job, &install_id, now)?;
+                let still = load(db, cfg)?.is_some_and(|a| a.install_id.as_deref() == Some(install_id.as_str()));
+                return to_settings(&base, if still { Ok(()) } else { Err(InstallError::Failed) });
             }
             if refused_claim(&answer) {
                 // The claim ran out and another workspace took it, or this one was deleted: this
@@ -756,22 +842,26 @@ pub(super) fn step(db: &dyn Db, cfg: &HostConfig, job: &mut SlackJob, app: &App,
             Ok(Step::Done(Finish::Redirect(then)))
         }
 
-        // Let go of a claim. Nothing is revoked first: Slack gives every install of the shared
-        // app into a Slack workspace the same token, so a revoke could reach the next owner's.
-        (Phase::Start, Work::Release { team_id, install_id }) => {
-            // Without an id: only a Slack workspace this workspace doesn't hold (again).
-            let holds = app.shared && app.team_id.as_deref() == Some(team_id.as_str());
-            match home(cfg) {
-                Some(home) if install_id.is_some() || !holds => {
-                    job.phase = Phase::Releasing;
-                    Ok(Step::Fetch(vec![directory_call("/slack/release", &team_id, home, install_id.as_deref())]))
-                }
-                _ => ok(),
+        // Let go of a claim, by its exact install. Nothing is revoked: Slack gives every install
+        // of the shared app into a Slack workspace the same token, so a revoke could reach the
+        // next owner's.
+        (Phase::Start, Work::Release { team_id, install_id }) => match home(cfg) {
+            Some(home) => {
+                job.phase = Phase::Releasing;
+                Ok(Step::Fetch(vec![directory_call("/slack/release", &team_id, home, Some(&install_id))]))
             }
+            None => ok(),
+        },
+        (Phase::Releasing, Work::Release { team_id, install_id }) => {
+            if answer.status == 200 {
+                released(db, &team_id, &install_id)?;
+            }
+            ok()
         }
         (Phase::Releasing, _) => ok(),
 
-        // Confirm a saved install whose confirmation never ran.
+        // Confirm a saved install whose confirmation never ran. Confirming a confirmed claim
+        // again changes nothing.
         (Phase::Start, Work::Confirm { install_id }) => {
             let (Some(team), Some(home)) = (app.team_id.clone(), home(cfg)) else { return ok() };
             if !app.confirming() || app.install_id.as_deref() != Some(install_id.as_str()) {
@@ -788,6 +878,33 @@ pub(super) fn step(db: &dyn Db, cfg: &HostConfig, job: &mut SlackJob, app: &App,
             }
             ok()
         }
+
+        // Channel messages: only once the directory confirms, now, that this install holds the
+        // Slack workspace.
+        (Phase::Start, Work::Post { team_id, install_id, .. }) => {
+            let Some(home) = home(cfg) else { return ok() };
+            if app.install_id.as_deref() != Some(install_id.as_str()) || app.bot_token.is_none() {
+                return ok();
+            }
+            job.phase = Phase::Confirming;
+            Ok(Step::Fetch(vec![directory_call("/slack/confirm", &team_id, home, Some(&install_id))]))
+        }
+        (Phase::Confirming, Work::Post { install_id, messages, .. }) => {
+            if refused_claim(&answer) {
+                forget_install(db, &install_id)?;
+                return ok();
+            }
+            if answer.status != 200 || app.install_id.as_deref() != Some(install_id.as_str()) || app.bot_token.is_none() {
+                return ok();
+            }
+            let calls = messages
+                .iter()
+                .map(|d| HttpCall { method: "POST", url: d.url.clone(), headers: d.headers.clone(), body: Some(d.body.clone()) })
+                .collect();
+            job.phase = Phase::Posting;
+            Ok(Step::Fetch(calls))
+        }
+        (Phase::Posting, Work::Post { .. }) => ok(),
 
         // Slack says the shared app was removed, or its token revoked: believe the token, not the
         // event's time, and change only the install the event arrived for.
@@ -823,6 +940,8 @@ pub(super) fn step(db: &dyn Db, cfg: &HostConfig, job: &mut SlackJob, app: &App,
                 job.effects.extend(std::mem::take(&mut ctx.effects));
                 match (home(cfg), team) {
                     (Some(home), Some(team)) => {
+                        queue_release(db, &team, &install_id, now)?;
+                        job.work = Work::Release { team_id: team.clone(), install_id: install_id.clone() };
                         job.phase = Phase::Releasing;
                         Ok(Step::Fetch(vec![directory_call("/slack/release", &team, home, Some(&install_id))]))
                     }
@@ -852,11 +971,13 @@ fn slack_actor() -> Actor {
     }
 }
 
-/// A request signed with the shared app's secret for a Slack workspace this workspace doesn't hold:
-/// the directory's claim still points here (letting go of it failed after a disconnect). A command
-/// says how to connect, everything is acknowledged, and a hosted workspace lets go of the claim, so
-/// the root stops sending its requests here.
-pub(super) fn stray(cfg: &HostConfig, base: &str, path: &str, body: &[u8]) -> ApiResult<Outcome> {
+/// A request signed with the shared app's secret for an install this workspace doesn't hold: the
+/// directory's claim still points here (letting go of it failed after a disconnect, or a job died
+/// after switching Slack workspaces). A command says how to connect, everything is acknowledged,
+/// and a hosted workspace lets go of exactly the claim the root routed it by, so the root stops
+/// sending its requests here. A newer claim of this workspace's, on the same Slack workspace, has
+/// another install id and stays.
+pub(super) fn stray(cfg: &HostConfig, base: &str, path: &str, body: &[u8], routed: Option<&str>) -> ApiResult<Outcome> {
     let mut response = Response::json(200, &json!({ "ok": true }));
     if path == COMMANDS_PATH {
         if form(body).get("ssl_check").map(|v| v.trim()) == Some("1") {
@@ -868,8 +989,8 @@ pub(super) fn stray(cfg: &HostConfig, base: &str, path: &str, body: &[u8]) -> Ap
     {
         return Ok(reply(json!({ "challenge": v["challenge"].as_str().unwrap_or_default() })));
     }
-    match (team_of(path, body), home(cfg)) {
-        (Some(team), Some(_)) => Ok(later(response, release_job(base, &team, None))),
+    match (team_of(path, body), routed, home(cfg)) {
+        (Some(team), Some(install), Some(_)) => Ok(later(response, release_job(base, &team, install))),
         _ => Ok(crate::http::done(response)),
     }
 }

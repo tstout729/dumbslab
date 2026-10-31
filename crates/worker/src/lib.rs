@@ -159,13 +159,26 @@ async fn forward(env: &Env, object: &str, mut req: Request, workspace: Option<&s
 
 /// One request to a workspace object. `route` is (requested address, the workspace's home address).
 async fn send(env: &Env, object: &str, req: &Request, body: Option<&[u8]>, route: Option<(&str, &str)>) -> Result<Response> {
-    send_to(env, object, req.url()?.as_str(), req, body, route).await
+    send_to(env, object, req.url()?.as_str(), req, body, route, None).await
 }
 
-/// [`send`], at another URL.
-async fn send_to(env: &Env, object: &str, url: &str, req: &Request, body: Option<&[u8]>, route: Option<(&str, &str)>) -> Result<Response> {
+/// [`send`], at another URL, and for Slack's requests naming the install whose claim routed them.
+async fn send_to(
+    env: &Env,
+    object: &str,
+    url: &str,
+    req: &Request,
+    body: Option<&[u8]>,
+    route: Option<(&str, &str)>,
+    slack_install: Option<&str>,
+) -> Result<Response> {
     let stub = env.durable_object("WORKSPACE")?.id_from_name(object)?.get_stub()?;
     let headers = req.headers().clone();
+    // Only this Worker may say which install a Slack request was routed by.
+    headers.delete(slack::INSTALL_HEADER)?;
+    if let Some(install) = slack_install {
+        headers.set(slack::INSTALL_HEADER, install)?;
+    }
     // Only this Worker may say which workspace a request is for.
     match route {
         Some((slug, home)) => {
@@ -270,13 +283,16 @@ async fn slack_root(mut req: Request, env: &Env, root: &str, path: &str) -> Resu
     };
     let (status, found) =
         call_object(env, "DIRECTORY", "directory", Method::Post, "/slack/lookup", Some(&json!({ "team_id": team }))).await?;
-    let (Some(home), Some(address)) = (found["home"].as_str().filter(|_| status == 200), found["address"].as_str()) else {
+    let (Some(home), Some(address), Some(install)) =
+        (found["home"].as_str().filter(|_| status == 200), found["address"].as_str(), found["install_id"].as_str())
+    else {
         return workspace::to_response(slack::unknown_team(path));
     };
-    // At the workspace's own address, so its links and replies name it.
+    // At the workspace's own address, so its links and replies name it, and naming the install
+    // the claim belongs to, so the workspace can let go of exactly that claim if it isn't its own.
     let mut url = req.url()?;
     url.set_host(Some(&format!("{address}.{root}"))).map_err(|e| worker::Error::RustError(e.to_string()))?;
-    send_to(env, &format!("ws:{home}"), url.as_str(), &req, Some(&body), Some((address, home))).await
+    send_to(env, &format!("ws:{home}"), url.as_str(), &req, Some(&body), Some((address, home)), Some(install)).await
 }
 
 /// A plain-text file for crawlers and agents. It changes only when the Worker deploys.

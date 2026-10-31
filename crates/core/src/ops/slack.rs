@@ -169,12 +169,17 @@ pub(crate) fn settings_view(ctx: &Ctx) -> ApiResult<SlackSettings> {
 
 fn get_slack(ctx: &mut Ctx, _: NoInput) -> ApiResult<SlackSettings> {
     let view = settings_view(ctx)?;
-    // An Add to Slack whose confirmation never ran (its job died): try again, after the answer.
-    if view.confirming
-        && ctx.cfg.hosting.is_some()
-        && let Some(id) = slack::load(ctx.db, ctx.cfg)?.and_then(|a| a.install_id)
-    {
-        ctx.effects.push(Effect::Background(crate::connect::Job::Slack(SlackJob::confirm(&ctx.base_url, &id))));
+    if ctx.cfg.hosting.is_some() {
+        // An Add to Slack whose confirmation never ran (its job died): try again, after the answer.
+        if view.confirming
+            && let Some(id) = slack::load(ctx.db, ctx.cfg)?.and_then(|a| a.install_id)
+        {
+            ctx.effects.push(Effect::Background(crate::connect::Job::Slack(SlackJob::confirm(&ctx.base_url, &id))));
+        }
+        // Claims a disconnect or a switch didn't finish letting go of, each by its exact install.
+        for (team, id) in slack::queued_releases(ctx.db)? {
+            ctx.effects.push(Effect::Background(crate::connect::Job::Slack(slack::release_job(&ctx.base_url, &team, &id))));
+        }
     }
     Ok(view)
 }
@@ -247,10 +252,12 @@ fn disconnect_slack(ctx: &mut Ctx, _: NoInput) -> ApiResult<Deferred<Done>> {
     emit(ctx, Event::new("slack.disconnected", "settings", "slack", "disconnected Slack").admin_only())?;
     // DumbSlab's own Slack app, hosted: let go of the Slack workspace before answering, so another
     // DumbSlab workspace can add it at once. Its token isn't revoked: it's every install's.
-    match (app.filter(|a| a.shared), ctx.cfg.hosting.is_some()) {
-        (Some(a), true) => {
-            let Some(team) = a.team_id else { return Ok(Deferred::Ready(DONE)) };
-            ctx.effects.push(Effect::Connect(crate::connect::Job::Slack(slack::release_job(&ctx.base_url, &team, a.install_id))));
+    // By its exact install; recorded until the directory has let go, so a failure here is
+    // finished on the next visit to Settings › Slack.
+    match (app.filter(|a| a.shared).and_then(|a| Some((a.team_id?, a.install_id?))), ctx.cfg.hosting.is_some()) {
+        (Some((team, id)), true) => {
+            slack::queue_release(ctx.db, &team, &id, ctx.now)?;
+            ctx.effects.push(Effect::Connect(crate::connect::Job::Slack(slack::release_job(&ctx.base_url, &team, &id))));
             Ok(Deferred::Pending)
         }
         _ => Ok(Deferred::Ready(DONE)),

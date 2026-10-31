@@ -30,3 +30,13 @@ CREATE TABLE IF NOT EXISTS slack_install_lock (
   job TEXT NOT NULL,
   until TEXT NOT NULL
 );
+
+-- Hosted: claims to let go of, each by its exact install: a disconnected install's, or the previous
+-- Slack workspace's after switching. Kept until the directory has let go, so one a job didn't
+-- finish is let go of on the next visit to Settings › Slack.
+CREATE TABLE IF NOT EXISTS slack_releases (
+  team_id TEXT NOT NULL,
+  install_id TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (team_id, install_id)
+);
