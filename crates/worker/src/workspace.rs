@@ -67,7 +67,7 @@ fn rust_err(e: ApiError) -> worker::Error {
 }
 
 /// Converts a core response, replacing defaults such as `application/octet-stream`. Only cookies repeat.
-fn to_response(r: dumbslab_core::Response) -> Result<Response> {
+pub fn to_response(r: dumbslab_core::Response) -> Result<Response> {
     // 204/304 responses must not have a body at all, not even an empty one.
     let mut resp = if r.body.is_empty() { Response::empty()? } else { Response::from_bytes(r.body)? }.with_status(r.status);
     let h = resp.headers_mut();
@@ -302,7 +302,7 @@ impl Workspace {
     /// the webhooks its operations left. Its writes count against the plan step by step (see
     /// [`drive_job`]).
     async fn run_job(&self, job: Job, cfg: &HostConfig) -> Result<Finish> {
-        let (finish, effects, written) = drive_job(&self.state, job, cfg).await?;
+        let (finish, effects, written) = drive_job(&self.state, &self.env, job, cfg).await?;
         send_webhooks(&self.state, effects);
         if let Some(h) = cfg.hosting.as_ref().filter(|_| written > 0) {
             self.report_usage(&h.home, false);
@@ -317,8 +317,9 @@ impl Workspace {
         // The object's state outlives this request; the job holds its own handle to it.
         let raw: &JsValue = self.state.as_raw().as_ref();
         let state = State::from(raw.clone().unchecked_into::<worker::worker_sys::DurableObjectState>());
+        let env = self.env.clone();
         self.state.wait_until(async move {
-            match drive_job(&state, job, &cfg).await {
+            match drive_job(&state, &env, job, &cfg).await {
                 Ok((finish, effects, _)) => {
                     if let Finish::Fail(e) = finish {
                         console_warn!("a background job failed: {} ({})", e.message, e.code);
@@ -496,6 +497,7 @@ impl DurableObject for Workspace {
             workspace: workspace.clone(),
             hosting,
             connectors: crate::connect::connectors(&self.env, &origin, multi),
+            slack: crate::connect::slack_app(&self.env, &origin, multi),
             // Session recordings and browser error reports; off unless these are set.
             telemetry: Telemetry::new(
                 var(&self.env, "QUILL_HOST").as_deref(),
@@ -610,8 +612,9 @@ impl DurableObject for Workspace {
 /// transaction ends, rolled back or not, like a request's: while the job waits on another app,
 /// other requests and jobs on this object check the allowance against them. Returns how it
 /// finished, the effects its operations left for the host (see `Job::take_effects`), and the rows
-/// its steps wrote.
-async fn drive_job(state: &State, mut job: Job, cfg: &HostConfig) -> Result<(Finish, Vec<Effect>, u64)> {
+/// its steps wrote. Calls to the directory (Add to Slack's claims) go to the `Directory` object.
+async fn drive_job(state: &State, env: &Env, mut job: Job, cfg: &HostConfig) -> Result<(Finish, Vec<Effect>, u64)> {
+    let home = cfg.hosting.as_ref().map(|h| h.home.clone());
     let signs_in = job.is_sign_in();
     let mut replies = vec![];
     let mut written = 0;
@@ -662,7 +665,9 @@ async fn drive_job(state: &State, mut job: Job, cfg: &HostConfig) -> Result<(Fin
                 return Ok((Finish::Fail(e), job.take_effects(), written));
             }
             Ok(Step::Done(done)) => return Ok((done, job.take_effects(), written)),
-            Ok(Step::Fetch(calls)) => replies = futures_util::future::join_all(calls.iter().map(crate::connect::send)).await,
+            Ok(Step::Fetch(calls)) => {
+                replies = futures_util::future::join_all(calls.iter().map(|c| crate::connect::send_for(env, home.as_deref(), c))).await
+            }
         }
     }
     Ok((Finish::Fail(ApiError::internal("connected apps took too many steps")), vec![], written))

@@ -239,6 +239,15 @@ CREATE TABLE IF NOT EXISTS billing (
   updated_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS billing_home ON billing(home);
+-- Slack workspaces added with the shared Slack app (Add to Slack), and the workspace (by its first
+-- address) each belongs to. Slack sends every Slack workspace's commands and events to the root
+-- domain, which forwards them to that workspace. One Slack workspace, one DumbSlab workspace.
+CREATE TABLE IF NOT EXISTS slack_teams (
+  team_id TEXT PRIMARY KEY,
+  home TEXT NOT NULL,
+  claimed_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS slack_teams_home ON slack_teams(home);
 ";
 
 /// The most addresses one workspace can use, counting its first.
@@ -372,6 +381,7 @@ pub fn remove(db: &dyn Db, home: &str) -> ApiResult<()> {
     db.execute("DELETE FROM addresses WHERE home = ?", &params![home])?;
     db.execute("DELETE FROM usage WHERE home = ?", &params![home])?;
     db.execute("UPDATE billing SET detached = 1 WHERE home = ?", &params![home])?;
+    db.execute("DELETE FROM slack_teams WHERE home = ?", &params![home])?;
     Ok(())
 }
 
@@ -424,6 +434,51 @@ pub fn resolve(db: &dyn Db, slug: &str) -> ApiResult<Option<(String, Vec<String>
     };
     let moved = db.query("SELECT slug FROM addresses WHERE home = ? ORDER BY created_at", &params![home.clone()])?;
     Ok(Some((home, moved.iter().map(|r| r.str("slug")).collect())))
+}
+
+// ---------------------------------------------------------------------------
+// Slack workspaces (Add to Slack)
+
+fn check_team(team_id: &str) -> ApiResult<()> {
+    let ok = !team_id.is_empty() && team_id.len() <= 32 && team_id.chars().all(|c| c.is_ascii_alphanumeric());
+    if ok { Ok(()) } else { Err(ApiError::bad_request("team_id must be a Slack workspace's ID, like T0123ABCD")) }
+}
+
+/// Claims a Slack workspace for the workspace whose first address is `home`, which lets go of any
+/// other it held: a workspace connects one Slack workspace. Refused (409 `slack_team_taken`) while
+/// another workspace holds it; claiming one's own again is fine.
+pub fn claim_slack_team(db: &dyn Db, team_id: &str, home: &str, now: DateTime<Utc>) -> ApiResult<()> {
+    check_team(team_id)?;
+    if let Some(row) = db.one("SELECT home FROM slack_teams WHERE team_id = ?", &params![team_id])?
+        && row.str("home") != home
+    {
+        return Err(ApiError::new(409, "slack_team_taken", "That Slack workspace is connected to another DumbSlab workspace."));
+    }
+    if db.one("SELECT slug FROM workspaces WHERE slug = ? AND status = 'active'", &params![home])?.is_none() {
+        return Err(ApiError::not_found(format!("workspace `{home}`")));
+    }
+    db.execute("DELETE FROM slack_teams WHERE home = ? AND team_id != ?", &params![home, team_id])?;
+    db.execute(
+        "INSERT INTO slack_teams (team_id, home, claimed_at) VALUES (?, ?, ?) ON CONFLICT(team_id) DO NOTHING",
+        &params![team_id, home, ts(now)],
+    )?;
+    Ok(())
+}
+
+/// Lets go of a Slack workspace, if `home` holds it.
+pub fn release_slack_team(db: &dyn Db, team_id: &str, home: &str) -> ApiResult<()> {
+    check_team(team_id)?;
+    db.execute("DELETE FROM slack_teams WHERE team_id = ? AND home = ?", &params![team_id, home])?;
+    Ok(())
+}
+
+/// The workspace that holds a Slack workspace: (its first address, which names its storage; the
+/// address it lives at now).
+pub fn slack_team_home(db: &dyn Db, team_id: &str) -> ApiResult<Option<(String, String)>> {
+    let Some(row) = db.one("SELECT home FROM slack_teams WHERE team_id = ?", &params![team_id])? else { return Ok(None) };
+    let home = row.str("home");
+    let current = db.one("SELECT slug FROM addresses WHERE home = ? AND current = 1", &params![home.clone()])?.map(|r| r.str("slug"));
+    Ok(Some((home.clone(), current.unwrap_or(home))))
 }
 
 // ---------------------------------------------------------------------------

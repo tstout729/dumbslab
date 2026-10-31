@@ -55,6 +55,12 @@ struct UsageInput {
 }
 
 #[derive(Deserialize)]
+struct SlackTeamInput {
+    team_id: String,
+    home: Option<String>,
+}
+
+#[derive(Deserialize)]
 struct BillingInput {
     customer: String,
     home: Option<String>,
@@ -221,6 +227,31 @@ impl DurableObject for Directory {
                 self.run(move |db| {
                     let input = input?;
                     tenancy::record_risk(db, &input.customer, &input.kind.unwrap_or_default(), Utc::now()).map(|_| json!({ "ok": true }))
+                })?
+            }
+            // Add to Slack: a workspace claims or lets go of a Slack workspace (from its jobs), and
+            // the root domain asks where to send a Slack workspace's commands and events.
+            (Method::Post, "/slack/claim") => {
+                let input: ApiResult<SlackTeamInput> = parse(&body);
+                self.run(move |db| {
+                    let input = input?;
+                    let home = input.home.ok_or_else(|| ApiError::bad_request("send the workspace's home"))?;
+                    tenancy::claim_slack_team(db, &input.team_id, &home, Utc::now()).map(|_| json!({ "ok": true }))
+                })?
+            }
+            (Method::Post, "/slack/release") => {
+                let input: ApiResult<SlackTeamInput> = parse(&body);
+                self.run(move |db| {
+                    let input = input?;
+                    let home = input.home.ok_or_else(|| ApiError::bad_request("send the workspace's home"))?;
+                    tenancy::release_slack_team(db, &input.team_id, &home).map(|_| json!({ "ok": true }))
+                })?
+            }
+            (Method::Post, "/slack/lookup") => {
+                let input: ApiResult<SlackTeamInput> = parse(&body);
+                self.run(move |db| match tenancy::slack_team_home(db, &input?.team_id)? {
+                    Some((home, address)) => Ok(json!({ "home": home, "address": address })),
+                    None => Err(ApiError::not_found("a workspace for that Slack workspace")),
                 })?
             }
             _ => Err(ApiError::not_found("directory route")),

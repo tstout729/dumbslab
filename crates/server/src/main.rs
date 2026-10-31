@@ -44,6 +44,14 @@ fn connectors_from_env() -> Connectors {
     Connectors { key: var("DUMBSLAB_CONNECTOR_KEY"), apps, callback_url: None }
 }
 
+/// Add to Slack with your own copy of DumbSlab's Slack app: `DUMBSLAB_SLACK_SIGNING_SECRET`, with
+/// `DUMBSLAB_SLACK_CLIENT_ID` and `DUMBSLAB_SLACK_CLIENT_SECRET` (the `slack` connected app above).
+/// Slack sends admins back to this server's own `/slack/install/callback`.
+fn slack_from_env() -> dumbslab_core::slack::SharedApp {
+    let signing_secret = std::env::var("DUMBSLAB_SLACK_SIGNING_SECRET").ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+    dumbslab_core::slack::SharedApp { signing_secret, callback_url: None }
+}
+
 #[derive(Parser)]
 #[command(name = "dumbslab", version, about = "An open-source team knowledge base for people and AI agents")]
 struct Cli {
@@ -213,7 +221,12 @@ fn local_actor(store: &Store, user: Option<&str>, via: Via) -> anyhow::Result<Ac
 
 /// Settings for commands that act on the database directly (`call`, `mcp`).
 fn local_config(base_url: Option<String>) -> HostConfig {
-    HostConfig { base_url: base_url.map(|u| u.trim_end_matches('/').to_string()), connectors: connectors_from_env(), ..Default::default() }
+    HostConfig {
+        base_url: base_url.map(|u| u.trim_end_matches('/').to_string()),
+        connectors: connectors_from_env(),
+        slack: slack_from_env(),
+        ..Default::default()
+    }
 }
 
 async fn call(
@@ -347,6 +360,7 @@ async fn serve(
         open_setup,
         telemetry,
         connectors: connectors_from_env(),
+        slack: slack_from_env(),
         ..Default::default()
     };
     let app = App::new(store, cfg, allow_private_webhooks);

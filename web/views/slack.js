@@ -1,5 +1,6 @@
-// Settings › Slack (admins): connect the workspace's own Slack app, turn link previews on or off,
-// and pick the Slack channels that hear about new and updated posts. See docs/slack.md.
+// Settings › Slack (admins): connect Slack with Add to Slack (DumbSlab's own Slack app, when the
+// server has one) or the workspace's own Slack app, turn link previews on or off, and pick the
+// Slack channels that hear about new and updated posts. See docs/slack.md.
 
 import { api, enc } from '/api.js';
 import { h, icon, button, busy, badge, toast, toastError, confirmDialog, field, input, select, checkbox, copyText, emptyState, frag } from '/ui.js';
@@ -11,6 +12,73 @@ function panel(title, description, ...body) {
 }
 
 const checked = (box) => box.querySelector('input').checked;
+
+// What the codes in `?slack_error=` mean. The link back from Slack carries only a code, never
+// Slack's words: anyone can make a link to this page.
+const installErrors = {
+  not_admin: 'Only admins can connect Slack.',
+  unavailable: 'Add to Slack isn’t set up on this server. Use your own Slack app instead.',
+  expired: 'That link to Slack was used already, or is no longer valid. Click Add to Slack again.',
+  too_slow: 'Connecting took too long. Click Add to Slack again.',
+  other_session: 'Finish connecting in the browser you started in, signed in as the same admin. Click Add to Slack again.',
+  declined: 'Slack didn’t allow DumbSlab. Click Add to Slack again, and choose Allow.',
+  slack_error: 'Slack didn’t finish connecting. Try again.',
+  enterprise_install: 'DumbSlab connects one Slack workspace at a time, not a whole Enterprise organization. Add it to one workspace instead.',
+  slack_team_taken: 'That Slack workspace is already connected to another DumbSlab workspace. Disconnect it there first, then try again.',
+  failed: 'Connecting Slack didn’t work. Try again.',
+};
+
+function installError(code) {
+  return Object.hasOwn(installErrors, code) ? installErrors[code] : installErrors.failed;
+}
+
+/** Add to Slack: DumbSlab's own Slack app. One click, then approve in Slack. */
+function addPanel(s) {
+  // A full page load (`data-native`): the server sends the browser on to Slack.
+  const add = h('a', { class: 'btn btn-primary', href: s.install_url, 'data-native': true }, icon('hash'), h('span', null, 'Add to Slack'));
+  return panel('Add to Slack', 'Approve DumbSlab in Slack and you’re done. There’s no app to create and nothing to paste.',
+    h('div', null, add),
+    h('p', { class: 'field-hint' }, `DumbSlab asks Slack for ${s.scopes.join(', ')}: the /dumbslab command, posting in channels, link previews, and matching people by the email address Slack has confirmed.`));
+}
+
+/** Connected with Add to Slack. */
+function sharedPanel(s) {
+  return panel('Connected', null,
+    h('p', { class: 'callout', role: 'status' }, icon('checkCircle'),
+      h('span', null, `Connected to ${s.slack_workspace || 'Slack'} with DumbSlab’s Slack app.`)),
+    s.install_url
+      ? h('p', { class: 'field-hint' }, 'To use another Slack workspace, click Add to Slack again and pick it there. ', h('a', { href: s.install_url, 'data-native': true }, 'Add to Slack'))
+      : null);
+}
+
+/** Own app connected, and the server offers Add to Slack too. */
+function switchPanel(s) {
+  const add = h('a', { class: 'btn btn-subtle btn-sm', href: s.install_url, 'data-native': true }, icon('hash'), h('span', null, 'Add to Slack'));
+  return panel('Switch to DumbSlab’s Slack app', 'This workspace uses its own Slack app. Click Add to Slack to use DumbSlab’s instead, then delete your own app at api.slack.com/apps, so Slack doesn’t send links and commands to both.',
+    h('div', null, add));
+}
+
+function previewsToggle(s) {
+  const toggle = h('input', { type: 'checkbox', role: 'switch', class: 'switch', checked: s.unfurls, 'aria-label': 'Preview links to posts' });
+  toggle.addEventListener('change', async () => {
+    try {
+      await api.patch('/slack', { unfurls: toggle.checked });
+      toast(toggle.checked ? 'Link previews on' : 'Link previews off');
+    } catch (e) {
+      toggle.checked = !toggle.checked;
+      toastError(e);
+    }
+  });
+  return frag(
+    h('div', { class: 'row gap-sm' },
+      h('label', { class: 'switch-wrap' }, toggle, h('span', { class: 'switch-ui', 'aria-hidden': 'true' })),
+      h('span', null, 'Preview links to posts pasted in Slack')),
+    h('p', { class: 'field-hint' }, 'Slack shows a preview to everyone in the conversation, including guests and people from other companies in shared channels. So DumbSlab previews only posts everyone in this workspace can see, and only when the person who shared the link can see them.'));
+}
+
+function previewsPanel(s) {
+  return panel('Link previews', null, previewsToggle(s));
+}
 
 /** Step 1: create the Slack app from this workspace's manifest. */
 function createPanel(s) {
@@ -60,25 +128,12 @@ function credentialsPanel(s, reload) {
 }
 
 /** Step 3: Slack checks the events URL; link previews on or off. */
-function eventsPanel(s, reload) {
-  const toggle = h('input', { type: 'checkbox', role: 'switch', class: 'switch', checked: s.unfurls, 'aria-label': 'Preview links to posts' });
-  toggle.addEventListener('change', async () => {
-    try {
-      await api.patch('/slack', { unfurls: toggle.checked });
-      toast(toggle.checked ? 'Link previews on' : 'Link previews off');
-    } catch (e) {
-      toggle.checked = !toggle.checked;
-      toastError(e);
-    }
-  });
+function eventsPanel(s) {
   return panel('3. Let Slack check the events URL', 'Once the signing secret is saved, open your Slack app’s App Manifest page (or Event Subscriptions) and click Verify next to the Request URL. Slack sends link previews there.',
     h('ul', { class: 'link-list' },
       h('li', null, h('span', null, 'Slash command '), h('code', null, s.commands_url)),
       h('li', null, h('span', null, 'Events '), h('code', null, s.events_url))),
-    h('div', { class: 'row gap-sm' },
-      h('label', { class: 'switch-wrap' }, toggle, h('span', { class: 'switch-ui', 'aria-hidden': 'true' })),
-      h('span', null, 'Preview links to posts pasted in Slack')),
-    h('p', { class: 'field-hint' }, 'Slack shows a preview to everyone in the conversation, including guests and people from other companies in shared channels. So DumbSlab previews only posts everyone in this workspace can see, and only when the person who shared the link can see them.'));
+    previewsToggle(s));
 }
 
 function topicOptions(topics, selected) {
@@ -161,10 +216,13 @@ function channelsPanel(s, topics, reload) {
     addChannelForm(topics, reload));
 }
 
-function disconnectPanel(reload) {
+function disconnectPanel(reload, shared) {
   const off = button('Disconnect Slack', { variant: 'subtle', size: 'sm', cls: 'text-danger' });
+  const message = shared
+    ? 'DumbSlab forgets the channel list and revokes its bot token in Slack. /dumbslab and link previews stop working, and the Slack workspace can be added to another DumbSlab workspace.'
+    : 'DumbSlab forgets the bot token, the signing secret and the channel list. /dumbslab and link previews stop working. Delete the app at api.slack.com/apps to remove it from Slack too.';
   off.addEventListener('click', async () => {
-    const ok = await confirmDialog({ title: 'Disconnect Slack?', message: 'DumbSlab forgets the bot token, the signing secret and the channel list. /dumbslab and link previews stop working. Delete the app at api.slack.com/apps to remove it from Slack too.', confirmLabel: 'Disconnect', danger: true });
+    const ok = await confirmDialog({ title: 'Disconnect Slack?', message, confirmLabel: 'Disconnect', danger: true });
     if (!ok) return;
     busy(off, async () => {
       await api.del('/slack');
@@ -183,10 +241,33 @@ export async function slackSection(ctx) {
     h('div', { class: 'hero-mark' }, icon('hash', { size: 22 })),
     h('h2', { class: 'panel-title' }, 'Slack ', s.connected ? badge('Connected', 'scope') : null),
     h('p', { class: 'panel-desc' }, 'Search DumbSlab with /dumbslab search, start a draft with /dumbslab new, preview links to posts, and tell channels about new posts. Everyone acts as themselves: Slack people are matched to DumbSlab people by the email address Slack has confirmed, and see only what they can see here.'));
+  // How Add to Slack went, when Slack sent the admin back here.
+  const query = new URLSearchParams(location.search);
+  const notes = [];
+  if (query.get('slack') === 'connected' && s.connected) {
+    notes.push(h('p', { class: 'callout', role: 'status' }, icon('check', { size: 15 }), h('span', null, `Slack is connected${s.slack_workspace ? ` to ${s.slack_workspace}` : ''}.`)));
+  }
+  if (query.get('slack_error')) {
+    notes.push(h('p', { class: 'callout callout-warn', role: 'alert' }, icon('alert', { size: 15 }), h('span', null, installError(query.get('slack_error')))));
+  }
   if (!s.available) {
-    return frag(intro, h('p', { class: 'callout callout-warn', role: 'alert' }, icon('alert'),
+    return frag(intro, ...notes, h('p', { class: 'callout callout-warn', role: 'alert' }, icon('alert'),
       h('span', null, 'Slack needs this server’s connector key to keep the Slack app’s secrets. Set DUMBSLAB_CONNECTOR_KEY (self-hosted) or the CONNECTOR_KEY secret (Cloudflare), then come back.')));
   }
   const saved = s.bot_token_saved || s.signing_secret_saved || s.channels.length;
-  return frag(intro, createPanel(s), credentialsPanel(s, reload), eventsPanel(s, reload), channelsPanel(s, topics, reload), saved ? disconnectPanel(reload) : null);
+  const channels = channelsPanel(s, topics, reload);
+  if (s.mode === 'shared') {
+    return frag(intro, ...notes, sharedPanel(s), previewsPanel(s), channels, disconnectPanel(reload, true));
+  }
+  const ownApp = [createPanel(s), credentialsPanel(s, reload), eventsPanel(s)];
+  const disconnect = saved ? disconnectPanel(reload, false) : null;
+  if (s.install_url && s.mode !== 'own') {
+    // Add to Slack first; your own app is the fallback, folded away.
+    const own = h('details', { class: 'stack' },
+      h('summary', null, 'Use your own Slack app instead'),
+      h('p', { class: 'field-hint' }, 'For a Slack workspace that only allows apps it made itself. You create the app from a manifest and paste its bot token and signing secret.'),
+      ...ownApp);
+    return frag(intro, ...notes, addPanel(s), own, channels, disconnect);
+  }
+  return frag(intro, ...notes, s.install_url ? switchPanel(s) : null, ...ownApp, channels, disconnect);
 }

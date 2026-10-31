@@ -1,14 +1,24 @@
 //! Slack: search DumbSlab, preview links to its posts and start drafts from Slack, and tell Slack
 //! channels about new and updated posts.
 //!
-//! Each workspace uses its own Slack app. An admin creates it from the manifest [`manifest`]
-//! builds, installs it, and gives DumbSlab its bot token and signing secret (Settings › Slack,
-//! `update_slack`). There's no shared Slack app: Slack lets an app reach other companies' Slack
-//! workspaces only through its Marketplace.
+//! Two ways to connect:
+//!
+//! - **Add to Slack** (shared): the host runs one Slack app for every workspace ([`SharedApp`]).
+//!   An admin opens [`INSTALL_PATH`], approves in Slack, and Slack sends them back to
+//!   [`INSTALL_CALLBACK_PATH`]; DumbSlab exchanges the code at `oauth.v2.access` for the bot token.
+//!   Hosted DumbSlab registers one redirect URL and one set of request URLs, on the root domain:
+//!   the root forwards a sign-in by its `state` (`{address}.{random}`) and Slack's commands and
+//!   events by their Slack workspace ([`route`]), which the directory maps to the one DumbSlab
+//!   workspace that claimed it. Jobs claim and release that mapping with calls to [`DIRECTORY`].
+//! - **Its own Slack app**: an admin creates one from the manifest [`manifest`] builds, installs
+//!   it, and gives DumbSlab its bot token and signing secret (Settings › Slack, `update_slack`).
+//!   Self-hosted servers without a shared app use this.
 //!
 //! - Slack calls `/slack/commands` (the `/dumbslab` slash command) and `/slack/events` (link
-//!   previews). These endpoints sit outside the session and CSRF checks: Slack's signature
-//!   ([`verify`]) is all that admits a request, and a signature seen before is refused.
+//!   previews, and with the shared app `app_uninstalled` and `tokens_revoked`). These endpoints sit
+//!   outside the session and CSRF checks: Slack's signature ([`verify`]) is all that admits a
+//!   request, and a signature seen before is refused. With the shared app, a request must also be
+//!   for the Slack workspace this workspace holds.
 //! - Who is asking: the Slack user's email, once Slack has confirmed it (`users.info`), matched to
 //!   an active DumbSlab person. Search and drafts then run as that person through the same
 //!   operations as the API, so they see and do only what that person may. Anyone else gets a
@@ -29,6 +39,26 @@
 //! https://docs.slack.dev/reference/methods/users.info, https://docs.slack.dev/reference/objects/user-object,
 //! https://docs.slack.dev/reference/methods/chat.postMessage, https://docs.slack.dev/reference/app-manifest,
 //! https://docs.slack.dev/messaging/formatting-message-text
+//!
+//! Add to Slack: https://docs.slack.dev/authentication/installing-with-oauth (redirect URLs must be
+//! https and match or be under a registered one; the code lasts ten minutes; `team` is `null` and
+//! `is_enterprise_install` true for an org-wide install), https://docs.slack.dev/reference/methods/oauth.v2.access
+//! (Basic auth preferred for the client's credentials), https://docs.slack.dev/reference/methods/auth.revoke,
+//! https://docs.slack.dev/reference/events/app_uninstalled, https://docs.slack.dev/reference/events/tokens_revoked
+//! (`tokens.bot` lists bot user IDs, not tokens), https://docs.slack.dev/apis/events-api/ (`authorizations` names
+//! the one installation an event is for), https://docs.slack.dev/apis/events-api/using-http-request-urls
+//! (`url_verification` names no workspace), https://docs.slack.dev/app-manifests/configuring-apps-with-app-manifests/
+//! (`https://api.slack.com/apps?new_app=1&manifest_json=…`, URL-encoded), https://docs.slack.dev/app-management/distribution
+//! (public distribution is switched on in Manage Distribution; the manifest has no field for it).
+//!
+//! Slack keeps one bot token per app and Slack workspace (its docs and SDKs model an install as
+//! one bot token per workspace; they don't spell out reinstalls), so installing the shared app for
+//! a Slack workspace another DumbSlab workspace holds is taken to hand back that workspace's token.
+//! A token is therefore revoked only when no other DumbSlab workspace can hold it: never when the
+//! Slack workspace is taken, only for a refused org-wide install, on Disconnect, and for the
+//! shared app's previous Slack workspace once this workspace moved to another.
+
+mod shared_app;
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -46,6 +76,11 @@ use crate::events::{Event, emit};
 use crate::registry::{Ctx, registry};
 use crate::util::{parse_ts, secure_eq, sha256_hex, ts};
 use crate::{Effect, HostConfig, Outcome, Request, Response, WebhookDelivery, params};
+pub use shared_app::{
+    InstallError, Routed, Shared, SharedApp, create_app_link, install_callback, install_callback_url, install_start, manifest_route, route,
+    shared, shared_manifest, team_of, unknown_team,
+};
+use shared_app::{Installed, home, ours, stray, uninstalled};
 
 /// Where Slack sends the slash command.
 pub const COMMANDS_PATH: &str = "/slack/commands";
@@ -58,6 +93,25 @@ pub const MAX_BODY: usize = 64 * 1024;
 pub const SCOPES: &[&str] = &["commands", "chat:write", "chat:write.public", "links:read", "links:write", "users:read", "users:read.email"];
 /// Where an admin creates the Slack app.
 pub const CREATE_APP_URL: &str = "https://api.slack.com/apps?new_app=1";
+/// Add to Slack: an admin's browser starts here (signed in), and is sent to Slack.
+pub const INSTALL_PATH: &str = "/slack/install";
+/// Add to Slack: where Slack sends the admin back. Hosted DumbSlab registers the root domain's,
+/// which forwards to the workspace named in the `state`.
+pub const INSTALL_CALLBACK_PATH: &str = "/slack/install/callback";
+/// The shared app's manifest, for the operator who creates it.
+pub const MANIFEST_PATH: &str = "/slack/app-manifest.json";
+/// Sends the operator to Slack's app creation page with the shared app's manifest filled in.
+pub const CREATE_SHARED_APP_PATH: &str = "/slack/create-app";
+/// The shared app's user scopes: searching Slack from DumbSlab (connected apps) and signing in with
+/// Slack (OpenID Connect). Add to Slack itself asks only for [`SCOPES`].
+pub const USER_SCOPES: &[&str] = &["search:read", "openid", "email", "profile"];
+/// The events the shared app subscribes to: link previews, and hearing that it was removed.
+pub const SHARED_EVENTS: &[&str] = &["link_shared", "app_uninstalled", "tokens_revoked"];
+/// Jobs reach hosted DumbSlab's directory with calls to this address (`{DIRECTORY}/slack/claim`
+/// and `/slack/release`, with `{"team_id": …, "home": …}`). Only the Cloudflare host answers them,
+/// and it names the workspace itself; any other host refuses them, as they aren't https. Claimed
+/// answers 200, taken 409.
+pub const DIRECTORY: &str = "dumbslab-directory:";
 
 /// How far a request's timestamp may be from now, either way.
 const TOLERANCE_SECS: i64 = 300;
@@ -89,17 +143,28 @@ const POST_HEADER: &str = "x-dumbslab-post";
 pub struct App {
     /// `None` when there's none, or it can't be read with the host's connector key.
     pub bot_token: Option<String>,
+    /// The workspace's own app's, or with the shared app the host's (while it has one).
     pub signing_secret: Option<String>,
-    /// The Slack workspace the bot token belongs to, from `auth.test`.
+    /// The Slack workspace the bot token belongs to, from `auth.test` or `oauth.v2.access`.
     pub team_id: Option<String>,
     pub team_name: String,
     pub bot_user_id: Option<String>,
     pub unfurls: bool,
+    /// Added with Add to Slack: the host's shared app, not the workspace's own.
+    pub shared: bool,
+    /// The bot scopes Slack granted the shared app.
+    pub scopes: Vec<String>,
+    /// When Add to Slack last finished.
+    pub installed_at: Option<DateTime<Utc>>,
 }
 
 impl fmt::Debug for App {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("App").field("team_id", &self.team_id).field("unfurls", &self.unfurls).finish_non_exhaustive()
+        f.debug_struct("App")
+            .field("team_id", &self.team_id)
+            .field("unfurls", &self.unfurls)
+            .field("shared", &self.shared)
+            .finish_non_exhaustive()
     }
 }
 
@@ -132,13 +197,21 @@ pub fn load(db: &dyn Db, cfg: &HostConfig) -> ApiResult<Option<App>> {
         let sealed = r.opt_str(column)?;
         connect::open(key(cfg)?, OWNER, kind, &sealed).ok().map(|c| c.token)
     };
+    let shared = r.bool("shared");
+    let signing_secret = match shared {
+        true => cfg.slack.signing_secret.clone().filter(|s| !s.is_empty()),
+        false => open(SIGNING_SECRET, "signing_secret"),
+    };
     Ok(Some(App {
         bot_token: open(BOT_TOKEN, "bot_token"),
-        signing_secret: open(SIGNING_SECRET, "signing_secret"),
+        signing_secret,
         team_id: r.opt_str("team_id"),
         team_name: r.str("team_name"),
         bot_user_id: r.opt_str("bot_user_id"),
         unfurls: r.bool("unfurls"),
+        shared,
+        scopes: r.str("scopes").split(',').filter(|s| !s.is_empty()).map(str::to_string).collect(),
+        installed_at: r.opt_str("installed_at").and_then(|t| parse_ts(&t)),
     }))
 }
 
@@ -313,9 +386,13 @@ fn run(db: &dyn Db, cfg: &HostConfig, req: &Request) -> ApiResult<Outcome> {
         return Err(ApiError::new(413, "too_large", "request body too large"));
     }
     let now = Utc::now();
-    let app = load(db, cfg)?;
-    let Some((app, secret)) = app.and_then(|a| a.signing_secret.clone().map(|s| (a, s))) else {
-        return Err(ApiError::new(404, "slack_off", "Slack isn't connected to this workspace."));
+    let app = load(db, cfg)?.filter(|a| a.signing_secret.is_some());
+    // The connected app's signing secret. Without one, the shared app's: Slack may still send its
+    // requests here for a Slack workspace whose claim points here (see `stray`).
+    let secret = match (&app, shared(cfg)) {
+        (Some(a), _) => a.signing_secret.clone().unwrap_or_default(),
+        (None, Some(s)) => s.signing_secret.to_string(),
+        (None, None) => return Err(ApiError::new(404, "slack_off", "Slack isn't connected to this workspace.")),
     };
     let sig = req.header("x-slack-signature");
     verify(&secret, req.header("x-slack-request-timestamp"), sig, &req.body, now.timestamp()).map_err(refused)?;
@@ -326,7 +403,9 @@ fn run(db: &dyn Db, cfg: &HostConfig, req: &Request) -> ApiResult<Outcome> {
         return Err(ApiError::new(401, "replayed", "This Slack request was handled already."));
     }
     let base = crate::http::base_url(cfg, req);
-    if path == COMMANDS_PATH { command(db, &app, &base, &req.body) } else { event(db, &app, &base, &req.body, now) }
+    // The shared app serves every Slack workspace: only the one this workspace holds gets in.
+    let Some(app) = app.filter(|a| !a.shared || ours(a, path, &req.body)) else { return stray(cfg, &base, path, &req.body) };
+    if path == COMMANDS_PATH { command(db, &app, &base, &req.body) } else { event(db, cfg, &app, &base, &req.body, now) }
 }
 
 /// A form body, as Slack sends slash commands.
@@ -347,6 +426,11 @@ fn later(response: Response, job: SlackJob) -> Outcome {
     out
 }
 
+/// A Slack ID (`T…`, `U…`, `E…`): letters and digits.
+fn valid_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 32 && id.chars().all(|c| c.is_ascii_alphanumeric())
+}
+
 /// Whether a slash command's `response_url` is one of Slack's: https on `hooks.slack.com` (or
 /// GovSlack's `hooks.slack-gov.com`) with no port or user name, a path under `/commands/` or
 /// `/actions/` made of letters, digits, `/`, `_` and `-`, and no query.
@@ -357,11 +441,6 @@ pub fn slack_reply_url(url: &str) -> bool {
         && (path.starts_with("commands/") || path.starts_with("actions/"))
         && path.len() <= 300
         && path.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '_' | '-'))
-}
-
-/// A Slack user id: letters and digits.
-fn valid_user(id: &str) -> bool {
-    !id.is_empty() && id.len() <= 32 && id.chars().all(|c| c.is_ascii_alphanumeric())
 }
 
 fn command(db: &dyn Db, app: &App, base: &str, body: &[u8]) -> ApiResult<Outcome> {
@@ -393,7 +472,7 @@ fn command(db: &dyn Db, app: &App, base: &str, body: &[u8]) -> ApiResult<Outcome
         }
         _ => return Ok(reply(help(&name, &workspace))),
     };
-    if !valid_user(&field("user_id")) {
+    if !valid_id(&field("user_id")) {
         return Ok(reply(ephemeral("Slack didn't say who's asking. Try again.")));
     }
     // The answer goes to this address later; only Slack's own are trusted with it.
@@ -410,7 +489,7 @@ fn command(db: &dyn Db, app: &App, base: &str, body: &[u8]) -> ApiResult<Outcome
     Ok(later(Response::empty(200), SlackJob::new(base, work)))
 }
 
-fn event(db: &dyn Db, app: &App, base: &str, body: &[u8], now: DateTime<Utc>) -> ApiResult<Outcome> {
+fn event(db: &dyn Db, cfg: &HostConfig, app: &App, base: &str, body: &[u8], now: DateTime<Utc>) -> ApiResult<Outcome> {
     let v: Value = serde_json::from_slice(body).map_err(|_| ApiError::bad_request("Slack sent an event DumbSlab couldn't read."))?;
     let ack = || reply(json!({ "ok": true }));
     match v["type"].as_str() {
@@ -423,11 +502,17 @@ fn event(db: &dyn Db, app: &App, base: &str, body: &[u8], now: DateTime<Utc>) ->
                 return Ok(ack());
             }
             let e = &v["event"];
+            // The shared app's install is gone from Slack. (An own app's admin disconnects here.)
+            let bot_revoked = e["type"] == "tokens_revoked"
+                && app.bot_user_id.as_deref().is_some_and(|b| e["tokens"]["bot"].as_array().is_some_and(|ids| ids.iter().any(|i| i == b)));
+            if app.shared && (e["type"] == "app_uninstalled" || bot_revoked) {
+                return uninstalled(db, cfg, app, base, &v, now);
+            }
             let user = e["user"].as_str().unwrap_or_default();
-            if e["type"] != "link_shared" || !app.unfurls || app.bot_token.is_none() || !valid_user(user) {
+            if e["type"] != "link_shared" || !app.unfurls || app.bot_token.is_none() || !valid_id(user) {
                 return Ok(ack());
             }
-            let links = post_links(base, &e["links"]);
+            let links = post_links(&own_hosts(cfg, base), &e["links"]);
             if links.is_empty() {
                 return Ok(ack());
             }
@@ -446,12 +531,24 @@ fn event(db: &dyn Db, app: &App, base: &str, body: &[u8], now: DateTime<Utc>) ->
     }
 }
 
+/// The hosts whose post links this workspace previews: its address and, hosted, its first one,
+/// which no other workspace can ever hold. Never another workspace's: the shared app's unfurl
+/// domain is the root domain, so Slack sends links to every workspace's address to each.
+fn own_hosts(cfg: &HostConfig, base: &str) -> Vec<String> {
+    let mut hosts: Vec<String> = connect::host_of(base).into_iter().collect();
+    if let (Some(current), Some(home)) = (cfg.workspace.as_deref(), home(cfg))
+        && current != home
+    {
+        hosts.extend(connect::host_of(&crate::tenancy::origin_for(base, current, home)));
+    }
+    hosts
+}
+
 /// Links to this workspace's posts among a `link_shared` event's links: (link as sent, post id).
-fn post_links(base: &str, links: &Value) -> Vec<(String, String)> {
-    let ours = connect::host_of(base);
+fn post_links(hosts: &[String], links: &Value) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = vec![];
     for url in links.as_array().into_iter().flatten().filter_map(|l| l["url"].as_str()) {
-        if connect::host_of(url) != ours || out.iter().any(|(u, _)| u == url) {
+        if !connect::host_of(url).is_some_and(|h| hosts.contains(&h)) || out.iter().any(|(u, _)| u == url) {
             continue;
         }
         let path = connect::path_of(url);
@@ -798,6 +895,10 @@ pub struct SlackJob {
     phase: Phase,
     /// What the job's operations left for the host to deliver (a new draft's webhooks).
     effects: Vec<Effect>,
+    /// Add to Slack: what Slack gave, while the directory claims its Slack workspace.
+    installed: Option<Installed>,
+    /// Add to Slack: where to send the admin once a token is revoked.
+    then: Option<String>,
 }
 
 #[derive(Clone)]
@@ -812,6 +913,12 @@ enum Work {
     Save { admin: String, via: Via, change: Change },
     /// An admin asked for a test message in a channel.
     Test { channel_id: String },
+    /// Add to Slack: Slack sent an admin back with a code. Exchange it for the bot token, claim the
+    /// Slack workspace in the directory (hosted), then save it.
+    Install { admin: String, via: Via, code: String, redirect_uri: String },
+    /// The shared app is disconnected: revoke its bot token (when there's one) and let go of its
+    /// Slack workspace's claim (hosted), unless the workspace connected that Slack workspace again.
+    Forget { token: Option<String>, team_id: Option<String> },
 }
 
 /// The message whose links Slack asked to preview.
@@ -836,6 +943,14 @@ enum Phase {
     Posting,
     /// Waiting for Slack to take a command's answer at its `response_url`.
     Replying,
+    /// Waiting for `oauth.v2.access`.
+    Exchanging,
+    /// Waiting for the directory to claim the Slack workspace.
+    Claiming,
+    /// Waiting for `auth.revoke`, then sending the admin to [`SlackJob::then`].
+    Revoking,
+    /// Waiting for `auth.revoke` and the directory to let go.
+    Forgetting,
 }
 
 // Jobs carry tokens and what people typed; never print them.
@@ -847,6 +962,8 @@ impl fmt::Debug for SlackJob {
             Work::Unfurl { .. } => "unfurl",
             Work::Save { .. } => "save",
             Work::Test { .. } => "test",
+            Work::Install { .. } => "install",
+            Work::Forget { .. } => "forget",
         };
         write!(f, "SlackJob({kind}, {:?})", self.phase)
     }
@@ -854,7 +971,12 @@ impl fmt::Debug for SlackJob {
 
 impl SlackJob {
     fn new(base_url: &str, work: Work) -> SlackJob {
-        SlackJob { base_url: base_url.to_string(), work, phase: Phase::Start, effects: vec![] }
+        SlackJob { base_url: base_url.to_string(), work, phase: Phase::Start, effects: vec![], installed: None, then: None }
+    }
+
+    /// Disconnecting the shared app: revokes its bot token and lets go of its Slack workspace.
+    pub(crate) fn forget(base_url: &str, token: Option<String>, team_id: Option<String>) -> SlackJob {
+        SlackJob::new(base_url, Work::Forget { token, team_id })
     }
 
     /// Checks a new bot token with Slack, then saves it with the rest of `change`.
@@ -1056,6 +1178,8 @@ pub fn step(db: &dyn Db, cfg: &HostConfig, job: &mut SlackJob, replies: Vec<Http
                 None => fill(json!({ "ok": true, "channel": channel })),
             }
         }
+        // Add to Slack, and letting go of the shared app.
+        (_, Work::Install { .. } | Work::Forget { .. }) => shared_app::step(db, cfg, job, &app, answer, now),
         (phase, _) => Err(ApiError::internal(format!("a Slack job can't continue from {phase:?}"))),
     }
 }
@@ -1237,7 +1361,7 @@ mod tests {
             { "url": "https://evil.test/p/abc123", "domain": "evil.test" },
             { "url": "https://kb.test@evil.test/p/abc123", "domain": "evil.test" },
         ]);
-        let found = post_links("https://kb.test", &links);
+        let found = post_links(&own_hosts(&HostConfig::default(), "https://kb.test"), &links);
         assert_eq!(
             found,
             vec![
@@ -1245,6 +1369,36 @@ mod tests {
                 ("https://kb.test/p/def456".into(), "def456".into())
             ]
         );
+    }
+
+    /// With the shared app, Slack sends links to every workspace on the root domain: a workspace
+    /// previews its own address and its first one, which only it can hold, and nobody else's.
+    #[test]
+    fn shared_previews_stay_in_their_workspace() {
+        let hosting = crate::Hosting {
+            plans: crate::plan::Plans {
+                free: crate::plan::Allowance { storage_bytes: 1, writes_per_day: 1 },
+                pro: crate::plan::Allowance { storage_bytes: 1, writes_per_day: 1 },
+                stripe_price: None,
+                price_label: String::new(),
+                portal_configuration: None,
+            },
+            home: "acme".into(),
+            storage_bytes: 0,
+            capacity: Default::default(),
+        };
+        let cfg = HostConfig { workspace: Some("docs".into()), hosting: Some(hosting), ..Default::default() };
+        let hosts = own_hosts(&cfg, "https://docs.dumbslab.com");
+        assert_eq!(hosts, vec!["docs.dumbslab.com".to_string(), "acme.dumbslab.com".to_string()]);
+        let links = json!([
+            { "url": "https://docs.dumbslab.com/p/a1", "domain": "dumbslab.com" },
+            { "url": "https://acme.dumbslab.com/p/a2", "domain": "dumbslab.com" },
+            { "url": "https://beta.dumbslab.com/p/a3", "domain": "dumbslab.com" },
+            { "url": "https://dumbslab.com/p/a4", "domain": "dumbslab.com" },
+            { "url": "https://x.docs.dumbslab.com/p/a5", "domain": "dumbslab.com" },
+        ]);
+        let ids: Vec<String> = post_links(&hosts, &links).into_iter().map(|(_, id)| id).collect();
+        assert_eq!(ids, vec!["a1", "a2"]);
     }
 
     #[test]
@@ -1263,7 +1417,15 @@ mod tests {
         let change = Change { bot_token: Some("xoxb-secret".into()), signing_secret: Some("s3cret".into()), unfurls: None };
         let job = SlackJob::new("https://kb.test", Work::Save { admin: "u".into(), via: Via::Web, change });
         let app = App { bot_token: Some("xoxb-secret".into()), signing_secret: Some("s3cret".into()), ..Default::default() };
-        let printed = format!("{job:?} {app:?}");
-        assert!(!printed.contains("secret"), "{printed}");
+        let install = SlackJob::new(
+            "https://kb.test",
+            Work::Install { admin: "u".into(), via: Via::Web, code: "secret-code".into(), redirect_uri: "https://kb.test/x".into() },
+        );
+        let forget = SlackJob::forget("https://kb.test", Some("xoxb-secret".into()), Some("T1".into()));
+        let host = SharedApp { signing_secret: Some("host-secret".into()), callback_url: None };
+        let printed = format!("{job:?} {app:?} {install:?} {forget:?} {host:?}");
+        for secret in ["xoxb-secret", "s3cret", "secret-code", "host-secret"] {
+            assert!(!printed.contains(secret), "{printed}");
+        }
     }
 }

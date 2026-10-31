@@ -24,6 +24,7 @@ pub use workspace::Workspace;
 
 use chrono::Utc;
 use dumbslab_core::http::{WORKSPACE_ROBOTS_TXT, is_core_path};
+use dumbslab_core::slack;
 use dumbslab_core::tenancy::{self, HostKind};
 use dumbslab_core::util::{secure_eq, sha256_hex};
 use serde::Deserialize;
@@ -158,6 +159,11 @@ async fn forward(env: &Env, object: &str, mut req: Request, workspace: Option<&s
 
 /// One request to a workspace object. `route` is (requested address, the workspace's home address).
 async fn send(env: &Env, object: &str, req: &Request, body: Option<&[u8]>, route: Option<(&str, &str)>) -> Result<Response> {
+    send_to(env, object, req.url()?.as_str(), req, body, route).await
+}
+
+/// [`send`], at another URL.
+async fn send_to(env: &Env, object: &str, url: &str, req: &Request, body: Option<&[u8]>, route: Option<(&str, &str)>) -> Result<Response> {
     let stub = env.durable_object("WORKSPACE")?.id_from_name(object)?.get_stub()?;
     let headers = req.headers().clone();
     // Only this Worker may say which workspace a request is for.
@@ -179,7 +185,7 @@ async fn send(env: &Env, object: &str, req: &Request, body: Option<&[u8]>, route
     if let Some(body) = body {
         init.with_body(Some(js_sys::Uint8Array::from(body).into()));
     }
-    stub.fetch_with_request(Request::new_with_init(req.url()?.as_str(), &init)?).await
+    stub.fetch_with_request(Request::new_with_init(url, &init)?).await
 }
 
 /// The root domain: the sign-up site, sign-up API and operator API.
@@ -200,7 +206,21 @@ async fn root_site(req: Request, env: &Env, root: &str, path: &str) -> Result<Re
         (Method::Get, "/api/signup/check") => check_address(&req, env).await,
         (Method::Post, "/api/signup") => signup(req, env, root).await,
         (Method::Get, "/api/plans") => billing::offer(env),
-        (Method::Get, "/connect/callback") => connect::root_callback_redirect(&req.url()?, root),
+        (Method::Get, "/connect/callback") => connect::root_callback_redirect(&req.url()?, root, "/connect/callback"),
+        // DumbSlab's own Slack app (Add to Slack): sign-ins come back here, and Slack sends every
+        // Slack workspace's commands and events here.
+        (Method::Get, slack::INSTALL_CALLBACK_PATH) => connect::root_callback_redirect(&req.url()?, root, slack::INSTALL_CALLBACK_PATH),
+        (Method::Post, slack::COMMANDS_PATH | slack::EVENTS_PATH) => slack_root(req, env, root, path).await,
+        (Method::Get | Method::Head, slack::MANIFEST_PATH) => {
+            let manifest = slack::shared_manifest(&root_origin(&req.url()?, root));
+            let mut resp = json_response(200, &manifest)?;
+            resp.headers_mut().set("cache-control", "no-store")?;
+            Ok(resp)
+        }
+        (Method::Get, slack::CREATE_SHARED_APP_PATH) => {
+            let manifest = slack::shared_manifest(&root_origin(&req.url()?, root));
+            Response::redirect(Url::parse(&slack::create_app_link(&manifest))?)
+        }
         (Method::Post, "/api/stripe/webhook") => billing::webhook(req, env).await,
         (_, p) if p.starts_with("/api/operator/") => operator(req, env, p).await,
         // Static files the sign-up page uses.
@@ -221,6 +241,40 @@ async fn root_site(req: Request, env: &Env, root: &str, path: &str) -> Result<Re
             Response::redirect(url)
         }
     }
+}
+
+/// `https://dumbslab.com` (with the port in development).
+fn root_origin(url: &Url, root: &str) -> String {
+    let port = url.port().map(|p| format!(":{p}")).unwrap_or_default();
+    format!("{}://{root}{port}", url.scheme())
+}
+
+/// A command or event from DumbSlab's own Slack app. The core checks Slack's signature with the
+/// shared signing secret and finds the Slack workspace it's for; the directory says which
+/// workspace claimed it; the request goes there unchanged, at that workspace's address, and the
+/// workspace checks it again and handles it.
+async fn slack_root(mut req: Request, env: &Env, root: &str, path: &str) -> Result<Response> {
+    let Some(secret) = var(env, "SLACK_SIGNING_SECRET") else {
+        return error_response(404, "slack_off", "This server has no shared Slack app.");
+    };
+    let Some(body) = read_body(&mut req).await? else {
+        return error_response(413, "too_large", "request body too large");
+    };
+    let header = |name: &str| req.headers().get(name).ok().flatten();
+    let (timestamp, signature) = (header("x-slack-request-timestamp"), header("x-slack-signature"));
+    let team = match slack::route(&secret, path, timestamp.as_deref(), signature.as_deref(), &body, Utc::now().timestamp()) {
+        slack::Routed::Answer(r) => return workspace::to_response(r),
+        slack::Routed::Forward(team) => team,
+    };
+    let (status, found) =
+        call_object(env, "DIRECTORY", "directory", Method::Post, "/slack/lookup", Some(&json!({ "team_id": team }))).await?;
+    let (Some(home), Some(address)) = (found["home"].as_str().filter(|_| status == 200), found["address"].as_str()) else {
+        return workspace::to_response(slack::unknown_team(path));
+    };
+    // At the workspace's own address, so its links and replies name it.
+    let mut url = req.url()?;
+    url.set_host(Some(&format!("{address}.{root}"))).map_err(|e| worker::Error::RustError(e.to_string()))?;
+    send_to(env, &format!("ws:{home}"), url.as_str(), &req, Some(&body), Some((address, home))).await
 }
 
 /// A plain-text file for crawlers and agents. It changes only when the Worker deploys.
@@ -298,7 +352,8 @@ async fn signup(mut req: Request, env: &Env, root: &str) -> Result<Response> {
 ///
 /// - `GET  /api/operator/workspaces`: every workspace with its plan and usage, and the free plan's totals.
 /// - `POST /api/operator/workspaces/{address}/disable` (or `enable`, `delete`). Any of a
-///   workspace's addresses works; `delete` frees all of them, and refuses while someone pays.
+///   workspace's addresses works; `delete` frees all of them and its Slack workspace (Add to
+///   Slack), and refuses while someone pays.
 /// - `POST /api/operator/workspaces/{address}/grant-pro` (or `revoke-pro`): Pro without paying.
 async fn operator(req: Request, env: &Env, path: &str) -> Result<Response> {
     let Some(expected) = var(env, "OPERATOR_TOKEN") else {

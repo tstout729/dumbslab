@@ -1322,13 +1322,9 @@ fn deleted_comments_leave_no_body_behind() {
         .unwrap()
         .unwrap();
     h.ok("DELETE", &format!("/api/v1/posts/{pid}?permanent=true"), None, &admin);
-    // Run the scrub (0004) again, and the migrations after it.
-    let before_scrub = dumbslab_core::db::MIGRATIONS.iter().position(|m| m.contains("UPDATE activity SET data = '{}'")).unwrap();
-    h.store
-        .with_tx(|db| (db.execute("UPDATE meta SET value = ? WHERE key = 'schema_version'", &[before_scrub.to_string().into()]), true))
-        .unwrap()
-        .unwrap();
-    let _reopened = Store::open(&h._dir.path().join("t.db")).unwrap();
+    // Run the scrub (0004) again. Only it: later migrations add columns, and each runs once.
+    let scrub = dumbslab_core::db::MIGRATIONS.iter().find(|m| m.contains("UPDATE activity SET data = '{}'")).unwrap();
+    h.store.with_tx(|db| (db.execute_batch(scrub), true)).unwrap().unwrap();
     assert!(!h.ok("GET", "/api/v1/activity?limit=200", None, &admin).to_string().contains("9999"));
 }
 
@@ -4792,6 +4788,450 @@ mod slack {
         // And nothing can be verified: Slack's requests are refused.
         let r = h.send(&signed_at("/slack/commands", &command_body("UMO", "search x"), "application/x-www-form-urlencoded", now(), SECRET));
         assert_eq!(r.status, 404);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Add to Slack: DumbSlab's own Slack app. The tests play Slack and the hosted directory: they run
+// each job's steps with canned answers.
+
+mod add_to_slack {
+    use super::*;
+    use dumbslab_core::connect::{self, Finish, HttpCall, HttpReply, Job, OAuthApp, Step};
+    use dumbslab_core::util::{hmac_sha256_hex, sha256_hex};
+
+    const HOST_SECRET: &str = "a0c1e2f3a4b5c6d7e8f9a0b1c2d3e4f5";
+    const CLIENT_ID: &str = "111.222";
+    const CLIENT_SECRET: &str = "the-client-secret";
+    const TOKEN: &str = "xoxb-shared-token-for-t1";
+    const TOKEN2: &str = "xoxb-shared-token-for-t2";
+    const ORG_TOKEN: &str = "xoxb-org-wide-token";
+    const REPLY_TO: &str = "https://hooks.slack.com/commands/T1/1234/abcXYZ";
+
+    /// Gives the host DumbSlab's shared Slack app (and a connector key).
+    fn share(h: &mut H) {
+        h.cfg.connectors.key = Some("connector-key".into());
+        h.cfg.connectors.apps.insert("slack".into(), OAuthApp { client_id: CLIENT_ID.into(), client_secret: CLIENT_SECRET.into() });
+        h.cfg.slack.signing_secret = Some(HOST_SECRET.into());
+    }
+
+    fn job_of(r: &Res) -> Job {
+        r.effects
+            .iter()
+            .find_map(|e| match e {
+                Effect::Connect(j) => Some(j.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("a job; got {} {:?}", r.status, r.headers))
+    }
+
+    fn later_of(r: &Res) -> Option<Job> {
+        r.effects.iter().find_map(|e| match e {
+            Effect::Background(j) => Some(j.clone()),
+            _ => None,
+        })
+    }
+
+    /// What Slack and the directory answer.
+    #[derive(Clone, Copy)]
+    struct Slack {
+        team: &'static str,
+        token: &'static str,
+        /// The directory's answer to a claim.
+        claim: u16,
+        org_wide: bool,
+    }
+
+    const T1: Slack = Slack { team: "T1", token: TOKEN, claim: 200, org_wide: false };
+
+    impl Slack {
+        fn answer(&self, call: &HttpCall) -> HttpReply {
+            let ok = |v: Value| HttpReply { status: 200, body: v.to_string() };
+            match call.url.as_str() {
+                "https://slack.com/api/oauth.v2.access" => {
+                    let team = if self.org_wide { Value::Null } else { json!({ "id": self.team, "name": format!("{} Slack", self.team) }) };
+                    let token = if self.org_wide { ORG_TOKEN } else { self.token };
+                    ok(json!({ "ok": true, "access_token": token, "token_type": "bot", "scope": "commands,chat:write,links:read",
+                        "bot_user_id": format!("UBOT{}", self.team), "app_id": "A1", "team": team,
+                        "enterprise": if self.org_wide { json!({ "id": "E1", "name": "Org" }) } else { Value::Null },
+                        "is_enterprise_install": self.org_wide }))
+                }
+                "https://slack.com/api/auth.revoke" => ok(json!({ "ok": true, "revoked": true })),
+                "dumbslab-directory:/slack/claim" => HttpReply { status: self.claim, body: "{}".into() },
+                "dumbslab-directory:/slack/release" => ok(json!({ "ok": true })),
+                other => panic!("unexpected call to {other}"),
+            }
+        }
+    }
+
+    /// Runs a job like a host: each step in its own transaction.
+    fn drive(h: &H, mut job: Job, slack: Slack) -> (Finish, Vec<HttpCall>) {
+        let mut replies = vec![];
+        let mut sent = vec![];
+        for _ in 0..connect::MAX_STEPS {
+            let (step, next) = h
+                .store
+                .with_tx(|db| {
+                    let (step, _) = connect::guarded_step(db, &h.cfg, &mut job, replies.clone(), chrono::Utc::now(), |_| None);
+                    let ok = step.is_ok();
+                    ((step, job.clone()), ok)
+                })
+                .unwrap();
+            job = next;
+            match step.unwrap() {
+                Step::Done(f) => return (f, sent),
+                Step::Fetch(calls) => {
+                    replies = calls.iter().map(|c| slack.answer(c)).collect();
+                    sent.extend(calls);
+                }
+            }
+        }
+        panic!("job didn't finish");
+    }
+
+    fn get(h: &H, path: &str, auth: &Auth) -> Res {
+        h.raw("GET", path, vec![], "text/html", auth)
+    }
+
+    fn location(r: &Res) -> String {
+        assert_eq!(r.status, 302, "{} {:?}", r.body, r.headers);
+        r.header("location").unwrap().to_string()
+    }
+
+    fn query_param(url: &str, key: &str) -> String {
+        let query = url.split_once('?').unwrap().1;
+        let raw = query.split('&').find_map(|p| p.strip_prefix(&format!("{key}="))).unwrap_or_else(|| panic!("{key} in {url}"));
+        urlencoding::decode(raw).unwrap().into_owned()
+    }
+
+    fn login(h: &H, email: &str, password: &str) -> Auth {
+        session_from(&h.call("POST", "/api/v1/auth/login", Some(json!({ "email": email, "password": password })), &Auth::None))
+    }
+
+    /// Starts Add to Slack as `auth`; the `state` Slack would send back.
+    fn start(h: &H, auth: &Auth) -> String {
+        let to = location(&get(h, "/slack/install", auth));
+        assert!(to.starts_with("https://slack.com/oauth/v2/authorize?"), "{to}");
+        query_param(&to, "state")
+    }
+
+    fn come_back(h: &H, auth: &Auth, query: &str) -> Res {
+        get(h, &format!("/slack/install/callback?{query}"), auth)
+    }
+
+    /// Add to Slack from start to finish, with Slack's (and the directory's) answers.
+    fn install(h: &H, admin: &Auth, slack: Slack) -> (Finish, Vec<HttpCall>) {
+        let state = start(h, admin);
+        let r = come_back(h, admin, &format!("code=the-code&state={}", urlencoding::encode(&state)));
+        assert!(location(&r).ends_with("slack_error=failed"), "fails safe if the job never finishes");
+        drive(h, job_of(&r), slack)
+    }
+
+    fn redirect(f: &Finish) -> &str {
+        match f {
+            Finish::Redirect(url) => url,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    fn urls(calls: &[HttpCall]) -> Vec<&str> {
+        calls.iter().map(|c| c.url.as_str()).collect()
+    }
+
+    fn bearer(call: &HttpCall) -> Option<&str> {
+        call.headers.iter().find(|(k, _)| k == "authorization").and_then(|(_, v)| v.strip_prefix("Bearer "))
+    }
+
+    fn signed(path: &str, body: &str, secret: &str) -> Request {
+        let at = chrono::Utc::now().timestamp();
+        let signature = format!("v0={}", hmac_sha256_hex(secret, &format!("v0:{at}:{body}")));
+        let content_type = if path.ends_with("commands") { "application/x-www-form-urlencoded" } else { "application/json" };
+        Request {
+            method: "POST".into(),
+            path: path.into(),
+            headers: vec![
+                ("content-type".into(), content_type.into()),
+                ("x-slack-request-timestamp".into(), at.to_string()),
+                ("x-slack-signature".into(), signature),
+            ],
+            body: body.as_bytes().to_vec(),
+            origin: "https://kb.test".into(),
+            ..Default::default()
+        }
+    }
+
+    fn command(team: &str) -> String {
+        format!(
+            "token=x&team_id={team}&channel_id=C1&user_id=UMO&command=%2Fdumbslab&text=search+x&response_url={}&trigger_id={}",
+            urlencoding::encode(REPLY_TO),
+            dumbslab_core::util::new_id()
+        )
+    }
+
+    fn event(team: &str, event: Value, at: i64) -> String {
+        json!({ "token": "x", "team_id": team, "api_app_id": "A1", "type": "event_callback", "event": event,
+            "event_id": format!("Ev{}", dumbslab_core::util::new_id()), "event_time": at,
+            "authorizations": [{ "enterprise_id": null, "team_id": team, "user_id": "UBOT", "is_bot": true, "is_enterprise_install": false }] })
+        .to_string()
+    }
+
+    #[test]
+    fn add_to_slack_connects_with_one_click() {
+        let mut h = H::new();
+        let (admin, admin_token) = h.setup();
+        h.user(&admin, "mo@acme.test", "Mo", "member");
+        let mo = login(&h, "mo@acme.test", "password123");
+        h.cfg.connectors.key = Some("connector-key".into());
+
+        // Without the shared app, there's nothing to click: an admin creates their own app.
+        assert!(h.ok("GET", "/api/v1/slack", None, &admin)["install_url"].is_null());
+        assert!(location(&get(&h, "/slack/install", &admin)).ends_with("/settings/slack?slack_error=unavailable"));
+
+        share(&mut h);
+        let s = h.ok("GET", "/api/v1/slack", None, &admin);
+        assert_eq!((s["install_url"].as_str(), &s["mode"]), (Some("https://kb.test/slack/install"), &Value::Null), "{s}");
+        // Admins only, in a browser: members are told, and anyone else signs in first.
+        assert_eq!(location(&get(&h, "/slack/install", &mo)), "https://kb.test/settings/slack?slack_error=not_admin");
+        let login_first = "https://kb.test/login?next=%2Fsettings%2Fslack";
+        assert_eq!(location(&get(&h, "/slack/install", &Auth::None)), login_first);
+        assert_eq!(location(&get(&h, "/slack/install", &admin_token)), login_first, "an API token isn't a browser");
+
+        // The admin goes to Slack with the bot scopes, this server's callback and a fresh state,
+        // which is stored only hashed.
+        let to = location(&get(&h, "/slack/install", &admin));
+        assert_eq!(query_param(&to, "client_id"), CLIENT_ID);
+        assert_eq!(query_param(&to, "scope"), dumbslab_core::slack::SCOPES.join(","));
+        assert_eq!(query_param(&to, "redirect_uri"), "https://kb.test/slack/install/callback");
+        assert!(!to.contains("user_scope"), "{to}");
+        let state = query_param(&to, "state");
+        assert_eq!(count(&h, &format!("SELECT COUNT(*) FROM slack_installs WHERE state_hash = '{}'", sha256_hex(&state))), 1);
+        assert_eq!(count(&h, &format!("SELECT COUNT(*) FROM slack_installs WHERE state_hash = '{state}'")), 0);
+
+        // Another session, even the same admin's, can't finish it; and then it's spent.
+        let elsewhere = login(&h, "ada@acme.test", "correct horse");
+        let back = |auth: &Auth, query: String| location(&come_back(&h, auth, &query));
+        assert!(back(&elsewhere, format!("code=c&state={state}")).ends_with("slack_error=other_session"));
+        assert!(back(&admin, format!("code=c&state={state}")).ends_with("slack_error=expired"));
+        assert!(back(&admin, "code=c&state=made-up".into()).ends_with("slack_error=expired"));
+        // Declining in Slack says so, without Slack's words.
+        let state = start(&h, &admin);
+        assert!(
+            back(&admin, format!("error=access_denied&error_description=%3Cb%3Eno%3C%2Fb%3E&state={state}"))
+                .ends_with("slack_error=declined")
+        );
+        let state = start(&h, &admin);
+        assert!(back(&admin, format!("error=server_error&state={state}")).ends_with("slack_error=slack_error"));
+
+        // Approving: the code is exchanged with the client's credentials, and that's all.
+        let (finish, calls) = install(&h, &admin, T1);
+        assert_eq!(redirect(&finish), "https://kb.test/settings/slack?slack=connected");
+        assert_eq!(urls(&calls), vec!["https://slack.com/api/oauth.v2.access"], "a self-hosted server claims nothing");
+        let basic = base64::engine::general_purpose::STANDARD.encode(format!("{CLIENT_ID}:{CLIENT_SECRET}"));
+        assert!(calls[0].headers.contains(&("authorization".into(), format!("Basic {basic}"))), "{:?}", calls[0].headers);
+        let form = calls[0].body.clone().unwrap();
+        assert!(
+            form.contains("code=the-code") && form.contains("redirect_uri=https%3A%2F%2Fkb.test%2Fslack%2Finstall%2Fcallback"),
+            "{form}"
+        );
+        assert!(!form.contains(CLIENT_SECRET));
+
+        let s = h.ok("GET", "/api/v1/slack", None, &admin);
+        assert_eq!((s["mode"].as_str(), s["connected"].as_bool()), (Some("shared"), Some(true)), "{s}");
+        assert_eq!((s["slack_workspace"].as_str(), s["slack_workspace_id"].as_str()), (Some("T1 Slack"), Some("T1")));
+        assert_eq!(s["granted_scopes"], json!(["commands", "chat:write", "links:read"]));
+        let shown = s.to_string();
+        for secret in [TOKEN, HOST_SECRET, CLIENT_SECRET] {
+            assert!(!shown.contains(secret), "{secret} in {shown}");
+        }
+        let stored = db_run(&h, |db| db.one("SELECT bot_token, signing_secret, shared FROM slack_app", &[])).unwrap();
+        assert!(!stored.str("bot_token").contains(TOKEN) && stored.opt_str("signing_secret").is_none() && stored.bool("shared"));
+        let activity = h.ok("GET", "/api/v1/activity?event=slack.installed", None, &admin);
+        assert_eq!(activity["items"].as_array().unwrap().len(), 1, "{activity}");
+
+        // Slack's requests, signed with the shared app's secret, work for this Slack workspace only.
+        let r = h.send(&signed("/slack/commands", &command("T1"), HOST_SECRET));
+        assert!(later_of(&r).is_some(), "{}", r.body);
+        let r = h.send(&signed("/slack/commands", &command("T9"), HOST_SECRET));
+        assert!(r.body.to_string().contains("isn't connected") && r.effects.is_empty(), "{}", r.body);
+        assert_eq!(h.send(&signed("/slack/commands", &command("T1"), "another-secret")).status, 401);
+
+        // Its own app's secrets can't be pasted over it; previews can still be turned off.
+        for change in [json!({ "bot_token": "xoxb-own" }), json!({ "signing_secret": "0123456789abcdef0123" })] {
+            let r = h.call("PATCH", "/api/v1/slack", Some(change), &admin);
+            assert_eq!((r.status, r.body["error"]["code"].as_str()), (409, Some("slack_shared")), "{}", r.body);
+        }
+        assert_eq!(h.ok("PATCH", "/api/v1/slack", Some(json!({ "unfurls": false })), &admin)["unfurls"], false);
+
+        // Disconnecting revokes the bot token in Slack, after the answer.
+        let r = h.call("DELETE", "/api/v1/slack", None, &admin);
+        assert_eq!(r.status, 200, "{}", r.body);
+        let (_, calls) = drive(&h, later_of(&r).expect("a job that revokes the token"), T1);
+        assert_eq!(urls(&calls), vec!["https://slack.com/api/auth.revoke"]);
+        assert_eq!(bearer(&calls[0]), Some(TOKEN));
+        assert!(h.ok("GET", "/api/v1/slack", None, &admin)["mode"].is_null());
+        let r = h.send(&signed("/slack/commands", &command("T1"), HOST_SECRET));
+        assert!(r.body.to_string().contains("isn't connected"), "{}", r.body);
+    }
+
+    #[test]
+    fn add_to_slack_claims_one_slack_workspace_for_one_workspace() {
+        let (mut h, admin) = hosted(None);
+        share(&mut h);
+        h.cfg.slack.callback_url = Some("https://kb.test/slack/install/callback".into());
+
+        // Slack sends everyone back to the root domain, which forwards by the state's address.
+        let to = location(&get(&h, "/slack/install", &admin));
+        assert_eq!(query_param(&to, "redirect_uri"), "https://kb.test/slack/install/callback");
+        assert!(query_param(&to, "state").starts_with("acme."));
+
+        // Another workspace holds the Slack workspace: nothing is saved, and the token stays (it's theirs).
+        let (finish, calls) = install(&h, &admin, Slack { claim: 409, ..T1 });
+        assert!(redirect(&finish).ends_with("/settings/slack?slack_error=slack_team_taken"));
+        assert_eq!(urls(&calls), vec!["https://slack.com/api/oauth.v2.access", "dumbslab-directory:/slack/claim"]);
+        let claim: Value = serde_json::from_str(calls[1].body.as_deref().unwrap()).unwrap();
+        assert_eq!(claim, json!({ "team_id": "T1", "home": "acme" }));
+        assert!(bearer(&calls[1]).is_none(), "the directory never sees a token");
+        assert!(h.ok("GET", "/api/v1/slack", None, &admin)["mode"].is_null());
+        // The directory didn't answer: nothing is saved either.
+        let (finish, _) = install(&h, &admin, Slack { claim: 0, ..T1 });
+        assert!(redirect(&finish).ends_with("slack_error=failed"));
+
+        // Claimed: connected.
+        let (finish, _) = install(&h, &admin, T1);
+        assert!(redirect(&finish).ends_with("/settings/slack?slack=connected"));
+        assert_eq!(h.ok("GET", "/api/v1/slack", None, &admin)["slack_workspace_id"], "T1");
+        h.ok("POST", "/api/v1/slack/channels", Some(json!({ "channel": "C0CHANNEL01" })), &admin);
+
+        // Moving to another Slack workspace drops the old one's channels and revokes its token.
+        let t2 = Slack { team: "T2", token: TOKEN2, ..T1 };
+        let (finish, calls) = install(&h, &admin, t2);
+        assert!(redirect(&finish).ends_with("slack=connected"));
+        assert_eq!(
+            urls(&calls),
+            vec!["https://slack.com/api/oauth.v2.access", "dumbslab-directory:/slack/claim", "https://slack.com/api/auth.revoke"]
+        );
+        assert_eq!(bearer(&calls[2]), Some(TOKEN));
+        let s = h.ok("GET", "/api/v1/slack", None, &admin);
+        assert_eq!((s["slack_workspace_id"].as_str(), s["channels"].as_array().unwrap().len()), (Some("T2"), 0), "{s}");
+        // Adding the same Slack workspace again keeps everything, and revokes nothing.
+        h.ok("POST", "/api/v1/slack/channels", Some(json!({ "channel": "C0CHANNEL02" })), &admin);
+        let (_, calls) = install(&h, &admin, t2);
+        assert_eq!(calls.len(), 2, "{calls:?}");
+        assert_eq!(h.ok("GET", "/api/v1/slack", None, &admin)["channels"].as_array().unwrap().len(), 1);
+
+        // Org-wide installs are refused, and their token revoked: nobody here can hold one.
+        let (finish, calls) = install(&h, &admin, Slack { org_wide: true, ..T1 });
+        assert!(redirect(&finish).ends_with("slack_error=enterprise_install"));
+        assert_eq!(urls(&calls), vec!["https://slack.com/api/oauth.v2.access", "https://slack.com/api/auth.revoke"]);
+        assert_eq!(bearer(&calls[1]), Some(ORG_TOKEN));
+        assert_eq!(h.ok("GET", "/api/v1/slack", None, &admin)["slack_workspace_id"], "T2", "nothing changed");
+
+        // A request for a Slack workspace this one doesn't hold: the claim pointing here lets go.
+        let r = h.send(&signed("/slack/commands", &command("T1"), HOST_SECRET));
+        assert!(r.body.to_string().contains("isn't connected"), "{}", r.body);
+        let (_, calls) = drive(&h, later_of(&r).expect("a job that lets go"), T1);
+        assert_eq!(urls(&calls), vec!["dumbslab-directory:/slack/release"]);
+        assert_eq!(serde_json::from_str::<Value>(calls[0].body.as_deref().unwrap()).unwrap(), json!({ "team_id": "T1", "home": "acme" }));
+
+        // An uninstall sent before this install is about an earlier one.
+        let now = chrono::Utc::now().timestamp();
+        let r = h.send(&signed("/slack/events", &event("T2", json!({ "type": "app_uninstalled" }), now - 3600), HOST_SECRET));
+        assert_eq!((r.status, &r.body), (200, &json!({ "ok": true })));
+        assert_eq!(h.ok("GET", "/api/v1/slack", None, &admin)["mode"], "shared");
+        // Nor does an uninstall that names no Slack workspace.
+        let nameless = json!({ "token": "x", "type": "event_callback", "event": { "type": "app_uninstalled" }, "event_id": "EvNoTeam", "event_time": now });
+        assert_eq!(h.send(&signed("/slack/events", &nameless.to_string(), HOST_SECRET)).status, 200);
+        assert_eq!(h.ok("GET", "/api/v1/slack", None, &admin)["mode"], "shared");
+        // Someone else's bot token being revoked changes nothing.
+        let other = json!({ "type": "tokens_revoked", "tokens": { "oauth": ["UPERSON"], "bot": ["USOMEONE"] } });
+        h.send(&signed("/slack/events", &event("T2", other, now), HOST_SECRET));
+        assert_eq!(h.ok("GET", "/api/v1/slack", None, &admin)["mode"], "shared");
+
+        // Slack says the app was removed: Slack is disconnected here, and the claim let go.
+        let r = h.send(&signed("/slack/events", &event("T2", json!({ "type": "app_uninstalled" }), now), HOST_SECRET));
+        assert_eq!((r.status, &r.body), (200, &json!({ "ok": true })));
+        let s = h.ok("GET", "/api/v1/slack", None, &admin);
+        assert!(s["mode"].is_null() && s["channels"].as_array().unwrap().is_empty(), "{s}");
+        let (_, calls) = drive(&h, later_of(&r).expect("a job that lets go"), T1);
+        assert_eq!(urls(&calls), vec!["dumbslab-directory:/slack/release"]);
+        let activity = h.ok("GET", "/api/v1/activity?event=slack.uninstalled", None, &admin);
+        assert_eq!(activity["items"][0]["via"], "slack", "{activity}");
+
+        // Revoking the bot token in Slack does the same.
+        install(&h, &admin, t2);
+        let revoked = json!({ "type": "tokens_revoked", "tokens": { "oauth": [], "bot": ["UBOTT2"] } });
+        h.send(&signed("/slack/events", &event("T2", revoked, now + 5), HOST_SECRET));
+        assert!(h.ok("GET", "/api/v1/slack", None, &admin)["mode"].is_null());
+    }
+
+    /// The directory maps each Slack workspace to one DumbSlab workspace, by its first address.
+    #[test]
+    fn the_directory_maps_a_slack_workspace_to_one_workspace() {
+        use chrono::Utc;
+        use dumbslab_core::tenancy::{self, Limits};
+        let h = H::new();
+        let limits = Limits { per_ip_per_day: 10, per_day: 10, max_workspaces: 10, free: ROOMY };
+        let now = Utc::now();
+        db_run(&h, |db| tenancy::directory_migrate(db));
+        for slug in ["acme", "beta", "gamma"] {
+            db_run(&h, |db| tenancy::reserve(db, slug, "Name", slug, now, limits).map(|_| ()));
+        }
+        db_run(&h, |db| tenancy::activate(db, "acme", now));
+        db_run(&h, |db| tenancy::activate(db, "beta", now));
+        let run = |f: &dyn Fn(&dyn dumbslab_core::Db) -> dumbslab_core::ApiResult<()>| {
+            h.store
+                .with_tx(|db| {
+                    let r = f(db);
+                    let ok = r.is_ok();
+                    (r, ok)
+                })
+                .unwrap()
+                .err()
+                .map(|e| e.code)
+        };
+        let lookup = |team: &str| db_run(&h, |db| tenancy::slack_team_home(db, team));
+        let claim = |team: &'static str, home: &'static str| run(&move |db| tenancy::claim_slack_team(db, team, home, now));
+        let release = |team: &'static str, home: &'static str| run(&move |db| tenancy::release_slack_team(db, team, home));
+
+        assert_eq!(claim("T1", "acme"), None);
+        assert_eq!(lookup("T1"), Some(("acme".into(), "acme".into())));
+        assert_eq!(claim("T1", "beta"), Some("slack_team_taken"));
+        assert_eq!(claim("T1", "acme"), None, "claiming one's own again");
+        // One Slack workspace per workspace: claiming another lets go of the first.
+        assert_eq!(claim("T2", "acme"), None);
+        assert_eq!(lookup("T1"), None);
+        assert_eq!(claim("T1", "beta"), None);
+        // Only the holder lets go.
+        assert_eq!(release("T2", "beta"), None);
+        assert_eq!(lookup("T2"), Some(("acme".into(), "acme".into())));
+        // Requests go to the address the workspace lives at now.
+        db_run(&h, |db| tenancy::move_address(db, "acme", "wiki", now));
+        assert_eq!(lookup("T2"), Some(("acme".into(), "wiki".into())));
+        // A reservation nobody set up, or a bad ID, can't claim.
+        assert_eq!(claim("T3", "gamma"), Some("not_found"));
+        assert_eq!(claim("T<3>", "acme"), Some("bad_request"));
+        // Deleting a workspace frees its Slack workspace.
+        db_run(&h, |db| tenancy::remove(db, "acme"));
+        assert_eq!(lookup("T2"), None);
+        assert_eq!(claim("T2", "beta"), None);
+        assert_eq!(release("T2", "beta"), None);
+        assert_eq!(lookup("T2"), None);
+    }
+
+    #[test]
+    fn the_shared_app_manifest_is_public() {
+        let h = H::new();
+        let r = get(&h, "/slack/app-manifest.json", &Auth::None);
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert_eq!(r.body["features"]["slash_commands"][0]["url"], "https://kb.test/slack/commands");
+        assert_eq!(r.body["settings"]["event_subscriptions"]["request_url"], "https://kb.test/slack/events");
+        assert_eq!(r.body["oauth_config"]["redirect_urls"][2], "https://kb.test/slack/install/callback");
+        let to = location(&get(&h, "/slack/create-app", &Auth::None));
+        assert!(to.starts_with("https://api.slack.com/apps?new_app=1&manifest_json=%7B"), "{to}");
+        // A hosted workspace leaves it to the root domain.
+        let (hosted, _) = hosted(None);
+        assert_eq!(get(&hosted, "/slack/app-manifest.json", &Auth::None).status, 404);
+        assert_eq!(get(&hosted, "/slack/create-app", &Auth::None).status, 404);
     }
 }
 
