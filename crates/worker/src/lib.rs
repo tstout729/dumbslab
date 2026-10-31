@@ -159,13 +159,27 @@ async fn forward(env: &Env, object: &str, mut req: Request, workspace: Option<&s
 
 /// One request to a workspace object. `route` is (requested address, the workspace's home address).
 async fn send(env: &Env, object: &str, req: &Request, body: Option<&[u8]>, route: Option<(&str, &str)>) -> Result<Response> {
-    send_to(env, object, req.url()?.as_str(), req, body, route).await
+    send_to(env, object, req.url()?.as_str(), req, body, route, false).await
 }
 
-/// [`send`], at another URL.
-async fn send_to(env: &Env, object: &str, url: &str, req: &Request, body: Option<&[u8]>, route: Option<(&str, &str)>) -> Result<Response> {
+/// [`send`], at another URL. `slack_root`: a request from DumbSlab's own Slack app, whose signature
+/// the root checked (see `slack::VIA_ROOT_HEADER`).
+async fn send_to(
+    env: &Env,
+    object: &str,
+    url: &str,
+    req: &Request,
+    body: Option<&[u8]>,
+    route: Option<(&str, &str)>,
+    slack_root: bool,
+) -> Result<Response> {
     let stub = env.durable_object("WORKSPACE")?.id_from_name(object)?.get_stub()?;
     let headers = req.headers().clone();
+    // Only this Worker may say a Slack request came through the root.
+    headers.delete(slack::VIA_ROOT_HEADER)?;
+    if slack_root {
+        headers.set(slack::VIA_ROOT_HEADER, "1")?;
+    }
     // Only this Worker may say which workspace a request is for.
     match route {
         Some((slug, home)) => {
@@ -279,10 +293,11 @@ async fn slack_root(mut req: Request, env: &Env, root: &str, path: &str) -> Resu
     let (Some(home), Some(address)) = (found["home"].as_str().filter(|_| status == 200), found["address"].as_str()) else {
         return workspace::to_response(slack::unknown_team(path));
     };
-    // At the workspace's own address, so its links and replies name it.
+    // At the workspace's own address, so its links and replies name it, and saying it came through
+    // here: the workspace checks it with the shared app's secret, whatever app it connected itself.
     let mut url = req.url()?;
     url.set_host(Some(&format!("{address}.{root}"))).map_err(|e| worker::Error::RustError(e.to_string()))?;
-    send_to(env, &format!("ws:{home}"), url.as_str(), &req, Some(&body), Some((address, home))).await
+    send_to(env, &format!("ws:{home}"), url.as_str(), &req, Some(&body), Some((address, home)), true).await
 }
 
 /// Checks the token of a Slack workspace Slack says removed the app, and forgets the installation

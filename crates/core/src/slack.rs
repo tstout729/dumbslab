@@ -61,16 +61,19 @@
 //! On hosted DumbSlab the directory holds each installation, token included, and is the only
 //! record of which DumbSlab workspace holds a Slack workspace:
 //!
-//! - Add to Slack exchanges the code, has the directory record the installation (refused while
-//!   another workspace holds that Slack workspace), then saves a reference here: the Slack
-//!   workspace's ID and name, and the settings. No token. Switching Slack workspaces then lets go of
-//!   the previous one. Disconnecting lets go first and forgets the reference only once the
-//!   directory has.
+//! - Add to Slack reads where this workspace's connection is (see below), exchanges the code, has
+//!   the directory record the installation (refused while another workspace holds that Slack
+//!   workspace), then saves a reference here: the Slack workspace's ID and name, and the settings.
+//!   No token. It saves only over the connection that was here when it recorded the installation,
+//!   and only in the same workspace (`workspace_instance`: one deleted and set up again at the same
+//!   address is another); otherwise it lets go of what it recorded. Switching Slack workspaces then
+//!   lets go of the previous one. Disconnecting lets go first and forgets the reference only once
+//!   the directory has.
 //! - Changes to which Slack workspaces a workspace holds are fenced by the directory's value for
 //!   its connection (`generation`, per workspace): Add to Slack, a switch, a disconnect and letting
 //!   go of leftovers read it when they start and name it in each change, which moves it on; a
-//!   change naming an old value is refused (`slack_changed`). Forgetting a dead token moves it on
-//!   too. So a delayed step (an install holding an older token, a release from an earlier switch)
+//!   change naming an old value is refused (`slack_changed`). Forgetting a dead token, and the
+//!   operator deleting the workspace, move it on too. So a delayed step (an install holding an older token, a release from an earlier switch)
 //!   never undoes a newer one, and of two Add to Slack at once one wins and the other hears
 //!   `slack_busy`.
 //! - Every job that acts on Slack (a command's `users.info`, `chat.unfurl`, channel and test
@@ -89,7 +92,8 @@
 //!   go of any other it still holds (a switch that stopped before letting go), but only ones
 //!   installed more than 15 minutes ago (an Add to Slack may still be finishing) and only if the
 //!   connection didn't change since it asked. So do requests the root routed here for a Slack
-//!   workspace this workspace doesn't hold.
+//!   workspace this workspace doesn't hold: the root marks them ([`VIA_ROOT_HEADER`]), and they're
+//!   checked with the shared app's signing secret even once the workspace uses its own app.
 //!
 //! Self-hosted servers have no directory: Add to Slack saves the token here, like a workspace's own
 //! app, and checks it with `auth.test` when Slack says the app was removed.
@@ -143,6 +147,10 @@ pub const CREATE_SHARED_APP_PATH: &str = "/slack/create-app";
 pub const USER_SCOPES: &[&str] = &["search:read", "openid", "email", "profile"];
 /// The events the shared app subscribes to: link previews, and hearing that it was removed.
 pub const SHARED_EVENTS: &[&str] = &["link_shared", "app_uninstalled", "tokens_revoked"];
+/// Hosted DumbSlab: on a request the root forwarded, which it checked with the shared app's signing
+/// secret. The workspace checks it with that secret too, whatever app it connected itself. Only the
+/// root sets it (the Worker removes any a client sent); it never names anything.
+pub const VIA_ROOT_HEADER: &str = "x-dumbslab-slack-via-root";
 /// Jobs reach hosted DumbSlab's directory with calls to this address: `{DIRECTORY}/slack/install`,
 /// `/slack/release`, `/slack/token`, `/slack/status` and `/slack/forget`, each with a JSON body
 /// naming the Slack workspace (`team_id`). Only the Cloudflare host answers them, and it names the
@@ -390,6 +398,25 @@ pub(crate) fn remove(db: &dyn Db) -> ApiResult<bool> {
     Ok(app + channels > 0)
 }
 
+const INSTANCE: &str = "workspace_instance";
+
+/// This workspace's storage, as one instance: a random value in its settings, made the first time
+/// it's needed. A workspace deleted and set up again at the same address is another instance, so
+/// work the deleted one started (an Add to Slack) changes nothing in the new one.
+pub(crate) fn instance(db: &dyn Db) -> ApiResult<String> {
+    if let Some(v) = crate::ops::admin::setting(db, INSTANCE)? {
+        return Ok(v);
+    }
+    let v = crate::util::new_id();
+    crate::ops::admin::put_setting(db, INSTANCE, &v)?;
+    Ok(v)
+}
+
+/// Whether this is still the instance `expect` names.
+fn same_instance(db: &dyn Db, expect: &str) -> ApiResult<bool> {
+    Ok(crate::ops::admin::setting(db, INSTANCE)?.is_some_and(|v| secure_eq(&v, expect)))
+}
+
 /// Forgets Add to Slack's connection to `team_id`, only if it's still that one at `version`.
 /// `false` when it changed meanwhile.
 fn forget_connection(db: &dyn Db, team_id: &str, version: Option<&str>) -> ApiResult<bool> {
@@ -509,12 +536,15 @@ fn run(db: &dyn Db, cfg: &HostConfig, req: &Request) -> ApiResult<Outcome> {
     }
     let now = Utc::now();
     let app = load(db, cfg)?.filter(|a| a.signing_secret.is_some());
-    // The connected app's signing secret. Without one, the shared app's: the directory may still
-    // send Slack's requests here for a Slack workspace this workspace holds there (see `stray`).
-    let secret = match (&app, shared(cfg)) {
-        (Some(a), _) => a.signing_secret.clone().unwrap_or_default(),
-        (None, Some(s)) => s.signing_secret.to_string(),
-        (None, None) => return Err(ApiError::new(404, "slack_off", "Slack isn't connected to this workspace.")),
+    // Forwarded by the root (hosted): the shared app's, whatever this workspace connected, since
+    // the directory may still send its requests here for a Slack workspace this workspace holds
+    // there (see `stray`). Otherwise the connected app's, or without one the shared app's.
+    let via_root = home(cfg).is_some() && req.header(VIA_ROOT_HEADER).is_some();
+    let off = || ApiError::new(404, "slack_off", "Slack isn't connected to this workspace.");
+    let secret = match (via_root, &app, shared(cfg)) {
+        (true, _, Some(s)) | (false, None, Some(s)) => s.signing_secret.to_string(),
+        (false, Some(a), _) => a.signing_secret.clone().unwrap_or_default(),
+        (_, _, None) => return Err(off()),
     };
     let sig = req.header("x-slack-signature");
     verify(&secret, req.header("x-slack-request-timestamp"), sig, &req.body, now.timestamp()).map_err(refused)?;
@@ -526,7 +556,8 @@ fn run(db: &dyn Db, cfg: &HostConfig, req: &Request) -> ApiResult<Outcome> {
     }
     let base = crate::http::base_url(cfg, req);
     // The shared app serves every Slack workspace: only the one this workspace holds gets in.
-    let Some(app) = app.filter(|a| !a.shared || ours(a, path, &req.body)) else {
+    let Some(app) = app.filter(|a| if via_root { a.shared && ours(a, path, &req.body) } else { !a.shared || ours(a, path, &req.body) })
+    else {
         return stray(cfg, &base, path, &req.body);
     };
     if path == COMMANDS_PATH { command(db, cfg, &app, &base, &req.body) } else { event(db, cfg, &app, &base, &req.body, now) }
@@ -1036,8 +1067,6 @@ pub struct SlackJob {
     token: Option<Token>,
     /// Add to Slack: what Slack gave.
     installed: Option<Box<Installed>>,
-    /// Add to Slack: where to send the admin once the last request is answered.
-    then: Option<String>,
     /// Settings › Slack, hosted: the directory said this workspace holds the Slack workspace it
     /// asked about.
     held: bool,
@@ -1045,6 +1074,9 @@ pub struct SlackJob {
     /// disconnecting, letting go of leftovers): the directory's value for its connection when the
     /// job started, moved on with each change it made. Each change names it.
     generation: Option<i64>,
+    /// Add to Slack: the connection saved here when it recorded the installation. It saves only
+    /// over exactly that.
+    expect: Option<Snapshot>,
 }
 
 /// The connection a job is for: Add to Slack's or the workspace's own app's, and its Slack
@@ -1092,7 +1124,10 @@ enum Work {
     Post { messages: Vec<WebhookDelivery> },
     /// Add to Slack: Slack sent an admin back with a code. Exchange it for the bot token; hosted,
     /// have the directory record the installation, then save a reference to it here.
-    Install { admin: String, via: Via, code: String, redirect_uri: String, home: Option<String> },
+    Install { admin: String, via: Via, code: String, redirect_uri: String, home: Option<String>, instance: String },
+    /// Hosted: let go of a Slack workspace, if this workspace's connection is still at
+    /// `generation` (after Add to Slack: the previous one, or its own that it couldn't save).
+    Release { team_id: String, generation: i64 },
     /// Add to Slack, hosted: let go of the Slack workspace in the directory, then forget the
     /// connection here.
     Disconnect { admin: String, via: Via },
@@ -1162,6 +1197,7 @@ impl fmt::Debug for SlackJob {
             Work::Test { .. } => "test",
             Work::Post { .. } => "post",
             Work::Install { .. } => "install",
+            Work::Release { .. } => "release",
             Work::Disconnect { .. } => "disconnect",
             Work::Status { .. } => "status",
             Work::Forget { .. } => "forget",
@@ -1182,9 +1218,9 @@ impl SlackJob {
             version: None,
             token: None,
             installed: None,
-            then: None,
             held: false,
             generation: None,
+            expect: None,
         }
     }
 
@@ -1525,9 +1561,10 @@ pub fn step(db: &dyn Db, cfg: &HostConfig, job: &mut SlackJob, replies: Vec<Http
             fill(serde_json::to_value(view).map_err(|e| ApiError::internal(e.to_string()))?)
         }
         // Add to Slack, disconnecting it, and the directory's view of it.
-        (_, Work::Install { .. } | Work::Disconnect { .. } | Work::Status { .. } | Work::Forget { .. } | Work::Check) => {
-            shared_app::step(db, cfg, job, &app, &replies, now)
-        }
+        (
+            _,
+            Work::Install { .. } | Work::Release { .. } | Work::Disconnect { .. } | Work::Status { .. } | Work::Forget { .. } | Work::Check,
+        ) => shared_app::step(db, cfg, job, &app, &replies, now),
         (phase, _) => Err(ApiError::internal(format!("a Slack job can't continue from {phase:?}"))),
     }
 }
@@ -1839,6 +1876,7 @@ mod tests {
                 code: "secret-code".into(),
                 redirect_uri: "https://kb.test/x".into(),
                 home: None,
+                instance: "i".into(),
             },
         );
         let mut acting = SlackJob::test("https://kb.test", "c1", &app);

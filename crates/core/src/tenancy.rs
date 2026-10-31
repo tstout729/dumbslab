@@ -394,13 +394,17 @@ pub fn set_status(db: &dyn Db, slug: &str, status: &str) -> ApiResult<()> {
 
 /// Removes a workspace (by its first address) and every address it moved to. Its billing records
 /// are detached: someone may claim the address again, and Stripe's later events about the old
-/// customers must not reach their workspace.
+/// customers must not reach their workspace. Its Slack workspaces are let go of, and its Slack
+/// connection's value moves on.
 pub fn remove(db: &dyn Db, home: &str) -> ApiResult<()> {
     db.execute("DELETE FROM workspaces WHERE slug = ?", &params![home])?;
     db.execute("DELETE FROM addresses WHERE home = ?", &params![home])?;
     db.execute("DELETE FROM usage WHERE home = ?", &params![home])?;
     db.execute("UPDATE billing SET detached = 1 WHERE home = ?", &params![home])?;
     db.execute("DELETE FROM slack_installs WHERE home = ?", &params![home])?;
+    // Whatever the deleted workspace still had under way (an Add to Slack) names an older value,
+    // so it's refused, also once someone sets up a workspace at this address again.
+    bump_generation(db, home)?;
     Ok(())
 }
 

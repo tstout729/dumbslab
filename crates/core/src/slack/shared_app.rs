@@ -10,8 +10,8 @@ use serde_json::{Value, json};
 
 use super::{
     API, App, BOT_TOKEN, COMMANDS_PATH, CREATE_APP_URL, CREATE_SHARED_APP_PATH, DIRECTORY, EVENTS_PATH, INSTALL_CALLBACK_PATH, MAX_BODY,
-    Phase, SCOPES, SHARED_EVENTS, SlackJob, USER_SCOPES, Work, dead, ephemeral, fail, fill, fingerprint, forget_connection, form, job_ctx,
-    key, later, load, open_from_directory, refused, reply, seal, seal_for_directory, slack_error, valid_id, verify,
+    Phase, SCOPES, SHARED_EVENTS, SlackJob, Snapshot, USER_SCOPES, Work, dead, ephemeral, fail, fill, fingerprint, forget_connection, form,
+    job_ctx, key, later, load, open_from_directory, refused, reply, seal, seal_for_directory, slack_error, valid_id, verify,
 };
 use crate::auth::{Actor, Role, Scopes, Via};
 use crate::connect::{self, Finish, HttpCall, HttpReply, Step};
@@ -311,6 +311,8 @@ pub fn install_callback(db: &dyn Db, cfg: &HostConfig, req: &Request) -> Outcome
                 code,
                 redirect_uri: install_callback_url(cfg, &base),
                 home: home(cfg).map(str::to_string),
+                // This workspace as it is now: deleted and set up again meanwhile, it's another.
+                instance: super::instance(db)?,
             },
         );
         out.effects.push(Effect::Connect(connect::Job::Slack(job)));
@@ -602,6 +604,16 @@ impl UninstallCheck {
     }
 }
 
+/// Exchanges Add to Slack's code at `oauth.v2.access`.
+fn exchange(job: &mut SlackJob, cfg: &HostConfig, code: &str, redirect_uri: &str) -> ApiResult<Step> {
+    let Some(app) = shared(cfg) else { return to_settings(&job.base_url, Err(InstallError::Unavailable)) };
+    // Basic auth, as Slack prefers, with the client's credentials form-encoded first (RFC 6749, 2.3.1).
+    let call = HttpCall::post_form(format!("{API}/oauth.v2.access"), &[("code", code), ("redirect_uri", redirect_uri)])
+        .basic(&urlencoding::encode(app.client_id), &urlencoding::encode(app.client_secret));
+    job.phase = Phase::Exchanging;
+    Ok(Step::Fetch(vec![call]))
+}
+
 fn to_settings(base_url: &str, outcome: Result<(), InstallError>) -> ApiResult<Step> {
     Ok(Step::Done(Finish::Redirect(settings_url(base_url, outcome))))
 }
@@ -613,11 +625,19 @@ fn still_admin(db: &dyn Db, user_id: &str, via: Via) -> ApiResult<Option<Actor>>
     }))
 }
 
-/// Saves Add to Slack's connection here, as the admin who added it, under a new version: with the
-/// token off hosted DumbSlab; on hosted DumbSlab without it (the directory holds it). It replaces
-/// whatever app was connected, and another Slack workspace's channels go with it. Returns the
-/// previous Add to Slack connection's Slack workspace when it was another one: hosted, the
-/// directory still holds that one for this workspace.
+/// How saving Add to Slack's connection here went.
+enum Saved {
+    /// Saved. The previous Add to Slack connection's Slack workspace, when it was another one:
+    /// hosted, the directory still holds that one for this workspace.
+    Done(Option<String>),
+    /// The connection here isn't the one the job started from any more: nothing was written.
+    Changed,
+}
+
+/// Saves Add to Slack's connection here, as the admin who added it, under a new version, only over
+/// `expect` (the connection here when the job recorded the installation): with the token off hosted
+/// DumbSlab; on hosted DumbSlab without it (the directory holds it). It replaces whatever app was
+/// connected, and another Slack workspace's channels go with it.
 fn save_install(
     db: &dyn Db,
     cfg: &HostConfig,
@@ -625,32 +645,54 @@ fn save_install(
     token: Option<&str>,
     admin: &str,
     now: DateTime<Utc>,
-) -> ApiResult<Option<String>> {
+    expect: &Snapshot,
+) -> ApiResult<Saved> {
     let old = load(db, cfg)?;
+    if Snapshot::of(old.as_ref()) != *expect {
+        return Ok(Saved::Changed);
+    }
     let sealed = token.map(|t| seal(cfg, BOT_TOKEN, t)).transpose()?;
-    db.execute(
-        "INSERT INTO slack_app (id, bot_token, signing_secret, team_id, team_name, bot_user_id, scopes, shared, version, updated_by, updated_at)
-         VALUES (1, ?, NULL, ?, ?, ?, ?, 1, ?, ?, ?)
-         ON CONFLICT(id) DO UPDATE SET bot_token = excluded.bot_token, signing_secret = NULL, team_id = excluded.team_id,
-           team_name = excluded.team_name, bot_user_id = excluded.bot_user_id, scopes = excluded.scopes, shared = 1,
-           version = excluded.version, updated_by = excluded.updated_by, updated_at = excluded.updated_at",
-        &params![
-            sealed,
-            inst.team_id.clone(),
-            inst.team_name.clone(),
-            Some(inst.bot_user_id.clone()).filter(|b| !b.is_empty()),
-            inst.scopes.join(","),
-            crate::util::new_id(),
-            admin,
-            ts(now)
-        ],
-    )?;
+    let mut values = params![
+        sealed,
+        inst.team_id.clone(),
+        inst.team_name.clone(),
+        Some(inst.bot_user_id.clone()).filter(|b| !b.is_empty()),
+        inst.scopes.join(","),
+        crate::util::new_id(),
+        admin,
+        ts(now)
+    ];
+    let written = match old {
+        None => db.execute(
+            "INSERT INTO slack_app (id, bot_token, signing_secret, team_id, team_name, bot_user_id, scopes, shared, version, updated_by,
+               updated_at) VALUES (1, ?, NULL, ?, ?, ?, ?, 1, ?, ?, ?) ON CONFLICT(id) DO NOTHING",
+            &values,
+        )?,
+        Some(_) => {
+            values.extend(params![expect.version.clone()]);
+            db.execute(
+                "UPDATE slack_app SET bot_token = ?, signing_secret = NULL, team_id = ?, team_name = ?, bot_user_id = ?, scopes = ?,
+                   shared = 1, version = ?, updated_by = ?, updated_at = ? WHERE id = 1 AND version IS ?",
+                &values,
+            )?
+        }
+    };
+    if written != 1 {
+        return Ok(Saved::Changed);
+    }
     let old_team = old.as_ref().and_then(|a| a.team_id.clone());
     if old_team.as_deref().is_some_and(|t| t != inst.team_id) {
         // Channel IDs belong to one Slack workspace.
         db.execute("DELETE FROM slack_channels", &[])?;
     }
-    Ok(old.filter(|a| a.shared).and_then(|a| a.team_id).filter(|t| *t != inst.team_id))
+    Ok(Saved::Done(old.filter(|a| a.shared).and_then(|a| a.team_id).filter(|t| *t != inst.team_id)))
+}
+
+/// A job, run after this one, that lets go of a Slack workspace if this workspace's connection is
+/// still at `generation` (see [`Work::Release`]).
+fn release_later(job: &mut SlackJob, team_id: &str, generation: i64) {
+    let release = SlackJob::new(&job.base_url, Work::Release { team_id: team_id.to_string(), generation });
+    job.effects.push(Effect::Background(connect::Job::Slack(release)));
 }
 
 /// Records that Slack is connected, as `actor`.
@@ -720,24 +762,25 @@ pub(super) fn step(
 ) -> ApiResult<Step> {
     let answer = replies.first().cloned().unwrap_or_default();
     match (job.phase, job.work.clone()) {
-        // Add to Slack: exchange the code; hosted, have the directory record the installation,
-        // then save the reference here.
+        // Add to Slack. Hosted: read where this workspace's connection is, exchange the code, have
+        // the directory record the installation, then save the reference here. Off hosted
+        // DumbSlab: exchange the code and save the token.
         (Phase::Start, Work::Install { code, redirect_uri, home, .. }) => {
-            let base = job.base_url.clone();
-            let Some(app) = shared(cfg) else { return to_settings(&base, Err(InstallError::Unavailable)) };
-            // Basic auth, as Slack prefers, with the client's credentials form-encoded first (RFC 6749, 2.3.1).
-            let call =
-                HttpCall::post_form(format!("{API}/oauth.v2.access"), &[("code", code.as_str()), ("redirect_uri", redirect_uri.as_str())])
-                    .basic(&urlencoding::encode(app.client_id), &urlencoding::encode(app.client_secret));
-            job.phase = Phase::Exchanging;
-            // Hosted: alongside, where this workspace's connection is now. The install names it.
-            let mut calls = vec![call];
-            if home.is_some() {
-                calls.push(status_call(None));
+            if home.is_none() {
+                return exchange(job, cfg, &code, &redirect_uri);
             }
-            Ok(Step::Fetch(calls))
+            // Before the code is exchanged: the token comes after the value the install names, so
+            // anything that changed this workspace's connection since (Slack removing the app,
+            // another Add to Slack) has it refused.
+            job.phase = Phase::Asking;
+            Ok(Step::Fetch(vec![status_call(None)]))
         }
-        (Phase::Exchanging, Work::Install { admin, via, home, .. }) => {
+        (Phase::Asking, Work::Install { code, redirect_uri, .. }) => {
+            let Some(generation) = generation_of(&answer) else { return to_settings(&job.base_url, Err(InstallError::Failed)) };
+            job.generation = Some(generation);
+            exchange(job, cfg, &code, &redirect_uri)
+        }
+        (Phase::Exchanging, Work::Install { admin, via, home, instance, .. }) => {
             let base = job.base_url.clone();
             let inst = match read_exchange(&answer) {
                 Exchange::Installed(i) => i,
@@ -747,15 +790,22 @@ pub(super) fn step(
                 // removes it in Slack.
                 Exchange::Enterprise => return to_settings(&base, Err(InstallError::EnterpriseInstall)),
             };
-            // The admin may have lost the role while Slack answered.
+            // Still this workspace (not one set up again at this address), and the admin may have
+            // lost the role while Slack answered.
+            if !super::same_instance(db, &instance)? {
+                return to_settings(&base, Err(InstallError::Failed));
+            }
             let Some(actor) = still_admin(db, &admin, via)? else { return to_settings(&base, Err(InstallError::NotAdmin)) };
+            let expect = Snapshot::of(load(db, cfg)?.as_ref());
             if home.is_none() {
                 // No directory: the token is kept here, like a workspace's own app's.
-                save_install(db, cfg, &inst, Some(&inst.token), &admin, now)?;
+                if let Saved::Changed = save_install(db, cfg, &inst, Some(&inst.token), &admin, now, &expect)? {
+                    return to_settings(&base, Err(InstallError::Busy));
+                }
                 record_install(db, cfg, job, &inst, actor, now)?;
                 return to_settings(&base, Ok(()));
             }
-            let Some(generation) = replies.get(1).and_then(generation_of) else { return to_settings(&base, Err(InstallError::Failed)) };
+            let Some(generation) = job.generation else { return to_settings(&base, Err(InstallError::Failed)) };
             // One Slack workspace belongs to one DumbSlab workspace: the directory records the
             // installation, token and all, unless another workspace holds it, or this one's
             // connection changed since the job started.
@@ -770,40 +820,70 @@ pub(super) fn step(
             let mut body = serde_json::to_value(install).map_err(|e| ApiError::internal(e.to_string()))?;
             body["generation"] = json!(generation);
             job.installed = Some(Box::new(inst));
+            job.expect = Some(expect);
             job.phase = Phase::Installing;
             Ok(Step::Fetch(vec![directory_call("/slack/install", body)]))
         }
-        (Phase::Installing, Work::Install { admin, via, .. }) => {
+        (Phase::Installing, Work::Install { admin, via, instance, .. }) => {
             let base = job.base_url.clone();
-            let Some(inst) = job.installed.clone() else { return to_settings(&base, Err(InstallError::Failed)) };
-            match (answer.status, generation_of(&answer)) {
-                (200, Some(generation)) => job.generation = Some(generation),
+            let (Some(inst), Some(expect)) = (job.installed.clone(), job.expect.clone()) else {
+                return to_settings(&base, Err(InstallError::Failed));
+            };
+            let generation = match (answer.status, generation_of(&answer)) {
+                (200, Some(generation)) => generation,
                 // Something changed this workspace's connection since the job started: a newer
-                // Add to Slack, a disconnect, Slack removing the app. That one stays.
+                // Add to Slack, a disconnect, Slack removing the app, the workspace deleted. That
+                // one stays.
                 (409, _) if refusal(&answer) == "slack_changed" => return to_settings(&base, Err(InstallError::Busy)),
                 (409, _) => return to_settings(&base, Err(InstallError::TeamTaken)),
                 // Perhaps recorded: then this workspace holds it there, and Settings › Slack lets
                 // go of it later (see `Work::Status`). Adding it again just records it again.
                 _ => return to_settings(&base, Err(InstallError::Failed)),
+            };
+            job.generation = Some(generation);
+            // The directory holds it for this workspace now. The reference is saved here, without
+            // the token, only in this same workspace (not one deleted and set up again at this
+            // address), while the admin still is one, and over exactly the connection here when
+            // the job recorded it: a newer Add to Slack that finished meanwhile stands.
+            let actor = still_admin(db, &admin, via)?;
+            let outcome = match (super::same_instance(db, &instance)?, &actor) {
+                (false, _) => Err(InstallError::Failed),
+                (true, None) => Err(InstallError::NotAdmin),
+                (true, Some(_)) => match save_install(db, cfg, &inst, None, &admin, now, &expect)? {
+                    Saved::Done(previous) => Ok(previous),
+                    Saved::Changed => Err(InstallError::Busy),
+                },
+            };
+            match outcome {
+                Ok(previous) => {
+                    record_install(db, cfg, job, &inst, actor.unwrap_or_else(slack_actor), now)?;
+                    // Switching Slack workspaces: let go of the previous one. If that doesn't
+                    // happen, Settings › Slack does it later.
+                    if let Some(previous) = previous {
+                        release_later(job, &previous, generation);
+                    }
+                    to_settings(&base, Ok(()))
+                }
+                Err(error) => {
+                    // Not saved: let go of what the directory just recorded, fenced on this job's
+                    // value, so it's refused if something newer moved that on. Not if the
+                    // connection here names it now (adding it again while something else changed).
+                    let named = load(db, cfg)?.is_some_and(|a| a.shared && a.team_id.as_deref() == Some(inst.team_id.as_str()));
+                    if !named {
+                        release_later(job, &inst.team_id, generation);
+                    }
+                    to_settings(&base, Err(error))
+                }
             }
-            // The directory holds it for this workspace now: the reference here, without the token.
-            let previous = save_install(db, cfg, &inst, None, &admin, now)?;
-            let actor = crate::model::actor_for_user(db, &admin)?.map(|mut a| {
-                a.via = via;
-                a
-            });
-            record_install(db, cfg, job, &inst, actor.unwrap_or_else(slack_actor), now)?;
-            // Switching Slack workspaces: let go of the previous one. If that doesn't happen, the
-            // next visit to Settings › Slack does it.
-            let (Some(previous), Some(generation)) = (previous, job.generation) else { return to_settings(&base, Ok(())) };
-            job.then = Some(settings_url(&base, Ok(())));
+        }
+
+        // After Add to Slack: let go of a Slack workspace, if nothing moved this workspace's
+        // connection on since. Refused otherwise; then Settings › Slack lets go of leftovers later.
+        (Phase::Start, Work::Release { team_id, generation }) => {
             job.phase = Phase::Releasing;
-            Ok(Step::Fetch(vec![release_call(&[previous], generation, false)]))
+            Ok(Step::Fetch(vec![release_call(&[team_id], generation, false)]))
         }
-        (Phase::Releasing, Work::Install { .. }) => {
-            let then = job.then.take().unwrap_or_else(|| settings_url(&job.base_url, Ok(())));
-            Ok(Step::Done(Finish::Redirect(then)))
-        }
+        (Phase::Releasing, Work::Release { .. }) => ok(),
 
         // Disconnecting Add to Slack, hosted: the directory lets go first. Nothing is revoked:
         // every install of the shared app into a Slack workspace gets the same token, so a
