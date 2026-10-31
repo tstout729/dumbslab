@@ -334,9 +334,15 @@ pub struct DocsJob {
     staged: Vec<crate::Effect>,
     /// Someone chose Sync now (not a push): a GitLab app source's webhook is checked too.
     manual: bool,
-    /// GitLab app sources: the request about the project's webhook that went with the last ones;
-    /// its answer comes last.
-    hook: HookCall,
+    /// GitLab app sources: the requests about the project's webhooks that went after the last
+    /// ones (see [`Extra`]).
+    extra: Extra,
+    /// The webhook was looked after in this sync already (Sync now does it once).
+    hook_checked: bool,
+    /// Webhooks pointing at this source other than its own, to delete with the next requests.
+    orphans: Vec<i64>,
+    /// GitLab app sources: the refresh token this sync spent, until its answer is in.
+    spent: Option<String>,
     /// The webhook turned out to be gone: it's added again with the next requests.
     hook_missing: bool,
     /// A webhook GitLab added during this sync, until the step that saves it commits: if that step
@@ -346,9 +352,21 @@ pub struct DocsJob {
     hook_target: String,
 }
 
+/// Requests about a GitLab app source's webhooks, sent after a step's others: from position
+/// `from`, the webhook's own (when `hook` isn't `None`), then pages listing the project's webhooks,
+/// then deletions of extra ones (whose answers don't matter).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct Extra {
+    from: usize,
+    hook: HookCall,
+    lists: usize,
+    deletes: usize,
+}
+
 /// A request about a GitLab app source's webhook, sent along with a step's others.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 enum HookCall {
+    #[default]
     None,
     /// Pointing it at the workspace's address now, with the source's secret.
     Editing,
@@ -369,37 +387,62 @@ impl DocsJob {
     /// workspace that moved fixes its webhook. Otherwise the address is the request's `Host`, which
     /// anyone can choose, so the webhook stays where it was set; only Reconnect, an admin's
     /// choice that shows the new address, moves it.
+    ///
+    /// It also lists the project's webhooks, and the next requests delete every other one
+    /// pointing at this source (at any address it had), such as one a sync that lost its lease
+    /// added and couldn't take off: none outlives the next Sync now.
     fn with_hook(&mut self, cfg: &HostConfig, mut calls: Vec<HttpCall>) -> Vec<HttpCall> {
         let Link::GitLabOAuth { project_id, hook_id, .. } = self.source.link else { return calls };
         if !self.manual {
             return calls;
         }
-        let stored = self.source.cred.field("hook_url").to_string();
-        let target = if cfg.knows_its_address() { self.hook_url() } else { stored };
         let (secret, token) = (self.source.cred.field("webhook_secret").to_string(), self.source.cred.token.clone());
-        if secret.is_empty() || target.is_empty() {
-            return calls;
-        }
-        self.hook_target = target.clone();
-        let call = match hook_id {
-            Some(hook) if !self.hook_missing => {
-                self.hook = HookCall::Editing;
-                super::gitlab_app::edit_hook_call(&token, project_id, hook, &target, &secret)
+        let mut extra = Extra { from: calls.len(), ..Extra::default() };
+        if !self.hook_checked {
+            self.hook_checked = true;
+            let stored = self.source.cred.field("hook_url").to_string();
+            let target = if cfg.knows_its_address() { self.hook_url() } else { stored };
+            if secret.is_empty() || target.is_empty() {
+                return calls;
             }
-            _ => {
+            self.hook_target = target.clone();
+            match hook_id {
+                Some(hook) => {
+                    extra.hook = HookCall::Editing;
+                    calls.push(super::gitlab_app::edit_hook_call(&token, project_id, hook, &target, &secret));
+                }
+                None => {
+                    extra.hook = HookCall::Adding;
+                    calls.push(super::gitlab_app::add_hook_call(&token, project_id, &target, &secret));
+                }
+            }
+            let lists = super::gitlab_app::list_hooks_calls(&token, project_id);
+            extra.lists = lists.len();
+            calls.extend(lists);
+        } else {
+            if self.hook_missing {
                 self.hook_missing = false;
-                self.hook = HookCall::Adding;
-                super::gitlab_app::add_hook_call(&token, project_id, &target, &secret)
+                extra.hook = HookCall::Adding;
+                calls.push(super::gitlab_app::add_hook_call(&token, project_id, &self.hook_target, &secret));
             }
-        };
-        calls.push(call);
+            for id in std::mem::take(&mut self.orphans) {
+                extra.deletes += 1;
+                calls.push(super::gitlab_app::remove_hook_call(&token, project_id, id));
+            }
+        }
+        self.extra = extra;
         calls
+    }
+
+    /// Webhook work still to send with the next requests.
+    fn hook_pending(&self) -> bool {
+        self.hook_missing || !self.orphans.is_empty()
     }
 
     /// Notes a webhook GitLab says it just added (see [`crate::connect::Job::note`]).
     pub(crate) fn note(&mut self, replies: &[HttpReply]) {
-        if self.hook == HookCall::Adding
-            && let Some(id) = replies.last().and_then(|r| super::gitlab_app::read_hook(r).ok())
+        if self.extra.hook == HookCall::Adding
+            && let Some(id) = replies.get(self.extra.from).and_then(|r| super::gitlab_app::read_hook(r).ok())
         {
             self.added_hook = Some(id);
         }
@@ -503,7 +546,10 @@ pub(crate) fn start(db: &dyn Db, source: Source, base_url: &str, manual: bool, n
         effects: vec![],
         staged: vec![],
         manual,
-        hook: HookCall::None,
+        extra: Extra::default(),
+        hook_checked: false,
+        orphans: vec![],
+        spent: None,
         hook_missing: false,
         added_hook: None,
         hook_target: String::new(),
@@ -538,6 +584,18 @@ pub fn step(db: &dyn Db, cfg: &HostConfig, j: &mut DocsJob, replies: Vec<HttpRep
                 let Some(app) = super::gitlab_app::app(cfg) else {
                     return fail(db, j, "DumbSlab's GitLab app isn't set up on this server any more, so this folder can't sync.", now);
                 };
+                // Another sync spending this same refresh token may still get its answer: GitLab
+                // takes each refresh token once, so this one waits rather than lose that answer.
+                let spent = j.source.cred.refresh_token.clone().unwrap_or_default();
+                let hash = crate::util::sha256_hex(&spent);
+                if refreshing_elsewhere(db, j, &hash, now)? {
+                    return fail(db, j, "Another sync is renewing this folder's GitLab access. Try again in a moment.", now);
+                }
+                db.execute(
+                    "UPDATE docs_source_links SET refreshing = ? WHERE source_id = ?",
+                    &params![format!("{}|{}|{hash}", ts(now), j.lease), j.source.id.clone()],
+                )?;
+                j.spent = Some(spent);
                 j.phase = Phase::Refreshing;
                 Ok(Step::Fetch(vec![super::gitlab_app::refresh_call(app, &j.source.cred)]))
             }
@@ -812,83 +870,178 @@ fn minted(db: &dyn Db, j: &mut DocsJob, replies: &[HttpReply], link: bool, now: 
     Ok(Step::Fetch(j.source.repo.tree_calls(j.source.token())))
 }
 
-/// A GitLab app source's refreshed tokens arrived: they're saved at once (GitLab has replaced the
-/// old ones), then the folder is listed with them. A refusal means the approval is gone: the
-/// source waits for an admin to Connect GitLab again and reconnect it.
+/// How long another sync's refresh of the same refresh token may still get its answer: a sync holds
+/// its lease [`super::LEASE_SECS`], and the answer to its last request can come after.
+const REFRESH_GRACE_SECS: i64 = 2 * super::LEASE_SECS;
+
+/// `docs_source_links.refreshing`: when, by whom (a sync's lease, or `refused`), and which refresh
+/// token (its hash).
+fn refreshing_mark(db: &dyn Db, source_id: &str) -> ApiResult<Option<(DateTime<Utc>, String, String)>> {
+    let Some(r) = db.one("SELECT refreshing FROM docs_source_links WHERE source_id = ?", &params![source_id])? else { return Ok(None) };
+    Ok(r.opt_str("refreshing").and_then(|m| {
+        let mut parts = m.splitn(3, '|');
+        let (at, by, hash) = (parts.next()?, parts.next()?, parts.next()?);
+        Some((crate::util::parse_ts(at)?, by.to_string(), hash.to_string()))
+    }))
+}
+
+/// Whether another sync started spending this refresh token recently enough that its answer may
+/// still come.
+fn refreshing_elsewhere(db: &dyn Db, j: &DocsJob, hash: &str, now: DateTime<Utc>) -> ApiResult<bool> {
+    Ok(refreshing_mark(db, &j.source.id)?.is_some_and(|(at, by, h)| {
+        h == hash && by != j.lease && by != "refused" && now - at < chrono::Duration::seconds(REFRESH_GRACE_SECS)
+    }))
+}
+
+/// The source's credentials as stored now, or `None` when it's gone or they can't be read.
+fn stored_cred(db: &dyn Db, cfg: &HostConfig, j: &DocsJob) -> ApiResult<Option<Credential>> {
+    let Some(r) = db.one("SELECT secret FROM docs_sources WHERE id = ?", &params![j.source.id.clone()])? else { return Ok(None) };
+    Ok(super::open(cfg, &owner(&j.source.id), j.source.repo.provider.id(), &r.str("secret")).ok())
+}
+
+/// A GitLab app source's refresh got its answer. GitLab has replaced the spent refresh token, so
+/// new tokens are kept whether or not this sync still holds its lease, as long as the source still
+/// has the token that was spent; only the token fields change, so newer webhook settings stay.
+/// If another refresh got there first, its tokens are newer, and they're used. A refusal counts
+/// (the source waits for Reconnect) only if the source still has the spent token and no other
+/// sync's refresh of it may still land; otherwise it's tried again later.
 fn refreshed(db: &dyn Db, cfg: &HostConfig, j: &mut DocsJob, replies: &[HttpReply], now: DateTime<Utc>) -> ApiResult<Step> {
     let reply = replies.first().cloned().unwrap_or_default();
+    let spent = j.spent.take().unwrap_or_default();
+    let hash = crate::util::sha256_hex(&spent);
+    let stored = stored_cred(db, cfg, j)?;
+    let still_spent = stored.as_ref().is_some_and(|c| c.refresh_token.as_deref() == Some(spent.as_str()));
     let tokens = match super::gitlab_app::read_refresh(&reply) {
         Ok(t) => t,
         Err(message) => {
+            let refused = reply.status != 0 && reply.status < 500 && reply.status != 429;
+            if !refused {
+                return fail(db, j, &message, now);
+            }
+            if !still_spent || refreshing_elsewhere(db, j, &hash, now)? {
+                return fail(
+                    db,
+                    j,
+                    "GitLab didn't renew this folder's access just now: another sync renewed it, or still may. Try again in a moment.",
+                    now,
+                );
+            }
             if !super::holds(db, TABLE, j.source.id.as_str().into(), &j.lease)? {
                 return Ok(lost());
             }
-            if reply.status != 0 && reply.status < 500 && reply.status != 429 {
-                db.execute(
-                    "UPDATE docs_source_links SET disconnected = ? WHERE source_id = ?",
-                    &params![super::gitlab_app::SIGNED_OUT, j.source.id.clone()],
-                )?;
-            }
+            db.execute(
+                "UPDATE docs_source_links SET disconnected = ?, refreshing = ? WHERE source_id = ?",
+                &params![super::gitlab_app::SIGNED_OUT, format!("{}|refused|{hash}", ts(now)), j.source.id.clone()],
+            )?;
             return fail(db, j, &message, now);
         }
     };
-    let expires_at = super::gitlab_app::expiry(now, &tokens).map(ts);
-    super::gitlab_app::apply_tokens(&mut j.source.cred, tokens);
-    let sealed = super::seal(cfg, &owner(&j.source.id), j.source.repo.provider.id(), &j.source.cred)?;
-    if !update_held(db, j, "secret = ?, updated_at = ?", params![sealed, ts(now)])? {
+    let Some(mut current) = stored else { return Ok(lost()) };
+    if still_spent {
+        let expires_at = super::gitlab_app::expiry(now, &tokens).map(ts);
+        super::gitlab_app::apply_tokens(&mut current, tokens);
+        let sealed = super::seal(cfg, &owner(&j.source.id), j.source.repo.provider.id(), &current)?;
+        db.execute("UPDATE docs_sources SET secret = ?, updated_at = ? WHERE id = ?", &params![sealed, ts(now), j.source.id.clone()])?;
+        // A refusal of this same token (another sync's, while this answer was on its way) is undone.
+        let refused_here = refreshing_mark(db, &j.source.id)?.is_some_and(|(_, by, h)| by == "refused" && h == hash);
+        db.execute(
+            "UPDATE docs_source_links SET token_expires_at = ?, refreshing = NULL,
+               disconnected = CASE WHEN ? AND disconnected = ? THEN NULL ELSE disconnected END WHERE source_id = ?",
+            &params![expires_at, refused_here, super::gitlab_app::SIGNED_OUT, j.source.id.clone()],
+        )?;
+    }
+    // The tokens stored now are the newest: this sync uses them.
+    j.source.cred.token = current.token;
+    j.source.cred.refresh_token = current.refresh_token;
+    if !super::holds(db, TABLE, j.source.id.as_str().into(), &j.lease)? {
         return Ok(lost());
     }
-    db.execute("UPDATE docs_source_links SET token_expires_at = ? WHERE source_id = ?", &params![expires_at, j.source.id.clone()])?;
     j.phase = Phase::Listing;
     let calls = j.source.repo.tree_calls(j.source.token());
     Ok(Step::Fetch(j.with_hook(cfg, calls)))
 }
 
-/// Reads the answer about a GitLab app source's webhook, if one came with `replies` (last), and
-/// returns the others. A webhook pointed at the right address keeps its address with the source's
-/// credentials; one that's gone is added again with the next requests.
+/// Reads the answers about a GitLab app source's webhooks that came after `replies`' others
+/// (see [`Extra`]), and returns those others. A webhook pointed at the right address keeps its
+/// address with the source's credentials; one that's gone is added again with the next requests;
+/// other webhooks pointing at this source are deleted with them.
 fn take_hook_reply(db: &dyn Db, cfg: &HostConfig, j: &mut DocsJob, replies: &[HttpReply], now: DateTime<Utc>) -> ApiResult<Vec<HttpReply>> {
-    let mut rest = replies.to_vec();
-    let kind = std::mem::replace(&mut j.hook, HookCall::None);
-    if kind == HookCall::None {
-        return Ok(rest);
+    let extra = std::mem::take(&mut j.extra);
+    if extra == Extra::default() {
+        return Ok(replies.to_vec());
     }
-    let reply = rest.pop().unwrap_or_default();
-    let moved = j.source.cred.field("hook_url") != j.hook_target;
-    match (kind, reply.status) {
-        (HookCall::Editing, 200..=299) => {
-            save_hook(db, cfg, j, None, now)?;
-            j.result.webhook = Some(if moved { "pointed at this workspace's address" } else { "checked" }.into());
-        }
-        (HookCall::Editing, 404) => j.hook_missing = true,
-        (HookCall::Adding, _) => match super::gitlab_app::read_hook(&reply) {
-            Ok(id) => {
-                j.added_hook = Some(id);
-                save_hook(db, cfg, j, Some(id), now)?;
-                j.result.webhook = Some("added again".into());
+    let from = extra.from.min(replies.len());
+    let mut at = from;
+    let hook = (extra.hook != HookCall::None).then(|| {
+        at += 1;
+        replies.get(at - 1).cloned().unwrap_or_default()
+    });
+    let lists: Vec<HttpReply> = replies.iter().skip(at).take(extra.lists).cloned().collect();
+    if let Some(reply) = hook {
+        let moved = j.source.cred.field("hook_url") != j.hook_target;
+        match (extra.hook, reply.status) {
+            (HookCall::Editing, 200..=299) => {
+                save_hook(db, cfg, j, None, now)?;
+                note_webhook(j, if moved { "pointed at this workspace's address" } else { "checked" });
             }
-            Err(message) => j.result.webhook = Some(message),
-        },
-        _ => {
-            j.result.webhook = Some(match reply.status {
-                401 | 403 => "GitLab refused to let DumbSlab manage the project's webhook. Choose Connect GitLab, then Reconnect (as a Maintainer of the project).".into(),
-                _ => crate::connect::http_error("GitLab", &reply),
-            })
+            (HookCall::Editing, 404) => j.hook_missing = true,
+            (HookCall::Adding, _) => match super::gitlab_app::read_hook(&reply) {
+                Ok(id) => {
+                    j.added_hook = Some(id);
+                    save_hook(db, cfg, j, Some(id), now)?;
+                    note_webhook(j, "added again");
+                }
+                Err(message) => note_webhook(j, &message),
+            },
+            _ => {
+                let why = match reply.status {
+                    401 | 403 => "GitLab refused to let DumbSlab manage the project's webhook. Choose Connect GitLab, then Reconnect (as a Maintainer of the project).".into(),
+                    _ => crate::connect::http_error("GitLab", &reply),
+                };
+                note_webhook(j, &why);
+            }
         }
     }
-    Ok(rest)
+    // Every other webhook pointing at this source goes: not its own, and not one just added.
+    if extra.lists > 0
+        && let Ok(found) = super::gitlab_app::source_hooks(&lists, &j.source.id)
+    {
+        let own = match j.source.link {
+            Link::GitLabOAuth { hook_id, .. } => hook_id,
+            _ => None,
+        };
+        let keep = |id: &i64| Some(*id) == own || Some(*id) == j.added_hook;
+        j.orphans = found.into_iter().filter(|id| !keep(id)).collect();
+        if !j.orphans.is_empty() {
+            let n = j.orphans.len();
+            note_webhook(j, &format!("{n} other webhook{} for this folder removed", if n == 1 { "" } else { "s" }));
+        }
+    }
+    Ok(replies[..from].to_vec())
 }
 
-/// Keeps where the webhook points (with the source's credentials) and, when it was added again,
-/// its new id. Only while this run holds its lease: a sync that took over may have put its own
-/// webhook in place, so this one fails instead, and the webhook it added comes off again (see
-/// [`DocsJob::failure_notice`]).
+/// Adds to what this sync says it did about the webhook.
+fn note_webhook(j: &mut DocsJob, what: &str) {
+    j.result.webhook = Some(match j.result.webhook.take() {
+        Some(w) => format!("{w}; {what}"),
+        None => what.to_string(),
+    });
+}
+
+/// Keeps where the webhook points, and when it was added again its new id, merged into the
+/// source's credentials as stored now (their tokens may be newer than this sync's). Only while
+/// this run holds its lease: a sync that took over may have put its own webhook in place, so this
+/// one fails instead, and the webhook it added comes off again (see
+/// [`DocsJob::failure_notice`]), or with the next Sync now's tidy-up.
 fn save_hook(db: &dyn Db, cfg: &HostConfig, j: &mut DocsJob, added: Option<i64>, now: DateTime<Utc>) -> ApiResult<()> {
-    j.source.cred.fields.insert("hook_url".into(), j.hook_target.clone());
-    let sealed = super::seal(cfg, &owner(&j.source.id), j.source.repo.provider.id(), &j.source.cred)?;
+    let lost = || super::sync_failed("Another sync of this source took over before this one finished.");
+    let mut current = stored_cred(db, cfg, j)?.ok_or_else(lost)?;
+    current.fields.insert("hook_url".into(), j.hook_target.clone());
+    let sealed = super::seal(cfg, &owner(&j.source.id), j.source.repo.provider.id(), &current)?;
     if !update_held(db, j, "secret = ?, updated_at = ?", params![sealed, ts(now)])? {
-        return Err(super::sync_failed("Another sync of this source took over before this one finished."));
+        return Err(lost());
     }
+    j.source.cred.fields.insert("hook_url".into(), j.hook_target.clone());
     if let (Some(id), Link::GitLabOAuth { hook_id, .. }) = (added, &mut j.source.link) {
         *hook_id = Some(id);
         db.execute("UPDATE docs_source_links SET hook_id = ? WHERE source_id = ?", &params![id, j.source.id.clone()])?;
@@ -1098,8 +1251,8 @@ fn listing(db: &dyn Db, cfg: &HostConfig, j: &mut DocsJob, replies: &[HttpReply]
     j.result.remaining = todo.len().saturating_sub(DOCS_PER_RUN);
     todo.truncate(DOCS_PER_RUN);
     if todo.is_empty() {
-        // A webhook that turned out to be gone is added again first.
-        if j.hook_missing {
+        // A webhook that turned out to be gone is added again, and extra ones deleted, first.
+        if j.hook_pending() {
             let calls = j.with_hook(cfg, vec![]);
             j.phase = Phase::Images(plan, vec![]);
             j.staged.append(&mut ctx.effects);

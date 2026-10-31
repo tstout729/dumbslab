@@ -8276,6 +8276,11 @@ mod syncs {
                 if !readable {
                     return HttpReply { status: 403, body: "{}".into() };
                 }
+                if c.method == "GET" && rest.starts_with("?per_page=100&page=") {
+                    let first = rest.ends_with("page=1");
+                    let all: Vec<Value> = self.hooks.borrow().iter().map(|(id, h)| json!({ "id": id, "url": h["url"] })).collect();
+                    return ok(if first { json!(all) } else { json!([]) });
+                }
                 let id: Option<i64> = rest.strip_prefix('/').and_then(|i| i.parse().ok());
                 return match (c.method, id) {
                     ("POST", None) => {
@@ -8891,10 +8896,14 @@ mod syncs {
         let (h, admin, lab, topic) = gitlab_setup();
         let answer = |c: &HttpCall| lab.answer(c);
         let newest = || *lab.hooks.borrow().keys().last().unwrap();
+        let hooks = || lab.hooks.borrow().keys().copied().collect::<Vec<i64>>();
         let (source, _) = add_gitlab_folder(&h, &admin, &lab, &topic, "docs");
         let stored = || db_run(&h, |db| db.one("SELECT hook_id FROM docs_source_links", &[])).unwrap().i64("hook_id");
-        lab.hooks.borrow_mut().clear();
+        let expire_token =
+            || db_run(&h, |db| db.execute("UPDATE docs_source_links SET token_expires_at = '2020-01-01T00:00:00.000Z'", &[]));
+        let expire_lease = || db_run(&h, |db| db.execute("UPDATE docs_sources SET running_until = '2000-01-01T00:00:00.000Z x'", &[]));
         let sync_now = || job_of(&h.call("POST", &format!("/api/v1/docs-sources/{source}/sync"), None, &admin));
+        lab.hooks.borrow_mut().clear();
 
         // Sync A finds the webhook gone and adds a new one...
         let mut a = sync_now();
@@ -8902,26 +8911,115 @@ mod syncs {
         let Ok(Step::Fetch(calls)) = step_with(&h, &mut a, calls.iter().map(answer).collect()).0 else {
             panic!("files and the new webhook")
         };
-        assert_eq!(calls.last().unwrap().method, "POST");
         let a_replies: Vec<HttpReply> = calls.iter().map(answer).collect();
         let a_hook = newest();
-        // ...then takes too long: its lease runs out, and sync B takes over and repairs it too.
-        db_run(&h, |db| db.execute("UPDATE docs_sources SET running_until = '2000-01-01T00:00:00.000Z x'", &[]));
-        let (finish, _) = drive(&h, sync_now(), &answer);
-        assert_eq!(filled(finish)["webhook"], "added again");
+        // ...then takes too long. Sync B takes over: it renews the tokens (A's no longer work),
+        // repairs the webhook, and removes A's, which points at this folder too.
+        expire_lease();
+        expire_token();
+        let (finish, sent) = drive(&h, sync_now(), &answer);
+        let v = filled(finish);
+        assert_eq!(sent[0].url, "https://gitlab.com/oauth/token");
+        assert!(
+            v["webhook"].as_str().unwrap().contains("added again") && v["webhook"].as_str().unwrap().contains("1 other webhook"),
+            "{v}"
+        );
         let b_hook = newest();
-        assert!(b_hook != a_hook);
-        assert_eq!(stored(), b_hook);
+        assert_eq!((hooks(), stored()), (vec![b_hook], b_hook));
 
-        // A resumes with GitLab's answer about its webhook: it may not save it over B's, so its
-        // step fails and its webhook comes off again. B's stays, and removing the folder removes it.
+        // A resumes: it may not save its webhook over B's, so its step fails, and its own clean-up
+        // (with tokens GitLab replaced) is refused; nothing depends on it.
         let (result, notice) = step_with(&h, &mut a, a_replies);
         assert!(result.is_err(), "{result:?}");
-        let notice = notice.expect("A's webhook comes off");
-        assert_eq!((notice.method, notice.url), ("DELETE", format!("https://gitlab.com/api/v4/projects/3/hooks/{a_hook}")));
-        assert_eq!(stored(), b_hook, "B's kept");
+        let notice = notice.expect("A tries to take its webhook off");
+        assert_eq!(notice.url, format!("https://gitlab.com/api/v4/projects/3/hooks/{a_hook}"));
+        assert_eq!(answer(&notice).status, 401, "A's token was replaced");
+        assert_eq!((hooks(), stored()), (vec![b_hook], b_hook), "B's kept");
+
+        // A leftover that no sync took off (here, from a sync that lost its lease after a push's
+        // sync renewed the tokens): the next Sync now removes it.
+        let leftover = {
+            let token = format!("glo_{}", lab.issued.borrow());
+            let url = format!("https://kb.test/hooks/docs/{source}");
+            let add = connect::HttpCall::post_json("https://gitlab.com/api/v4/projects/3/hooks", &json!({ "url": url, "token": "x" }))
+                .header("authorization", format!("Bearer {token}"));
+            answer(&add);
+            newest()
+        };
+        assert_eq!(hooks(), vec![b_hook, leftover]);
+        let (finish, _) = drive(&h, sync_now(), &answer);
+        assert!(filled(finish)["webhook"].as_str().unwrap().contains("1 other webhook"));
+        assert_eq!(hooks(), vec![b_hook], "only the folder's own");
+
+        // Removing the folder removes every webhook pointing at it, not just the recorded one.
+        answer(
+            &connect::HttpCall::post_json(
+                "https://gitlab.com/api/v4/projects/3/hooks",
+                &json!({ "url": format!("https://old.kb.test/hooks/docs/{source}"), "token": "x" }),
+            )
+            .header("authorization", format!("Bearer glo_{}", lab.issued.borrow())),
+        );
         let r = h.call("DELETE", &format!("/api/v1/docs-sources/{source}"), None, &admin);
-        drive(&h, background(&r)[0].clone(), &answer);
-        assert_eq!(lab.removed.borrow().last().unwrap(), &format!("https://gitlab.com/api/v4/projects/3/hooks/{b_hook}"));
+        assert_eq!(filled(drive(&h, background(&r)[0].clone(), &answer).0)["removed"], 2);
+        assert!(hooks().is_empty());
+    }
+
+    #[test]
+    fn a_refresh_that_lands_late_keeps_its_tokens() {
+        let (h, admin, lab, topic) = gitlab_setup();
+        let answer = |c: &HttpCall| lab.answer(c);
+        let (source, _) = add_gitlab_folder(&h, &admin, &lab, &topic, "docs");
+        let expire_token =
+            || db_run(&h, |db| db.execute("UPDATE docs_source_links SET token_expires_at = '2020-01-01T00:00:00.000Z'", &[]));
+        let expire_lease = || db_run(&h, |db| db.execute("UPDATE docs_sources SET running_until = '2000-01-01T00:00:00.000Z x'", &[]));
+        let sync = || h.call("POST", &format!("/api/v1/docs-sources/{source}/sync"), None, &admin);
+        let disconnected = || source_of(&h, &admin)["disconnected"].clone();
+        // Sync A asks GitLab to renew the tokens; the answer is on its way when A's lease runs out.
+        let refreshing = || {
+            expire_token();
+            let mut a = job_of(&sync());
+            let Ok(Step::Fetch(calls)) = step_with(&h, &mut a, vec![]).0 else { panic!("a refresh") };
+            assert_eq!(calls[0].url, "https://gitlab.com/oauth/token");
+            let replies: Vec<HttpReply> = calls.iter().map(answer).collect();
+            expire_lease();
+            (a, replies)
+        };
+        // The next sync uses the newest tokens, without renewing them.
+        let works = || {
+            let (finish, sent) = drive(&h, job_of(&sync()), &answer);
+            filled(finish);
+            assert!(sent.iter().all(|c| c.url != "https://gitlab.com/oauth/token"));
+            assert!(sent[0].headers.contains(&("authorization".into(), format!("Bearer glo_{}", lab.issued.borrow()))), "{:?}", sent[0]);
+        };
+
+        // Sync B takes over meanwhile: it doesn't spend the same refresh token, which GitLab would
+        // refuse, while A's answer may still land.
+        let (mut a, a_refresh) = refreshing();
+        let (finish, sent) = drive(&h, job_of(&sync()), &answer);
+        assert!(matches!(finish, Finish::Fail(ref e) if e.message.contains("Another sync is renewing")), "{finish:?}");
+        assert!(sent.is_empty(), "nothing spent");
+        assert_eq!(disconnected(), Value::Null);
+        // A's answer lands: its tokens are kept, though A lost its lease.
+        assert!(matches!(step_with(&h, &mut a, a_refresh).0, Ok(Step::Done(Finish::Fail(_)))));
+        assert_eq!(disconnected(), Value::Null);
+        works();
+
+        // Past the time A's answer could take, B spends the token anyway, GitLab refuses it (A spent
+        // it), and the folder waits for Reconnect. A's answer still lands: its tokens are kept and
+        // the folder is back.
+        let (mut a, a_refresh) = refreshing();
+        db_run(&h, |db| {
+            db.execute(
+                "UPDATE docs_source_links SET refreshing = '2000-01-01T00:00:00.000Z' || substr(refreshing, instr(refreshing, '|'))",
+                &[],
+            )
+        });
+        let (finish, sent) = drive(&h, job_of(&sync()), &answer);
+        assert!(matches!(finish, Finish::Fail(_)));
+        assert_eq!(sent[0].url, "https://gitlab.com/oauth/token");
+        assert!(disconnected().as_str().unwrap().contains("Reconnect"));
+        assert!(matches!(step_with(&h, &mut a, a_refresh).0, Ok(Step::Done(Finish::Fail(_)))), "A lost its lease");
+        assert_eq!(disconnected(), Value::Null, "A's tokens put it back");
+        works();
     }
 }

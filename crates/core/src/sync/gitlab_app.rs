@@ -334,6 +334,35 @@ pub(crate) fn edit_hook_call(token: &str, project_id: i64, hook_id: i64, url: &s
         .bearer(token)
 }
 
+/// Pages of 100 of a project's webhooks read when looking for a source's.
+pub(crate) const HOOK_PAGES: usize = 2;
+
+/// The requests that list a project's webhooks.
+pub(crate) fn list_hooks_calls(token: &str, project_id: i64) -> Vec<HttpCall> {
+    (1..=HOOK_PAGES).map(|page| api_get(format!("{API}/projects/{project_id}/hooks?per_page=100&page={page}"), token)).collect()
+}
+
+/// Whether a webhook's address is this source's `/hooks/docs/<id>`, at any address the
+/// workspace has had.
+fn points_at(url: &str, source_id: &str) -> bool {
+    let path = url.split(['?', '#']).next().unwrap_or_default().trim_end_matches('/');
+    path.ends_with(&format!("/hooks/docs/{source_id}"))
+}
+
+/// The ids of the project's webhooks that point at this source, from the answers to
+/// [`list_hooks_calls`]. `Err` when GitLab didn't list them.
+pub(crate) fn source_hooks(replies: &[HttpReply], source_id: &str) -> Result<Vec<i64>, String> {
+    let mut out = vec![];
+    for r in replies {
+        let v = r.json();
+        let (true, Some(page)) = (r.ok(), v.as_array()) else { return Err(http_error("GitLab", r)) };
+        out.extend(page.iter().filter(|h| h["url"].as_str().is_some_and(|u| points_at(u, source_id))).filter_map(|h| h["id"].as_i64()));
+    }
+    out.sort_unstable();
+    out.dedup();
+    Ok(out)
+}
+
 pub(crate) fn remove_hook_call(token: &str, project_id: i64, hook_id: i64) -> HttpCall {
     HttpCall { method: "DELETE", url: format!("{API}/projects/{project_id}/hooks/{hook_id}"), headers: vec![], body: None }
         .header("user-agent", "DumbSlab")
@@ -460,8 +489,9 @@ enum Kind {
     /// Reconnecting a folder: make sure its webhook is there with its secret and address, then
     /// move the approval onto it. `added` is a webhook this job had to add again.
     Reconnect { claim: String, approval: Option<Pending>, rejoin: Rejoin, added: Option<i64> },
-    /// A source was removed: take its webhook off the project, best effort.
-    RemoveHook { project_id: i64, hook_id: i64, cred: Credential, expires_at: Option<DateTime<Utc>> },
+    /// A source was removed: take every webhook pointing at it off the project, best effort (the
+    /// one recorded, and any another sync left behind).
+    RemoveHook { source_id: String, project_id: i64, hook_id: Option<i64>, cred: Credential, expires_at: Option<DateTime<Utc>> },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -507,9 +537,15 @@ impl GitLabJob {
         GitLabJob::new(user_id, base_url, Kind::Reconnect { claim, approval: None, rejoin, added: None })
     }
 
-    /// Removes a deleted source's webhook.
-    pub(crate) fn remove_hook(project_id: i64, hook_id: i64, cred: Credential, expires_at: Option<DateTime<Utc>>) -> GitLabJob {
-        GitLabJob::new("", "", Kind::RemoveHook { project_id, hook_id, cred, expires_at })
+    /// Removes a deleted source's webhooks, with its credentials as they were stored.
+    pub(crate) fn remove_hook(
+        source_id: &str,
+        project_id: i64,
+        hook_id: Option<i64>,
+        cred: Credential,
+        expires_at: Option<DateTime<Utc>>,
+    ) -> GitLabJob {
+        GitLabJob::new("", "", Kind::RemoveHook { source_id: source_id.into(), project_id, hook_id, cred, expires_at })
     }
 
     pub(crate) fn take_effects(&mut self) -> Vec<Effect> {
@@ -793,27 +829,39 @@ pub fn step(db: &dyn Db, cfg: &HostConfig, j: &mut GitLabJob, replies: Vec<HttpR
             Err(message) => give_up(db, j, message),
         },
 
-        // Removing a deleted source's webhook.
-        (Kind::RemoveHook { project_id, hook_id, cred, expires_at }, Phase::Start) => {
+        // Removing a deleted source's webhooks: every one pointing at it, found by listing the
+        // project's (the recorded one too, if GitLab didn't list them).
+        (Kind::RemoveHook { project_id, cred, expires_at, .. }, Phase::Start) => {
             if needs_refresh(cred, *expires_at, now) {
                 j.phase = Phase::Refreshing;
                 return Ok(Step::Fetch(vec![refresh_call(app, cred)]));
             }
             j.phase = Phase::Working;
-            Ok(Step::Fetch(vec![remove_hook_call(&cred.token, *project_id, *hook_id)]))
+            Ok(Step::Fetch(list_hooks_calls(&cred.token, *project_id)))
         }
-        (Kind::RemoveHook { project_id, hook_id, cred, .. }, Phase::Refreshing) => {
+        (Kind::RemoveHook { project_id, cred, .. }, Phase::Refreshing) => {
             let Ok(tokens) = read_refresh(&reply) else {
                 return failed("GitLab no longer accepts DumbSlab's access; remove the webhook in the project's settings.");
             };
             apply_tokens(cred, tokens);
             j.phase = Phase::Working;
-            Ok(Step::Fetch(vec![remove_hook_call(&cred.token, *project_id, *hook_id)]))
+            Ok(Step::Fetch(list_hooks_calls(&cred.token, *project_id)))
         }
-        (Kind::RemoveHook { .. }, Phase::Working) => match reply.status {
-            200..=299 | 404 => Ok(Step::Done(Finish::Fill(json!({ "ok": true })))),
-            _ => failed(http_error("GitLab", &reply)),
-        },
+        (Kind::RemoveHook { source_id, project_id, hook_id, cred, .. }, Phase::Working) => {
+            let mut ids = source_hooks(&replies, source_id).unwrap_or_default();
+            ids.extend(*hook_id);
+            ids.sort_unstable();
+            ids.dedup();
+            if ids.is_empty() {
+                return Ok(Step::Done(Finish::Fill(json!({ "ok": true, "removed": 0 }))));
+            }
+            j.phase = Phase::Finishing;
+            Ok(Step::Fetch(ids.iter().map(|id| remove_hook_call(&cred.token, *project_id, *id)).collect()))
+        }
+        (Kind::RemoveHook { .. }, Phase::Finishing) => {
+            let removed = replies.iter().filter(|r| r.ok() || r.status == 404).count();
+            Ok(Step::Done(Finish::Fill(json!({ "ok": true, "removed": removed }))))
+        }
         _ => Err(ApiError::internal("a GitLab job got out of step")),
     }
 }

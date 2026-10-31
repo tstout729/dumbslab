@@ -836,10 +836,10 @@ pub(crate) fn remove_sources(ctx: &mut Ctx, rows: &[Row]) -> ApiResult<()> {
         // The webhook DumbSlab added to a GitLab project comes off too, once this is done. No sync
         // holds the source, so its stored tokens are the current ones.
         if let Ok(source) = Source::from_row(ctx.cfg, row)
-            && let Link::GitLabOAuth { project_id, hook_id: Some(hook_id), token_expires_at } = source.link
+            && let Link::GitLabOAuth { project_id, hook_id, token_expires_at } = source.link
         {
             let expires_at = token_expires_at.as_deref().and_then(crate::util::parse_ts);
-            let job = gitlab_app::GitLabJob::remove_hook(project_id, hook_id, source.cred, expires_at);
+            let job = gitlab_app::GitLabJob::remove_hook(&source.id, project_id, hook_id, source.cred, expires_at);
             ctx.effects.push(Effect::Background(Job::GitLab(Box::new(job))));
         }
         ctx.db.execute("DELETE FROM docs_items WHERE source_id = ?", &params![id.clone()])?;
