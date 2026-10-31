@@ -48,6 +48,10 @@ The connector key must be set too. With both, Settings › Docs sync offers **Co
   - The pass renews the tokens if they're about to expire, saving the new ones first. Then it lists the project's webhooks, deletes the folder's, and drops the record.
   - A pass that fails (GitLab down, 429, 5xx) waits a minute, doubling up to a day. Passes run again when Settings › Docs sync loads and with Sync now.
   - DumbSlab gives up only when GitLab definitely won't let it: it refuses to renew the same tokens twice (the first refusal may be a renewal still on its way), answers 401 or 403, or no longer shows the project. It also gives up after 30 days. Either way the activity log says so for admins (`docs_source.webhook_abandoned`), with the project and the webhook ids to delete by hand, and the tokens are dropped.
+- **Adding a folder records its webhook first.** In the step that commits just before it asks GitLab for the webhook, DumbSlab keeps a cleanup record. The record holds the project, the webhook's exact address (with the new folder's id), and a sealed copy of the approval's tokens. Saving the folder drops the record in the same transaction.
+  - If GitLab added the webhook but its answer was lost, or the folder wasn't saved, the record stays.
+  - After 10 minutes (an add may still be under way), the usual cleanup passes find the webhook by that address and delete it. They have the same waits, retries and 30-day limit.
+  - The copied tokens may still be the approval's, or the folder's it moved to, so a pass never renews them. Once they expire, it holds the admin's approval like any request, renews that the approval's way if needed, and uses it.
 - **Failed saves.** If saving a new folder, a reconnect, or a sync fails after GitLab added a webhook, the webhook comes off again: even when the host rolls the save back, or its transaction never starts or commits. Each job notes a webhook GitLab added before the step that saves it, so the notice a host sends for a failed step deletes it.
 
 ## Facts this relies on

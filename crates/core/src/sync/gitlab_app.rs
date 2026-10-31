@@ -844,6 +844,12 @@ pub fn step(db: &dyn Db, cfg: &HostConfig, j: &mut GitLabJob, replies: Vec<HttpR
                 };
                 return give_up(db, j, message);
             };
+            // Recorded before the webhook is asked for, in this step's transaction: if GitLab adds
+            // it but the answer is lost, or the folder isn't saved, a cleanup finds it (see
+            // `record_pending_hook`).
+            let mut held = Credential { token: p.cred.token.clone(), refresh_token: p.cred.refresh_token.clone(), ..Default::default() };
+            held.fields.insert("hook_url".into(), draft.webhook_url.clone());
+            record_pending_hook(db, cfg, &j.user_id, &draft.source_id, &found, &held, p.expires_at, now)?;
             let call = add_hook_call(&p.cred.token, found.id, &draft.webhook_url, secret);
             *project = Some(found);
             j.phase = Phase::Finishing;
@@ -880,6 +886,8 @@ pub fn step(db: &dyn Db, cfg: &HostConfig, j: &mut GitLabJob, replies: Vec<HttpR
             if !take(db, &j.user_id, claim)? {
                 return Err(ApiError::conflict("Your GitLab approval changed while the folder was being added. Try again."));
             }
+            // Saved with its webhook: nothing left behind to clean up.
+            db.execute("DELETE FROM docs_hook_cleanup WHERE source_id = ?", &params![draft.source_id.clone()])?;
             let created = crate::ops::sync::created_value(&ctx, &draft.source_id)?;
             j.staged.append(&mut ctx.effects);
             Ok(Step::Done(Finish::Fill(created)))
@@ -1024,6 +1032,58 @@ pub struct Cleanup {
     spent: Option<String>,
     /// The webhooks this pass is deleting.
     deleting: Vec<i64>,
+    /// A folder being added: whose approval the tokens are borrowed from (see
+    /// [`record_pending_hook`]).
+    borrowed_from: Option<String>,
+    /// That approval, while this pass holds it (its claim) to use its tokens.
+    approval: Option<(String, Pending)>,
+}
+
+/// How long a folder being added has to save itself before its webhook counts as left behind. An
+/// add takes a few steps of seconds each; this is far longer.
+const PENDING_GRACE_SECS: i64 = 600;
+
+/// Before a new folder's webhook is asked for, in the step whose transaction commits before the
+/// request goes out: if GitLab adds the webhook but its answer is lost, or the folder then isn't
+/// saved, that webhook would post to a folder that never existed, which no Sync now looks after.
+/// So the intent is recorded first, as a cleanup record (see [`Cleanup`]) with the webhook's exact
+/// address, and the step that saves the folder drops it. Left behind, a pass finds the webhook
+/// by that address and deletes it, after [`PENDING_GRACE_SECS`] (the add may still be under way).
+///
+/// Its tokens are a copy of the admin's approval's, which may live on (another try uses it) or
+/// move to a folder. So a pass never renews them: it uses them while they last, and then the
+/// approval itself, held like any request ([`claim`]) and renewed its own way. GitLab takes each
+/// refresh token once, and only its holder spends it.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn record_pending_hook(
+    db: &dyn Db,
+    cfg: &HostConfig,
+    user_id: &str,
+    source_id: &str,
+    project: &Project,
+    cred: &Credential,
+    expires_at: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> ApiResult<()> {
+    let secret = super::seal(cfg, &cleanup_owner(source_id), "gitlab", cred)?;
+    db.execute(
+        "INSERT INTO docs_hook_cleanup (source_id, project_id, repo, known_ids, secret, expires_at, refresh_hash, removed_by, borrowed_from,
+           next_attempt_at, created_at)
+         VALUES (?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(source_id) DO NOTHING",
+        &params![
+            source_id,
+            project.id,
+            project.path.clone(),
+            secret,
+            expires_at.map(ts),
+            cred.refresh_token.as_deref().map(crate::util::sha256_hex),
+            user_id,
+            user_id,
+            ts(now + Duration::seconds(PENDING_GRACE_SECS)),
+            ts(now)
+        ],
+    )?;
+    Ok(())
 }
 
 /// Records a removed GitLab app folder's webhooks for cleanup (see [`Cleanup`]): its project, the
@@ -1041,9 +1101,13 @@ pub(crate) fn record_cleanup(
     let addresses = hook_addresses(&cred, current.as_deref());
     cred.fields.insert("hook_urls".into(), addresses.join("\n"));
     let secret = super::seal(ctx.cfg, &cleanup_owner(&source.id), "gitlab", &cred)?;
+    // (A record left from adding it, if any, gives way to this one: these are the folder's own.)
     ctx.db.execute(
         "INSERT INTO docs_hook_cleanup (source_id, project_id, repo, known_ids, secret, expires_at, refresh_hash, removed_by, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(source_id) DO UPDATE SET project_id = excluded.project_id, repo = excluded.repo, known_ids = excluded.known_ids,
+           secret = excluded.secret, expires_at = excluded.expires_at, refresh_hash = excluded.refresh_hash, refused = 0, failures = 0,
+           next_attempt_at = NULL, removed_by = excluded.removed_by, borrowed_from = NULL, created_at = excluded.created_at",
         &params![
             source.id.clone(),
             project_id,
@@ -1089,6 +1153,8 @@ pub(crate) fn resume_cleanups(db: &dyn Db, cfg: &HostConfig, base_url: &str, now
             created_at: parse_ts(&r.str("created_at")).unwrap_or(now),
             spent: None,
             deleting: vec![],
+            borrowed_from: r.opt_str("borrowed_from"),
+            approval: None,
         };
         match super::open(cfg, &cleanup_owner(&source_id), "gitlab", &r.str("secret")) {
             Ok(cred) => c.cred = cred,
@@ -1125,8 +1191,10 @@ fn abandon(db: &dyn Db, cfg: &HostConfig, base_url: &str, removed_by: &str, c: &
         [one] => format!("webhook {one}"),
         many => format!("webhooks {}", many.iter().map(i64::to_string).collect::<Vec<_>>().join(", ")),
     };
+    let after =
+        if c.borrowed_from.is_some() { "after adding a docs sync folder didn't finish" } else { "after removing a docs sync folder" };
     let summary = format!(
-        "couldn't take DumbSlab's {hooks} off the GitLab project {} (id {}) after removing a docs sync folder: {why}. Delete them in the project's Settings › Webhooks",
+        "couldn't take DumbSlab's {hooks} off the GitLab project {} (id {}) {after}: {why}. Delete them in the project's Settings › Webhooks",
         c.repo, c.project_id
     );
     let mut ctx = super::ctx(db, cfg, removed_by, base_url, now)?;
@@ -1164,8 +1232,19 @@ fn cleaned(removed: usize) -> ApiResult<Step> {
     Ok(Step::Done(Finish::Fill(json!({ "ok": true, "removed": removed }))))
 }
 
-/// Runs a cleanup pass's next step (see [`Cleanup`]).
+/// Runs a cleanup pass's next step (see [`Cleanup`]). A pass that's done lets go of an approval it
+/// held.
 fn cleanup_step(db: &dyn Db, cfg: &HostConfig, j: &mut GitLabJob, replies: &[HttpReply], now: DateTime<Utc>) -> ApiResult<Step> {
+    let step = cleanup_pass(db, cfg, j, replies, now)?;
+    if let (Step::Done(_), Kind::Cleanup(c)) = (&step, &mut j.kind)
+        && let (Some((claim, _)), Some(user)) = (c.approval.take(), c.borrowed_from.as_deref())
+    {
+        release(db, user, &claim)?;
+    }
+    Ok(step)
+}
+
+fn cleanup_pass(db: &dyn Db, cfg: &HostConfig, j: &mut GitLabJob, replies: &[HttpReply], now: DateTime<Utc>) -> ApiResult<Step> {
     let (base_url, removed_by, phase) = (j.base_url.clone(), j.user_id.clone(), j.phase);
     let Kind::Cleanup(c) = &mut j.kind else { return Err(ApiError::internal("not a cleanup")) };
     let reply = replies.first().cloned().unwrap_or_default();
@@ -1179,14 +1258,78 @@ fn cleanup_step(db: &dyn Db, cfg: &HostConfig, j: &mut GitLabJob, replies: &[Htt
     };
     match phase {
         Phase::Start => {
+            // A folder being added that was saved after all: its webhook is its own.
+            if db.one("SELECT 1 AS ok FROM docs_sources WHERE id = ?", &params![c.source_id.clone()])?.is_some() {
+                db.execute(
+                    "DELETE FROM docs_hook_cleanup WHERE source_id = ? AND working_until = ?",
+                    &params![c.source_id.clone(), c.lease.clone()],
+                )?;
+                return cleaned(0);
+            }
             if now - c.created_at > Duration::days(CLEANUP_RETENTION_DAYS) {
                 return give_up(c, &format!("DumbSlab tried for {CLEANUP_RETENTION_DAYS} days"));
+            }
+            // Borrowed tokens that expired: the approval they came from, held like any request
+            // (see `record_pending_hook`), renewed its own way if need be.
+            if let Some(user) = c.borrowed_from.clone()
+                && needs_refresh(&c.cred, c.expires_at, now)
+            {
+                let claim = match claim(db, &user, now) {
+                    Ok(Some(claim)) => claim,
+                    Ok(None) => {
+                        let why = "the tokens DumbSlab kept expired, and the admin has no approval of DumbSlab's GitLab app to use instead (Connect GitLab lets it try again)";
+                        return back_off(db, c, why.into(), now);
+                    }
+                    Err(e) => return back_off(db, c, e.message, now),
+                };
+                let Some(p) = held(db, cfg, &user, &claim)? else {
+                    release(db, &user, &claim)?;
+                    return back_off(db, c, reconnect_message(), now);
+                };
+                c.cred.token = p.cred.token.clone();
+                let refresh = needs_refresh(&p.cred, p.expires_at, now).then(|| app(cfg).map(|a| refresh_call(a, &p.cred)));
+                c.approval = Some((claim, p));
+                match refresh {
+                    None => {}
+                    Some(None) => return back_off(db, c, "DumbSlab's GitLab app isn't set up on this server.".into(), now),
+                    Some(Some(call)) => {
+                        j.phase = Phase::Refreshing;
+                        return Ok(Step::Fetch(vec![call]));
+                    }
+                }
+                j.phase = Phase::Working;
+                return Ok(Step::Fetch(list_hooks_calls(&c.cred.token, c.project_id)));
             }
             if needs_refresh(&c.cred, c.expires_at, now) {
                 let Some(app) = app(cfg) else { return back_off(db, c, "DumbSlab's GitLab app isn't set up on this server.".into(), now) };
                 c.spent = c.cred.refresh_token.clone();
                 j.phase = Phase::Refreshing;
                 return Ok(Step::Fetch(vec![refresh_call(app, &c.cred)]));
+            }
+            j.phase = Phase::Working;
+            Ok(Step::Fetch(list_hooks_calls(&c.cred.token, c.project_id)))
+        }
+        // The approval's renewal: kept in the approval, as any request would (`save_held`); the
+        // pass uses the new access token.
+        Phase::Refreshing if c.approval.is_some() => {
+            let user = c.borrowed_from.clone().unwrap_or_default();
+            let (claim, mut p) = c.approval.take().expect("held");
+            let tokens = match read_refresh(&reply) {
+                Ok(tokens) => tokens,
+                Err(message) => {
+                    release(db, &user, &claim)?;
+                    return back_off(db, c, message, now);
+                }
+            };
+            p.expires_at = expiry(now, &tokens);
+            apply_tokens(&mut p.cred, tokens);
+            let saved = save_held(db, cfg, &user, &claim, &p)?;
+            // This step stored only the approval's renewed tokens: a full workspace keeps it.
+            j.rotated = true;
+            c.cred.token = p.cred.token.clone();
+            c.approval = Some((claim, p));
+            if !saved || !holds_cleanup(db, c)? {
+                return cleaned(0);
             }
             j.phase = Phase::Working;
             Ok(Step::Fetch(list_hooks_calls(&c.cred.token, c.project_id)))

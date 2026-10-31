@@ -2,7 +2,8 @@
 -- before (the GitHub app's, which already holds GitLab app sources' links and approvals). Only new
 -- tables, so every statement here can run again.
 
--- Webhooks DumbSlab still has to take off a GitLab project, one row per removed GitLab app folder
+-- Webhooks DumbSlab still has to take off a GitLab project, one row per removed GitLab app folder,
+-- or per folder being added, from just before its webhook is asked for until the folder is saved
 -- (see `sync::gitlab_app::Cleanup`). A pass lists the project's webhooks with the folder's tokens,
 -- deletes those pointing at the folder, then drops the row. A failed pass waits longer each time.
 -- DumbSlab gives up only when GitLab no longer accepts the tokens or shows the project, or after
@@ -28,7 +29,13 @@ CREATE TABLE IF NOT EXISTS docs_hook_cleanup (
   next_attempt_at TEXT,
   -- A pass working on it holds this lease: when it runs out, then a random id.
   working_until TEXT,
-  -- The admin who removed the folder: the activity log's entry is theirs if DumbSlab gives up.
+  -- The admin who removed the folder (or was adding it): the activity log's entry is theirs if
+  -- DumbSlab gives up.
   removed_by TEXT NOT NULL,
+  -- A folder being added: the admin whose approval of DumbSlab's GitLab app the tokens in `secret`
+  -- were copied from. That approval (or the folder it moves to) may still use them, so a pass never
+  -- renews them: once they've expired, it holds and uses the approval instead. NULL for a removed
+  -- folder's own tokens.
+  borrowed_from TEXT,
   created_at TEXT NOT NULL
 );
