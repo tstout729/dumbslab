@@ -44,6 +44,14 @@ fn github_app_from_env() -> Option<dumbslab_core::sync::github_app::GitHubApp> {
     dumbslab_core::sync::github_app::GitHubApp::from_env(|name| std::env::var(format!("DUMBSLAB_{name}")).ok())
 }
 
+/// Add to Slack with your own copy of DumbSlab's Slack app: `DUMBSLAB_SLACK_SIGNING_SECRET`, with
+/// `DUMBSLAB_SLACK_CLIENT_ID` and `DUMBSLAB_SLACK_CLIENT_SECRET` (the `slack` connected app above).
+/// Slack sends admins back to this server's own `/slack/install/callback`.
+fn slack_from_env() -> dumbslab_core::slack::SharedApp {
+    let signing_secret = std::env::var("DUMBSLAB_SLACK_SIGNING_SECRET").ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+    dumbslab_core::slack::SharedApp { signing_secret, callback_url: None }
+}
+
 /// This server's own sign-in apps for single sign-on: `DUMBSLAB_SSO_GOOGLE_CLIENT_ID` /
 /// `_SECRET`, `DUMBSLAB_SSO_MICROSOFT_CLIENT_ID` / `_SECRET` and `DUMBSLAB_SLACK_CLIENT_ID` /
 /// `_SECRET` (see `dumbslab_core::sso::SharedApps`). Their redirect URI is `<public URL>/sso/callback`.
@@ -224,6 +232,7 @@ fn local_config(base_url: Option<String>) -> HostConfig {
         base_url: base_url.map(|u| u.trim_end_matches('/').to_string()),
         connectors: connectors_from_env(),
         github_app: github_app_from_env(),
+        slack: slack_from_env(),
         sso_apps: sso_apps_from_env(),
         ..Default::default()
     }
@@ -361,6 +370,7 @@ async fn serve(
         telemetry,
         connectors: connectors_from_env(),
         github_app: github_app_from_env(),
+        slack: slack_from_env(),
         sso_apps: sso_apps_from_env(),
         ..Default::default()
     };

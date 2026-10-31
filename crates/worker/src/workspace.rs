@@ -70,7 +70,7 @@ fn rust_err(e: ApiError) -> worker::Error {
 }
 
 /// Converts a core response, replacing defaults such as `application/octet-stream`. Only cookies repeat.
-fn to_response(r: dumbslab_core::Response) -> Result<Response> {
+pub fn to_response(r: dumbslab_core::Response) -> Result<Response> {
     // 204/304 responses must not have a body at all, not even an empty one.
     let mut resp = if r.body.is_empty() { Response::empty()? } else { Response::from_bytes(r.body)? }.with_status(r.status);
     let h = resp.headers_mut();
@@ -306,56 +306,11 @@ impl Workspace {
     /// [`drive_job`]).
     async fn run_job(&self, job: Job, cfg: &HostConfig) -> Result<Finish> {
         let (finish, effects, written) = drive_job(&self.state, &self.env, job, cfg).await?;
-        // A job can leave another to run after the answer (a check of a GitHub App installation).
-        let (later, effects): (Vec<Effect>, Vec<Effect>) = effects.into_iter().partition(|e| matches!(e, Effect::Background(_)));
-        send_effects(&self.state, &self.env, cfg, effects);
-        for effect in later {
-            if let Effect::Background(job) = effect {
-                self.run_job_later(job, cfg.clone());
-            }
-        }
+        deliver(&self.state, &self.env, cfg, effects);
         if let Some(h) = cfg.hosting.as_ref().filter(|_| written > 0) {
             self.report_usage(&h.home, false);
         }
         Ok(finish)
-    }
-
-    /// Runs a job once the response has gone (Slack's commands and events: Slack wants an answer
-    /// within three seconds). Its steps are storage-checked and metered like any job's (see
-    /// [`drive_job`]); the directory hears about them with this workspace's next report.
-    fn run_job_later(&self, job: Job, cfg: HostConfig) {
-        // The object's state outlives this request; the job holds its own handle to it.
-        let raw: &JsValue = self.state.as_raw().as_ref();
-        let state = State::from(raw.clone().unchecked_into::<worker::worker_sys::DurableObjectState>());
-        let env = self.env.clone();
-        self.state.wait_until(async move {
-            // Jobs it leaves run after it, a few at most (a check chains one more when changes
-            // arrived while it ran).
-            let mut queue = vec![job];
-            let mut ran = 0;
-            while let Some(job) = queue.pop() {
-                if ran == MAX_CHAINED_JOBS {
-                    console_warn!("a background job left more jobs than run in a row; the rest wait for their next trigger");
-                    break;
-                }
-                ran += 1;
-                match drive_job(&state, &env, job, &cfg).await {
-                    Ok((finish, effects, _)) => {
-                        if let Finish::Fail(e) = finish {
-                            console_warn!("a background job failed: {} ({})", e.message, e.code);
-                        }
-                        let (later, effects): (Vec<Effect>, Vec<Effect>) =
-                            effects.into_iter().partition(|e| matches!(e, Effect::Background(_)));
-                        queue.extend(later.into_iter().filter_map(|e| match e {
-                            Effect::Background(j) => Some(j),
-                            _ => None,
-                        }));
-                        send_effects(&state, &env, &cfg, effects);
-                    }
-                    Err(e) => console_error!("a background job failed: {e}"),
-                }
-            }
-        });
     }
 
     /// Answers for an address nobody has set up yet, without creating storage.
@@ -525,6 +480,7 @@ impl DurableObject for Workspace {
             hosting,
             connectors: crate::connect::connectors(&self.env, &origin, multi),
             github_app: crate::connect::github_app(&self.env),
+            slack: crate::connect::slack_app(&self.env, &origin, multi),
             sso_apps: crate::connect::sso_apps(&self.env, &origin, multi),
             // Session recordings and browser error reports; off unless these are set.
             telemetry: Telemetry::new(
@@ -623,14 +579,61 @@ impl DurableObject for Workspace {
         }
 
         // The request's own webhooks, once each, and the jobs that run after the response.
-        let (later, effects): (Vec<Effect>, Vec<Effect>) = effects.into_iter().partition(|e| matches!(e, Effect::Background(_)));
-        send_effects(&self.state, &self.env, &move_cfg, effects);
-        for effect in later {
-            if let Effect::Background(job) = effect {
-                self.run_job_later(job, move_cfg.clone());
+        deliver(&self.state, &self.env, &move_cfg, effects);
+        to_response(response)
+    }
+}
+
+/// Runs a job once the response has gone (Slack's commands and events: Slack wants an answer
+/// within three seconds). Its steps are storage-checked and metered like any job's (see
+/// [`drive_job`]); the directory hears about them with this workspace's next report. The object's
+/// state outlives the request; the job holds its own handle to it.
+fn run_later(state: &State, env: &Env, job: Job, cfg: HostConfig) {
+    let raw: &JsValue = state.as_raw().as_ref();
+    let own = State::from(raw.clone().unchecked_into::<worker::worker_sys::DurableObjectState>());
+    let env = env.clone();
+    state.wait_until(async move {
+        // Jobs it leaves run after it, a few at most (a check of a GitHub App installation chains
+        // one more when changes arrived while it ran); past that, the rest wait for their next
+        // trigger.
+        let mut queue = vec![job];
+        let mut ran = 0;
+        while let Some(job) = queue.pop() {
+            if ran == MAX_CHAINED_JOBS {
+                console_warn!("a background job left more jobs than run in a row; the rest wait for their next trigger");
+                break;
+            }
+            ran += 1;
+            match drive_job(&own, &env, job, &cfg).await {
+                Ok((finish, effects, _)) => {
+                    if let Finish::Fail(e) = finish {
+                        console_warn!("a background job failed: {} ({})", e.message, e.code);
+                    }
+                    let (later, effects): (Vec<Effect>, Vec<Effect>) =
+                        effects.into_iter().partition(|e| matches!(e, Effect::Background(_)));
+                    queue.extend(later.into_iter().filter_map(|e| match e {
+                        Effect::Background(j) => Some(j),
+                        _ => None,
+                    }));
+                    send_effects(&own, &env, &cfg, effects);
+                }
+                Err(e) => console_error!("a background job failed: {e}"),
             }
         }
-        to_response(response)
+    });
+}
+
+/// Delivers what a request or job left: webhooks, GitHub App installations to record with the
+/// directory, and jobs to run afterwards (Slack's: channel messages that wait for the directory's
+/// token, forgetting a token Slack called dead; checks of GitHub App installations; GitLab webhook
+/// cleanups).
+fn deliver(state: &State, env: &Env, cfg: &HostConfig, effects: Vec<Effect>) {
+    let (later, effects): (Vec<Effect>, Vec<Effect>) = effects.into_iter().partition(|e| matches!(e, Effect::Background(_)));
+    send_effects(state, env, cfg, effects);
+    for effect in later {
+        if let Effect::Background(job) = effect {
+            run_later(state, env, job, cfg.clone());
+        }
     }
 }
 
@@ -640,8 +643,10 @@ impl DurableObject for Workspace {
 /// transaction ends, rolled back or not, like a request's: while the job waits on another app,
 /// other requests and jobs on this object check the allowance against them. Returns how it
 /// finished, the effects its operations left for the host (see `Job::take_effects`), and the rows
-/// its steps wrote.
+/// its steps wrote. Calls to the directory (Add to Slack's installation and its token) go to the
+/// `Directory` object.
 async fn drive_job(state: &State, env: &Env, mut job: Job, cfg: &HostConfig) -> Result<(Finish, Vec<Effect>, u64)> {
+    let home = cfg.hosting.as_ref().map(|h| h.home.clone());
     let signs_in = job.is_sign_in();
     let mut replies = vec![];
     let mut written = 0;
@@ -678,7 +683,7 @@ async fn drive_job(state: &State, env: &Env, mut job: Job, cfg: &HostConfig) -> 
         let (step, notice, next) = match ran {
             Ok(v) => v,
             Err(e) => {
-                notify_failure(unran).await;
+                notify_failure(env, home.as_deref(), unran).await;
                 return Err(e);
             }
         };
@@ -688,13 +693,12 @@ async fn drive_job(state: &State, env: &Env, mut job: Job, cfg: &HostConfig) -> 
                 // The step rolled back (a full workspace, a failed operation); whoever is waiting
                 // elsewhere (a Slack command) hears so. Earlier steps committed, and their webhooks
                 // still go (see `Job::settle`).
-                notify_failure(notice).await;
+                notify_failure(env, home.as_deref(), notice).await;
                 return Ok((Finish::Fail(e), job.take_effects(), written));
             }
             Ok(Step::Done(done)) => return Ok((done, job.take_effects(), written)),
             Ok(Step::Fetch(calls)) => {
-                let home = cfg.hosting.as_ref().map(|h| h.home.as_str());
-                replies = futures_util::future::join_all(calls.iter().map(|c| send_call(env, home, c))).await;
+                replies = futures_util::future::join_all(calls.iter().map(|c| send_call(env, home.as_deref(), c))).await;
             }
         }
     }
@@ -703,10 +707,10 @@ async fn drive_job(state: &State, env: &Env, mut job: Job, cfg: &HostConfig) -> 
 
 /// Sends one request a job asked for. A request to record a GitHub App installation in the
 /// directory (`github_app::DIRECTORY_LINK_URL`) goes to the Directory object, for this workspace's
-/// home, and its answer is the reply; everything else goes out over https.
+/// home, and its answer is the reply; the rest go as [`crate::connect::send_for`] sends them.
 async fn send_call(env: &Env, home: Option<&str>, call: &HttpCall) -> connect::HttpReply {
     if call.url != dumbslab_core::sync::github_app::DIRECTORY_LINK_URL {
-        return crate::connect::send(call).await;
+        return crate::connect::send_for(env, home, call).await;
     }
     let Some(home) = home else { return connect::HttpReply::default() };
     let mut body: Value = serde_json::from_str(call.body.as_deref().unwrap_or("{}")).unwrap_or_default();
@@ -725,10 +729,11 @@ async fn send_call(env: &Env, home: Option<&str>, call: &HttpCall) -> connect::H
     }
 }
 
-/// Sends a failed job's notice (see `connect::Job::failure_notice`), best effort.
-async fn notify_failure(notice: Option<HttpCall>) {
+/// Sends a failed job's notice (see `connect::Job::failure_notice`), best effort: a Slack command's
+/// answer.
+async fn notify_failure(env: &Env, home: Option<&str>, notice: Option<HttpCall>) {
     if let Some(call) = notice {
-        crate::connect::send(&call).await;
+        crate::connect::send_for(env, home, &call).await;
     }
 }
 

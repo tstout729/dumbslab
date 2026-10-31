@@ -77,6 +77,12 @@ pub fn handle(db: &dyn Db, cfg: &HostConfig, req: &Request) -> Option<Outcome> {
         crate::sso::callback(db, cfg, req)
     } else if path.starts_with("/sso/") {
         failed(&ApiError::not_found("route"))
+    } else if path == crate::slack::INSTALL_PATH && req.method == "GET" {
+        crate::slack::install_start(db, cfg, req)
+    } else if path == crate::slack::INSTALL_CALLBACK_PATH && req.method == "GET" {
+        crate::slack::install_callback(db, cfg, req)
+    } else if (path == crate::slack::MANIFEST_PATH || path == crate::slack::CREATE_SHARED_APP_PATH) && req.method == "GET" {
+        crate::slack::manifest_route(cfg, req)
     } else if path.starts_with("/slack/") {
         // Slack's own requests: no session or token, only Slack's signature.
         crate::slack::handle(db, cfg, req)

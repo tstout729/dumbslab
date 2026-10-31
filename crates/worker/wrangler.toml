@@ -83,6 +83,9 @@ FREE_TOTAL_STORAGE_MB = "4096"
 # too. Empty turns a provider off.
 SSO_GOOGLE_CLIENT_ID = ""
 SSO_MICROSOFT_CLIENT_ID = ""
+# DumbSlab's Slack app (docs/hosting/slack-app.md): the same SLACK_CLIENT_ID here and SLACK_CLIENT_SECRET
+# secret, with the SLACK_SIGNING_SECRET secret, also turn on Add to Slack and Slack search:
+# SLACK_CLIENT_ID = "1234567890.1234567890"
 STRIPE_PRICE_ID = ""
 # Optional: the customer portal settings scripts/stripe-setup.sh made (bpc_…).
 STRIPE_PORTAL_CONFIG = ""

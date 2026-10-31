@@ -1,14 +1,24 @@
 //! Slack: search DumbSlab, preview links to its posts and start drafts from Slack, and tell Slack
 //! channels about new and updated posts.
 //!
-//! Each workspace uses its own Slack app. An admin creates it from the manifest [`manifest`]
-//! builds, installs it, and gives DumbSlab its bot token and signing secret (Settings › Slack,
-//! `update_slack`). There's no shared Slack app: Slack lets an app reach other companies' Slack
-//! workspaces only through its Marketplace.
+//! Two ways to connect:
+//!
+//! - **Add to Slack** (shared): the host runs one Slack app for every workspace ([`SharedApp`]).
+//!   An admin opens [`INSTALL_PATH`], approves in Slack, and Slack sends them back to
+//!   [`INSTALL_CALLBACK_PATH`]; DumbSlab exchanges the code at `oauth.v2.access` for the bot token.
+//!   Hosted DumbSlab registers one redirect URL and one set of request URLs, on the root domain:
+//!   the root forwards a sign-in by its `state` (`{address}.{random}`) and Slack's commands and
+//!   events by their Slack workspace ([`route`]), which the directory maps to the one DumbSlab
+//!   workspace that holds it. Jobs reach the directory with calls to [`DIRECTORY`].
+//! - **Its own Slack app**: an admin creates one from the manifest [`manifest`] builds, installs
+//!   it, and gives DumbSlab its bot token and signing secret (Settings › Slack, `update_slack`).
+//!   Self-hosted servers without a shared app use this.
 //!
 //! - Slack calls `/slack/commands` (the `/dumbslab` slash command) and `/slack/events` (link
-//!   previews). These endpoints sit outside the session and CSRF checks: Slack's signature
-//!   ([`verify`]) is all that admits a request, and a signature seen before is refused.
+//!   previews, and with the shared app `app_uninstalled` and `tokens_revoked`). These endpoints sit
+//!   outside the session and CSRF checks: Slack's signature ([`verify`]) is all that admits a
+//!   request, and a signature seen before is refused. With the shared app, a request must also be
+//!   for the Slack workspace this workspace holds.
 //! - Who is asking: the Slack user's email, once Slack has confirmed it (`users.info`), matched to
 //!   an active DumbSlab person. Search and drafts then run as that person through the same
 //!   operations as the API, so they see and do only what that person may. Anyone else gets a
@@ -29,6 +39,66 @@
 //! https://docs.slack.dev/reference/methods/users.info, https://docs.slack.dev/reference/objects/user-object,
 //! https://docs.slack.dev/reference/methods/chat.postMessage, https://docs.slack.dev/reference/app-manifest,
 //! https://docs.slack.dev/messaging/formatting-message-text
+//!
+//! Add to Slack: https://docs.slack.dev/authentication/installing-with-oauth (redirect URLs must be
+//! https and match or be under a registered one; the code lasts ten minutes; `team` is `null` and
+//! `is_enterprise_install` true for an org-wide install), https://docs.slack.dev/reference/methods/oauth.v2.access
+//! (Basic auth preferred for the client's credentials), https://docs.slack.dev/enterprise/migrating-to-organization-wide-deployment/
+//! (an org-wide install's bot token also reaches the workspaces that installed the app themselves, so a
+//! refused org-wide install isn't revoked either), https://docs.slack.dev/reference/events/app_uninstalled, https://docs.slack.dev/reference/events/tokens_revoked
+//! (`tokens.bot` lists bot user IDs, not tokens), https://docs.slack.dev/apis/events-api/ (`authorizations` names
+//! the one installation an event is for), https://docs.slack.dev/apis/events-api/using-http-request-urls
+//! (`url_verification` names no workspace; a request that isn't answered with a 200 is tried again), https://docs.slack.dev/app-manifests/configuring-apps-with-app-manifests/
+//! (`https://api.slack.com/apps?new_app=1&manifest_json=…`, URL-encoded), https://docs.slack.dev/app-management/distribution
+//! (public distribution is switched on in Manage Distribution; the manifest has no field for it).
+//!
+//! Slack keeps one bot token per app and Slack workspace: every install of the shared app into a
+//! Slack workspace gets the same one. So a revoke by one DumbSlab workspace could always reach the
+//! next one's token, and DumbSlab never revokes a shared-app token. Disconnecting lets go of the
+//! Slack workspace; removing the app from Slack is the Slack admin's (Slack then sends
+//! `app_uninstalled`).
+//!
+//! On hosted DumbSlab the directory holds each installation, token included, and is the only
+//! record of which DumbSlab workspace holds a Slack workspace:
+//!
+//! - Add to Slack reads where this workspace's connection is (see below), exchanges the code, has
+//!   the directory record the installation (refused while another workspace holds that Slack
+//!   workspace), then saves a reference here: the Slack workspace's ID and name, and the settings.
+//!   No token. It saves only over the connection that was here when it recorded the installation,
+//!   and only in the same workspace (`workspace_instance`: one deleted and set up again at the same
+//!   address is another); otherwise it lets go of what it recorded. Switching Slack workspaces then
+//!   lets go of the previous one. Disconnecting lets go first and forgets the reference only once
+//!   the directory has.
+//! - Changes to which Slack workspaces a workspace holds are fenced by the directory's value for
+//!   its connection (`generation`, per workspace): Add to Slack, a switch, a disconnect and letting
+//!   go of leftovers read it when they start and name it in each change, which moves it on; a
+//!   change naming an old value is refused (`slack_changed`). Forgetting a dead token, and the
+//!   operator deleting the workspace, move it on too. So a delayed step (an install holding an older token, a release from an earlier switch)
+//!   never undoes a newer one, and of two Add to Slack at once one wins and the other hears
+//!   `slack_busy`.
+//! - Every job that acts on Slack (a command's `users.info`, `chat.unfurl`, channel and test
+//!   messages) asks the directory for the token right before it acts. Only the workspace that holds
+//!   the Slack workspace gets it. A refusal stops the job, and the reference here, stale, is
+//!   forgotten. A restored backup, or a workspace whose Slack workspace was taken over, can't act.
+//!   The invariant, exactly: a workspace acts on Slack only with a token the directory gave it as
+//!   the holder; an action that already fetched the token may complete within seconds of a
+//!   transfer (the job's next Slack call follows the directory's answer at once), and the job's
+//!   next action asks again.
+//! - A token Slack calls dead is forgotten in the directory, only while the directory still holds
+//!   that very token (by its fingerprint): an install made since stays. The root domain checks
+//!   `app_uninstalled` and `tokens_revoked` itself, with `auth.test` ([`UninstallCheck`]); no
+//!   workspace is involved.
+//! - Settings › Slack asks the directory whether this workspace holds its Slack workspace, and lets
+//!   go of any other it still holds (a switch that stopped before letting go), but only ones
+//!   installed more than 15 minutes ago (an Add to Slack may still be finishing) and only if the
+//!   connection didn't change since it asked. So do requests the root routed here for a Slack
+//!   workspace this workspace doesn't hold: the root marks them ([`VIA_ROOT_HEADER`]), and they're
+//!   checked with the shared app's signing secret even once the workspace uses its own app.
+//!
+//! Self-hosted servers have no directory: Add to Slack saves the token here, like a workspace's own
+//! app, and checks it with `auth.test` when Slack says the app was removed.
+
+mod shared_app;
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -46,6 +116,11 @@ use crate::events::{Event, emit};
 use crate::registry::{Ctx, registry};
 use crate::util::{parse_ts, secure_eq, sha256_hex, ts};
 use crate::{Effect, HostConfig, Outcome, Request, Response, WebhookDelivery, params};
+pub use shared_app::{
+    CheckStep, InstallError, Routed, Shared, SharedApp, UninstallCheck, create_app_link, install_callback, install_callback_url,
+    install_start, manifest_route, route, shared, shared_manifest, team_of, unknown_team,
+};
+use shared_app::{Installed, directory_call, home, ours, stray};
 
 /// Where Slack sends the slash command.
 pub const COMMANDS_PATH: &str = "/slack/commands";
@@ -58,6 +133,30 @@ pub const MAX_BODY: usize = 64 * 1024;
 pub const SCOPES: &[&str] = &["commands", "chat:write", "chat:write.public", "links:read", "links:write", "users:read", "users:read.email"];
 /// Where an admin creates the Slack app.
 pub const CREATE_APP_URL: &str = "https://api.slack.com/apps?new_app=1";
+/// Add to Slack: an admin's browser starts here (signed in), and is sent to Slack.
+pub const INSTALL_PATH: &str = "/slack/install";
+/// Add to Slack: where Slack sends the admin back. Hosted DumbSlab registers the root domain's,
+/// which forwards to the workspace named in the `state`.
+pub const INSTALL_CALLBACK_PATH: &str = "/slack/install/callback";
+/// The shared app's manifest, for the operator who creates it.
+pub const MANIFEST_PATH: &str = "/slack/app-manifest.json";
+/// Sends the operator to Slack's app creation page with the shared app's manifest filled in.
+pub const CREATE_SHARED_APP_PATH: &str = "/slack/create-app";
+/// The shared app's user scopes: searching Slack from DumbSlab (connected apps) and signing in with
+/// Slack (OpenID Connect). Add to Slack itself asks only for [`SCOPES`].
+pub const USER_SCOPES: &[&str] = &["search:read", "openid", "email", "profile"];
+/// The events the shared app subscribes to: link previews, and hearing that it was removed.
+pub const SHARED_EVENTS: &[&str] = &["link_shared", "app_uninstalled", "tokens_revoked"];
+/// Hosted DumbSlab: on a request the root forwarded, which it checked with the shared app's signing
+/// secret. The workspace checks it with that secret too, whatever app it connected itself. Only the
+/// root sets it (the Worker removes any a client sent); it never names anything.
+pub const VIA_ROOT_HEADER: &str = "x-dumbslab-slack-via-root";
+/// Jobs reach hosted DumbSlab's directory with calls to this address: `{DIRECTORY}/slack/install`,
+/// `/slack/release`, `/slack/token`, `/slack/status` and `/slack/forget`, each with a JSON body
+/// naming the Slack workspace (`team_id`). Only the Cloudflare host answers them, and it names the
+/// workspace itself (`home`), whatever the call says; any other host refuses them, as they aren't
+/// https.
+pub const DIRECTORY: &str = "dumbslab-directory:";
 
 /// How far a request's timestamp may be from now, either way.
 const TOLERANCE_SECS: i64 = 300;
@@ -87,19 +186,48 @@ const POST_HEADER: &str = "x-dumbslab-post";
 /// The workspace's Slack app, with its secrets decrypted. Never printed.
 #[derive(Clone, Default)]
 pub struct App {
-    /// `None` when there's none, or it can't be read with the host's connector key.
+    /// The saved bot token: the workspace's own app's, or Add to Slack's off hosted DumbSlab.
+    /// `None` when there's none, when it can't be read with the host's connector key, and always
+    /// for Add to Slack on hosted DumbSlab, whose token only the directory holds.
     pub bot_token: Option<String>,
+    /// The workspace's own app's, or with the shared app the host's (while it has one).
     pub signing_secret: Option<String>,
-    /// The Slack workspace the bot token belongs to, from `auth.test`.
+    /// The Slack workspace the bot token belongs to, from `auth.test` or `oauth.v2.access`.
     pub team_id: Option<String>,
     pub team_name: String,
     pub bot_user_id: Option<String>,
     pub unfurls: bool,
+    /// Added with Add to Slack: the host's shared app, not the workspace's own.
+    pub shared: bool,
+    /// The bot scopes Slack granted the shared app.
+    pub scopes: Vec<String>,
+    /// Changes with every change to the saved connection (see the migration).
+    pub version: Option<String>,
 }
 
 impl fmt::Debug for App {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("App").field("team_id", &self.team_id).field("unfurls", &self.unfurls).finish_non_exhaustive()
+        f.debug_struct("App")
+            .field("team_id", &self.team_id)
+            .field("unfurls", &self.unfurls)
+            .field("shared", &self.shared)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Add to Slack on hosted DumbSlab: the directory holds the token, and says who may use it.
+pub fn via_directory(cfg: &HostConfig, app: &App) -> bool {
+    app.shared && home(cfg).is_some()
+}
+
+impl App {
+    /// Whether the workspace can act on Slack with this connection: it has a token here, or (Add
+    /// to Slack, hosted) names a Slack workspace whose token the directory may give.
+    pub fn can_act(&self, cfg: &HostConfig) -> bool {
+        match via_directory(cfg, self) {
+            true => self.team_id.is_some() && key(cfg).is_some(),
+            false => self.bot_token.is_some(),
+        }
     }
 }
 
@@ -117,6 +245,25 @@ fn seal(cfg: &HostConfig, kind: &str, secret: &str) -> ApiResult<String> {
     connect::seal(key, OWNER, kind, &Credential { token: secret.to_string(), ..Default::default() })
 }
 
+/// Whose a token sealed for the directory is, for the encryption's associated data, with its Slack
+/// workspace as the kind: a sealed token opens only for the Slack workspace it was sealed for.
+const DIRECTORY_OWNER: &str = "@slack-directory";
+
+fn seal_for_directory(cfg: &HostConfig, team_id: &str, token: &str) -> ApiResult<String> {
+    let key = key(cfg).ok_or_else(unavailable)?;
+    connect::seal(key, DIRECTORY_OWNER, team_id, &Credential { token: token.to_string(), ..Default::default() })
+}
+
+/// Opens a token the directory holds for `team_id`.
+fn open_from_directory(key: &str, team_id: &str, sealed: &str) -> Option<String> {
+    connect::open(key, DIRECTORY_OWNER, team_id, sealed).ok().map(|c| c.token)
+}
+
+/// What the directory keeps to recognize a token without reading it.
+fn fingerprint(token: &str) -> String {
+    sha256_hex(token)
+}
+
 pub fn unavailable() -> ApiError {
     ApiError::new(
         503,
@@ -132,13 +279,22 @@ pub fn load(db: &dyn Db, cfg: &HostConfig) -> ApiResult<Option<App>> {
         let sealed = r.opt_str(column)?;
         connect::open(key(cfg)?, OWNER, kind, &sealed).ok().map(|c| c.token)
     };
+    let shared = r.bool("shared");
+    let signing_secret = match shared {
+        true => cfg.slack.signing_secret.clone().filter(|s| !s.is_empty()),
+        false => open(SIGNING_SECRET, "signing_secret"),
+    };
     Ok(Some(App {
-        bot_token: open(BOT_TOKEN, "bot_token"),
-        signing_secret: open(SIGNING_SECRET, "signing_secret"),
+        // Add to Slack, hosted: never one kept here, even in a row restored from somewhere.
+        bot_token: open(BOT_TOKEN, "bot_token").filter(|_| !(shared && home(cfg).is_some())),
+        signing_secret,
         team_id: r.opt_str("team_id"),
         team_name: r.str("team_name"),
         bot_user_id: r.opt_str("bot_user_id"),
         unfurls: r.bool("unfurls"),
+        shared,
+        scopes: r.str("scopes").split(',').filter(|s| !s.is_empty()).map(str::to_string).collect(),
+        version: r.opt_str("version"),
     }))
 }
 
@@ -150,6 +306,20 @@ pub struct Change {
     pub unfurls: Option<bool>,
 }
 
+/// The saved connection when a change was decided on: whether there was one, and its version. A
+/// change written later is written only if that's still so.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Snapshot {
+    exists: bool,
+    version: Option<String>,
+}
+
+impl Snapshot {
+    pub fn of(app: Option<&App>) -> Snapshot {
+        Snapshot { exists: app.is_some(), version: app.and_then(|a| a.version.clone()) }
+    }
+}
+
 /// The Slack workspace a bot token belongs to.
 #[derive(Clone, Debug, Default)]
 struct Team {
@@ -158,12 +328,35 @@ struct Team {
     bot_user_id: String,
 }
 
-/// Saves a change. A bot token comes with the Slack workspace `auth.test` said it belongs to.
-fn save(db: &dyn Db, cfg: &HostConfig, change: &Change, team: Option<&Team>, actor_id: &str, now: DateTime<Utc>) -> ApiResult<()> {
-    db.execute("INSERT INTO slack_app (id, updated_at) VALUES (1, ?) ON CONFLICT(id) DO NOTHING", &params![ts(now)])?;
+/// Saves a change to the workspace's own app, if the saved connection is still `expect`, under a
+/// new version. A bot token comes with the Slack workspace `auth.test` said it belongs to. `false`
+/// when the connection changed meanwhile: then nothing was written.
+fn save(
+    db: &dyn Db,
+    cfg: &HostConfig,
+    change: &Change,
+    team: Option<&Team>,
+    actor_id: &str,
+    now: DateTime<Utc>,
+    expect: &Snapshot,
+) -> ApiResult<bool> {
+    let version = crate::util::new_id();
+    let written = match expect.exists {
+        true => db.execute(
+            "UPDATE slack_app SET version = ?, updated_by = ?, updated_at = ? WHERE id = 1 AND version IS ?",
+            &params![version, actor_id, ts(now), expect.version.clone()],
+        )?,
+        false => db.execute(
+            "INSERT INTO slack_app (id, version, updated_by, updated_at) VALUES (1, ?, ?, ?) ON CONFLICT(id) DO NOTHING",
+            &params![version, actor_id, ts(now)],
+        )?,
+    };
+    if written == 0 {
+        return Ok(false);
+    }
     if let (Some(token), Some(team)) = (&change.bot_token, team) {
         db.execute(
-            "UPDATE slack_app SET bot_token = ?, team_id = ?, team_name = ?, bot_user_id = ? WHERE id = 1",
+            "UPDATE slack_app SET bot_token = ?, team_id = ?, team_name = ?, bot_user_id = ?, shared = 0, scopes = '' WHERE id = 1",
             &params![
                 seal(cfg, BOT_TOKEN, token)?,
                 team.id.clone(),
@@ -178,13 +371,13 @@ fn save(db: &dyn Db, cfg: &HostConfig, change: &Change, team: Option<&Team>, act
     if let Some(on) = change.unfurls {
         db.execute("UPDATE slack_app SET unfurls = ? WHERE id = 1", &params![on])?;
     }
-    db.execute("UPDATE slack_app SET updated_by = ?, updated_at = ? WHERE id = 1", &params![actor_id, ts(now)])?;
-    Ok(())
+    Ok(true)
 }
 
 /// Saves a change that needs no word from Slack (everything but a bot token), and records it.
 pub(crate) fn save_now(ctx: &mut Ctx, change: &Change) -> ApiResult<()> {
-    save(ctx.db, ctx.cfg, change, None, &ctx.actor.user_id.clone(), ctx.now)?;
+    let expect = Snapshot::of(load(ctx.db, ctx.cfg)?.as_ref());
+    save(ctx.db, ctx.cfg, change, None, &ctx.actor.user_id.clone(), ctx.now, &expect)?;
     record_change(ctx, change)
 }
 
@@ -203,6 +396,35 @@ pub(crate) fn remove(db: &dyn Db) -> ApiResult<bool> {
     let app = db.execute("DELETE FROM slack_app", &[])?;
     let channels = db.execute("DELETE FROM slack_channels", &[])?;
     Ok(app + channels > 0)
+}
+
+const INSTANCE: &str = "workspace_instance";
+
+/// This workspace's storage, as one instance: a random value in its settings, made the first time
+/// it's needed. A workspace deleted and set up again at the same address is another instance, so
+/// work the deleted one started (an Add to Slack) changes nothing in the new one.
+pub(crate) fn instance(db: &dyn Db) -> ApiResult<String> {
+    if let Some(v) = crate::ops::admin::setting(db, INSTANCE)? {
+        return Ok(v);
+    }
+    let v = crate::util::new_id();
+    crate::ops::admin::put_setting(db, INSTANCE, &v)?;
+    Ok(v)
+}
+
+/// Whether this is still the instance `expect` names.
+fn same_instance(db: &dyn Db, expect: &str) -> ApiResult<bool> {
+    Ok(crate::ops::admin::setting(db, INSTANCE)?.is_some_and(|v| secure_eq(&v, expect)))
+}
+
+/// Forgets Add to Slack's connection to `team_id`, only if it's still that one at `version`.
+/// `false` when it changed meanwhile.
+fn forget_connection(db: &dyn Db, team_id: &str, version: Option<&str>) -> ApiResult<bool> {
+    let n = db.execute("DELETE FROM slack_app WHERE id = 1 AND shared = 1 AND team_id = ? AND version IS ?", &params![team_id, version])?;
+    if n > 0 {
+        db.execute("DELETE FROM slack_channels", &[])?;
+    }
+    Ok(n > 0)
 }
 
 /// The Slack app manifest for this workspace: its slash command, the domain whose links it
@@ -313,9 +535,16 @@ fn run(db: &dyn Db, cfg: &HostConfig, req: &Request) -> ApiResult<Outcome> {
         return Err(ApiError::new(413, "too_large", "request body too large"));
     }
     let now = Utc::now();
-    let app = load(db, cfg)?;
-    let Some((app, secret)) = app.and_then(|a| a.signing_secret.clone().map(|s| (a, s))) else {
-        return Err(ApiError::new(404, "slack_off", "Slack isn't connected to this workspace."));
+    let app = load(db, cfg)?.filter(|a| a.signing_secret.is_some());
+    // Forwarded by the root (hosted): the shared app's, whatever this workspace connected, since
+    // the directory may still send its requests here for a Slack workspace this workspace holds
+    // there (see `stray`). Otherwise the connected app's, or without one the shared app's.
+    let via_root = home(cfg).is_some() && req.header(VIA_ROOT_HEADER).is_some();
+    let off = || ApiError::new(404, "slack_off", "Slack isn't connected to this workspace.");
+    let secret = match (via_root, &app, shared(cfg)) {
+        (true, _, Some(s)) | (false, None, Some(s)) => s.signing_secret.to_string(),
+        (false, Some(a), _) => a.signing_secret.clone().unwrap_or_default(),
+        (_, _, None) => return Err(off()),
     };
     let sig = req.header("x-slack-signature");
     verify(&secret, req.header("x-slack-request-timestamp"), sig, &req.body, now.timestamp()).map_err(refused)?;
@@ -326,7 +555,12 @@ fn run(db: &dyn Db, cfg: &HostConfig, req: &Request) -> ApiResult<Outcome> {
         return Err(ApiError::new(401, "replayed", "This Slack request was handled already."));
     }
     let base = crate::http::base_url(cfg, req);
-    if path == COMMANDS_PATH { command(db, &app, &base, &req.body) } else { event(db, &app, &base, &req.body, now) }
+    // The shared app serves every Slack workspace: only the one this workspace holds gets in.
+    let Some(app) = app.filter(|a| if via_root { a.shared && ours(a, path, &req.body) } else { !a.shared || ours(a, path, &req.body) })
+    else {
+        return stray(cfg, &base, path, &req.body);
+    };
+    if path == COMMANDS_PATH { command(db, cfg, &app, &base, &req.body) } else { event(db, cfg, &app, &base, &req.body, now) }
 }
 
 /// A form body, as Slack sends slash commands.
@@ -347,6 +581,11 @@ fn later(response: Response, job: SlackJob) -> Outcome {
     out
 }
 
+/// A Slack ID (`T…`, `U…`, `E…`): letters and digits.
+fn valid_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 32 && id.chars().all(|c| c.is_ascii_alphanumeric())
+}
+
 /// Whether a slash command's `response_url` is one of Slack's: https on `hooks.slack.com` (or
 /// GovSlack's `hooks.slack-gov.com`) with no port or user name, a path under `/commands/` or
 /// `/actions/` made of letters, digits, `/`, `_` and `-`, and no query.
@@ -359,12 +598,7 @@ pub fn slack_reply_url(url: &str) -> bool {
         && path.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '_' | '-'))
 }
 
-/// A Slack user id: letters and digits.
-fn valid_user(id: &str) -> bool {
-    !id.is_empty() && id.len() <= 32 && id.chars().all(|c| c.is_ascii_alphanumeric())
-}
-
-fn command(db: &dyn Db, app: &App, base: &str, body: &[u8]) -> ApiResult<Outcome> {
+fn command(db: &dyn Db, cfg: &HostConfig, app: &App, base: &str, body: &[u8]) -> ApiResult<Outcome> {
     let f = form(body);
     let field = |k: &str| f.get(k).map(|v| v.trim().to_string()).unwrap_or_default();
     // Slack checks the certificate of publicly distributed apps' commands now and then.
@@ -393,41 +627,53 @@ fn command(db: &dyn Db, app: &App, base: &str, body: &[u8]) -> ApiResult<Outcome
         }
         _ => return Ok(reply(help(&name, &workspace))),
     };
-    if !valid_user(&field("user_id")) {
+    if !valid_id(&field("user_id")) {
         return Ok(reply(ephemeral("Slack didn't say who's asking. Try again.")));
     }
     // The answer goes to this address later; only Slack's own are trusted with it.
     if !slack_reply_url(&field("response_url")) {
         return Ok(reply(ephemeral("Slack sent a reply address DumbSlab doesn't recognize, so it can't answer. Try again.")));
     }
-    if app.bot_token.is_none() {
+    if !app.can_act(cfg) {
         return Ok(reply(ephemeral(&format!(
             "{} hasn't finished connecting Slack: an admin needs to paste the bot token in Settings › Slack.",
             escape(&workspace)
         ))));
     }
     // An empty answer acknowledges the command; the result follows through `response_url`.
-    Ok(later(Response::empty(200), SlackJob::new(base, work)))
+    Ok(later(Response::empty(200), SlackJob::new(base, work).bound_to(app)))
 }
 
-fn event(db: &dyn Db, app: &App, base: &str, body: &[u8], now: DateTime<Utc>) -> ApiResult<Outcome> {
+fn event(db: &dyn Db, cfg: &HostConfig, app: &App, base: &str, body: &[u8], now: DateTime<Utc>) -> ApiResult<Outcome> {
     let v: Value = serde_json::from_slice(body).map_err(|_| ApiError::bad_request("Slack sent an event DumbSlab couldn't read."))?;
     let ack = || reply(json!({ "ok": true }));
     match v["type"].as_str() {
         // Slack checks the events URL when an admin saves it.
         Some("url_verification") => Ok(reply(json!({ "challenge": v["challenge"].as_str().unwrap_or_default() }))),
         Some("event_callback") => {
+            let e = &v["event"];
+            // The shared app was removed from Slack, or its bot token revoked. Hosted, the root
+            // domain checks these itself; they never reach a workspace. Self-hosted, the token is
+            // checked before Slack hears back, and an unclear answer has Slack send it again.
+            let bot_revoked = e["type"] == "tokens_revoked"
+                && app.bot_user_id.as_deref().is_some_and(|b| e["tokens"]["bot"].as_array().is_some_and(|ids| ids.iter().any(|i| i == b)));
+            if app.shared && (e["type"] == "app_uninstalled" || bot_revoked) {
+                let mut out = reply(json!({ "ok": true }));
+                if !via_directory(cfg, app) && app.bot_token.is_some() {
+                    out.effects.push(Effect::Connect(connect::Job::Slack(SlackJob::new(base, Work::Check))));
+                }
+                return Ok(out);
+            }
             // Slack sends an event again when an answer was slow; it's handled once.
             let id = v["event_id"].as_str().unwrap_or_default();
             if !id.is_empty() && !remember(db, &format!("event:{id}"), now + Duration::seconds(EVENT_MEMORY_SECS))? {
                 return Ok(ack());
             }
-            let e = &v["event"];
             let user = e["user"].as_str().unwrap_or_default();
-            if e["type"] != "link_shared" || !app.unfurls || app.bot_token.is_none() || !valid_user(user) {
+            if e["type"] != "link_shared" || !app.unfurls || !app.can_act(cfg) || !valid_id(user) {
                 return Ok(ack());
             }
-            let links = post_links(base, &e["links"]);
+            let links = post_links(&own_hosts(cfg, base), &e["links"]);
             if links.is_empty() {
                 return Ok(ack());
             }
@@ -439,19 +685,31 @@ fn event(db: &dyn Db, app: &App, base: &str, body: &[u8], now: DateTime<Utc>) ->
             };
             Ok(later(
                 Response::json(200, &json!({ "ok": true })),
-                SlackJob::new(base, Work::Unfurl { user: user.to_string(), links, target }),
+                SlackJob::new(base, Work::Unfurl { user: user.to_string(), links, target }).bound_to(app),
             ))
         }
         _ => Ok(ack()),
     }
 }
 
+/// The hosts whose post links this workspace previews: its address and, hosted, its first one,
+/// which no other workspace can ever hold. Never another workspace's: the shared app's unfurl
+/// domain is the root domain, so Slack sends links to every workspace's address to each.
+fn own_hosts(cfg: &HostConfig, base: &str) -> Vec<String> {
+    let mut hosts: Vec<String> = connect::host_of(base).into_iter().collect();
+    if let (Some(current), Some(home)) = (cfg.workspace.as_deref(), home(cfg))
+        && current != home
+    {
+        hosts.extend(connect::host_of(&crate::tenancy::origin_for(base, current, home)));
+    }
+    hosts
+}
+
 /// Links to this workspace's posts among a `link_shared` event's links: (link as sent, post id).
-fn post_links(base: &str, links: &Value) -> Vec<(String, String)> {
-    let ours = connect::host_of(base);
+fn post_links(hosts: &[String], links: &Value) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = vec![];
     for url in links.as_array().into_iter().flatten().filter_map(|l| l["url"].as_str()) {
-        if connect::host_of(url) != ours || out.iter().any(|(u, _)| u == url) {
+        if !connect::host_of(url).is_some_and(|h| hosts.contains(&h)) || out.iter().any(|(u, _)| u == url) {
             continue;
         }
         let path = connect::path_of(url);
@@ -798,6 +1056,54 @@ pub struct SlackJob {
     phase: Phase,
     /// What the job's operations left for the host to deliver (a new draft's webhooks).
     effects: Vec<Effect>,
+    /// The connection a job that acts on Slack is for. It acts only while that's still the one
+    /// saved here.
+    bound: Option<Bound>,
+    /// The saved connection's version when the job looked: a connection found stale is forgotten
+    /// only if it's still that one.
+    version: Option<String>,
+    /// The bot token the job acts with, once it has it: on hosted DumbSlab, Add to Slack's from
+    /// the directory, right before it acts; otherwise the one saved here.
+    token: Option<Token>,
+    /// Add to Slack: what Slack gave.
+    installed: Option<Box<Installed>>,
+    /// Settings › Slack, hosted: the directory said this workspace holds the Slack workspace it
+    /// asked about.
+    held: bool,
+    /// Hosted, a job that changes which Slack workspaces this workspace holds (Add to Slack,
+    /// disconnecting, letting go of leftovers): the directory's value for its connection when the
+    /// job started, moved on with each change it made. Each change names it.
+    generation: Option<i64>,
+    /// Add to Slack: the connection saved here when it recorded the installation. It saves only
+    /// over exactly that.
+    expect: Option<Snapshot>,
+}
+
+/// The connection a job is for: Add to Slack's or the workspace's own app's, and its Slack
+/// workspace.
+#[derive(Clone, Debug, PartialEq)]
+struct Bound {
+    shared: bool,
+    team_id: Option<String>,
+}
+
+impl Bound {
+    fn of(app: &App) -> Bound {
+        Bound { shared: app.shared, team_id: app.team_id.clone() }
+    }
+
+    fn matches(&self, app: Option<&App>) -> bool {
+        app.is_some_and(|a| *self == Bound::of(a))
+    }
+}
+
+/// A bot token a job acts with. Never printed.
+#[derive(Clone)]
+struct Token {
+    value: String,
+    /// From the directory: what it knows the token by, so a token Slack calls dead can be
+    /// forgotten there. `None` for one saved here.
+    fingerprint: Option<String>,
 }
 
 #[derive(Clone)]
@@ -808,11 +1114,41 @@ enum Work {
     NewDraft { user: String, title: String, reply_to: String },
     /// Preview links someone shared.
     Unfurl { user: String, links: Vec<(String, String)>, target: UnfurlTarget },
-    /// An admin saved a bot token: check it with Slack, then save it with the rest of the change.
-    Save { admin: String, via: Via, change: Change },
+    /// An admin saved a bot token: check it with Slack, then save it with the rest of the change,
+    /// if the saved connection is still `expect`.
+    Save { admin: String, via: Via, change: Change, expect: Snapshot },
     /// An admin asked for a test message in a channel.
     Test { channel_id: String },
+    /// Hosted: channel messages from DumbSlab's own Slack app, sent once the directory gives the
+    /// token (they carry none).
+    Post { messages: Vec<WebhookDelivery> },
+    /// Add to Slack: Slack sent an admin back with a code. Exchange it for the bot token; hosted,
+    /// have the directory record the installation, then save a reference to it here.
+    Install { admin: String, via: Via, code: String, redirect_uri: String, home: Option<String>, instance: String },
+    /// Hosted: let go of a Slack workspace, if this workspace's connection is still at
+    /// `generation` (after Add to Slack: the previous one, or its own that it couldn't save).
+    Release { team_id: String, generation: i64 },
+    /// Add to Slack, hosted: let go of the Slack workspace in the directory, then forget the
+    /// connection here.
+    Disconnect { admin: String, via: Via },
+    /// Hosted: ask the directory what this workspace holds. Forgets a connection it doesn't hold
+    /// any more, and lets go of leftovers: other Slack workspaces it has held for more than 15
+    /// minutes, if its connection didn't change meanwhile. With `admin`, for Settings › Slack, it
+    /// answers with the settings.
+    Status { admin: Option<(String, Via)> },
+    /// Hosted: Slack called the directory's token dead. The directory forgets it, only while it
+    /// still holds that very token.
+    Forget { team_id: String, fingerprint: String },
+    /// Add to Slack off hosted DumbSlab: Slack says the app was removed. Check the saved token,
+    /// and answer Slack.
+    Check,
 }
+
+/// What a command's job says when its Slack workspace isn't connected here any more.
+const NO_LONGER_CONNECTED: &str = "This Slack workspace is no longer connected to DumbSlab here.";
+
+/// What a command's job says when Slack called the shared app's token dead.
+const REMOVED: &str = "DumbSlab's Slack app was removed from this Slack workspace. A DumbSlab admin can add it again in Settings › Slack.";
 
 /// The message whose links Slack asked to preview.
 #[derive(Clone, Debug)]
@@ -826,6 +1162,8 @@ struct UnfurlTarget {
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Phase {
     Start,
+    /// Waiting for the directory to give the bot token.
+    Token,
     /// Waiting for `users.info`.
     Identifying,
     /// Waiting for `chat.unfurl`.
@@ -836,6 +1174,16 @@ enum Phase {
     Posting,
     /// Waiting for Slack to take a command's answer at its `response_url`.
     Replying,
+    /// Waiting for `oauth.v2.access`.
+    Exchanging,
+    /// Waiting for the directory to record an installation.
+    Installing,
+    /// Waiting for the directory to let go of a Slack workspace.
+    Releasing,
+    /// Waiting for the directory to say what this workspace holds.
+    Asking,
+    /// Waiting for the directory to forget a dead token.
+    Forgetting,
 }
 
 // Jobs carry tokens and what people typed; never print them.
@@ -847,6 +1195,13 @@ impl fmt::Debug for SlackJob {
             Work::Unfurl { .. } => "unfurl",
             Work::Save { .. } => "save",
             Work::Test { .. } => "test",
+            Work::Post { .. } => "post",
+            Work::Install { .. } => "install",
+            Work::Release { .. } => "release",
+            Work::Disconnect { .. } => "disconnect",
+            Work::Status { .. } => "status",
+            Work::Forget { .. } => "forget",
+            Work::Check => "check",
         };
         write!(f, "SlackJob({kind}, {:?})", self.phase)
     }
@@ -854,22 +1209,57 @@ impl fmt::Debug for SlackJob {
 
 impl SlackJob {
     fn new(base_url: &str, work: Work) -> SlackJob {
-        SlackJob { base_url: base_url.to_string(), work, phase: Phase::Start, effects: vec![] }
+        SlackJob {
+            base_url: base_url.to_string(),
+            work,
+            phase: Phase::Start,
+            effects: vec![],
+            bound: None,
+            version: None,
+            token: None,
+            installed: None,
+            held: false,
+            generation: None,
+            expect: None,
+        }
     }
 
-    /// Checks a new bot token with Slack, then saves it with the rest of `change`.
-    pub(crate) fn save(base_url: &str, admin: &Actor, change: Change) -> SlackJob {
-        SlackJob::new(base_url, Work::Save { admin: admin.user_id.clone(), via: admin.via, change })
+    /// Binds a job that acts on Slack to the connection `app` is now.
+    fn bound_to(mut self, app: &App) -> SlackJob {
+        self.bound = Some(Bound::of(app));
+        self
     }
 
-    /// Sends a test message to a channel.
-    pub(crate) fn test(base_url: &str, channel_id: &str) -> SlackJob {
-        SlackJob::new(base_url, Work::Test { channel_id: channel_id.to_string() })
+    /// Checks a new bot token with Slack, then saves it with the rest of `change`, if the saved
+    /// connection is still `expect`.
+    pub(crate) fn save(base_url: &str, admin: &Actor, change: Change, expect: Snapshot) -> SlackJob {
+        SlackJob::new(base_url, Work::Save { admin: admin.user_id.clone(), via: admin.via, change, expect })
+    }
+
+    /// Sends a test message to a channel, from the connection `app` is now.
+    pub(crate) fn test(base_url: &str, channel_id: &str, app: &App) -> SlackJob {
+        SlackJob::new(base_url, Work::Test { channel_id: channel_id.to_string() }).bound_to(app)
+    }
+
+    /// Hosted: Settings › Slack, from what the directory says (see [`Work::Status`]). Without an
+    /// admin it only tidies up.
+    pub(crate) fn status(base_url: &str, admin: Option<&Actor>) -> SlackJob {
+        SlackJob::new(base_url, Work::Status { admin: admin.map(|a| (a.user_id.clone(), a.via)) })
+    }
+
+    /// Add to Slack, hosted: disconnects the connection `app` is now (see [`Work::Disconnect`]).
+    pub(crate) fn disconnect(base_url: &str, admin: &Actor, app: &App) -> SlackJob {
+        SlackJob::new(base_url, Work::Disconnect { admin: admin.user_id.clone(), via: admin.via }).bound_to(app)
     }
 
     /// What the job's operations left for the host to deliver.
     pub fn take_effects(&mut self) -> Vec<Effect> {
         std::mem::take(&mut self.effects)
+    }
+
+    /// Whether the job acts on Slack with the connection's bot token.
+    fn acts(&self) -> bool {
+        matches!(self.work, Work::Search { .. } | Work::NewDraft { .. } | Work::Unfurl { .. } | Work::Test { .. } | Work::Post { .. })
     }
 
     /// The answer to send when a step failed and was rolled back, so a command Slack was told
@@ -920,25 +1310,127 @@ fn job_ctx<'a>(db: &'a dyn Db, cfg: &'a HostConfig, base_url: &str, actor: Actor
     Ctx { db, actor, now, cfg, base_url: base_url.to_string(), effects: vec![] }
 }
 
-/// Runs a Slack job's next step.
-pub fn step(db: &dyn Db, cfg: &HostConfig, job: &mut SlackJob, replies: Vec<HttpReply>, now: DateTime<Utc>) -> ApiResult<Step> {
-    let answer = replies.into_iter().next().unwrap_or_default();
-    let app = load(db, cfg)?.unwrap_or_default();
-    match (job.phase, job.work.clone()) {
-        (Phase::Start, Work::Search { user, .. } | Work::NewDraft { user, .. } | Work::Unfurl { user, .. }) => {
-            let Some(token) = app.bot_token.clone() else {
-                // Disconnected meanwhile.
-                return match job.work.clone() {
-                    Work::Search { reply_to, .. } | Work::NewDraft { reply_to, .. } => {
-                        answer_at(job, &reply_to, ephemeral("Slack isn't connected to DumbSlab any more."))
-                    }
-                    _ => fill(json!({ "ok": true })),
-                };
-            };
+/// A job that acts on Slack stops: its connection isn't the one saved here any more, or the
+/// directory says this workspace doesn't hold its Slack workspace. A command says so at its
+/// `response_url` (Slack's own address: no token, nothing of the workspace's).
+fn stop(job: &mut SlackJob) -> ApiResult<Step> {
+    match job.work.clone() {
+        Work::Search { reply_to, .. } | Work::NewDraft { reply_to, .. } => answer_at(job, &reply_to, ephemeral(NO_LONGER_CONNECTED)),
+        Work::Test { .. } => fail(ApiError::new(
+            409,
+            "slack_disconnected",
+            "This workspace isn't connected to that Slack workspace any more. Connect Slack again in Settings › Slack.",
+        )),
+        _ => fill(json!({ "ok": true })),
+    }
+}
+
+/// The directory didn't answer with the token: nothing goes to Slack.
+fn unanswered(job: &mut SlackJob) -> ApiResult<Step> {
+    match job.work.clone() {
+        Work::Search { reply_to, .. } | Work::NewDraft { reply_to, .. } => {
+            answer_at(job, &reply_to, ephemeral("DumbSlab couldn't reach Slack just now. Try again in a minute."))
+        }
+        Work::Test { .. } => {
+            fail(ApiError::new(503, "slack_unavailable", "DumbSlab couldn't check the Slack connection just now. Try again in a minute."))
+        }
+        _ => fill(json!({ "ok": true })),
+    }
+}
+
+/// Slack's error codes for a bot token that's no good any more.
+fn dead(code: &str) -> bool {
+    matches!(code, "invalid_auth" | "account_inactive" | "token_revoked")
+}
+
+/// Whether Slack called the directory's token dead in `reply`. Then a job of its own has the
+/// directory forget it, if it still holds that very token. Never for a token saved here.
+fn dead_token(job: &mut SlackJob, reply: &HttpReply) -> bool {
+    let (Some(Token { fingerprint: Some(fingerprint), .. }), Some(team_id)) =
+        (job.token.clone(), job.bound.as_ref().and_then(|b| b.team_id.clone()))
+    else {
+        return false;
+    };
+    if !slack_error(reply).is_some_and(|c| dead(&c)) {
+        return false;
+    }
+    job.effects.push(Effect::Background(connect::Job::Slack(SlackJob::new(&job.base_url, Work::Forget { team_id, fingerprint }))));
+    true
+}
+
+/// The Slack call a job that acts on Slack makes, with its token.
+fn act(db: &dyn Db, job: &mut SlackJob) -> ApiResult<Step> {
+    let token = job.token.as_ref().map(|t| t.value.clone()).unwrap_or_default();
+    match job.work.clone() {
+        Work::Search { user, .. } | Work::NewDraft { user, .. } | Work::Unfurl { user, .. } => {
             job.phase = Phase::Identifying;
             Ok(Step::Fetch(vec![users_info(&token, &user)]))
         }
+        Work::Test { channel_id } => test_message(db, job, &token, &channel_id),
+        Work::Post { messages } => {
+            let calls = messages
+                .iter()
+                .map(|d| {
+                    HttpCall { method: "POST", url: d.url.clone(), headers: d.headers.clone(), body: Some(d.body.clone()) }.bearer(&token)
+                })
+                .collect();
+            job.phase = Phase::Posting;
+            Ok(Step::Fetch(calls))
+        }
+        _ => Err(ApiError::internal("this Slack job doesn't act on Slack")),
+    }
+}
+
+/// Runs a Slack job's next step.
+pub fn step(db: &dyn Db, cfg: &HostConfig, job: &mut SlackJob, replies: Vec<HttpReply>, now: DateTime<Utc>) -> ApiResult<Step> {
+    let answer = replies.first().cloned().unwrap_or_default();
+    let saved = load(db, cfg)?;
+    // A job that acts on Slack acts only for the connection it's for, while that's still the one
+    // saved here: not after a disconnect, nor once it switched Slack workspaces.
+    if job.acts()
+        && matches!(job.phase, Phase::Start | Phase::Token | Phase::Identifying)
+        && !job.bound.as_ref().is_none_or(|b| b.matches(saved.as_ref()))
+    {
+        return stop(job);
+    }
+    let app = saved.unwrap_or_default();
+    match (job.phase, job.work.clone()) {
+        // Acting on Slack: first the token. Add to Slack, hosted: the directory gives it, only to
+        // the workspace that holds the Slack workspace, right before the job acts.
+        (Phase::Start, Work::Search { .. } | Work::NewDraft { .. } | Work::Unfurl { .. } | Work::Test { .. } | Work::Post { .. }) => {
+            job.version = app.version.clone();
+            if via_directory(cfg, &app) {
+                let Some(team) = app.team_id.clone() else { return stop(job) };
+                job.phase = Phase::Token;
+                return Ok(Step::Fetch(vec![directory_call("/slack/token", json!({ "team_id": team }))]));
+            }
+            let Some(token) = app.bot_token.clone() else { return stop(job) };
+            job.token = Some(Token { value: token, fingerprint: None });
+            act(db, job)
+        }
+        (Phase::Token, _) => {
+            let team = app.team_id.clone().unwrap_or_default();
+            match answer.status {
+                200 => {
+                    let v = answer.json();
+                    let token = key(cfg).and_then(|k| open_from_directory(k, &team, v["bot_token"].as_str().unwrap_or_default()));
+                    let (Some(value), Some(fingerprint)) = (token, connect::opt(&v["token_fingerprint"])) else { return unanswered(job) };
+                    job.token = Some(Token { value, fingerprint: Some(fingerprint) });
+                    act(db, job)
+                }
+                // This workspace doesn't hold the Slack workspace (any more): a restored backup, or
+                // one Slack removed the app from. The connection saved here is stale: forget it.
+                404 => {
+                    shared_app::forget_stale(db, cfg, job, &team, now)?;
+                    stop(job)
+                }
+                _ => unanswered(job),
+            }
+        }
         (Phase::Identifying, Work::Search { q, reply_to, .. }) => {
+            if dead_token(job, &answer) {
+                return answer_at(job, &reply_to, ephemeral(REMOVED));
+            }
             let actor = match identify(db, &app, &answer)? {
                 Ok(a) => a,
                 Err(message) => return answer_at(job, &reply_to, ephemeral(&message)),
@@ -952,6 +1444,9 @@ pub fn step(db: &dyn Db, cfg: &HostConfig, job: &mut SlackJob, replies: Vec<Http
             answer_at(job, &reply_to, message)
         }
         (Phase::Identifying, Work::NewDraft { title, reply_to, .. }) => {
+            if dead_token(job, &answer) {
+                return answer_at(job, &reply_to, ephemeral(REMOVED));
+            }
             let actor = match identify(db, &app, &answer)? {
                 Ok(a) => a,
                 Err(message) => return answer_at(job, &reply_to, ephemeral(&message)),
@@ -975,6 +1470,9 @@ pub fn step(db: &dyn Db, cfg: &HostConfig, job: &mut SlackJob, replies: Vec<Http
         // Slack has the answer; nothing waits for this result.
         (Phase::Replying, _) => fill(json!({ "ok": answer.ok() })),
         (Phase::Identifying, Work::Unfurl { links, target, .. }) => {
+            if dead_token(job, &answer) {
+                return fill(json!({ "ok": true }));
+            }
             let Ok(actor) = identify(db, &app, &answer)? else { return fill(json!({ "ok": true })) };
             let mut unfurls = Map::new();
             for (url, id) in &links {
@@ -986,7 +1484,9 @@ pub fn step(db: &dyn Db, cfg: &HostConfig, job: &mut SlackJob, replies: Vec<Http
                     unfurls.insert(url.clone(), json!({ "blocks": c.blocks(&c.byline()) }));
                 }
             }
-            let Some(token) = app.bot_token.filter(|_| !unfurls.is_empty()) else { return fill(json!({ "ok": true })) };
+            let Some(token) = job.token.as_ref().map(|t| t.value.clone()).filter(|_| !unfurls.is_empty()) else {
+                return fill(json!({ "ok": true }));
+            };
             let mut body = json!({ "unfurls": unfurls });
             match (&target.unfurl_id, &target.source) {
                 (Some(id), Some(source)) => {
@@ -1001,15 +1501,42 @@ pub fn step(db: &dyn Db, cfg: &HostConfig, job: &mut SlackJob, replies: Vec<Http
             job.phase = Phase::Unfurling;
             Ok(Step::Fetch(vec![post_json("chat.unfurl", &token, &body)]))
         }
-        (Phase::Unfurling, _) => fill(json!({ "ok": slack_error(&answer).is_none() })),
+        (Phase::Unfurling, _) => {
+            dead_token(job, &answer);
+            fill(json!({ "ok": slack_error(&answer).is_none() }))
+        }
+        (Phase::Posting, Work::Test { channel_id }) => {
+            let channel = channel_row(db, &channel_id)?.map(|c| c.channel).unwrap_or_default();
+            if dead_token(job, &answer) {
+                return fail(ApiError::new(
+                    400,
+                    "slack_refused",
+                    "DumbSlab's Slack app was removed from that Slack workspace. Add it again in Settings › Slack.",
+                ));
+            }
+            match slack_error(&answer) {
+                Some(code) => fail(post_refused(&code, &channel)),
+                None => fill(json!({ "ok": true, "channel": channel })),
+            }
+        }
+        (Phase::Posting, Work::Post { .. }) => {
+            if let Some(gone) = replies.iter().find(|r| slack_error(r).is_some_and(|c| dead(&c))) {
+                dead_token(job, gone);
+            }
+            fill(json!({ "ok": true }))
+        }
         (Phase::Start, Work::Save { change, .. }) => {
             let Some(token) = change.bot_token.as_deref() else { return fail(ApiError::internal("no bot token to check")) };
             job.phase = Phase::Checking;
             Ok(Step::Fetch(vec![auth_test(token)]))
         }
-        (Phase::Checking, Work::Save { admin, via, change }) => {
+        (Phase::Checking, Work::Save { admin, via, change, expect }) => {
             if let Some(code) = slack_error(&answer) {
                 return fail(token_refused(&code));
+            }
+            // Add to Slack may have connected while Slack checked the token.
+            if app.shared {
+                return fail(crate::ops::slack::shared_refusal());
             }
             let v = answer.json();
             let team = Team { id: connect::s(&v["team_id"]), name: connect::s(&v["team"]), bot_user_id: connect::s(&v["user_id"]) };
@@ -1018,46 +1545,66 @@ pub fn step(db: &dyn Db, cfg: &HostConfig, job: &mut SlackJob, replies: Vec<Http
                 return fail(ApiError::forbidden("only admins can connect Slack"));
             };
             actor.via = via;
-            save(db, cfg, &change, Some(&team), &admin, now)?;
+            // Only over the connection the token was checked against: a disconnect, another
+            // token or a new signing secret meanwhile wins.
+            if !save(db, cfg, &change, Some(&team), &admin, now, &expect)? {
+                return fail(ApiError::new(
+                    409,
+                    "slack_changed",
+                    "Slack's settings changed while Slack checked the token. Look again, then save.",
+                ));
+            }
             let mut ctx = job_ctx(db, cfg, &job.base_url, actor, now);
             record_change(&mut ctx, &change)?;
             job.effects.extend(std::mem::take(&mut ctx.effects));
-            let view = crate::ops::slack::settings_view(&ctx)?;
+            let view = crate::ops::slack::settings_view(&ctx, None)?;
             fill(serde_json::to_value(view).map_err(|e| ApiError::internal(e.to_string()))?)
         }
-        (Phase::Start, Work::Test { channel_id }) => {
-            let Some(token) = app.bot_token.clone() else {
-                return fail(ApiError::bad_request("Connect Slack first: paste the bot token in Settings › Slack."));
-            };
-            let Some(c) = channel_row(db, &channel_id)? else { return fail(ApiError::not_found("Slack channel")) };
-            let what = match (c.topic_name.as_deref(), c.new_posts, c.updated_posts) {
-                (_, false, false) => "nothing yet: pick new or updated posts in Settings › Slack".to_string(),
-                (topic, new, updated) => format!(
-                    "{} {}",
-                    match (new, updated) {
-                        (true, true) => "new and updated posts",
-                        (true, false) => "new posts",
-                        _ => "updated posts",
-                    },
-                    match topic {
-                        Some(t) => format!("in {}", escape(t)),
-                        None => format!("that everyone in {} can see", escape(&workspace_name(db)?)),
-                    }
-                ),
-            };
-            let text = format!("DumbSlab is connected. This channel gets {what}.");
-            job.phase = Phase::Posting;
-            Ok(Step::Fetch(vec![post_json("chat.postMessage", &token, &message(&c.channel, &text, vec![section(&text)]))]))
-        }
-        (Phase::Posting, Work::Test { channel_id }) => {
-            let channel = channel_row(db, &channel_id)?.map(|c| c.channel).unwrap_or_default();
-            match slack_error(&answer) {
-                Some(code) => fail(post_refused(&code, &channel)),
-                None => fill(json!({ "ok": true, "channel": channel })),
-            }
-        }
+        // Add to Slack, disconnecting it, and the directory's view of it.
+        (
+            _,
+            Work::Install { .. } | Work::Release { .. } | Work::Disconnect { .. } | Work::Status { .. } | Work::Forget { .. } | Work::Check,
+        ) => shared_app::step(db, cfg, job, &app, &replies, now),
         (phase, _) => Err(ApiError::internal(format!("a Slack job can't continue from {phase:?}"))),
     }
+}
+
+fn changed() -> ApiError {
+    ApiError::new(409, "slack_changed", "Slack's settings changed meanwhile. Look again, then try again.")
+}
+
+/// Settings › Slack. On hosted DumbSlab with the shared app, from what the directory says, by a
+/// job (see [`Work::Status`]).
+pub(crate) fn settings(ctx: &mut Ctx) -> ApiResult<connect::Deferred<crate::ops::slack::SlackSettings>> {
+    if home(ctx.cfg).is_some() && shared(ctx.cfg).is_some() {
+        let job = SlackJob::status(&ctx.base_url, Some(&ctx.actor));
+        ctx.effects.push(Effect::Connect(connect::Job::Slack(job)));
+        return Ok(connect::Deferred::Pending);
+    }
+    Ok(connect::Deferred::Ready(crate::ops::slack::settings_view(ctx, None)?))
+}
+
+/// Posts a test message in a channel (see [`SlackJob::test`]).
+fn test_message(db: &dyn Db, job: &mut SlackJob, token: &str, channel_id: &str) -> ApiResult<Step> {
+    let Some(c) = channel_row(db, channel_id)? else { return fail(ApiError::not_found("Slack channel")) };
+    let what = match (c.topic_name.as_deref(), c.new_posts, c.updated_posts) {
+        (_, false, false) => "nothing yet: pick new or updated posts in Settings › Slack".to_string(),
+        (topic, new, updated) => format!(
+            "{} {}",
+            match (new, updated) {
+                (true, true) => "new and updated posts",
+                (true, false) => "new posts",
+                _ => "updated posts",
+            },
+            match topic {
+                Some(t) => format!("in {}", escape(t)),
+                None => format!("that everyone in {} can see", escape(&workspace_name(db)?)),
+            }
+        ),
+    };
+    let text = format!("DumbSlab is connected. This channel gets {what}.");
+    job.phase = Phase::Posting;
+    Ok(Step::Fetch(vec![post_json("chat.postMessage", token, &message(&c.channel, &text, vec![section(&text)]))]))
 }
 
 // ---------------------------------------------------------------------------
@@ -1120,7 +1667,10 @@ pub fn on_event(ctx: &mut Ctx, event: &str, post_id: Option<&str>) -> ApiResult<
     if channels.is_empty() {
         return Ok(());
     }
-    let Some(token) = load(ctx.db, ctx.cfg)?.and_then(|a| a.bot_token) else { return Ok(()) };
+    let Some(app) = load(ctx.db, ctx.cfg)?.filter(|a| a.can_act(ctx.cfg)) else { return Ok(()) };
+    // DumbSlab's own app, hosted: no token here. A job asks the directory for it, then sends them.
+    let gated = via_directory(ctx.cfg, &app);
+    let token = app.bot_token.clone().unwrap_or_default();
     let Some(card) = card(ctx.db, &ctx.base_url, post_id)? else { return Ok(()) };
     let public = everyone_sees(ctx.db, post_id)?;
     for c in channels {
@@ -1141,14 +1691,7 @@ pub fn on_event(ctx: &mut Ctx, event: &str, post_id: Option<&str>) -> ApiResult<
         // there once, and the per-request limit is the channel's (Slack's own limit is too).
         let channel = c.str("channel");
         let queue = format!("slack:{channel}");
-        let queued: Vec<&WebhookDelivery> = ctx
-            .effects
-            .iter()
-            .filter_map(|e| match e {
-                Effect::Webhook(d) if d.webhook_id == queue => Some(d),
-                _ => None,
-            })
-            .collect();
+        let queued: Vec<&WebhookDelivery> = queued_messages(&ctx.effects).into_iter().filter(|d| d.webhook_id == queue).collect();
         let already = queued.iter().any(|d| d.headers.iter().any(|(k, v)| k == POST_HEADER && v == post_id));
         if already || queued.len() >= MAX_MESSAGES_PER_REQUEST {
             continue;
@@ -1160,18 +1703,50 @@ pub fn on_event(ctx: &mut Ctx, event: &str, post_id: Option<&str>) -> ApiResult<
         }
         let text = format!("{actor} {} “{}”", verb.to_lowercase(), escape(&card.title));
         let body = message(&channel, &text, card.blocks(&line));
-        ctx.effects.push(Effect::Webhook(WebhookDelivery {
-            webhook_id: queue,
-            url: format!("{API}/chat.postMessage"),
-            headers: vec![
-                ("content-type".into(), "application/json; charset=utf-8".into()),
-                ("authorization".into(), format!("Bearer {token}")),
-                (POST_HEADER.into(), post_id.to_string()),
-            ],
-            body: body.to_string(),
-        }));
+        let mut headers =
+            vec![("content-type".to_string(), "application/json; charset=utf-8".to_string()), (POST_HEADER.into(), post_id.to_string())];
+        if !gated {
+            headers.push(("authorization".into(), format!("Bearer {token}")));
+        }
+        let delivery = WebhookDelivery { webhook_id: queue, url: format!("{API}/chat.postMessage"), headers, body: body.to_string() };
+        match gated {
+            false => ctx.effects.push(Effect::Webhook(delivery)),
+            true => queue_gated(&mut ctx.effects, &ctx.base_url, &app, delivery),
+        }
     }
     Ok(())
+}
+
+/// The channel messages a request queued so far: webhook deliveries, and the token-first job's.
+fn queued_messages(effects: &[Effect]) -> Vec<&WebhookDelivery> {
+    let mut out = vec![];
+    for e in effects {
+        match e {
+            Effect::Webhook(d) => out.push(d),
+            Effect::Background(connect::Job::Slack(j)) => {
+                if let Work::Post { messages, .. } = &j.work {
+                    out.extend(messages);
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Adds a message to the request's token-first job (see [`Work::Post`]), starting one if needed:
+/// one token from the directory for all of a request's messages.
+fn queue_gated(effects: &mut Vec<Effect>, base_url: &str, app: &App, delivery: WebhookDelivery) {
+    for e in effects.iter_mut() {
+        if let Effect::Background(connect::Job::Slack(j)) = e
+            && let Work::Post { messages, .. } = &mut j.work
+        {
+            messages.push(delivery);
+            return;
+        }
+    }
+    let job = SlackJob::new(base_url, Work::Post { messages: vec![delivery] }).bound_to(app);
+    effects.push(Effect::Background(connect::Job::Slack(job)));
 }
 
 #[cfg(test)]
@@ -1237,7 +1812,7 @@ mod tests {
             { "url": "https://evil.test/p/abc123", "domain": "evil.test" },
             { "url": "https://kb.test@evil.test/p/abc123", "domain": "evil.test" },
         ]);
-        let found = post_links("https://kb.test", &links);
+        let found = post_links(&own_hosts(&HostConfig::default(), "https://kb.test"), &links);
         assert_eq!(
             found,
             vec![
@@ -1245,6 +1820,36 @@ mod tests {
                 ("https://kb.test/p/def456".into(), "def456".into())
             ]
         );
+    }
+
+    /// With the shared app, Slack sends links to every workspace on the root domain: a workspace
+    /// previews its own address and its first one, which only it can hold, and nobody else's.
+    #[test]
+    fn shared_previews_stay_in_their_workspace() {
+        let hosting = crate::Hosting {
+            plans: crate::plan::Plans {
+                free: crate::plan::Allowance { storage_bytes: 1, writes_per_day: 1 },
+                pro: crate::plan::Allowance { storage_bytes: 1, writes_per_day: 1 },
+                stripe_price: None,
+                price_label: String::new(),
+                portal_configuration: None,
+            },
+            home: "acme".into(),
+            storage_bytes: 0,
+            capacity: Default::default(),
+        };
+        let cfg = HostConfig { workspace: Some("docs".into()), hosting: Some(hosting), ..Default::default() };
+        let hosts = own_hosts(&cfg, "https://docs.dumbslab.com");
+        assert_eq!(hosts, vec!["docs.dumbslab.com".to_string(), "acme.dumbslab.com".to_string()]);
+        let links = json!([
+            { "url": "https://docs.dumbslab.com/p/a1", "domain": "dumbslab.com" },
+            { "url": "https://acme.dumbslab.com/p/a2", "domain": "dumbslab.com" },
+            { "url": "https://beta.dumbslab.com/p/a3", "domain": "dumbslab.com" },
+            { "url": "https://dumbslab.com/p/a4", "domain": "dumbslab.com" },
+            { "url": "https://x.docs.dumbslab.com/p/a5", "domain": "dumbslab.com" },
+        ]);
+        let ids: Vec<String> = post_links(&hosts, &links).into_iter().map(|(_, id)| id).collect();
+        assert_eq!(ids, vec!["a1", "a2"]);
     }
 
     #[test]
@@ -1261,9 +1866,45 @@ mod tests {
     #[test]
     fn jobs_never_print_secrets() {
         let change = Change { bot_token: Some("xoxb-secret".into()), signing_secret: Some("s3cret".into()), unfurls: None };
-        let job = SlackJob::new("https://kb.test", Work::Save { admin: "u".into(), via: Via::Web, change });
+        let job = SlackJob::new("https://kb.test", Work::Save { admin: "u".into(), via: Via::Web, change, expect: Snapshot::default() });
         let app = App { bot_token: Some("xoxb-secret".into()), signing_secret: Some("s3cret".into()), ..Default::default() };
-        let printed = format!("{job:?} {app:?}");
-        assert!(!printed.contains("secret"), "{printed}");
+        let install = SlackJob::new(
+            "https://kb.test",
+            Work::Install {
+                admin: "u".into(),
+                via: Via::Web,
+                code: "secret-code".into(),
+                redirect_uri: "https://kb.test/x".into(),
+                home: None,
+                instance: "i".into(),
+            },
+        );
+        let mut acting = SlackJob::test("https://kb.test", "c1", &app);
+        acting.token = Some(Token { value: "xoxb-from-directory".into(), fingerprint: Some("fp".into()) });
+        let (check, _) = UninstallCheck::start("T1");
+        let host = SharedApp { signing_secret: Some("host-secret".into()), callback_url: None };
+        let printed = format!("{job:?} {app:?} {install:?} {acting:?} {check:?} {host:?}");
+        for secret in ["xoxb-secret", "s3cret", "secret-code", "xoxb-from-directory", "host-secret"] {
+            assert!(!printed.contains(secret), "{printed}");
+        }
+    }
+
+    /// The directory keeps a token sealed for one Slack workspace: it opens with the host's key, for
+    /// that Slack workspace only.
+    #[test]
+    fn directory_tokens_open_for_their_slack_workspace_only() {
+        let cfg = HostConfig {
+            connectors: connect::Connectors { key: Some("connector-key".into()), ..Default::default() },
+            ..Default::default()
+        };
+        let sealed = seal_for_directory(&cfg, "T1", "xoxb-1").unwrap();
+        assert!(!sealed.contains("xoxb-1"));
+        assert_eq!(open_from_directory("connector-key", "T1", &sealed).as_deref(), Some("xoxb-1"));
+        assert_eq!(open_from_directory("connector-key", "T2", &sealed), None);
+        assert_eq!(open_from_directory("another-key", "T1", &sealed), None);
+        // Not one of the workspace's own sealed secrets either way.
+        let own = seal(&cfg, BOT_TOKEN, "xoxb-1").unwrap();
+        assert_eq!(open_from_directory("connector-key", "T1", &own), None);
+        assert_ne!(fingerprint("xoxb-1"), fingerprint("xoxb-2"));
     }
 }
