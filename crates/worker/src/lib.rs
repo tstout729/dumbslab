@@ -26,6 +26,7 @@ use chrono::Utc;
 use dumbslab_core::http::{WORKSPACE_ROBOTS_TXT, is_core_path};
 use dumbslab_core::slack;
 use dumbslab_core::sync::github_app::{self, Routed};
+use dumbslab_core::sync::gitlab_app;
 use dumbslab_core::tenancy::{self, HostKind};
 use dumbslab_core::util::{secure_eq, sha256_hex};
 use serde::Deserialize;
@@ -243,6 +244,7 @@ async fn root_site(req: Request, env: &Env, root: &str, path: &str) -> Result<Re
             Response::redirect(Url::parse(&slack::create_app_link(&manifest))?)
         }
         (Method::Get, github_app::CALLBACK_PATH) => connect::root_callback_redirect(&req.url()?, root, github_app::CALLBACK_PATH),
+        (Method::Get, gitlab_app::CALLBACK_PATH) => connect::root_callback_redirect(&req.url()?, root, gitlab_app::CALLBACK_PATH),
         (Method::Post, "/hooks/github") => github_hook(req, env, root).await,
         (Method::Post, "/api/stripe/webhook") => billing::webhook(req, env).await,
         (_, p) if p.starts_with("/api/operator/") => operator(req, env, p).await,

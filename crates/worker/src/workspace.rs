@@ -651,9 +651,9 @@ async fn drive_job(state: &State, env: &Env, mut job: Job, cfg: &HostConfig) -> 
     let mut replies = vec![];
     let mut written = 0;
     for _ in 0..connect::MAX_STEPS {
-        // Who to tell if this step can't even run (the job goes with it). Like any failure
-        // notice, it's decided from the job as it is before the step.
-        let unran = job.failure_notice(&ApiError::internal("the step didn't run"));
+        // Who to tell if this step can't even run or commit (the job goes with it): decided before
+        // the step, from the job and the answers it's about to read (see `connect::unran_notice`).
+        let unran = connect::unran_notice(&mut job, &replies);
         let storage = state.storage();
         let step_cfg = cfg.clone();
         let db = DoDb::new(storage.sql());

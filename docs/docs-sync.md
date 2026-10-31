@@ -2,7 +2,7 @@
 
 Docs sync keeps the Markdown files in a repository folder as posts in a topic. Write docs next to the code in GitHub or GitLab, and people find them in DumbSlab, with search, comments and verification. It's one way: the repository is the source of truth.
 
-On GitHub, there's nothing to copy: choose **Connect GitHub**, install DumbSlab's app on the repositories you want, and pick one. Pushes sync by themselves. See [set it up](#set-it-up).
+There's nothing to copy: on GitHub, choose **Connect GitHub**, install DumbSlab's app on the repositories you want, and pick one. On gitlab.com, choose **Connect GitLab**, approve DumbSlab's app, and pick a project. Pushes sync by themselves. See [set it up](#set-it-up).
 
 - **Each file is a published post.** Files ending in `.md` or `.markdown`, in the folder and its sub-folders. Hidden folders (like `.github`) and `node_modules` are skipped.
 - **Titles.** A post's title comes from the file's front matter (`title:`), or from a `# heading` at the very top (which then leaves the body, since the post shows its title), or from the file name: `getting-started.md` becomes "Getting started". A `README.md` or `index.md` is named after its folder.
@@ -20,7 +20,7 @@ On GitHub, there's nothing to copy: choose **Connect GitHub**, install DumbSlab'
 - **Removed files.** When a file is gone from the repository, its post is **archived, never deleted**. It stays linked to the repository: if the file comes back at the same path, the post is published again once the file has been synced, even if that takes several runs.
 - **Read-only here.** A synced post's title and content can only change in the repository. Saving, `edit_post` and restoring an old version are refused with a `synced_post` error that links to the file. The post shows "Synced from …; edit it there". Topics, status, pins, verification, comments and reactions still work. To edit a synced post here, duplicate it, or remove the source (its posts then become ordinary posts).
 
-Only admins can set up, run or change a source (Settings › Docs sync, or the `list_docs_sources`, `list_github_repositories`, `create_docs_source`, `update_docs_source`, `sync_docs_source` and `delete_docs_source` operations). It's available on every plan. It needs the server's connector key (`CONNECTOR_KEY` on Cloudflare, `DUMBSLAB_CONNECTOR_KEY` self-hosted; see [connected apps](connected-apps.md)): tokens and webhook secrets are encrypted with it, and no operation returns a token. Synced posts are written as the admin who added the source, while they're still an active admin; otherwise as the workspace's first active admin. If that admin stops being one, at the next sync their synced posts and images pass to the admin it now writes as, and they keep no membership the sync gave them unless they're still in the chosen topic, so they keep no access through the source.
+Only admins can set up, run or change a source (Settings › Docs sync, or the `list_docs_sources`, `list_github_repositories`, `list_gitlab_projects`, `create_docs_source`, `update_docs_source`, `sync_docs_source` and `delete_docs_source` operations). It's available on every plan. It needs the server's connector key (`CONNECTOR_KEY` on Cloudflare, `DUMBSLAB_CONNECTOR_KEY` self-hosted; see [connected apps](connected-apps.md)): tokens and webhook secrets are encrypted with it, and no operation returns a token. Synced posts are written as the admin who added the source, while they're still an active admin; otherwise as the workspace's first active admin. If that admin stops being one, at the next sync their synced posts and images pass to the admin it now writes as, and they keep no membership the sync gave them unless they're still in the chosen topic, so they keep no access through the source.
 
 ## Set it up
 
@@ -44,9 +44,29 @@ That's all. Every push to the branch syncs.
 
 Agents can do the same: `list_github_repositories` lists the repositories (and the `connect_url` an admin opens in a browser for step 2). Then `create_docs_source` with the repository's `installation_id`, its `id` as `repository_id`, and its `full_name` as `repository`. The id decides which repository is added, so one renamed (or whose name another repository took) since the list was read can't be mixed up; the name alone still works.
 
+### gitlab.com: Connect GitLab
+
+This works when the server has DumbSlab's GitLab app (see [the operator steps](hosting/gitlab-app.md)). Self-managed GitLab uses [a token](#with-a-token).
+
+1. In DumbSlab, open **Settings › Docs sync** and choose **Connect GitLab**.
+2. GitLab asks you to authorize DumbSlab. Choose **Authorize**.
+3. Back in DumbSlab, pick the project: the list has the projects where you're a Maintainer, which adding a webhook needs. Then the branch, the folder and the topic.
+4. Choose **Add and sync**. DumbSlab adds the project's push webhook, and the first sync runs.
+
+- **What DumbSlab can do.** GitLab only offers full API access (`api`) for adding webhooks, so that's what you approve. DumbSlab uses it to list your projects, add and remove its own webhook, and read files. The tokens are encrypted, belong to that one folder, and are refreshed as GitLab requires.
+- **Another folder** needs another approval: choose Connect GitLab again.
+- **One request at a time.** An approval is used by one request at a time (listing projects, adding or reconnecting a folder): GitLab replaces its tokens whenever they're refreshed. Another request meanwhile is refused with "try again in a moment".
+- **When a folder can't sync** because GitLab stopped accepting its approval (you revoked it), or whoever approved it lost access to the project, the folder says so. **Sync now** still tries, in case DumbSlab has newer access than what GitLab refused. It tells you when only Reconnect helps, and the folder connects again by itself as soon as GitLab accepts its access. Its posts stay. Any admin who maintains the project chooses Connect GitLab, then **Reconnect** on the folder (it's there on every Connect GitLab folder, to switch to someone else's access at any time). Reconnecting also puts the webhook right: it points it at the workspace's address now, gives it the folder's secret, and adds it again if someone deleted it.
+- **The webhook looks after itself.** **Sync now** checks it every time: it fixes its secret, adds it again if someone deleted it, and removes any other webhook DumbSlab pointed at this folder (at exactly this folder's address, now or before; a webhook of yours that only looks similar stays). It also points it at the workspace's address if that changed, but only where the server knows its own address: hosted DumbSlab, or a self-hosted server started with `--base-url` (`DUMBSLAB_BASE_URL`). Otherwise the address a request names can't be trusted, so the webhook stays where it was set, and only **Reconnect** moves it, saying where to. Pushes never change it. The folder shows where its webhook points, and the result says what a sync did.
+- **Renamed or moved projects** keep syncing: DumbSlab reads the project by its id, not its path, and follows its new path for links. A new project that takes the old path is never read.
+- **Removing the folder**, or its topic, removes the webhook DumbSlab added. While a sync of it runs, or is renewing its GitLab access, removing it waits: it's refused with "try again in a moment", so the removal keeps the folder's newest tokens. If GitLab can't be reached, DumbSlab tries again later (when Settings › Docs sync loads, and with Sync now) for up to 30 days. If GitLab no longer lets it, the activity log tells admins which webhook to delete by hand.
+- **A known limit.** If GitLab is slow to answer while DumbSlab adds a webhook back during **Sync now** or **Reconnect**, and the folder is removed soon after, that webhook can be left behind on the project. It's harmless: DumbSlab refuses its deliveries (a removed folder's address answers 404) and stores nothing from them. GitLab.com also turns off a webhook after repeated failed deliveries ([auto-disabled webhooks](https://docs.gitlab.com/user/project/integrations/webhooks/)). An admin can delete it in the project's Settings › Webhooks.
+
+Agents can do the same: `list_gitlab_projects` lists the projects (and the `connect_url` an admin opens in a browser first). Then `create_docs_source` with `gitlab_connection: true`, the project's `id` as `project_id`, and its `path` as `repository`. The id decides which project is added, so a project that moved (or whose path another project took) since the list was read can't be mixed up. A path alone still works: it's looked up once, and the id kept.
+
 ### With a token
 
-For GitLab, self-managed GitLab, and GitHub without DumbSlab's app. In Settings › Docs sync, **Use a token instead** shows this form.
+For self-managed GitLab, and for GitHub or gitlab.com without DumbSlab's apps. In Settings › Docs sync, **Use a token instead** shows this form.
 
 1. Make a read-only token, unless the repository is public:
    - **GitHub:** a [fine-grained personal access token](https://github.com/settings/personal-access-tokens/new) with access to just that repository and the **Contents: Read-only** permission (Metadata: Read-only is added automatically). A classic token with `repo` works too, but gives far more access.
@@ -63,11 +83,11 @@ After that, every push to the branch syncs. **Sync now** syncs any time. **New w
 
 - **DumbSlab's GitHub App:** GitHub sends every push to the app's own address. DumbSlab checks its signature, and syncs the folders on that repository and branch in workspaces whose admins connected the installation. Pushes to other branches, tags, and repositories no folder syncs are ignored. The sync starts right after the answer, so GitHub never waits for it.
 - **GitHub with a token:** DumbSlab checks `X-Hub-Signature-256` (`sha256=` + hex HMAC-SHA256 of the raw body, keyed with the secret) in constant time. A ping gets `pong`. A push to another branch, or another event, is ignored.
-- **GitLab:** DumbSlab compares `X-Gitlab-Token` with the secret in constant time. Only `Push Hook` events to the branch start a sync.
+- **GitLab:** DumbSlab compares `X-Gitlab-Token` with the secret in constant time. Only `Push Hook` events to the branch start a sync. Through DumbSlab's GitLab app, DumbSlab added the webhook with the folder's own secret, so there's nothing to check by hand.
 - **What a delivery is trusted for.** A delivery only means that something changed. Apart from the repository and branch, used to pick the folders it's about, nothing in it is used: the sync reads the repository itself.
 - **Errors.** A delivery with a wrong or missing signature gets a 401. If a sync is already running, the delivery is noted, and Settings says to sync again.
 - **Timing.** With a token, a delivery's response waits for its sync, which is usually a second or two. GitHub and GitLab give up after 10 seconds, but the sync's progress is kept either way.
-- **Moving the workspace.** Webhooks you added with a token are on the workspace's own address. If the workspace moves to a new address, update them. The GitHub App's address doesn't change.
+- **Moving the workspace.** Webhooks you added with a token are on the workspace's own address: if the workspace moves to a new address, update them. Folders that came through Connect GitLab: choose **Sync now**, which points the webhook at the new address. (Pushes never move it.) The GitHub App's address doesn't change.
 
 ## Limits
 
@@ -90,7 +110,7 @@ If a listing has no Markdown files at all (a renamed folder or a deleted branch,
 
 - **Requests.** The core builds every request and the host only sends it: over https, without following redirects, within 8 seconds, reading at most 4 MB.
   - GitHub: `GET /repos/{owner}/{repo}/git/trees/{branch}:{folder}?recursive=1` lists the folder, and `GET /repos/{owner}/{repo}/git/blobs/{sha}` reads each changed file and image. Through DumbSlab's GitHub App, a sync first signs the app's token request (a JWT) and asks for a token: `POST /app/installations/{id}/access_tokens`, for this repository and Contents: Read-only only. The app's private key stays with the server; it's never in a workspace's database.
-  - GitLab: `GET /projects/{path}/repository/tree` and `.../repository/blobs/{sha}`.
+  - GitLab: `GET /projects/{path}/repository/tree` and `.../repository/blobs/{sha}` with a token, which follow whatever project has that path. Through DumbSlab's GitLab app, the same by the project's id (`/projects/{id}/...`), plus `GET /projects/{id}` for its current path; a sync first refreshes the folder's token when it's about to expire (`POST https://gitlab.com/oauth/token`). Adding a folder finds the picked project by id among those the admin maintains (`GET /projects?membership=true&min_access_level=40&id_after=…&id_before=…`; a path alone: `GET /projects/{path}`) and adds its webhook (`POST /projects/{id}/hooks`); removing it deletes the webhook.
   - The self-hosted server refuses private network addresses, as it does for connected apps.
 - **What changed.** Files are compared by their git blob id, so unchanged files aren't read again. A file is also read again when a file it links to appears, or when an image it shows changes.
 - **Where things are kept.** The `docs_items` table remembers each file's post, each image's upload and each folder's topic. `github_installations` and `github_repositories` keep the app installations admins here connected, and the repositories their GitHub accounts could read there. A new file's post id is chosen when it's first listed, so links to it work while a large first sync is still running.

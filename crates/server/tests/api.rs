@@ -7885,7 +7885,7 @@ fn healthz_reports_build_identity_without_auth() {
 
 mod syncs {
     use std::cell::RefCell;
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
 
     use super::*;
     use dumbslab_core::connect::{self, Finish, HttpCall, HttpReply, Job, Step};
@@ -12128,5 +12128,1728 @@ mod syncs {
         let repos = h.ok("GET", "/api/v1/docs-sources/github", None, &admin);
         assert_eq!((repos["available"].as_bool(), repos["connect_url"].clone()), (Some(false), Value::Null));
         assert_eq!(h.call("GET", "/sync/github/other", None, &admin).status, 404);
+    }
+
+    // -----------------------------------------------------------------------
+    // Docs through DumbSlab's GitLab app
+
+    /// gitlab.com, for an admin who maintains `acme/handbook` (id 3). Each approval is a grant: an
+    /// access token `glo_<n>` and a refresh token `glr_<n>`, and a refresh replaces both, as GitLab
+    /// does. Webhooks are kept as GitLab would.
+    /// A project's files, by path.
+    type Files = BTreeMap<String, Vec<u8>>;
+
+    struct GitLabCom {
+        files: RefCell<BTreeMap<String, Vec<u8>>>,
+        /// Live grants: refresh token → access token.
+        grants: RefCell<BTreeMap<String, String>>,
+        issued: RefCell<u32>,
+        /// Access tokens that can no longer read the project (their person lost access).
+        blocked: RefCell<BTreeSet<String>>,
+        hooks: RefCell<BTreeMap<i64, Value>>,
+        next_hook: RefCell<i64>,
+        removed: RefCell<Vec<String>>,
+        /// Project 3's path now (renamed or moved, it changes).
+        path: RefCell<String>,
+        /// Other projects the admin maintains: id → (path, files).
+        others: RefCell<BTreeMap<i64, (String, Files)>>,
+        /// GitLab can't answer just now (5xx).
+        down: RefCell<bool>,
+    }
+
+    impl GitLabCom {
+        fn new(files: &[(&str, &[u8])]) -> GitLabCom {
+            GitLabCom {
+                files: RefCell::new(files.iter().map(|(p, b)| (p.to_string(), b.to_vec())).collect()),
+                grants: RefCell::new(BTreeMap::new()),
+                issued: RefCell::new(0),
+                blocked: RefCell::new(BTreeSet::new()),
+                hooks: RefCell::new(BTreeMap::new()),
+                next_hook: RefCell::new(9),
+                removed: RefCell::new(vec![]),
+                path: RefCell::new("acme/handbook".into()),
+                others: RefCell::new(BTreeMap::new()),
+                down: RefCell::new(false),
+            }
+        }
+
+        fn grant(&self) -> HttpReply {
+            *self.issued.borrow_mut() += 1;
+            let n = *self.issued.borrow();
+            self.grants.borrow_mut().insert(format!("glr_{n}"), format!("glo_{n}"));
+            ok(
+                json!({ "access_token": format!("glo_{n}"), "refresh_token": format!("glr_{n}"), "expires_in": 7200, "token_type": "Bearer" }),
+            )
+        }
+
+        fn hook_token(&self, id: i64) -> String {
+            self.hooks.borrow()[&id]["token"].as_str().unwrap().to_string()
+        }
+
+        /// A project's files: its tree and blobs, `rest` coming after `/repository`.
+        fn repository(rest: &str, files: &BTreeMap<String, Vec<u8>>) -> HttpReply {
+            if rest.starts_with("/tree?ref=main&recursive=true&per_page=100&page=") {
+                let entries: Vec<Value> = files
+                    .iter()
+                    .map(|(p, b)| json!({ "id": sha(b), "name": p.rsplit('/').next(), "type": "blob", "path": p, "mode": "100644" }))
+                    .collect();
+                return ok(if rest.contains("&page=1&") { json!(entries) } else { json!([]) });
+            }
+            if let Some(blob) = rest.strip_prefix("/blobs/")
+                && let Some(b) = files.values().find(|b| sha(b) == blob)
+            {
+                return ok(json!({ "content": base64::engine::general_purpose::STANDARD.encode(b), "encoding": "base64" }));
+            }
+            HttpReply { status: 404, body: "{}".into() }
+        }
+
+        /// Every project the admin maintains: (id, path).
+        fn projects(&self) -> Vec<(i64, String)> {
+            let mut all = vec![(3, self.path.borrow().clone())];
+            all.extend(self.others.borrow().iter().map(|(id, (path, _))| (*id, path.clone())));
+            all
+        }
+
+        fn files_of(&self, id: i64) -> Option<Files> {
+            if id == 3 {
+                return Some(self.files.borrow().clone());
+            }
+            self.others.borrow().get(&id).map(|(_, files)| files.clone())
+        }
+
+        fn answer(&self, c: &HttpCall) -> HttpReply {
+            if *self.down.borrow() {
+                return HttpReply { status: 503, body: "{}".into() };
+            }
+            let form = c.body.clone().unwrap_or_default();
+            if c.url == "https://gitlab.com/oauth/token" {
+                assert!(form.contains("client_id=gl-client") && form.contains("client_secret=gl-secret"), "{form}");
+                if form.contains("grant_type=authorization_code") {
+                    assert!(
+                        form.contains("code_verifier=") && form.contains("redirect_uri=https%3A%2F%2Fkb.test%2Fsync%2Fgitlab%2Fcallback"),
+                        "{form}"
+                    );
+                    return self.grant();
+                }
+                let refresh = form.split('&').find_map(|kv| kv.strip_prefix("refresh_token=")).unwrap_or_default().to_string();
+                if self.grants.borrow_mut().remove(&refresh).is_some() {
+                    return self.grant();
+                }
+                return HttpReply { status: 400, body: json!({ "error": "invalid_grant" }).to_string() };
+            }
+            let token = c.headers.iter().find(|(k, _)| k == "authorization").map(|(_, v)| v.trim_start_matches("Bearer ").to_string());
+            let Some(token) = token.filter(|t| self.grants.borrow().values().any(|v| v == t)) else {
+                return HttpReply { status: 401, body: "{}".into() };
+            };
+            let api = "https://gitlab.com/api/v4";
+            if c.url == format!("{api}/user") {
+                return ok(json!({ "username": "ada" }));
+            }
+            let listed =
+                |id: i64, path: &str| json!({ "id": id, "path_with_namespace": path, "default_branch": "main", "visibility": "private" });
+            if let Some(query) = c.url.strip_prefix(&format!("{api}/projects?membership=true&min_access_level=40&simple=true")) {
+                // One project by id (`id_after` and `id_before` around it), or a page of them.
+                let bound = |key: &str| query.split('&').find_map(|kv| kv.strip_prefix(key)).and_then(|v| v.parse::<i64>().ok());
+                let (after, before) = (bound("id_after="), bound("id_before="));
+                let all = self.projects();
+                if after.is_some() || before.is_some() {
+                    let (after, before) = (after.unwrap_or(i64::MIN), before.unwrap_or(i64::MAX));
+                    let found: Vec<Value> =
+                        all.iter().filter(|(id, _)| *id > after && *id < before).map(|(id, p)| listed(*id, p)).collect();
+                    return ok(json!(found));
+                }
+                return ok(if c.url.ends_with("&page=1") {
+                    json!(all.iter().map(|(id, p)| listed(*id, p)).collect::<Vec<_>>())
+                } else {
+                    json!([])
+                });
+            }
+            let readable = !self.blocked.borrow().contains(&token);
+            let Some(rest) = c.url.strip_prefix(&format!("{api}/projects/")) else { panic!("unexpected {c:?}") };
+            let (key, rest) = rest.split_at(rest.find(['/', '?']).unwrap_or(rest.len()));
+            let by_id = key.parse::<i64>().ok();
+            assert!(by_id.is_some() || rest.is_empty(), "a GitLab app folder works on its project by id: {c:?}");
+            let project = self.projects().into_iter().find(|(id, path)| by_id == Some(*id) || urlencoding::encode(path) == key);
+            let Some((pid, path)) = project.filter(|_| readable || rest.starts_with("/hooks")) else {
+                return HttpReply { status: 404, body: "{}".into() };
+            };
+            if rest.is_empty() {
+                return ok(json!({ "id": pid, "path_with_namespace": path, "default_branch": "main" }));
+            }
+            if let Some(rest) = rest.strip_prefix("/hooks") {
+                if !readable {
+                    return HttpReply { status: 403, body: "{}".into() };
+                }
+                if c.method == "GET" && rest.starts_with("?per_page=100&page=") {
+                    let first = rest.ends_with("page=1");
+                    let all: Vec<Value> = self
+                        .hooks
+                        .borrow()
+                        .iter()
+                        .filter(|(_, h)| h["project"] == pid)
+                        .map(|(id, h)| json!({ "id": id, "url": h["url"] }))
+                        .collect();
+                    return ok(if first { json!(all) } else { json!([]) });
+                }
+                let id: Option<i64> = rest.strip_prefix('/').and_then(|i| i.parse().ok());
+                let mut body: Value = serde_json::from_str(&form).unwrap_or(json!({}));
+                body["project"] = json!(pid);
+                return match (c.method, id) {
+                    ("POST", None) => {
+                        let id = *self.next_hook.borrow();
+                        *self.next_hook.borrow_mut() += 1;
+                        self.hooks.borrow_mut().insert(id, body);
+                        HttpReply { status: 201, body: json!({ "id": id }).to_string() }
+                    }
+                    ("PUT", Some(id)) if self.hooks.borrow().get(&id).is_some_and(|h| h["project"] == pid) => {
+                        self.hooks.borrow_mut().insert(id, body);
+                        ok(json!({ "id": id }))
+                    }
+                    ("DELETE", Some(id)) => {
+                        self.removed.borrow_mut().push(c.url.clone());
+                        self.hooks.borrow_mut().remove(&id);
+                        HttpReply { status: 204, body: String::new() }
+                    }
+                    _ => HttpReply { status: 404, body: "{}".into() },
+                };
+            }
+            if let Some(rest) = rest.strip_prefix("/repository") {
+                return Self::repository(rest, &self.files_of(pid).unwrap());
+            }
+            HttpReply { status: 404, body: "{}".into() }
+        }
+    }
+
+    fn with_gitlab_app(h: &mut H) {
+        h.cfg
+            .connectors
+            .apps
+            .insert("gitlab".into(), connect::OAuthApp { client_id: "gl-client".into(), client_secret: "gl-secret".into() });
+    }
+
+    /// Connect GitLab in `who`'s browser session, all the way.
+    fn connect_gitlab(h: &H, who: &Auth, lab: &GitLabCom) {
+        let to = location(&h.raw("GET", "/sync/gitlab/start", vec![], "", who));
+        assert!(
+            to.starts_with(
+                "https://gitlab.com/oauth/authorize?client_id=gl-client&redirect_uri=https%3A%2F%2Fkb.test%2Fsync%2Fgitlab%2Fcallback"
+            ),
+            "{to}"
+        );
+        assert!(to.contains("&scope=api&") && to.contains("code_challenge_method=S256"), "{to}");
+        let state = to.split("&state=").nth(1).unwrap().split('&').next().unwrap().to_string();
+        let r = h.raw("GET", &format!("/sync/gitlab/callback?state={state}&code=gl-code"), vec![], "", who);
+        assert_eq!(redirect_of(drive(h, job_of(&r), &|c| lab.answer(c)).0), "https://kb.test/settings/docs-sync?connected=gitlab");
+    }
+
+    /// Runs a job like a host: each step in its own transaction, a step the guard refuses rolled
+    /// back (as the Worker refuses one that grows a full workspace), and `before` called ahead of
+    /// each step. Returns how it ended, the notice the host would send, its effects and requests.
+    fn run_job(
+        h: &H,
+        mut job: Job,
+        answer: &dyn Fn(&HttpCall) -> HttpReply,
+        before: &dyn Fn(usize),
+        refuse: &dyn Fn(usize) -> bool,
+    ) -> (Result<Finish, dumbslab_core::ApiError>, Option<HttpCall>, Vec<Effect>, Vec<HttpCall>) {
+        let mut replies = vec![];
+        let mut sent = vec![];
+        for n in 0..connect::MAX_STEPS {
+            before(n);
+            let (step, notice, next) = h
+                .store
+                .with_tx(|db| {
+                    let full = || dumbslab_core::ApiError::new(507, "storage_full", "the workspace is full");
+                    let (step, notice) =
+                        connect::guarded_step(db, &h.cfg, &mut job, replies.clone(), chrono::Utc::now(), |_| refuse(n).then(full));
+                    let ok = step.is_ok();
+                    ((step, notice, job.clone()), ok)
+                })
+                .unwrap();
+            job = next;
+            match step {
+                Err(e) => return (Err(e), notice, job.take_effects(), sent),
+                Ok(Step::Done(f)) => return (Ok(f), None, job.take_effects(), sent),
+                Ok(Step::Fetch(calls)) => {
+                    replies = calls.iter().map(answer).collect();
+                    sent.extend(calls);
+                }
+            }
+        }
+        panic!("the job took more steps than a host allows");
+    }
+
+    fn no_op(_: usize) {}
+
+    fn never(_: usize) -> bool {
+        false
+    }
+
+    /// Adds a GitLab app folder (after Connect GitLab): its id and its webhook's id.
+    fn add_gitlab_folder(h: &H, admin: &Auth, lab: &GitLabCom, topic: &str, folder: &str) -> (String, i64) {
+        connect_gitlab(h, admin, lab);
+        let input =
+            json!({ "provider": "gitlab", "repository": "acme/handbook", "folder": folder, "topic_id": topic, "gitlab_connection": true });
+        let r = h.call("POST", "/api/v1/docs-sources", Some(input), admin);
+        assert_eq!(r.status, 200, "{}", r.body);
+        let created = filled(drive(h, job_of(&r), &|c| lab.answer(c)).0);
+        let hook = *lab.hooks.borrow().keys().last().unwrap();
+        (created["source"]["id"].as_str().unwrap().to_string(), hook)
+    }
+
+    fn gitlab_setup() -> (H, Auth, GitLabCom, String) {
+        let mut h = H::new();
+        let (admin, _) = h.setup();
+        with_key(&mut h);
+        with_gitlab_app(&mut h);
+        let lab = GitLabCom::new(&[("docs/README.md", b"# Runbooks\n\nStart here.\n"), ("docs/deploy.md", b"# Deploy\n")]);
+        let topic = h.ok("POST", "/api/v1/topics", Some(json!({ "name": "Runbooks" })), &admin)["id"].as_str().unwrap().to_string();
+        (h, admin, lab, topic)
+    }
+
+    #[test]
+    fn gitlab_app_adds_its_own_webhook_and_refreshes_its_tokens() {
+        let mut h = H::new();
+        let (admin, _) = h.setup();
+        let (_, mo) = h.user(&admin, "mo@acme.test", "Mo", "member");
+        let mo_cookie = sign_in(&h, "mo@acme.test", "password123");
+        with_key(&mut h);
+        assert_eq!(h.ok("GET", "/api/v1/docs-sources", None, &admin)["gitlab_app"], false);
+        assert!(location(&h.raw("GET", "/sync/gitlab/start", vec![], "", &admin)).ends_with("connect_error=unavailable&app=gitlab"));
+        with_gitlab_app(&mut h);
+        assert_eq!(h.ok("GET", "/api/v1/docs-sources", None, &admin)["gitlab_app"], true);
+        let lab = GitLabCom::new(&[("docs/README.md", b"# Runbooks\n\nStart here.\n"), ("docs/deploy.md", b"# Deploy\n")]);
+        let answer = |c: &HttpCall| lab.answer(c);
+
+        // Not connected yet: nothing to list, and nothing to add a folder with.
+        let none = h.ok("GET", "/api/v1/docs-sources/gitlab", None, &admin);
+        assert_eq!((none["connected"].as_bool(), none["connect_url"].as_str()), (Some(false), Some("https://kb.test/sync/gitlab/start")));
+        assert!(location(&h.raw("GET", "/sync/gitlab/start", vec![], "", &mo_cookie)).ends_with("connect_error=not_admin&app=gitlab"));
+
+        connect_gitlab(&h, &admin, &lab);
+        assert_eq!(count(&h, "SELECT COUNT(*) FROM docs_connections WHERE secret LIKE '%glo_%' OR secret LIKE '%glr_%'"), 0, "sealed");
+        assert_eq!(count(&h, "SELECT COUNT(*) FROM activity WHERE event = 'gitlab.connected'"), 1);
+        let r = h.call("GET", "/api/v1/docs-sources/gitlab", None, &admin);
+        let listed = filled(drive(&h, job_of(&r), &answer).0);
+        assert_eq!((listed["account"].as_str(), listed["projects"][0]["path"].as_str()), (Some("@ada"), Some("acme/handbook")), "{listed}");
+        assert_eq!(h.call("GET", "/api/v1/docs-sources/gitlab", None, &mo).status, 403);
+
+        // Adding a folder: DumbSlab adds the project's webhook with the source's own secret.
+        let topic = h.ok("POST", "/api/v1/topics", Some(json!({ "name": "Runbooks" })), &admin)["id"].as_str().unwrap().to_string();
+        let input =
+            json!({ "provider": "gitlab", "repository": "acme/handbook", "folder": "docs", "topic_id": topic, "gitlab_connection": true });
+        let refused = |change: Value| {
+            let mut i = input.clone();
+            i.as_object_mut().unwrap().extend(change.as_object().unwrap().clone());
+            h.call("POST", "/api/v1/docs-sources", Some(i), &admin).status
+        };
+        assert_eq!(refused(json!({ "token": "glpat-x" })), 400);
+        assert_eq!(refused(json!({ "host": "https://git.acme.test" })), 400, "self-managed GitLab takes a token");
+        assert_eq!(refused(json!({ "provider": "github" })), 400);
+        assert_eq!(h.call("POST", "/api/v1/docs-sources", Some(input.clone()), &mo).status, 403);
+        let r = h.call("POST", "/api/v1/docs-sources", Some(input.clone()), &admin);
+        assert_eq!(r.status, 200, "{}", r.body);
+        let created = filled(drive(&h, job_of(&r), &answer).0);
+        let source = created["source"]["id"].as_str().unwrap().to_string();
+        assert_eq!((created["source"]["connection"].as_str(), created["source"]["branch"].as_str()), (Some("gitlab_oauth"), Some("main")));
+        assert_eq!(created["webhook_secret"], Value::Null, "nothing to add by hand");
+        assert_eq!(created["source"]["webhook_url"], format!("https://kb.test/hooks/docs/{source}"), "where DumbSlab pointed it");
+        let hook_body = lab.hooks.borrow()[&9].clone();
+        assert_eq!(
+            (hook_body["url"].as_str(), hook_body["push_events"].as_bool()),
+            (Some(format!("https://kb.test/hooks/docs/{source}").as_str()), Some(true))
+        );
+        let secret = lab.hook_token(9);
+        assert!(secret.starts_with("whsec_"));
+        assert!(!h.ok("GET", "/api/v1/docs-sources", None, &admin).to_string().contains(&secret), "the secret never comes back");
+        assert_eq!(count(&h, "SELECT COUNT(*) FROM docs_connections"), 0, "the approval moved to the source");
+        let again = h.call(
+            "POST",
+            "/api/v1/docs-sources",
+            Some(json!({ "provider": "gitlab", "repository": "acme/handbook", "topic_id": topic, "gitlab_connection": true })),
+            &admin,
+        );
+        assert_eq!(again.status, 409, "connect again for another folder");
+
+        // Syncs read with the source's own token, and pushes arrive through the webhook it added.
+        let r = h.call("POST", &format!("/api/v1/docs-sources/{source}/sync"), None, &admin);
+        assert_eq!(filled(drive(&h, job_of(&r), &answer).0)["created"], 2);
+        let push = json!({ "object_kind": "push", "ref": "refs/heads/main" }).to_string();
+        let r = hook(&h, &format!("/hooks/docs/{source}"), &push, &[("x-gitlab-event", "Push Hook"), ("x-gitlab-token", &secret)]);
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert_eq!(filled(drive(&h, job_of(&r), &answer).0)["unchanged"], 2);
+        assert_eq!(
+            hook(&h, &format!("/hooks/docs/{source}"), &push, &[("x-gitlab-event", "Push Hook"), ("x-gitlab-token", "nope")]).status,
+            401
+        );
+
+        // A token about to expire is refreshed first, and the new ones are kept (GitLab has
+        // replaced the old ones).
+        let expire = || db_run(&h, |db| db.execute("UPDATE docs_source_links SET token_expires_at = '2020-01-01T00:00:00.000Z'", &[]));
+        expire();
+        let r = h.call("POST", &format!("/api/v1/docs-sources/{source}/sync"), None, &admin);
+        let (finish, sent) = drive(&h, job_of(&r), &answer);
+        filled(finish);
+        assert_eq!(sent[0].url, "https://gitlab.com/oauth/token");
+        assert!(sent[1].headers.contains(&("authorization".into(), "Bearer glo_2".into())), "listed with the new token");
+        let r = h.call("POST", &format!("/api/v1/docs-sources/{source}/sync"), None, &admin);
+        let (_, sent) = drive(&h, job_of(&r), &answer);
+        assert!(sent.iter().all(|c| c.url != "https://gitlab.com/oauth/token"), "fresh now");
+
+        // Access revoked on GitLab: the folder waits, and Reconnect with a new approval fixes it.
+        lab.grants.borrow_mut().clear();
+        expire();
+        let r = h.call("POST", &format!("/api/v1/docs-sources/{source}/sync"), None, &admin);
+        let (finish, _) = drive(&h, job_of(&r), &answer);
+        assert!(matches!(finish, Finish::Fail(ref e) if e.message.contains("Connect GitLab again")), "{finish:?}");
+        assert!(source_of(&h, &admin)["disconnected"].as_str().unwrap().contains("Reconnect"));
+        assert_eq!(h.call("POST", &format!("/api/v1/docs-sources/{source}/sync"), None, &admin).status, 409);
+        assert_eq!(
+            h.call("PATCH", &format!("/api/v1/docs-sources/{source}"), Some(json!({ "gitlab_connection": true })), &admin).status,
+            409,
+            "connect first"
+        );
+        connect_gitlab(&h, &admin, &lab);
+        let r = h.call("PATCH", &format!("/api/v1/docs-sources/{source}"), Some(json!({ "gitlab_connection": true })), &admin);
+        assert_eq!(r.status, 200, "{}", r.body);
+        filled(drive(&h, job_of(&r), &answer).0);
+        assert_eq!(source_of(&h, &admin)["disconnected"], Value::Null);
+        assert_eq!(lab.hook_token(9), secret, "the webhook kept its secret");
+        let r = h.call("POST", &format!("/api/v1/docs-sources/{source}/sync"), None, &admin);
+        filled(drive(&h, job_of(&r), &answer).0);
+        let r = hook(&h, &format!("/hooks/docs/{source}"), &push, &[("x-gitlab-event", "Push Hook"), ("x-gitlab-token", &secret)]);
+        assert_eq!(r.status, 200);
+        drive(&h, job_of(&r), &answer);
+
+        // Removing the source takes the webhook off the project.
+        let r = h.call("DELETE", &format!("/api/v1/docs-sources/{source}"), None, &admin);
+        assert_eq!(r.status, 200);
+        let jobs = background(&r);
+        assert_eq!(jobs.len(), 1);
+        filled(drive(&h, jobs[0].clone(), &answer).0);
+        assert_eq!(lab.removed.borrow().as_slice(), ["https://gitlab.com/api/v4/projects/3/hooks/9"]);
+        assert!(lab.hooks.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_gitlab_approval_serves_one_request_at_a_time() {
+        let (h, admin, lab, topic) = gitlab_setup();
+        let answer = |c: &HttpCall| lab.answer(c);
+        connect_gitlab(&h, &admin, &lab);
+        let folder = |name: &str| json!({ "provider": "gitlab", "repository": "acme/handbook", "folder": name, "topic_id": topic, "gitlab_connection": true });
+
+        // Two folders at once: the first holds the approval until it's saved with it; the second is
+        // refused, so the approval never ends up in two folders.
+        let first = h.call("POST", "/api/v1/docs-sources", Some(folder("docs")), &admin);
+        assert_eq!(first.status, 200);
+        let second = h.call("POST", "/api/v1/docs-sources", Some(folder("guides")), &admin);
+        assert_eq!(second.status, 409, "{}", second.body);
+        assert!(second.body["error"]["message"].as_str().unwrap().contains("in use"));
+        assert_eq!(h.call("GET", "/api/v1/docs-sources/gitlab", None, &admin).status, 409, "listing waits too");
+        filled(drive(&h, job_of(&first), &answer).0);
+        assert_eq!(count(&h, "SELECT COUNT(*) FROM docs_sources"), 1);
+        assert_eq!(h.call("POST", "/api/v1/docs-sources", Some(folder("guides")), &admin).status, 409, "used up: connect again");
+
+        // Listing while the approval's token expires: only the request holding it refreshes it.
+        connect_gitlab(&h, &admin, &lab);
+        db_run(&h, |db| db.execute("UPDATE docs_connections SET expires_at = '2020-01-01T00:00:00.000Z'", &[]));
+        let listing = h.call("GET", "/api/v1/docs-sources/gitlab", None, &admin);
+        assert_eq!(h.call("GET", "/api/v1/docs-sources/gitlab", None, &admin).status, 409);
+        let (finish, sent) = drive(&h, job_of(&listing), &answer);
+        assert_eq!(filled(finish)["projects"][0]["path"], "acme/handbook");
+        assert_eq!(sent[0].url, "https://gitlab.com/oauth/token");
+        // The refreshed approval was kept and let go: the next request uses it without refreshing.
+        let r = h.call("GET", "/api/v1/docs-sources/gitlab", None, &admin);
+        let (finish, sent) = drive(&h, job_of(&r), &answer);
+        filled(finish);
+        assert!(sent.iter().all(|c| c.url != "https://gitlab.com/oauth/token"));
+
+        // Connecting again while a folder is being added replaces the approval it holds: the folder
+        // isn't saved, and the webhook it added comes off again.
+        let r = h.call("POST", "/api/v1/docs-sources", Some(folder("guides")), &admin);
+        let replace = |n: usize| {
+            if n == 2 {
+                connect_gitlab(&h, &admin, &lab);
+            }
+        };
+        let (result, notice, _, _) = run_job(&h, job_of(&r), &answer, &replace, &never);
+        assert!(matches!(&result, Err(e) if e.status == 409), "{result:?}");
+        let notice = notice.expect("the new webhook comes off");
+        assert_eq!((notice.method, notice.url.as_str()), ("DELETE", "https://gitlab.com/api/v4/projects/3/hooks/10"));
+        assert_eq!(count(&h, "SELECT COUNT(*) FROM docs_sources"), 1, "not saved");
+        assert_eq!(count(&h, "SELECT COUNT(*) FROM docs_connections WHERE claimed_until IS NULL"), 1, "the new approval is free");
+    }
+
+    #[test]
+    fn gitlab_webhooks_come_off_however_their_folder_goes() {
+        let (h, admin, lab, topic) = gitlab_setup();
+        let answer = |c: &HttpCall| lab.answer(c);
+        let (source, hook_id) = add_gitlab_folder(&h, &admin, &lab, &topic, "docs");
+
+        // Removing a folder while its sync is refreshing the token: refused until the sync has
+        // saved the new tokens, so the removal uses those, not ones GitLab has replaced.
+        db_run(&h, |db| db.execute("UPDATE docs_source_links SET token_expires_at = '2020-01-01T00:00:00.000Z'", &[]));
+        let sync = job_of(&h.call("POST", &format!("/api/v1/docs-sources/{source}/sync"), None, &admin));
+        let midway = |n: usize| {
+            if n == 1 {
+                let r = h.call("DELETE", &format!("/api/v1/docs-sources/{source}"), None, &admin);
+                assert_eq!(r.status, 409, "between the refresh and its answer: {}", r.body);
+            }
+        };
+        let (result, _, _, sent) = run_job(&h, sync, &answer, &midway, &never);
+        assert!(matches!(result, Ok(Finish::Fill(_))), "{result:?}");
+        assert_eq!(sent[0].url, "https://gitlab.com/oauth/token");
+        let r = h.call("DELETE", &format!("/api/v1/docs-sources/{source}"), None, &admin);
+        assert_eq!(r.status, 200, "{}", r.body);
+        filled(drive(&h, background(&r)[0].clone(), &answer).0);
+        assert_eq!(
+            lab.removed.borrow().as_slice(),
+            [format!("https://gitlab.com/api/v4/projects/3/hooks/{hook_id}")],
+            "with the refreshed token"
+        );
+
+        // Deleting the topic removes its folders' webhooks too.
+        let (_, first) = add_gitlab_folder(&h, &admin, &lab, &topic, "docs");
+        let (_, second) = add_gitlab_folder(&h, &admin, &lab, &topic, "guides");
+        let r = h.call("DELETE", &format!("/api/v1/topics/{topic}"), None, &admin);
+        assert_eq!(r.status, 200, "{}", r.body);
+        let jobs = background(&r);
+        assert_eq!(jobs.len(), 2);
+        for j in jobs {
+            filled(drive(&h, j, &answer).0);
+        }
+        assert!(!lab.hooks.borrow().contains_key(&first) && !lab.hooks.borrow().contains_key(&second));
+        assert_eq!(count(&h, "SELECT COUNT(*) FROM docs_sources"), 0);
+
+        // A folder whose save the host rolls back (the workspace is full): its new webhook comes
+        // off again through the failure notice, and the approval waits to be tried again.
+        let topic = h.ok("POST", "/api/v1/topics", Some(json!({ "name": "Again" })), &admin)["id"].as_str().unwrap().to_string();
+        connect_gitlab(&h, &admin, &lab);
+        let input = json!({ "provider": "gitlab", "repository": "acme/handbook", "topic_id": topic, "gitlab_connection": true });
+        let r = h.call("POST", "/api/v1/docs-sources", Some(input), &admin);
+        let (result, notice, _, _) = run_job(&h, job_of(&r), &answer, &no_op, &|n| n == 2);
+        assert!(matches!(&result, Err(e) if e.code == "storage_full"), "{result:?}");
+        let notice = notice.expect("a notice");
+        let added = *lab.hooks.borrow().keys().last().unwrap();
+        assert_eq!((notice.method, notice.url), ("DELETE", format!("https://gitlab.com/api/v4/projects/3/hooks/{added}")));
+        assert_eq!(count(&h, "SELECT COUNT(*) FROM docs_sources"), 0, "rolled back");
+        assert_eq!(count(&h, "SELECT COUNT(*) FROM docs_connections"), 1);
+    }
+
+    #[test]
+    fn reconnecting_a_gitlab_folder_puts_its_webhook_right() {
+        let (mut h, admin, lab, topic) = gitlab_setup();
+        let answer = |c: &HttpCall| lab.answer(c);
+        let (source, hook_id) = add_gitlab_folder(&h, &admin, &lab, &topic, "docs");
+        let push = json!({ "object_kind": "push", "ref": "refs/heads/main" }).to_string();
+        let deliver = |h: &H, token: &str| {
+            hook(h, &format!("/hooks/docs/{source}"), &push, &[("x-gitlab-event", "Push Hook"), ("x-gitlab-token", token)])
+        };
+        let sync = |h: &H| drive(h, job_of(&h.call("POST", &format!("/api/v1/docs-sources/{source}/sync"), None, &admin)), &answer).0;
+
+        // The person who approved it loses access to the project, though GitLab still refreshes
+        // their tokens: the sync fails, and another maintainer reconnects it.
+        let ada_token = format!("glo_{}", lab.issued.borrow());
+        lab.blocked.borrow_mut().insert(ada_token);
+        assert!(matches!(sync(&h), Finish::Fail(_)));
+        let s = source_of(&h, &admin);
+        assert_eq!((s["last_status"].as_str(), s["disconnected"].clone()), (Some("failed"), Value::Null), "not a refused refresh");
+        h.user(&admin, "bo@acme.test", "Bo", "admin");
+        let bo = sign_in(&h, "bo@acme.test", "password123");
+        connect_gitlab(&h, &bo, &lab);
+        let r = h.call("PATCH", &format!("/api/v1/docs-sources/{source}"), Some(json!({ "gitlab_connection": true })), &bo);
+        let fixed = filled(drive(&h, job_of(&r), &answer).0);
+        assert_eq!(fixed["source"]["id"], source.as_str());
+        assert!(matches!(sync(&h), Finish::Fill(_)), "Bo's approval reads the project");
+        let secret = lab.hook_token(hook_id);
+        let r = deliver(&h, &secret);
+        assert_eq!(r.status, 200);
+        filled(drive(&h, job_of(&r), &answer).0);
+
+        // The server's connector key changes: the folder's secret can't be read, so reconnecting
+        // gives its webhook a new one on GitLab too, and pushes check out again.
+        h.cfg.connectors.key = Some("another-connector-key".into());
+        let s = source_of(&h, &admin);
+        assert!(s["last_error"].as_str().unwrap().contains("Reconnect"), "{s}");
+        assert_eq!(h.call("PATCH", &format!("/api/v1/docs-sources/{source}"), Some(json!({ "branch": "main" })), &admin).status, 409);
+        connect_gitlab(&h, &admin, &lab);
+        let r = h.call("PATCH", &format!("/api/v1/docs-sources/{source}"), Some(json!({ "gitlab_connection": true })), &admin);
+        filled(drive(&h, job_of(&r), &answer).0);
+        let renewed = lab.hook_token(hook_id);
+        assert_ne!(renewed, secret, "a new secret");
+        assert_eq!(deliver(&h, &secret).status, 401);
+        let r = deliver(&h, &renewed);
+        assert_eq!(r.status, 200, "{}", r.body);
+        filled(drive(&h, job_of(&r), &answer).0);
+
+        // A webhook someone deleted on GitLab is added again on reconnecting.
+        lab.hooks.borrow_mut().clear();
+        connect_gitlab(&h, &admin, &lab);
+        let r = h.call("PATCH", &format!("/api/v1/docs-sources/{source}"), Some(json!({ "gitlab_connection": true })), &admin);
+        filled(drive(&h, job_of(&r), &answer).0);
+        let (&new_hook, body) = lab.hooks.borrow().iter().next().map(|(k, v)| (k, v.clone())).unwrap();
+        assert_eq!(body["token"].as_str(), Some(renewed.as_str()));
+        let r = h.call("DELETE", &format!("/api/v1/docs-sources/{source}"), None, &admin);
+        filled(drive(&h, background(&r)[0].clone(), &answer).0);
+        assert!(lab.removed.borrow().last().unwrap().ends_with(&format!("/hooks/{new_hook}")), "the stored webhook is the new one");
+    }
+
+    /// How a host's transaction for a step can fail.
+    #[derive(Clone, Copy)]
+    enum Broken {
+        /// It can't start: the step never runs.
+        Start,
+        /// It can't commit: the step runs and is rolled back.
+        Commit,
+    }
+
+    /// Runs a job like a host whose transaction for step `n` fails. The host then sends the notice
+    /// it worked out before that step (see `connect::unran_notice`), which this returns.
+    fn run_broken(h: &H, mut job: Job, answer: &dyn Fn(&HttpCall) -> HttpReply, n: usize, how: Broken) -> Option<HttpCall> {
+        let mut replies = vec![];
+        for i in 0..connect::MAX_STEPS {
+            let unran = connect::unran_notice(&mut job, &replies);
+            if i == n {
+                if let Broken::Commit = how {
+                    h.store
+                        .with_tx(|db| {
+                            let (step, _) = connect::guarded_step(db, &h.cfg, &mut job, replies.clone(), chrono::Utc::now(), |_| None);
+                            assert!(step.is_ok(), "the step itself works; only its commit fails");
+                            ((), false)
+                        })
+                        .unwrap();
+                }
+                return unran;
+            }
+            let (step, next) = h
+                .store
+                .with_tx(|db| {
+                    let (step, _) = connect::guarded_step(db, &h.cfg, &mut job, replies.clone(), chrono::Utc::now(), |_| None);
+                    let ok = step.is_ok();
+                    ((step, job.clone()), ok)
+                })
+                .unwrap();
+            job = next;
+            match step.unwrap() {
+                Step::Fetch(calls) => replies = calls.iter().map(answer).collect(),
+                Step::Done(f) => panic!("the job finished before step {n}: {f:?}"),
+            }
+        }
+        panic!("the job took more steps than a host allows");
+    }
+
+    #[test]
+    fn a_new_gitlab_webhook_comes_off_when_its_save_never_commits() {
+        let (h, admin, lab, topic) = gitlab_setup();
+        let answer = |c: &HttpCall| lab.answer(c);
+        let newest = || *lab.hooks.borrow().keys().last().unwrap();
+        let removes = |notice: Option<HttpCall>, hook: i64| {
+            let n = notice.expect("a notice");
+            assert_eq!((n.method, n.url), ("DELETE", format!("https://gitlab.com/api/v4/projects/3/hooks/{hook}")));
+        };
+
+        // Adding a folder: the step that saves it (the third) can't start, or can't commit.
+        for how in [Broken::Start, Broken::Commit] {
+            connect_gitlab(&h, &admin, &lab);
+            let input = json!({ "provider": "gitlab", "repository": "acme/handbook", "topic_id": topic, "gitlab_connection": true });
+            let r = h.call("POST", "/api/v1/docs-sources", Some(input), &admin);
+            let notice = run_broken(&h, job_of(&r), &answer, 2, how);
+            removes(notice, newest());
+            assert_eq!(count(&h, "SELECT COUNT(*) FROM docs_sources"), 0);
+        }
+
+        // Reconnecting a folder whose webhook someone deleted: the replacement comes off the same way.
+        let (source, first) = add_gitlab_folder(&h, &admin, &lab, &topic, "docs");
+        for how in [Broken::Start, Broken::Commit] {
+            lab.hooks.borrow_mut().clear();
+            // The failed attempt's hold on the folder runs out.
+            db_run(&h, |db| db.execute("UPDATE docs_sources SET running_until = NULL", &[]));
+            connect_gitlab(&h, &admin, &lab);
+            let r = h.call("PATCH", &format!("/api/v1/docs-sources/{source}"), Some(json!({ "gitlab_connection": true })), &admin);
+            assert_eq!(r.status, 200, "{}", r.body);
+            let notice = run_broken(&h, job_of(&r), &answer, 2, how);
+            removes(notice, newest());
+            let kept = db_run(&h, |db| db.one("SELECT hook_id FROM docs_source_links", &[])).unwrap().i64("hook_id");
+            assert_eq!(kept, first, "nothing saved");
+        }
+    }
+
+    #[test]
+    fn gitlab_syncs_keep_their_webhook_pointed_here() {
+        let (mut h, admin, lab, topic) = gitlab_setup();
+        let answer = |c: &HttpCall| lab.answer(c);
+        let (source, hook_id) = add_gitlab_folder(&h, &admin, &lab, &topic, "docs");
+        let secret = lab.hook_token(hook_id);
+        let puts = |sent: &[HttpCall]| sent.iter().filter(|c| c.method == "PUT").count();
+        let push = json!({ "object_kind": "push", "ref": "refs/heads/main" }).to_string();
+        let pushed = |h: &H| -> (Value, Vec<HttpCall>) {
+            let r = hook(h, &format!("/hooks/docs/{source}"), &push, &[("x-gitlab-event", "Push Hook"), ("x-gitlab-token", &secret)]);
+            assert_eq!(r.status, 200, "{}", r.body);
+            let (finish, sent) = drive(h, job_of(&r), &answer);
+            (filled(finish), sent)
+        };
+        let sync_now = |h: &H| -> (Value, Vec<HttpCall>) {
+            let r = h.call("POST", &format!("/api/v1/docs-sources/{source}/sync"), None, &admin);
+            let (finish, sent) = drive(h, job_of(&r), &answer);
+            (filled(finish), sent)
+        };
+
+        // A push leaves a webhook that points here alone; Sync now checks it anyway.
+        assert_eq!(puts(&pushed(&h).1), 0);
+        let (v, sent) = sync_now(&h);
+        assert_eq!((puts(&sent), v["webhook"].as_str()), (1, Some("checked")));
+
+        // The workspace moves (this server knows its address): a push never moves the webhook;
+        // Sync now points it at the new address.
+        h.cfg.base_url = Some("https://wiki.kb.test".into());
+        assert_eq!(puts(&pushed(&h).1), 0, "pushes leave it alone");
+        let (v, sent) = sync_now(&h);
+        assert_eq!((puts(&sent), v["webhook"].as_str()), (1, Some("pointed at this workspace's address")));
+        assert_eq!(lab.hooks.borrow()[&hook_id]["url"], format!("https://wiki.kb.test/hooks/docs/{source}"));
+        assert_eq!(lab.hook_token(hook_id), secret, "same secret");
+        assert_eq!(source_of(&h, &admin)["webhook_url"], format!("https://wiki.kb.test/hooks/docs/{source}"));
+
+        // Someone deletes it on GitLab: Sync now adds it again, within the same sync, even with an
+        // expired token to refresh and files to read.
+        lab.hooks.borrow_mut().clear();
+        lab.files.borrow_mut().insert("docs/new.md".into(), b"# New\n".to_vec());
+        db_run(&h, |db| db.execute("UPDATE docs_source_links SET token_expires_at = '2020-01-01T00:00:00.000Z'", &[]));
+        let (v, sent) = sync_now(&h);
+        assert_eq!((v["webhook"].as_str(), v["created"].as_i64()), (Some("added again"), Some(1)), "{v}");
+        assert_eq!(sent[0].url, "https://gitlab.com/oauth/token");
+        let (&again, body) = lab.hooks.borrow().iter().next().map(|(k, v)| (k, v.clone())).unwrap();
+        assert_eq!(
+            (body["url"].as_str(), body["token"].as_str()),
+            (Some(format!("https://wiki.kb.test/hooks/docs/{source}").as_str()), Some(secret.as_str()))
+        );
+        assert_eq!(db_run(&h, |db| db.one("SELECT hook_id FROM docs_source_links", &[])).unwrap().i64("hook_id"), again);
+        assert_eq!(pushed(&h).0["unchanged"], 3, "pushes arrive again");
+
+        // And if the step saving the new one never commits, it comes off again.
+        lab.hooks.borrow_mut().clear();
+        let r = h.call("POST", &format!("/api/v1/docs-sources/{source}/sync"), None, &admin);
+        let notice = run_broken(&h, job_of(&r), &answer, 2, Broken::Commit).expect("a notice");
+        let added = *lab.hooks.borrow().keys().last().unwrap();
+        assert_eq!((notice.method, notice.url), ("DELETE", format!("https://gitlab.com/api/v4/projects/3/hooks/{added}")));
+    }
+
+    #[test]
+    fn a_server_that_doesnt_know_its_address_keeps_the_webhook_where_it_was_set() {
+        let (mut h, admin, lab, topic) = gitlab_setup();
+        let answer = |c: &HttpCall| lab.answer(c);
+        let (source, hook_id) = add_gitlab_folder(&h, &admin, &lab, &topic, "docs");
+        let set = format!("https://kb.test/hooks/docs/{source}");
+        let secret = lab.hook_token(hook_id);
+        // Self-hosted without --base-url: the address is whatever Host a request names.
+        h.cfg.base_url = None;
+        assert!(!h.cfg.knows_its_address());
+        let Auth::Cookie(session) = admin.clone() else { panic!("a browser session") };
+        let from = |origin: &str, method: &str, path: &str, body: Option<Value>| {
+            h.send(&Request {
+                method: method.into(),
+                path: path.into(),
+                query: String::new(),
+                headers: vec![
+                    ("content-type".into(), "application/json".into()),
+                    ("x-dumbslab-client".into(), "web".into()),
+                    ("cookie".into(), format!("dumbslab_session={session}")),
+                ],
+                body: body.map(|b| b.to_string().into_bytes()).unwrap_or_default(),
+                origin: origin.into(),
+                client_ip: None,
+            })
+        };
+
+        // Sync now through an unexpected Host (a LAN address, a proxy, DNS rebinding): the webhook
+        // is checked where it was set, with its secret, and not pointed anywhere else.
+        let r = from("http://192.168.1.20:8080", "POST", &format!("/api/v1/docs-sources/{source}/sync"), None);
+        assert_eq!(r.status, 200, "{}", r.body);
+        let (finish, sent) = drive(&h, job_of(&r), &answer);
+        assert_eq!(filled(finish)["webhook"], "checked");
+        assert!(sent.iter().filter(|c| c.method == "PUT").all(|c| c.body.as_deref().unwrap().contains(&set)), "only the address it had");
+        assert_eq!((lab.hooks.borrow()[&hook_id]["url"].as_str(), lab.hook_token(hook_id)), (Some(set.as_str()), secret.clone()));
+
+        // Gone on GitLab: added again at the address it had, not the request's.
+        lab.hooks.borrow_mut().clear();
+        let r = from("http://evil.test", "POST", &format!("/api/v1/docs-sources/{source}/sync"), None);
+        assert_eq!(filled(drive(&h, job_of(&r), &answer).0)["webhook"], "added again");
+        let (_, body) = lab.hooks.borrow().iter().next().map(|(k, v)| (*k, v.clone())).unwrap();
+        assert_eq!(body["url"].as_str(), Some(set.as_str()));
+
+        // Only Reconnect, an admin's choice, moves it, and the answer shows where.
+        connect_gitlab(&h, &admin, &lab);
+        let r = from(
+            "https://wiki.example.test",
+            "PATCH",
+            &format!("/api/v1/docs-sources/{source}"),
+            Some(json!({ "gitlab_connection": true })),
+        );
+        assert_eq!(r.status, 200, "{}", r.body);
+        let moved = filled(drive(&h, job_of(&r), &answer).0);
+        assert_eq!(moved["source"]["webhook_url"], format!("https://wiki.example.test/hooks/docs/{source}"));
+    }
+
+    #[test]
+    fn a_late_sync_never_overwrites_a_newer_webhook_repair() {
+        let (h, admin, lab, topic) = gitlab_setup();
+        let answer = |c: &HttpCall| lab.answer(c);
+        let newest = || *lab.hooks.borrow().keys().last().unwrap();
+        let hooks = || lab.hooks.borrow().keys().copied().collect::<Vec<i64>>();
+        let (source, _) = add_gitlab_folder(&h, &admin, &lab, &topic, "docs");
+        let stored = || db_run(&h, |db| db.one("SELECT hook_id FROM docs_source_links", &[])).unwrap().i64("hook_id");
+        let expire_token =
+            || db_run(&h, |db| db.execute("UPDATE docs_source_links SET token_expires_at = '2020-01-01T00:00:00.000Z'", &[]));
+        let expire_lease = || db_run(&h, |db| db.execute("UPDATE docs_sources SET running_until = '2000-01-01T00:00:00.000Z x'", &[]));
+        let sync_now = || job_of(&h.call("POST", &format!("/api/v1/docs-sources/{source}/sync"), None, &admin));
+        lab.hooks.borrow_mut().clear();
+
+        // Sync A finds the webhook gone and adds a new one...
+        let mut a = sync_now();
+        let Ok(Step::Fetch(calls)) = step_with(&h, &mut a, vec![]).0 else { panic!("the listing") };
+        let Ok(Step::Fetch(calls)) = step_with(&h, &mut a, calls.iter().map(answer).collect()).0 else {
+            panic!("files and the new webhook")
+        };
+        let a_replies: Vec<HttpReply> = calls.iter().map(answer).collect();
+        let a_hook = newest();
+        // ...then takes too long. Sync B takes over: it renews the tokens (A's no longer work),
+        // repairs the webhook, and removes A's, which points at this folder too.
+        expire_lease();
+        expire_token();
+        let (finish, sent) = drive(&h, sync_now(), &answer);
+        let v = filled(finish);
+        assert_eq!(sent[0].url, "https://gitlab.com/oauth/token");
+        assert!(
+            v["webhook"].as_str().unwrap().contains("added again") && v["webhook"].as_str().unwrap().contains("1 other webhook"),
+            "{v}"
+        );
+        let b_hook = newest();
+        assert_eq!((hooks(), stored()), (vec![b_hook], b_hook));
+
+        // A resumes: it may not save its webhook over B's, so its step fails, and its own clean-up
+        // (with tokens GitLab replaced) is refused; nothing depends on it.
+        let (result, notice) = step_with(&h, &mut a, a_replies);
+        assert!(result.is_err(), "{result:?}");
+        let notice = notice.expect("A tries to take its webhook off");
+        assert_eq!(notice.url, format!("https://gitlab.com/api/v4/projects/3/hooks/{a_hook}"));
+        assert_eq!(answer(&notice).status, 401, "A's token was replaced");
+        assert_eq!((hooks(), stored()), (vec![b_hook], b_hook), "B's kept");
+
+        // A leftover that no sync took off (here, from a sync that lost its lease after a push's
+        // sync renewed the tokens): the next Sync now removes it.
+        let leftover = {
+            let token = format!("glo_{}", lab.issued.borrow());
+            let url = format!("https://kb.test/hooks/docs/{source}");
+            let add = connect::HttpCall::post_json("https://gitlab.com/api/v4/projects/3/hooks", &json!({ "url": url, "token": "x" }))
+                .header("authorization", format!("Bearer {token}"));
+            answer(&add);
+            newest()
+        };
+        assert_eq!(hooks(), vec![b_hook, leftover]);
+        let (finish, _) = drive(&h, sync_now(), &answer);
+        assert!(filled(finish)["webhook"].as_str().unwrap().contains("1 other webhook"));
+        assert_eq!(hooks(), vec![b_hook], "only the folder's own");
+
+        // Removing the folder removes every webhook pointing at it, not just the recorded one.
+        answer(
+            &connect::HttpCall::post_json(
+                "https://gitlab.com/api/v4/projects/3/hooks",
+                &json!({ "url": format!("https://kb.test/hooks/docs/{source}"), "token": "x" }),
+            )
+            .header("authorization", format!("Bearer glo_{}", lab.issued.borrow())),
+        );
+        let r = h.call("DELETE", &format!("/api/v1/docs-sources/{source}"), None, &admin);
+        assert_eq!(filled(drive(&h, background(&r)[0].clone(), &answer).0)["removed"], 2);
+        assert!(hooks().is_empty());
+    }
+
+    #[test]
+    fn a_moved_gitlab_project_is_still_read_by_its_id() {
+        let (h, admin, lab, topic) = gitlab_setup();
+        let answer = |c: &HttpCall| lab.answer(c);
+        let (source, _) = add_gitlab_folder(&h, &admin, &lab, &topic, "docs");
+        lab.files.borrow_mut().insert("docs/README.md".into(), b"# Runbooks\n\nSee [the code](../src/main.rs).\n".to_vec());
+        let sync = || filled(drive(&h, job_of(&h.call("POST", &format!("/api/v1/docs-sources/{source}/sync"), None, &admin)), &answer).0);
+        let readme = || post(&h, &doc_ids(&h)["README.md"], &admin)["content"].as_str().unwrap().to_string();
+        assert_eq!(sync()["created"], 2);
+        assert!(readme().contains("[the code](https://gitlab.com/acme/handbook/-/blob/main/src/main.rs)"), "{}", readme());
+
+        // The project moves to acme/manual, and another project takes acme/handbook, with other
+        // files. The folder's syncs still read its own project, by id (the fake refuses reads of
+        // project 3 by path), and its links follow the new path.
+        *lab.path.borrow_mut() = "acme/manual".into();
+        lab.others
+            .borrow_mut()
+            .insert(4, ("acme/handbook".into(), BTreeMap::from([("docs/README.md".to_string(), b"# Not ours\n".to_vec())])));
+        let r = sync();
+        assert_eq!((r["updated"].as_i64(), r["unchanged"].as_i64(), r["archived"].as_i64()), (Some(1), Some(1), Some(0)), "{r}");
+        assert_eq!(source_of(&h, &admin)["repository"], "acme/manual");
+        assert!(readme().contains("[the code](https://gitlab.com/acme/manual/-/blob/main/src/main.rs)"), "{}", readme());
+        assert!(!readme().contains("Not ours"));
+        let synced =
+            "SELECT COUNT(*) FROM posts WHERE status = 'published' AND id IN (SELECT target_id FROM docs_items WHERE kind = 'doc')";
+        assert_eq!(count(&h, synced), 2, "none archived");
+        let push = json!({ "object_kind": "push", "ref": "refs/heads/main" }).to_string();
+        let secret = lab.hook_token(9);
+        let r = hook(&h, &format!("/hooks/docs/{source}"), &push, &[("x-gitlab-event", "Push Hook"), ("x-gitlab-token", &secret)]);
+        assert_eq!(filled(drive(&h, job_of(&r), &answer).0)["unchanged"], 2, "a push reads it by id too");
+    }
+
+    #[test]
+    fn only_a_folders_own_gitlab_webhooks_are_taken_off() {
+        let (mut h, admin, lab, topic) = gitlab_setup();
+        let answer = |c: &HttpCall| lab.answer(c);
+        let (source, own) = add_gitlab_folder(&h, &admin, &lab, &topic, "docs");
+        let add = |url: String| {
+            let token = format!("glo_{}", lab.issued.borrow());
+            let call = connect::HttpCall::post_json("https://gitlab.com/api/v4/projects/3/hooks", &json!({ "url": url, "token": "x" }))
+                .header("authorization", format!("Bearer {token}"));
+            answer(&call);
+            *lab.hooks.borrow().keys().last().unwrap()
+        };
+        let hooks = || lab.hooks.borrow().keys().copied().collect::<Vec<i64>>();
+        // People's own webhooks that merely end like the folder's: another host (with a path and
+        // a query), another host, a path under another one here, and a query.
+        let theirs = vec![
+            add(format!("https://unrelated.example/custom/hooks/docs/{source}?mode=other")),
+            add(format!("https://unrelated.example/hooks/docs/{source}")),
+            add(format!("https://kb.test/custom/hooks/docs/{source}")),
+            add(format!("https://kb.test/hooks/docs/{source}?mode=other")),
+        ];
+        let sync_now =
+            |h: &H| filled(drive(h, job_of(&h.call("POST", &format!("/api/v1/docs-sources/{source}/sync"), None, &admin)), &answer).0);
+
+        // A leftover at the folder's own address goes; theirs stay.
+        let leftover = add(format!("https://kb.test/hooks/docs/{source}"));
+        assert!(sync_now(&h)["webhook"].as_str().unwrap().contains("1 other webhook"));
+        assert!(!hooks().contains(&leftover) && hooks().contains(&own));
+        assert!(theirs.iter().all(|t| hooks().contains(t)));
+
+        // The workspace moves: a leftover at its old address, which the folder's webhook had, goes
+        // too.
+        h.cfg.base_url = Some("https://wiki.kb.test".into());
+        sync_now(&h);
+        let old = add(format!("https://kb.test/hooks/docs/{source}"));
+        assert!(sync_now(&h)["webhook"].as_str().unwrap().contains("1 other webhook"));
+        assert!(!hooks().contains(&old));
+        assert!(theirs.iter().all(|t| hooks().contains(t)));
+
+        // Removing the folder takes off its own and leaves theirs.
+        let stale = add(format!("https://KB.test:443/hooks/docs/{source}"));
+        let r = h.call("DELETE", &format!("/api/v1/docs-sources/{source}"), None, &admin);
+        assert_eq!(filled(drive(&h, background(&r)[0].clone(), &answer).0)["removed"], 2);
+        let mut left = hooks();
+        left.sort_unstable();
+        assert_eq!(left, theirs);
+        assert!(!left.contains(&stale) && !left.contains(&own));
+        assert_eq!(count(&h, "SELECT COUNT(*) FROM docs_hook_cleanup"), 0);
+    }
+
+    #[test]
+    fn removing_a_gitlab_folder_waits_for_a_renewal_and_its_cleanup_is_retried() {
+        let (h, admin, lab, topic) = gitlab_setup();
+        let (_, mo) = h.user(&admin, "mo@acme.test", "Mo", "member");
+        let answer = |c: &HttpCall| lab.answer(c);
+        let remove = |source: &str| h.call("DELETE", &format!("/api/v1/docs-sources/{source}"), None, &admin);
+        let settings = || background(&h.call("GET", "/api/v1/docs-sources", None, &admin));
+        let due = || db_run(&h, |db| db.execute("UPDATE docs_hook_cleanup SET next_attempt_at = '2000-01-01T00:00:00.000Z'", &[]));
+        let records = || count(&h, "SELECT COUNT(*) FROM docs_hook_cleanup");
+
+        // A sync asks GitLab to renew the folder's tokens; its lease runs out with the answer on its
+        // way. Removing the folder now would keep tokens GitLab is replacing: it waits.
+        let (source, hook_id) = add_gitlab_folder(&h, &admin, &lab, &topic, "docs");
+        db_run(&h, |db| db.execute("UPDATE docs_source_links SET token_expires_at = '2020-01-01T00:00:00.000Z'", &[]));
+        let mut a = job_of(&h.call("POST", &format!("/api/v1/docs-sources/{source}/sync"), None, &admin));
+        let Ok(Step::Fetch(calls)) = step_with(&h, &mut a, vec![]).0 else { panic!("a refresh") };
+        let a_refresh: Vec<HttpReply> = calls.iter().map(answer).collect();
+        db_run(&h, |db| db.execute("UPDATE docs_sources SET running_until = '2000-01-01T00:00:00.000Z x'", &[]));
+        let r = remove(&source);
+        assert_eq!(r.status, 409, "{}", r.body);
+        assert!(r.body["error"]["message"].as_str().unwrap().contains("renewing its GitLab access"), "{}", r.body);
+        // The answer lands; then the folder goes, and its cleanup uses the new tokens.
+        assert!(matches!(step_with(&h, &mut a, a_refresh).0, Ok(Step::Done(Finish::Fail(_)))), "A lost its lease, its tokens kept");
+        let r = remove(&source);
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert_eq!(count(&h, "SELECT COUNT(*) FROM docs_hook_cleanup WHERE secret LIKE '%glo_%'"), 0, "sealed");
+        let (finish, sent) = drive(&h, background(&r)[0].clone(), &answer);
+        assert_eq!(filled(finish)["removed"], 1);
+        assert!(sent.iter().all(|c| c.url != "https://gitlab.com/oauth/token"), "fresh tokens");
+        assert!(!lab.hooks.borrow().contains_key(&hook_id));
+        assert_eq!(records(), 0);
+
+        // GitLab is down when the next folder goes: the record stays, and waits.
+        let (source, hook_id) = add_gitlab_folder(&h, &admin, &lab, &topic, "docs");
+        *lab.down.borrow_mut() = true;
+        let r = remove(&source);
+        assert!(matches!(drive(&h, background(&r)[0].clone(), &answer).0, Finish::Fail(_)));
+        assert_eq!(records(), 1);
+        assert!(settings().is_empty(), "waiting");
+        // Once the wait is over, loading Settings tries again, and it's done.
+        *lab.down.borrow_mut() = false;
+        due();
+        let jobs = settings();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(filled(drive(&h, jobs[0].clone(), &answer).0)["removed"], 1);
+        assert!(!lab.hooks.borrow().contains_key(&hook_id));
+        assert_eq!(records(), 0);
+
+        // GitLab stops accepting the tokens: the first refusal waits (another renewal's answer
+        // may still land), the second gives up, telling admins which webhook to delete.
+        let (source, hook_id) = add_gitlab_folder(&h, &admin, &lab, &topic, "docs");
+        *lab.down.borrow_mut() = true;
+        drive(&h, background(&remove(&source))[0].clone(), &answer);
+        *lab.down.borrow_mut() = false;
+        lab.grants.borrow_mut().clear();
+        db_run(&h, |db| db.execute("UPDATE docs_hook_cleanup SET expires_at = '2020-01-01T00:00:00.000Z'", &[]));
+        for _ in 0..2 {
+            due();
+            let jobs = settings();
+            assert_eq!(jobs.len(), 1);
+            assert!(matches!(drive(&h, jobs[0].clone(), &answer).0, Finish::Fail(_)));
+        }
+        assert_eq!(records(), 0);
+        assert!(lab.hooks.borrow().contains_key(&hook_id), "left for an admin to delete");
+        let event =
+            db_run(&h, |db| db.one("SELECT summary, audience, data FROM activity WHERE event = 'docs_source.webhook_abandoned'", &[]))
+                .expect("an activity entry");
+        assert_eq!(event.str("audience"), "admin");
+        assert!(
+            event.str("summary").contains(&format!("webhook {hook_id} off the GitLab project acme/handbook (id 3)")),
+            "{}",
+            event.str("summary")
+        );
+        assert_eq!(serde_json::from_str::<Value>(&event.str("data")).unwrap(), json!({ "project_id": 3, "hook_ids": [hook_id] }));
+        assert!(!h.ok("GET", "/api/v1/activity?limit=200", None, &mo).to_string().contains("webhook_abandoned"), "admins only");
+
+        // A record DumbSlab kept trying for 30 days ends the same way.
+        connect_gitlab(&h, &admin, &lab);
+        let (source, _) = add_gitlab_folder(&h, &admin, &lab, &topic, "docs");
+        *lab.down.borrow_mut() = true;
+        drive(&h, background(&remove(&source))[0].clone(), &answer);
+        *lab.down.borrow_mut() = false;
+        db_run(&h, |db| db.execute("UPDATE docs_hook_cleanup SET created_at = '2000-01-01T00:00:00.000Z'", &[]));
+        due();
+        drive(&h, settings()[0].clone(), &answer);
+        assert_eq!(records(), 0);
+        assert_eq!(
+            count(&h, "SELECT COUNT(*) FROM activity WHERE event = 'docs_source.webhook_abandoned' AND summary LIKE '%tried for 30 days%'"),
+            1
+        );
+    }
+
+    #[test]
+    fn a_full_workspace_keeps_renewed_gitlab_tokens() {
+        let (h, admin, lab, topic) = gitlab_setup();
+        let answer = |c: &HttpCall| lab.answer(c);
+        let (source, hook_id) = add_gitlab_folder(&h, &admin, &lab, &topic, "docs");
+        let full = |n: usize| n >= 1;
+        let renewals = |sent: &[HttpCall]| sent.iter().filter(|c| c.url == "https://gitlab.com/oauth/token").count();
+        let sync = || job_of(&h.call("POST", &format!("/api/v1/docs-sources/{source}/sync"), None, &admin));
+
+        // The workspace is full: the host refuses every step after the first. The step that stores
+        // the renewed tokens is kept anyway (GitLab spent the old refresh token); the next isn't.
+        db_run(&h, |db| db.execute("UPDATE docs_source_links SET token_expires_at = '2020-01-01T00:00:00.000Z'", &[]));
+        let (result, _, _, sent) = run_job(&h, sync(), &answer, &no_op, &full);
+        assert!(result.is_err(), "the listing step is refused: {result:?}");
+        assert_eq!(renewals(&sent), 1);
+        // With room again, the next sync uses the renewed tokens, without renewing.
+        db_run(&h, |db| db.execute("UPDATE docs_sources SET running_until = NULL", &[]));
+        let (finish, sent) = drive(&h, sync(), &answer);
+        filled(finish);
+        assert_eq!(renewals(&sent), 0);
+        assert!(sent[0].headers.contains(&("authorization".into(), format!("Bearer glo_{}", lab.issued.borrow()))), "{:?}", sent[0]);
+
+        // The same for a removed folder's webhook cleanup.
+        *lab.down.borrow_mut() = true;
+        let r = h.call("DELETE", &format!("/api/v1/docs-sources/{source}"), None, &admin);
+        drive(&h, background(&r)[0].clone(), &answer);
+        *lab.down.borrow_mut() = false;
+        db_run(&h, |db| {
+            db.execute(
+                "UPDATE docs_hook_cleanup SET expires_at = '2020-01-01T00:00:00.000Z', next_attempt_at = '2000-01-01T00:00:00.000Z'",
+                &[],
+            )
+        });
+        let pass = || background(&h.call("GET", "/api/v1/docs-sources", None, &admin)).remove(0);
+        let (result, _, _, sent) = run_job(&h, pass(), &answer, &no_op, &full);
+        assert!(result.is_err() && renewals(&sent) == 1, "{result:?}");
+        db_run(&h, |db| db.execute("UPDATE docs_hook_cleanup SET working_until = NULL", &[]));
+        let (finish, sent) = drive(&h, pass(), &answer);
+        assert_eq!((filled(finish)["removed"].as_i64(), renewals(&sent)), (Some(1), 0));
+        assert!(!lab.hooks.borrow().contains_key(&hook_id));
+    }
+
+    #[test]
+    fn the_picked_gitlab_project_is_added_whatever_its_path_is_now() {
+        let (h, admin, lab, topic) = gitlab_setup();
+        let answer = |c: &HttpCall| lab.answer(c);
+        let project_of = |id: &str| count(&h, &format!("SELECT project_id FROM docs_source_links WHERE source_id = '{id}'"));
+        let add = |input: Value| {
+            let r = h.call("POST", "/api/v1/docs-sources", Some(input), &admin);
+            assert_eq!(r.status, 200, "{}", r.body);
+            drive(&h, job_of(&r), &answer).0
+        };
+        // A path alone (an agent's request) is looked up once, and the project's id kept.
+        connect_gitlab(&h, &admin, &lab);
+        let by_path = json!({ "provider": "gitlab", "gitlab_connection": true, "repository": "acme/handbook", "folder": "guides", "topic_id": topic });
+        let first = filled(add(by_path))["source"]["id"].as_str().unwrap().to_string();
+        assert_eq!(project_of(&first), 3);
+
+        // The picker lists project 3 as acme/handbook.
+        connect_gitlab(&h, &admin, &lab);
+        let listed = filled(drive(&h, job_of(&h.call("GET", "/api/v1/docs-sources/gitlab", None, &admin)), &answer).0);
+        let picked = listed["projects"].as_array().unwrap().iter().find(|p| p["path"] == "acme/handbook").unwrap().clone();
+        assert_eq!(picked["id"], 3);
+        // Then project 3 moves to acme/manual, and project 4, which the admin maintains too, takes
+        // acme/handbook. Adding what they picked adds project 3, under its path now, with its
+        // webhook on project 3.
+        *lab.path.borrow_mut() = "acme/manual".into();
+        lab.others.borrow_mut().insert(4, ("acme/handbook".into(), BTreeMap::new()));
+        let input = json!({ "provider": "gitlab", "gitlab_connection": true, "project_id": picked["id"], "repository": picked["path"], "folder": "docs", "topic_id": topic });
+        let created = filled(add(input.clone()));
+        assert_eq!(created["source"]["repository"], "acme/manual");
+        let second = created["source"]["id"].as_str().unwrap().to_string();
+        assert_eq!(project_of(&second), 3);
+        let newest = *lab.hooks.borrow().keys().last().unwrap();
+        assert_eq!(lab.hooks.borrow()[&newest]["project"], 3);
+        assert!(lab.hooks.borrow().values().all(|h| h["project"] == 3), "nothing on project 4");
+
+        // A project the admin doesn't maintain (any more) is refused.
+        connect_gitlab(&h, &admin, &lab);
+        let mut gone = input;
+        gone["project_id"] = json!(77);
+        gone["folder"] = json!("other");
+        assert!(matches!(add(gone), Finish::Fail(ref e) if e.message.contains("no longer shows")));
+        let mut wrong =
+            json!({ "provider": "gitlab", "project_id": 3, "repository": "acme/manual", "topic_id": topic, "token": "glpat-x" });
+        assert_eq!(
+            h.call("POST", "/api/v1/docs-sources", Some(wrong.clone()), &admin).status,
+            400,
+            "project_id goes with gitlab_connection"
+        );
+        wrong["provider"] = json!("github");
+        assert_eq!(h.call("POST", "/api/v1/docs-sources", Some(wrong), &admin).status, 400);
+    }
+
+    #[test]
+    fn a_project_that_takes_another_folders_old_path_still_syncs() {
+        let (h, admin, lab, topic) = gitlab_setup();
+        let answer = |c: &HttpCall| lab.answer(c);
+        // A is project 3 at acme/a, B is project 5 at acme/b: the same folder into the same topic.
+        *lab.path.borrow_mut() = "acme/a".into();
+        lab.others.borrow_mut().insert(5, ("acme/b".into(), lab.files.borrow().clone()));
+        let add = |project: i64, path: &str| {
+            connect_gitlab(&h, &admin, &lab);
+            let input = json!({ "provider": "gitlab", "gitlab_connection": true, "project_id": project, "repository": path, "folder": "docs", "topic_id": topic });
+            let r = h.call("POST", "/api/v1/docs-sources", Some(input), &admin);
+            filled(drive(&h, job_of(&r), &answer).0)["source"]["id"].as_str().unwrap().to_string()
+        };
+        let a = add(3, "acme/a");
+        let b = add(5, "acme/b");
+        let sync = |id: &str| drive(&h, job_of(&h.call("POST", &format!("/api/v1/docs-sources/{id}/sync"), None, &admin)), &answer).0;
+        let listed = |id: &str| {
+            let list = h.ok("GET", "/api/v1/docs-sources", None, &admin);
+            list["items"].as_array().unwrap().iter().find(|s| s["id"] == id).unwrap().clone()
+        };
+
+        // B moves to acme/c, then A moves to acme/b, and A syncs first: A now shows acme/b, and B
+        // still shows it too until it syncs. They're different projects, so neither waits.
+        lab.others.borrow_mut().get_mut(&5).unwrap().0 = "acme/c".into();
+        *lab.path.borrow_mut() = "acme/b".into();
+        assert_eq!(filled(sync(&a))["created"], 2);
+        assert_eq!((listed(&a)["repository"].as_str(), listed(&b)["repository"].as_str()), (Some("acme/b"), Some("acme/b")));
+        assert_eq!((listed(&a)["disconnected"].clone(), listed(&b)["disconnected"].clone()), (Value::Null, Value::Null));
+        // Reconnecting B isn't refused, nor is its push, and its sync follows its new path.
+        connect_gitlab(&h, &admin, &lab);
+        let r = h.call("PATCH", &format!("/api/v1/docs-sources/{b}"), Some(json!({ "gitlab_connection": true })), &admin);
+        assert_eq!(r.status, 200, "{}", r.body);
+        filled(drive(&h, job_of(&r), &answer).0);
+        let secret = lab.hooks.borrow().values().find(|h| h["project"] == 5).unwrap()["token"].as_str().unwrap().to_string();
+        let push = json!({ "object_kind": "push", "ref": "refs/heads/main" }).to_string();
+        let r = hook(&h, &format!("/hooks/docs/{b}"), &push, &[("x-gitlab-event", "Push Hook"), ("x-gitlab-token", &secret)]);
+        assert_eq!(filled(drive(&h, job_of(&r), &answer).0)["created"], 2);
+        assert_eq!(listed(&b)["repository"], "acme/c");
+    }
+
+    #[test]
+    fn gitlab_folders_work_after_upgrading_from_the_github_apps_migration() {
+        use dumbslab_core::db::MIGRATIONS;
+        let (mut h, admin, lab, topic) = gitlab_setup();
+        let answer = |c: &HttpCall| lab.answer(c);
+        // A workspace that ran the GitHub app's docs sync migration but not the GitLab app's: its
+        // schema version stops before the GitLab app's, and it has none of its tables.
+        let gitlab = MIGRATIONS.iter().position(|m| m.contains("CREATE TABLE IF NOT EXISTS docs_hook_cleanup")).unwrap();
+        let github = MIGRATIONS.iter().position(|m| m.contains("CREATE TABLE IF NOT EXISTS docs_source_links")).unwrap();
+        assert!(github < gitlab, "the GitLab app's comes after the GitHub app's");
+        assert!(!MIGRATIONS[github].contains("docs_hook_cleanup"), "the GitHub app's migration is left as it shipped");
+        h.store.with_tx(|db| (db.execute_batch("DROP TABLE docs_hook_cleanup"), true)).unwrap().unwrap();
+        db_run(&h, |db| db.execute("UPDATE meta SET value = ? WHERE key = 'schema_version'", &dumbslab_core::params![gitlab.to_string()]));
+        // The new version starts: it runs the GitLab app's migration.
+        h.store = Store::open(&h._dir.path().join("t.db")).unwrap();
+        assert_eq!(count(&h, "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'docs_hook_cleanup'"), 1);
+        assert_eq!(count(&h, "SELECT value FROM meta WHERE key = 'schema_version'"), MIGRATIONS.len() as i64);
+
+        // A GitLab app folder: added, listed, synced with Sync now, and removed with its webhook.
+        let (source, hook_id) = add_gitlab_folder(&h, &admin, &lab, &topic, "docs");
+        let list = h.call("GET", "/api/v1/docs-sources", None, &admin);
+        assert_eq!((list.status, list.body["items"][0]["id"].as_str()), (200, Some(source.as_str())), "{}", list.body);
+        let synced = filled(drive(&h, job_of(&h.call("POST", &format!("/api/v1/docs-sources/{source}/sync"), None, &admin)), &answer).0);
+        assert_eq!(synced["created"], 2);
+        let r = h.call("DELETE", &format!("/api/v1/docs-sources/{source}"), None, &admin);
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert_eq!(filled(drive(&h, background(&r)[0].clone(), &answer).0)["removed"], 1);
+        assert!(!lab.hooks.borrow().contains_key(&hook_id));
+    }
+
+    #[test]
+    fn a_webhook_whose_answer_was_lost_is_cleaned_up() {
+        let (h, admin, lab, topic) = gitlab_setup();
+        let answer = |c: &HttpCall| lab.answer(c);
+        // GitLab adds the webhook, but its answer never arrives (the request timed out).
+        let lost = |c: &HttpCall| {
+            let reply = lab.answer(c);
+            if c.method == "POST" && c.url == "https://gitlab.com/api/v4/projects/3/hooks" {
+                HttpReply { status: 0, body: String::new() }
+            } else {
+                reply
+            }
+        };
+        let input = json!({ "provider": "gitlab", "gitlab_connection": true, "project_id": 3, "repository": "acme/handbook", "folder": "docs", "topic_id": topic });
+        let add = |reply: &dyn Fn(&HttpCall) -> HttpReply| {
+            drive(&h, job_of(&h.call("POST", "/api/v1/docs-sources", Some(input.clone()), &admin)), reply).0
+        };
+        let records = || count(&h, "SELECT COUNT(*) FROM docs_hook_cleanup");
+        let sources = || count(&h, "SELECT COUNT(*) FROM docs_sources");
+        let settings = || background(&h.call("GET", "/api/v1/docs-sources", None, &admin));
+        let due = || db_run(&h, |db| db.execute("UPDATE docs_hook_cleanup SET next_attempt_at = '2000-01-01T00:00:00.000Z'", &[]));
+
+        connect_gitlab(&h, &admin, &lab);
+        assert!(matches!(add(&lost), Finish::Fail(_)));
+        // A webhook no folder knows of, but recorded before it was asked for, sealed.
+        assert_eq!((lab.hooks.borrow().len(), sources(), records()), (1, 0, 1));
+        assert_eq!(count(&h, "SELECT COUNT(*) FROM docs_hook_cleanup WHERE secret LIKE '%glo_%' OR secret LIKE '%glr_%'"), 0);
+        // While an add may still be under way, it's left alone.
+        assert!(settings().is_empty());
+        // Later, a pass finds it by its exact address and deletes it.
+        due();
+        let jobs = settings();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(filled(drive(&h, jobs[0].clone(), &answer).0)["removed"], 1);
+        assert_eq!((lab.hooks.borrow().len(), records()), (0, 0));
+        // Trying again (the approval is still there) makes exactly one webhook, and leaves nothing
+        // to clean up.
+        filled(add(&answer));
+        assert_eq!((lab.hooks.borrow().len(), sources(), records()), (1, 1, 0));
+    }
+
+    #[test]
+    fn a_cleanup_never_renews_tokens_an_approval_still_holds() {
+        let (h, admin, lab, topic) = gitlab_setup();
+        let answer = |c: &HttpCall| lab.answer(c);
+        let lost = |c: &HttpCall| {
+            let reply = lab.answer(c);
+            if c.method == "POST" && c.url == "https://gitlab.com/api/v4/projects/3/hooks" {
+                HttpReply { status: 0, body: String::new() }
+            } else {
+                reply
+            }
+        };
+        let input = json!({ "provider": "gitlab", "gitlab_connection": true, "project_id": 3, "repository": "acme/handbook", "folder": "docs", "topic_id": topic });
+        let add = |reply: &dyn Fn(&HttpCall) -> HttpReply| {
+            drive(&h, job_of(&h.call("POST", "/api/v1/docs-sources", Some(input.clone()), &admin)), reply).0
+        };
+        let renewals = |sent: &[HttpCall]| sent.iter().filter(|c| c.url == "https://gitlab.com/oauth/token").count();
+        connect_gitlab(&h, &admin, &lab);
+        assert!(matches!(add(&lost), Finish::Fail(_)));
+
+        // Hours later, the tokens the record copied have expired, and so has the approval's (the
+        // same refresh token). The pass holds the approval and renews it the approval's way, once.
+        db_run(&h, |db| {
+            db.execute(
+                "UPDATE docs_hook_cleanup SET expires_at = '2020-01-01T00:00:00.000Z', next_attempt_at = '2000-01-01T00:00:00.000Z'",
+                &[],
+            )
+        });
+        db_run(&h, |db| db.execute("UPDATE docs_connections SET expires_at = '2020-01-01T00:00:00.000Z'", &[]));
+        let jobs = background(&h.call("GET", "/api/v1/docs-sources", None, &admin));
+        let (finish, sent, _) = drive_all(&h, jobs[0].clone(), &answer);
+        assert_eq!((filled(finish)["removed"].as_i64(), renewals(&sent)), (Some(1), 1));
+        assert!(lab.hooks.borrow().is_empty());
+        // The approval kept its renewed tokens and was let go: the next add uses it as it is.
+        let (finish, sent, _) = drive_all(&h, job_of(&h.call("POST", "/api/v1/docs-sources", Some(input.clone()), &admin)), &answer);
+        assert_eq!(renewals(&sent), 0, "already renewed");
+        filled(finish);
+        assert_eq!(lab.hooks.borrow().len(), 1);
+    }
+
+    #[test]
+    fn a_gitlab_folder_changed_while_its_files_are_fetched_writes_nothing() {
+        let (h, admin, lab, topic) = gitlab_setup();
+        let answer = |c: &HttpCall| lab.answer(c);
+        let (source, _) = add_gitlab_folder(&h, &admin, &lab, &topic, "docs");
+        let posts = || {
+            count(
+                &h,
+                &format!(
+                    "SELECT COUNT(*) FROM posts WHERE id IN (SELECT target_id FROM docs_items WHERE source_id = '{source}' AND kind = 'doc')"
+                ),
+            )
+        };
+        // Sync now lists the folder (and the project, by id) and asks for its files.
+        let mut job = job_of(&h.call("POST", &format!("/api/v1/docs-sources/{source}/sync"), None, &admin));
+        let Ok(Step::Fetch(calls)) = step_with(&h, &mut job, vec![]).0 else { panic!("a listing") };
+        let Ok(Step::Fetch(calls)) = step_with(&h, &mut job, calls.iter().map(answer).collect()).0 else { panic!("files to read") };
+        let files: Vec<HttpReply> = calls.iter().map(answer).collect();
+        // Meanwhile an admin switches the folder to another branch.
+        h.ok("PATCH", &format!("/api/v1/docs-sources/{source}"), Some(json!({ "branch": "release" })), &admin);
+        // The run's next step finds its folder isn't the one it started with: it writes nothing,
+        // and ends so the next sync starts from the folder as it is.
+        let (result, _) = step_with(&h, &mut job, files);
+        let Ok(Step::Done(Finish::Fill(v))) = result else { panic!("an end, not {result:?}") };
+        assert_eq!((v["created"].as_i64(), v["done"].as_bool()), (Some(0), Some(false)), "{v}");
+        assert_eq!(posts(), 0);
+        let s = source_of(&h, &admin);
+        assert_eq!((s["branch"].as_str(), s["pending"].as_bool()), (Some("release"), Some(true)), "{s}");
+        assert!(s["last_error"].as_str().unwrap().contains("changed while it synced"), "{s}");
+    }
+
+    #[test]
+    fn a_retry_before_its_cleanup_leaves_the_orphan_to_the_new_folders_tokens() {
+        let (h, admin, lab, topic) = gitlab_setup();
+        let answer = |c: &HttpCall| lab.answer(c);
+        let lost = |c: &HttpCall| {
+            let reply = lab.answer(c);
+            if c.method == "POST" && c.url == "https://gitlab.com/api/v4/projects/3/hooks" {
+                HttpReply { status: 0, body: String::new() }
+            } else {
+                reply
+            }
+        };
+        let input = json!({ "provider": "gitlab", "gitlab_connection": true, "project_id": 3, "repository": "acme/handbook", "folder": "docs", "topic_id": topic });
+        let add = |reply: &dyn Fn(&HttpCall) -> HttpReply| {
+            drive(&h, job_of(&h.call("POST", "/api/v1/docs-sources", Some(input.clone()), &admin)), reply).0
+        };
+        let renewals = |sent: &[HttpCall]| sent.iter().filter(|c| c.url == "https://gitlab.com/oauth/token").count();
+        let hooks = || lab.hooks.borrow().keys().copied().collect::<Vec<i64>>();
+        connect_gitlab(&h, &admin, &lab);
+        assert!(matches!(add(&lost), Finish::Fail(_)));
+        let orphan = hooks()[0];
+
+        // The admin tries again at once: the folder is saved, and the approval's tokens move onto
+        // it. The orphan's record borrows that folder's tokens from now on.
+        let folder = filled(add(&answer))["source"]["id"].as_str().unwrap().to_string();
+        let own = *hooks().iter().find(|id| **id != orphan).unwrap();
+        assert_eq!(count(&h, &format!("SELECT COUNT(*) FROM docs_hook_cleanup WHERE borrowed_source = '{folder}'")), 1);
+
+        // Hours later the record's copy and the folder's tokens have both expired. A pass holds the
+        // folder, renews its tokens its way (once), and deletes the orphan, leaving the folder's own.
+        db_run(&h, |db| {
+            db.execute(
+                "UPDATE docs_hook_cleanup SET expires_at = '2020-01-01T00:00:00.000Z', next_attempt_at = '2000-01-01T00:00:00.000Z'",
+                &[],
+            )
+        });
+        db_run(&h, |db| db.execute("UPDATE docs_source_links SET token_expires_at = '2020-01-01T00:00:00.000Z'", &[]));
+        let jobs = background(&h.call("GET", "/api/v1/docs-sources", None, &admin));
+        let (finish, sent, _) = drive_all(&h, jobs[0].clone(), &answer);
+        assert_eq!((filled(finish)["removed"].as_i64(), renewals(&sent)), (Some(1), 1));
+        assert_eq!(hooks(), [own]);
+        assert_eq!(count(&h, "SELECT COUNT(*) FROM docs_hook_cleanup"), 0);
+        // The folder kept its renewed tokens, and was let go: its sync works without renewing.
+        let (finish, sent, _) =
+            drive_all(&h, job_of(&h.call("POST", &format!("/api/v1/docs-sources/{folder}/sync"), None, &admin)), &answer);
+        assert_eq!(filled(finish)["created"], 2);
+        assert_eq!(renewals(&sent), 0);
+    }
+
+    #[test]
+    fn an_add_that_finishes_after_its_cleanup_saves_nothing() {
+        let (h, admin, lab, topic) = gitlab_setup();
+        let answer = |c: &HttpCall| lab.answer(c);
+        let input = json!({ "provider": "gitlab", "gitlab_connection": true, "project_id": 3, "repository": "acme/handbook", "folder": "docs", "topic_id": topic });
+        let sources = || count(&h, "SELECT COUNT(*) FROM docs_sources");
+        connect_gitlab(&h, &admin, &lab);
+        // The add finds the project and asks GitLab for the webhook, which GitLab adds.
+        let mut job = job_of(&h.call("POST", "/api/v1/docs-sources", Some(input.clone()), &admin));
+        let Ok(Step::Fetch(calls)) = step_with(&h, &mut job, vec![]).0 else { panic!("the project") };
+        let Ok(Step::Fetch(calls)) = step_with(&h, &mut job, calls.iter().map(answer).collect()).0 else { panic!("the webhook") };
+        let added: Vec<HttpReply> = calls.iter().map(answer).collect();
+        assert_eq!(lab.hooks.borrow().len(), 1);
+        // The add stalls past its grace. A pass claims its record and deletes the webhook.
+        db_run(&h, |db| db.execute("UPDATE docs_hook_cleanup SET next_attempt_at = '2000-01-01T00:00:00.000Z'", &[]));
+        let jobs = background(&h.call("GET", "/api/v1/docs-sources", None, &admin));
+        assert_eq!(filled(drive(&h, jobs[0].clone(), &answer).0)["removed"], 1);
+        assert!(lab.hooks.borrow().is_empty());
+        // The add finally finishes: it saves nothing, and says to try again.
+        let (result, _) = step_with(&h, &mut job, added);
+        assert!(matches!(result, Ok(Step::Done(Finish::Fail(ref e))) if e.message.contains("Try again")), "{result:?}");
+        assert_eq!(sources(), 0);
+        // Trying again works, with exactly one webhook.
+        filled(drive(&h, job_of(&h.call("POST", "/api/v1/docs-sources", Some(input), &admin)), &answer).0);
+        assert_eq!((sources(), lab.hooks.borrow().len(), count(&h, "SELECT COUNT(*) FROM docs_hook_cleanup")), (1, 1, 0));
+    }
+
+    #[test]
+    fn removing_the_folder_that_lent_its_tokens_takes_the_orphans_too() {
+        let (h, admin, lab, topic) = gitlab_setup();
+        let answer = |c: &HttpCall| lab.answer(c);
+        lab.others.borrow_mut().insert(5, ("acme/site".into(), lab.files.borrow().clone()));
+        // GitLab adds the webhook, but its answer never arrives.
+        let lost = |c: &HttpCall| {
+            let reply = lab.answer(c);
+            if c.method == "POST" && c.url.ends_with("/hooks") { HttpReply { status: 0, body: String::new() } } else { reply }
+        };
+        let input = |project: i64, path: &str| json!({ "provider": "gitlab", "gitlab_connection": true, "project_id": project, "repository": path, "folder": "docs", "topic_id": topic });
+        let add = |input: Value, reply: &dyn Fn(&HttpCall) -> HttpReply| {
+            drive(&h, job_of(&h.call("POST", "/api/v1/docs-sources", Some(input), &admin)), reply).0
+        };
+        let records = || count(&h, "SELECT COUNT(*) FROM docs_hook_cleanup");
+        connect_gitlab(&h, &admin, &lab);
+        // Two adds lose their answers: one on project 3, and one on project 5.
+        assert!(matches!(add(input(3, "acme/handbook"), &lost), Finish::Fail(_)));
+        assert!(matches!(add(input(5, "acme/site"), &lost), Finish::Fail(_)));
+        // The next try succeeds; the orphans' records now borrow its tokens.
+        let folder = filled(add(input(3, "acme/handbook"), &answer))["source"]["id"].as_str().unwrap().to_string();
+        assert_eq!((lab.hooks.borrow().len(), records()), (3, 2));
+        assert_eq!(count(&h, &format!("SELECT COUNT(*) FROM docs_hook_cleanup WHERE borrowed_source = '{folder}'")), 2);
+        // The admin removes that folder within the orphans' grace. Its removal record takes their
+        // webhooks over (the one on project 5 too), with the one set of tokens, and its pass deletes
+        // all three. Nothing is left behind.
+        let r = h.call("DELETE", &format!("/api/v1/docs-sources/{folder}"), None, &admin);
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert_eq!(records(), 1, "the folder's own record, with the others' work");
+        let jobs = background(&r);
+        assert_eq!(filled(drive(&h, jobs[0].clone(), &answer).0)["removed"], 3);
+        assert!(lab.hooks.borrow().is_empty(), "{:?}", lab.hooks.borrow());
+        // Kept until the orphans' grace is over (a webhook they asked for may still appear); then
+        // a pass finds nothing left, and it's done.
+        assert_eq!(records(), 1);
+        db_run(&h, |db| {
+            db.execute(
+                "UPDATE docs_hook_cleanup SET hold_until = '2000-01-01T00:00:00.000Z', next_attempt_at = '2000-01-01T00:00:00.000Z'",
+                &[],
+            )
+        });
+        let jobs = background(&h.call("GET", "/api/v1/docs-sources", None, &admin));
+        assert_eq!(filled(drive(&h, jobs[0].clone(), &answer).0)["removed"], 0);
+        assert_eq!(records(), 0);
+    }
+
+    #[test]
+    fn a_late_webhook_of_an_add_is_still_taken_off_after_its_folder_goes() {
+        let (h, admin, lab, topic) = gitlab_setup();
+        let answer = |c: &HttpCall| lab.answer(c);
+        // The webhook request times out while GitLab is still adding it: no webhook yet.
+        let slow = |c: &HttpCall| {
+            if c.method == "POST" && c.url.ends_with("/projects/3/hooks") {
+                HttpReply { status: 0, body: String::new() }
+            } else {
+                lab.answer(c)
+            }
+        };
+        let input = json!({ "provider": "gitlab", "gitlab_connection": true, "project_id": 3, "repository": "acme/handbook", "folder": "docs", "topic_id": topic });
+        let add = |reply: &dyn Fn(&HttpCall) -> HttpReply| {
+            drive(&h, job_of(&h.call("POST", "/api/v1/docs-sources", Some(input.clone()), &admin)), reply).0
+        };
+        let records = || count(&h, "SELECT COUNT(*) FROM docs_hook_cleanup");
+        connect_gitlab(&h, &admin, &lab);
+        assert!(matches!(add(&slow), Finish::Fail(_)));
+        let pending = db_run(&h, |db| db.one("SELECT source_id FROM docs_hook_cleanup", &[])).unwrap().str("source_id");
+        // The retry succeeds, and the admin removes that folder within the first add's grace. The
+        // removal pass takes the folder's webhook off at once, finds nothing else yet, and keeps the
+        // record until that grace is over.
+        let folder = filled(add(&answer))["source"]["id"].as_str().unwrap().to_string();
+        let r = h.call("DELETE", &format!("/api/v1/docs-sources/{folder}"), None, &admin);
+        assert_eq!(filled(drive(&h, background(&r)[0].clone(), &answer).0)["removed"], 1);
+        assert!(lab.hooks.borrow().is_empty());
+        assert_eq!(records(), 1, "held for the first add's grace");
+        assert!(background(&h.call("GET", "/api/v1/docs-sources", None, &admin)).is_empty(), "not due before then");
+        // GitLab finishes adding the first webhook.
+        let token = format!("Bearer glo_{}", lab.issued.borrow());
+        let url = format!("https://kb.test/hooks/docs/{pending}");
+        answer(
+            &connect::HttpCall::post_json("https://gitlab.com/api/v4/projects/3/hooks", &json!({ "url": url, "token": "x" }))
+                .header("authorization", token),
+        );
+        assert_eq!(lab.hooks.borrow().len(), 1);
+        // Once the grace is over, a pass takes it off, and then the record is done.
+        db_run(&h, |db| {
+            db.execute(
+                "UPDATE docs_hook_cleanup SET hold_until = '2000-01-01T00:00:00.000Z', next_attempt_at = '2000-01-01T00:00:00.000Z'",
+                &[],
+            )
+        });
+        let jobs = background(&h.call("GET", "/api/v1/docs-sources", None, &admin));
+        assert_eq!(filled(drive(&h, jobs[0].clone(), &answer).0)["removed"], 1);
+        assert!(lab.hooks.borrow().is_empty());
+        assert_eq!(records(), 0);
+    }
+
+    #[test]
+    fn a_pass_that_listed_before_the_hold_ends_lists_again() {
+        let (h, admin, lab, topic) = gitlab_setup();
+        let answer = |c: &HttpCall| lab.answer(c);
+        let slow = |c: &HttpCall| {
+            if c.method == "POST" && c.url.ends_with("/projects/3/hooks") {
+                HttpReply { status: 0, body: String::new() }
+            } else {
+                lab.answer(c)
+            }
+        };
+        let input = json!({ "provider": "gitlab", "gitlab_connection": true, "project_id": 3, "repository": "acme/handbook", "folder": "docs", "topic_id": topic });
+        let add = |reply: &dyn Fn(&HttpCall) -> HttpReply| {
+            drive(&h, job_of(&h.call("POST", "/api/v1/docs-sources", Some(input.clone()), &admin)), reply).0
+        };
+        let records = || count(&h, "SELECT COUNT(*) FROM docs_hook_cleanup");
+        let pass = || background(&h.call("GET", "/api/v1/docs-sources", None, &admin)).remove(0);
+        connect_gitlab(&h, &admin, &lab);
+        assert!(matches!(add(&slow), Finish::Fail(_)));
+        let pending = db_run(&h, |db| db.one("SELECT source_id FROM docs_hook_cleanup", &[])).unwrap().str("source_id");
+        let folder = filled(add(&answer))["source"]["id"].as_str().unwrap().to_string();
+        let r = h.call("DELETE", &format!("/api/v1/docs-sources/{folder}"), None, &admin);
+        filled(drive(&h, background(&r)[0].clone(), &answer).0);
+        assert_eq!(records(), 1);
+
+        // The hold ends a moment from now. A pass asks for the list just before it ends...
+        let soon = dumbslab_core::util::ts(chrono::Utc::now() + chrono::Duration::milliseconds(400));
+        db_run(&h, |db| {
+            db.execute(
+                "UPDATE docs_hook_cleanup SET hold_until = ?, next_attempt_at = '2000-01-01T00:00:00.000Z'",
+                &dumbslab_core::params![soon.clone()],
+            )
+        });
+        let mut job = pass();
+        let Ok(Step::Fetch(calls)) = step_with(&h, &mut job, vec![]).0 else { panic!("a listing") };
+        let listed: Vec<HttpReply> = calls.iter().map(answer).collect();
+        // ...and the add's webhook appears after that listing, while the pass finishes only after
+        // the hold ended. It found nothing, but it keeps the record: what it read was from before.
+        let token = format!("Bearer glo_{}", lab.issued.borrow());
+        let url = format!("https://kb.test/hooks/docs/{pending}");
+        answer(
+            &connect::HttpCall::post_json("https://gitlab.com/api/v4/projects/3/hooks", &json!({ "url": url, "token": "x" }))
+                .header("authorization", token),
+        );
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        let Ok(Step::Done(Finish::Fill(v))) = step_with(&h, &mut job, listed).0 else { panic!("an end") };
+        assert_eq!(v["removed"], 0);
+        assert_eq!(records(), 1, "kept: it listed before the hold ended");
+        // The next pass lists again, now after the hold: it takes the webhook off, and is done.
+        assert_eq!(filled(drive(&h, pass(), &answer).0)["removed"], 1);
+        assert!(lab.hooks.borrow().is_empty());
+        assert_eq!(records(), 0);
+    }
+
+    #[test]
+    fn a_borrowed_renewal_that_lands_late_reconnects_the_folder() {
+        let (h, admin, lab, topic) = gitlab_setup();
+        let answer = |c: &HttpCall| lab.answer(c);
+        let lost = |c: &HttpCall| {
+            let reply = lab.answer(c);
+            if c.method == "POST" && c.url.ends_with("/projects/3/hooks") { HttpReply { status: 0, body: String::new() } } else { reply }
+        };
+        let input = json!({ "provider": "gitlab", "gitlab_connection": true, "project_id": 3, "repository": "acme/handbook", "folder": "docs", "topic_id": topic });
+        let add = |reply: &dyn Fn(&HttpCall) -> HttpReply| {
+            drive(&h, job_of(&h.call("POST", "/api/v1/docs-sources", Some(input.clone()), &admin)), reply).0
+        };
+        let renewals = |sent: &[HttpCall]| sent.iter().filter(|c| c.url == "https://gitlab.com/oauth/token").count();
+        connect_gitlab(&h, &admin, &lab);
+        assert!(matches!(add(&lost), Finish::Fail(_)));
+        let folder = filled(add(&answer))["source"]["id"].as_str().unwrap().to_string();
+        let disconnected = || source_of(&h, &admin)["disconnected"].clone();
+        // The orphan's record borrows the folder's tokens; both its copy and the folder's expire.
+        db_run(&h, |db| {
+            db.execute(
+                "UPDATE docs_hook_cleanup SET expires_at = '2000-01-01T00:00:00.000Z', next_attempt_at = '2000-01-01T00:00:00.000Z'",
+                &[],
+            )
+        });
+        db_run(&h, |db| db.execute("UPDATE docs_source_links SET token_expires_at = '2000-01-01T00:00:00.000Z'", &[]));
+
+        // A pass holds the folder and asks GitLab to renew its tokens. GitLab does, but the answer
+        // is slow, past the pass's hold and the wait others give a renewal.
+        let mut pass = background(&h.call("GET", "/api/v1/docs-sources", None, &admin)).remove(0);
+        let Ok(Step::Fetch(calls)) = step_with(&h, &mut pass, vec![]).0 else { panic!("a renewal") };
+        assert_eq!(calls[0].url, "https://gitlab.com/oauth/token");
+        let renewed: Vec<HttpReply> = calls.iter().map(answer).collect();
+        db_run(&h, |db| {
+            db.execute(
+                "UPDATE docs_source_links SET refreshing = '2000-01-01T00:00:00.000Z' || substr(refreshing, instr(refreshing, '|'))",
+                &[],
+            )
+        });
+        db_run(&h, |db| db.execute("UPDATE docs_sources SET running_until = NULL", &[]));
+        // Meanwhile a sync spends the same refresh token, GitLab refuses it, and the folder waits
+        // for Reconnect.
+        let (finish, _) = drive(&h, job_of(&h.call("POST", &format!("/api/v1/docs-sources/{folder}/sync"), None, &admin)), &answer);
+        assert!(matches!(finish, Finish::Fail(_)));
+        assert!(disconnected().is_string(), "signed out");
+        // The pass's answer lands: the folder keeps the new tokens, and the refusal is undone.
+        let Ok(Step::Fetch(calls)) = step_with(&h, &mut pass, renewed).0 else { panic!("the webhooks' list") };
+        assert_eq!(disconnected(), Value::Null);
+        let Ok(Step::Fetch(calls)) = step_with(&h, &mut pass, calls.iter().map(answer).collect()).0 else { panic!("deletions") };
+        assert!(matches!(step_with(&h, &mut pass, calls.iter().map(answer).collect()).0, Ok(Step::Done(Finish::Fill(_)))));
+        // Sync now works, with the tokens the pass kept.
+        let (finish, sent, _) =
+            drive_all(&h, job_of(&h.call("POST", &format!("/api/v1/docs-sources/{folder}/sync"), None, &admin)), &answer);
+        assert_eq!(filled(finish)["created"], 2);
+        assert_eq!(renewals(&sent), 0);
+    }
+
+    #[test]
+    fn a_folder_signed_out_by_a_stale_refusal_heals_when_good_tokens_land() {
+        let (h, admin, lab, topic) = gitlab_setup();
+        let answer = |c: &HttpCall| lab.answer(c);
+        let lost = |c: &HttpCall| {
+            let reply = lab.answer(c);
+            if c.method == "POST" && c.url.ends_with("/projects/3/hooks") { HttpReply { status: 0, body: String::new() } } else { reply }
+        };
+        let input = json!({ "provider": "gitlab", "gitlab_connection": true, "project_id": 3, "repository": "acme/handbook", "folder": "docs", "topic_id": topic });
+        let add = |reply: &dyn Fn(&HttpCall) -> HttpReply| {
+            drive(&h, job_of(&h.call("POST", "/api/v1/docs-sources", Some(input.clone()), &admin)), reply).0
+        };
+        let renewals = |sent: &[HttpCall]| sent.iter().filter(|c| c.url == "https://gitlab.com/oauth/token").count();
+        connect_gitlab(&h, &admin, &lab);
+        assert!(matches!(add(&lost), Finish::Fail(_)));
+        let folder = filled(add(&answer))["source"]["id"].as_str().unwrap().to_string();
+        let disconnected = || source_of(&h, &admin)["disconnected"].clone();
+        let secret = lab.hooks.borrow().values().find(|h| h["url"].as_str().unwrap().ends_with(&folder)).unwrap()["token"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        db_run(&h, |db| {
+            db.execute(
+                "UPDATE docs_hook_cleanup SET expires_at = '2000-01-01T00:00:00.000Z', next_attempt_at = '2000-01-01T00:00:00.000Z'",
+                &[],
+            )
+        });
+        db_run(&h, |db| db.execute("UPDATE docs_source_links SET token_expires_at = '2000-01-01T00:00:00.000Z'", &[]));
+
+        // Cleanup A renews the folder's refresh token R; its answer is slow.
+        let mut a = background(&h.call("GET", "/api/v1/docs-sources", None, &admin)).remove(0);
+        let Ok(Step::Fetch(calls)) = step_with(&h, &mut a, vec![]).0 else { panic!("a renewal") };
+        let a_renewed: Vec<HttpReply> = calls.iter().map(answer).collect();
+        db_run(&h, |db| {
+            db.execute(
+                "UPDATE docs_source_links SET refreshing = '2000-01-01T00:00:00.000Z' || substr(refreshing, instr(refreshing, '|'))",
+                &[],
+            )
+        });
+        db_run(&h, |db| db.execute("UPDATE docs_sources SET running_until = NULL", &[]));
+        // Sync B spends R too, is refused, and signs the folder out.
+        drive(&h, job_of(&h.call("POST", &format!("/api/v1/docs-sources/{folder}/sync"), None, &admin)), &answer);
+        assert!(disconnected().is_string());
+        // A push starts sync C, which notes its own renewal of R over B's refusal.
+        let push = json!({ "object_kind": "push", "ref": "refs/heads/main" }).to_string();
+        let r = hook(&h, &format!("/hooks/docs/{folder}"), &push, &[("x-gitlab-event", "Push Hook"), ("x-gitlab-token", &secret)]);
+        let mut c = job_of(&r);
+        let Ok(Step::Fetch(calls)) = step_with(&h, &mut c, vec![]).0 else { panic!("a renewal") };
+        let c_refused: Vec<HttpReply> = calls.iter().map(answer).collect();
+        // A's answer lands: GitLab just issued those tokens, so the folder is connected again.
+        let Ok(Step::Fetch(calls)) = step_with(&h, &mut a, a_renewed).0 else { panic!("the webhooks' list") };
+        assert_eq!(disconnected(), Value::Null);
+        let Ok(Step::Fetch(calls)) = step_with(&h, &mut a, calls.iter().map(answer).collect()).0 else { panic!("deletions") };
+        assert!(matches!(step_with(&h, &mut a, calls.iter().map(answer).collect()).0, Ok(Step::Done(_))));
+        // C's refusal comes back: newer tokens are there, so it doesn't sign the folder out.
+        assert!(matches!(step_with(&h, &mut c, c_refused).0, Ok(Step::Done(Finish::Fail(_)))));
+        assert_eq!(disconnected(), Value::Null);
+        let (finish, sent, _) =
+            drive_all(&h, job_of(&h.call("POST", &format!("/api/v1/docs-sources/{folder}/sync"), None, &admin)), &answer);
+        assert_eq!((filled(finish)["created"].as_i64(), renewals(&sent)), (Some(2), 0));
+    }
+
+    #[test]
+    fn a_revoked_gitlab_folder_is_signed_out_again_and_asks_for_reconnect() {
+        let (h, admin, lab, topic) = gitlab_setup();
+        let answer = |c: &HttpCall| lab.answer(c);
+        let (folder, _) = add_gitlab_folder(&h, &admin, &lab, &topic, "docs");
+        let sync = || h.call("POST", &format!("/api/v1/docs-sources/{folder}/sync"), None, &admin);
+        let renewals = |sent: &[HttpCall]| sent.iter().filter(|c| c.url == "https://gitlab.com/oauth/token").count();
+        let disconnected = || source_of(&h, &admin)["disconnected"].clone();
+        // Signed out by a refusal of other tokens than it has: Sync now tries, GitLab accepts its
+        // tokens, and it's connected again.
+        db_run(&h, |db| {
+            db.execute(
+                "UPDATE docs_source_links SET disconnected = 'gitlab_signed_out', refreshing = '2000-01-01T00:00:00.000Z|refused|other'",
+                &[],
+            )
+        });
+        assert!(disconnected().is_string());
+        filled(drive(&h, job_of(&sync()), &answer).0);
+        assert_eq!(disconnected(), Value::Null);
+        // A renewal: the folder works.
+        db_run(&h, |db| db.execute("UPDATE docs_source_links SET token_expires_at = '2000-01-01T00:00:00.000Z'", &[]));
+        let (finish, sent, _) = drive_all(&h, job_of(&sync()), &answer);
+        assert_eq!((filled(finish)["unchanged"].as_i64(), renewals(&sent)), (Some(2), 1));
+        // The person revokes DumbSlab's access. The next request gets 401: the run fails, and the
+        // next one renews, is refused, and signs the folder out.
+        lab.grants.borrow_mut().clear();
+        let (finish, _) = drive(&h, job_of(&sync()), &answer);
+        assert!(matches!(finish, Finish::Fail(ref e) if e.message.contains("renews it")), "{finish:?}");
+        assert_eq!(disconnected(), Value::Null);
+        let (finish, sent, _) = drive_all(&h, job_of(&sync()), &answer);
+        assert!(matches!(finish, Finish::Fail(_)) && renewals(&sent) == 1);
+        assert!(disconnected().as_str().unwrap().contains("Reconnect"));
+        // Its tokens are the refused ones: Sync now says to reconnect, and tries nothing.
+        let r = sync();
+        assert_eq!((r.status, r.body["error"]["code"].as_str()), (409, Some("disconnected")), "{}", r.body);
+        assert!(r.body["error"]["message"].as_str().unwrap().contains("Reconnect"));
+    }
+
+    #[test]
+    fn a_refresh_that_lands_late_keeps_its_tokens() {
+        let (h, admin, lab, topic) = gitlab_setup();
+        let answer = |c: &HttpCall| lab.answer(c);
+        let (source, _) = add_gitlab_folder(&h, &admin, &lab, &topic, "docs");
+        let expire_token =
+            || db_run(&h, |db| db.execute("UPDATE docs_source_links SET token_expires_at = '2020-01-01T00:00:00.000Z'", &[]));
+        let expire_lease = || db_run(&h, |db| db.execute("UPDATE docs_sources SET running_until = '2000-01-01T00:00:00.000Z x'", &[]));
+        let sync = || h.call("POST", &format!("/api/v1/docs-sources/{source}/sync"), None, &admin);
+        let disconnected = || source_of(&h, &admin)["disconnected"].clone();
+        // Sync A asks GitLab to renew the tokens; the answer is on its way when A's lease runs out.
+        let refreshing = || {
+            expire_token();
+            let mut a = job_of(&sync());
+            let Ok(Step::Fetch(calls)) = step_with(&h, &mut a, vec![]).0 else { panic!("a refresh") };
+            assert_eq!(calls[0].url, "https://gitlab.com/oauth/token");
+            let replies: Vec<HttpReply> = calls.iter().map(answer).collect();
+            expire_lease();
+            (a, replies)
+        };
+        // The next sync uses the newest tokens, without renewing them.
+        let works = || {
+            let (finish, sent) = drive(&h, job_of(&sync()), &answer);
+            filled(finish);
+            assert!(sent.iter().all(|c| c.url != "https://gitlab.com/oauth/token"));
+            assert!(sent[0].headers.contains(&("authorization".into(), format!("Bearer glo_{}", lab.issued.borrow()))), "{:?}", sent[0]);
+        };
+
+        // Sync B takes over meanwhile: it doesn't spend the same refresh token, which GitLab would
+        // refuse, while A's answer may still land.
+        let (mut a, a_refresh) = refreshing();
+        let (finish, sent) = drive(&h, job_of(&sync()), &answer);
+        assert!(matches!(finish, Finish::Fail(ref e) if e.message.contains("Another sync is renewing")), "{finish:?}");
+        assert!(sent.is_empty(), "nothing spent");
+        assert_eq!(disconnected(), Value::Null);
+        // A's answer lands: its tokens are kept, though A lost its lease.
+        assert!(matches!(step_with(&h, &mut a, a_refresh).0, Ok(Step::Done(Finish::Fail(_)))));
+        assert_eq!(disconnected(), Value::Null);
+        works();
+
+        // Past the time A's answer could take, B spends the token anyway, GitLab refuses it (A spent
+        // it), and the folder waits for Reconnect. A's answer still lands: its tokens are kept and
+        // the folder is back.
+        let (mut a, a_refresh) = refreshing();
+        db_run(&h, |db| {
+            db.execute(
+                "UPDATE docs_source_links SET refreshing = '2000-01-01T00:00:00.000Z' || substr(refreshing, instr(refreshing, '|'))",
+                &[],
+            )
+        });
+        let (finish, sent) = drive(&h, job_of(&sync()), &answer);
+        assert!(matches!(finish, Finish::Fail(_)));
+        assert_eq!(sent[0].url, "https://gitlab.com/oauth/token");
+        assert!(disconnected().as_str().unwrap().contains("Reconnect"));
+        assert!(matches!(step_with(&h, &mut a, a_refresh).0, Ok(Step::Done(Finish::Fail(_)))), "A lost its lease");
+        assert_eq!(disconnected(), Value::Null, "A's tokens put it back");
+        works();
     }
 }
