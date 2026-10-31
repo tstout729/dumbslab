@@ -28,9 +28,13 @@ pub fn ops() -> Vec<Op> {
             .title("People sync settings")
             .desc("The workspace's people sync from BambooHR: its company domain, whether changes in BambooHR start a sync (its webhook) and why not, and how the last sync went. Credentials are never shown.")
             .build(),
+        op("sync", "connect_people_sync", "POST", "/people-sync/sign-in", Access::Admin, connect_people_sync)
+            .title("Sign in with BambooHR")
+            .desc("Set up the people sync by signing in with BambooHR, the one way on hosted DumbSlab. Give the company domain, then open `authorize_url` in the admin's browser: they approve DumbSlab in BambooHR and come back to Settings › People sync, where DumbSlab checks access, adds BambooHR's webhook so changes there start a sync, and saves. The link works once, for 15 minutes, for the admin who asked. Needs the host's BambooHR app (`sign_in_available` in get_people_sync).")
+            .build(),
         op("sync", "set_people_sync", "PUT", "/people-sync", Access::Admin, set_people_sync)
             .title("Set up the people sync")
-            .desc("Set up (or change) the people sync from BambooHR with the company domain and an API key. DumbSlab checks the key with BambooHR first and saves nothing if it doesn't work. Then it adds a webhook in BambooHR (replacing the one it added before), so changes there start a sync. If BambooHR won't let the key's user add webhooks, the sync is saved anyway, and `webhook_error` says why: add the webhook in BambooHR by hand and pass its private key as `webhook_key`. Leave the API key out to keep the saved one. Then run sync_people. A sync fills in title, department, location, work phone, pronouns and manager for people here whose email matches a BambooHR work email; it never adds, deactivates or removes anyone.")
+            .desc("Set up the people sync with the company domain and an API key (self-hosted only: BambooHR's terms let hosted services use Sign in with BambooHR alone, see connect_people_sync), or save it again with the saved credentials, e.g. to move the webhook after the workspace moved. DumbSlab checks access with BambooHR first and saves nothing if it doesn't work. Then it adds a webhook in BambooHR, so changes there start a sync; saving again keeps that webhook when nothing changed and BambooHR still has it, and replaces it otherwise. If BambooHR won't let DumbSlab's user add webhooks, the sync is saved anyway, and `webhook_error` says why: add the webhook in BambooHR by hand and pass its private key as `webhook_key`. Leave the API key out to keep the saved credentials. Then run sync_people. A sync fills in title, department, location, work phone, pronouns and manager for people here whose email matches a BambooHR work email; it never adds, deactivates or removes anyone.")
             .idempotent()
             .build(),
         op("sync", "sync_people", "POST", "/people-sync/run", Access::Admin, sync_people)
@@ -93,6 +97,12 @@ pub struct PeopleSync {
     pub provider: String,
     /// The BambooHR company domain: `acme` for acme.bamboohr.com.
     pub subdomain: Option<String>,
+    /// How DumbSlab signs in to BambooHR: `oauth` (Sign in with BambooHR) or `api_key`.
+    pub auth: Option<String>,
+    /// Sign in with BambooHR works here: the host registered a BambooHR app.
+    pub sign_in_available: bool,
+    /// API keys are accepted here. Self-hosted only: BambooHR's developer terms allow API keys only in systems a company runs itself (https://www.bamboohr.com/legal/developer-terms-of-service, §3.2–3.3).
+    pub api_key_allowed: bool,
     /// Changes in BambooHR start a sync: a webhook's private key is saved, so its calls are checked.
     pub webhook: bool,
     /// DumbSlab added that webhook in BambooHR itself. When `webhook` is on and this is off, an admin added it by hand and pasted its private key.
@@ -121,6 +131,9 @@ pub(crate) fn people_view(ctx: &Ctx) -> ApiResult<PeopleSync> {
         configured: row.is_some(),
         provider: people::PROVIDER.into(),
         subdomain: row.as_ref().map(|r| r.str("subdomain")),
+        auth: row.as_ref().map(|r| r.str("auth")),
+        sign_in_available: people::sign_in_app(ctx.cfg).is_some(),
+        api_key_allowed: !people::hosted(ctx.cfg),
         webhook: row.as_ref().is_some_and(|r| r.bool("webhook")),
         automatic_webhook: row.as_ref().is_some_and(|r| r.bool("webhook") && r.opt_str("webhook_id").is_some()),
         webhook_error: row.as_ref().and_then(|r| people::webhook_problem(r, &webhook_url)),
@@ -140,7 +153,7 @@ fn get_people_sync(ctx: &mut Ctx, _: NoInput) -> ApiResult<PeopleSync> {
 pub struct SetPeopleSyncInput {
     /// The BambooHR company domain: `acme` for acme.bamboohr.com. `acme.bamboohr.com` or any address on it works too.
     pub subdomain: String,
-    /// A BambooHR API key (in BambooHR: your name › API Keys). Its user must be able to see employees' work emails and job details, and to add webhooks for changes to start a sync. Checked with BambooHR before it's saved. Required the first time; leave out to keep the saved one.
+    /// A BambooHR API key (in BambooHR: your name › API Keys), self-hosted only. Its user must be able to see employees' work emails and job details, and to add webhooks for changes to start a sync. Checked with BambooHR before it's saved. Required the first time; leave out to keep the saved one.
     pub api_key: Option<String>,
     /// Only when DumbSlab can't add BambooHR's webhook itself (see `webhook_error`): the private key of a webhook you added in BambooHR that posts to `webhook_url`. DumbSlab then adds none. An empty string removes it, and DumbSlab adds its own again; leave out to keep the saved one.
     pub webhook_key: Option<String>,
@@ -157,6 +170,25 @@ fn set_people_sync(ctx: &mut Ctx, input: SetPeopleSyncInput) -> ApiResult<Deferr
     Ok(Deferred::Pending)
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ConnectPeopleSyncInput {
+    /// The BambooHR company domain: `acme` for acme.bamboohr.com. `acme.bamboohr.com` or any address on it works too.
+    pub subdomain: String,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct PeopleSyncSignIn {
+    /// BambooHR's sign-in page. Open it in the admin's browser, signed in to DumbSlab as the admin who asked.
+    pub authorize_url: String,
+}
+
+fn connect_people_sync(ctx: &mut Ctx, input: ConnectPeopleSyncInput) -> ApiResult<PeopleSyncSignIn> {
+    key_needed(ctx)?;
+    let subdomain = people::valid_subdomain(&input.subdomain).map_err(ApiError::bad_request)?;
+    Ok(PeopleSyncSignIn { authorize_url: people::start_sign_in(ctx, &subdomain)? })
+}
+
 fn sync_people(ctx: &mut Ctx, _: NoInput) -> ApiResult<Deferred<PeopleSyncResult>> {
     key_needed(ctx)?;
     match people::start(ctx.db, ctx.cfg, &ctx.base_url, Utc::now())? {
@@ -170,10 +202,13 @@ fn sync_people(ctx: &mut Ctx, _: NoInput) -> ApiResult<Deferred<PeopleSyncResult
 
 fn remove_people_sync(ctx: &mut Ctx, _: NoInput) -> ApiResult<Deferred<PeopleSyncRemoved>> {
     let row = people_row(ctx)?.ok_or_else(|| ApiError::not_found("people sync"))?;
+    if people::saving(ctx.db, ctx.now)? {
+        return Err(people::busy());
+    }
     ctx.db.execute("DELETE FROM people_sync WHERE id = 1", &[])?;
     emit(ctx, Event::new("people_sync.removed", "people_sync", "1", "removed the people sync").admin_only())?;
     // Then the host deletes the webhook DumbSlab added in BambooHR. The sync is gone either way.
-    match people::removal_job(ctx.cfg, &row) {
+    match people::removal_job(ctx.cfg, &row, &ctx.base_url) {
         Ok(Some(job)) => {
             ctx.effects.push(Effect::Connect(job));
             Ok(Deferred::Pending)

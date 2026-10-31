@@ -28,12 +28,13 @@ use dumbslab::web;
 
 /// Connected apps' settings from the environment: `DUMBSLAB_CONNECTOR_KEY` encrypts people's
 /// credentials, and `DUMBSLAB_<APP>_CLIENT_ID` / `_CLIENT_SECRET` (e.g. `DUMBSLAB_GITHUB_CLIENT_ID`,
-/// `DUMBSLAB_GOOGLE_DRIVE_CLIENT_SECRET`) let people sign in to that app.
+/// `DUMBSLAB_GOOGLE_DRIVE_CLIENT_SECRET`) let people sign in to that app. `DUMBSLAB_BAMBOOHR_…` is
+/// the people sync's Sign in with BambooHR (docs/hosting/bamboohr-app.md).
 fn connectors_from_env() -> Connectors {
     let var = |k: &str| std::env::var(k).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
     let mut apps = BTreeMap::new();
-    for c in connect::providers::ALL {
-        let id = c.info().id;
+    let ids = connect::providers::ALL.iter().map(|c| c.info().id).chain([dumbslab_core::sync::people::PROVIDER]);
+    for id in ids {
         let env = id.to_ascii_uppercase().replace('-', "_");
         if let (Some(client_id), Some(client_secret)) =
             (var(&format!("DUMBSLAB_{env}_CLIENT_ID")), var(&format!("DUMBSLAB_{env}_CLIENT_SECRET")))

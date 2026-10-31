@@ -14,11 +14,13 @@ use crate::sql::var;
 
 /// `CONNECTOR_KEY` (secret) encrypts people's credentials; `<APP>_CLIENT_ID` and the secret
 /// `<APP>_CLIENT_SECRET` (e.g. `GITHUB_CLIENT_ID`, `GOOGLE_DRIVE_CLIENT_SECRET`) let people sign in
-/// to that app. Hosted workspaces send sign-ins back through the root domain, which forwards them.
+/// to that app. `BAMBOOHR_CLIENT_ID` and `BAMBOOHR_CLIENT_SECRET` are the people sync's Sign in
+/// with BambooHR (docs/hosting/bamboohr-app.md). Hosted workspaces send sign-ins back through the
+/// root domain, which forwards them.
 pub fn connectors(env: &Env, origin: &str, hosted: bool) -> Connectors {
     let mut apps = BTreeMap::new();
-    for c in connect::providers::ALL {
-        let id = c.info().id;
+    let ids = connect::providers::ALL.iter().map(|c| c.info().id).chain([dumbslab_core::sync::people::PROVIDER]);
+    for id in ids {
         let name = id.to_ascii_uppercase().replace('-', "_");
         if let (Some(client_id), Some(client_secret)) = (var(env, &format!("{name}_CLIENT_ID")), var(env, &format!("{name}_CLIENT_SECRET")))
         {
@@ -81,9 +83,10 @@ pub async fn send(call: &HttpCall) -> HttpReply {
     }
 }
 
-/// `GET /connect/callback` on the root domain: an app sent someone back after they signed in. The
-/// `state` starts with their workspace's address; send them on to the workspace, which checks it.
-pub fn root_callback_redirect(url: &Url, root: &str) -> Result<Response> {
+/// `GET <path>` on the root domain (`/connect/callback`, `/sync/bamboohr/callback`): an app sent
+/// someone back after they signed in. The `state` starts with their workspace's address; send them
+/// on to the same path at the workspace, which checks it.
+pub fn root_callback_redirect(url: &Url, root: &str, path: &str) -> Result<Response> {
     let query = url.query().unwrap_or_default();
     let state = url.query_pairs().find(|(k, _)| k == "state").map(|(_, v)| v.into_owned()).unwrap_or_default();
     let address = state.split_once('.').map(|(a, _)| a).unwrap_or_default();
@@ -95,7 +98,7 @@ pub fn root_callback_redirect(url: &Url, root: &str) -> Result<Response> {
         );
     }
     let port = url.port().map(|p| format!(":{p}")).unwrap_or_default();
-    let target = Url::parse(&format!("{}://{address}.{root}{port}/connect/callback?{query}", url.scheme()))?;
+    let target = Url::parse(&format!("{}://{address}.{root}{port}{path}?{query}", url.scheme()))?;
     // Built with all its headers: a `Response::redirect`'s headers can't be changed afterwards.
     let headers = Headers::new();
     headers.set("location", target.as_str())?;

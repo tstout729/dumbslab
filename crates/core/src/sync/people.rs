@@ -7,11 +7,15 @@
 //! they are. Photos are left out: BambooHR's photo links expire, and its photo download needs the
 //! API key.
 //!
-//! Saving the sync checks the API key and adds BambooHR's webhook (see [`setup`]).
+//! DumbSlab signs in to BambooHR with Sign in with BambooHR (OAuth), or, self-hosted only, an API
+//! key: BambooHR's developer terms (https://www.bamboohr.com/legal/developer-terms-of-service,
+//! §3.2 and §3.3) allow API keys only in systems a company runs itself (see [`oauth`]). Saving the
+//! sync checks access and adds BambooHR's webhook (see [`setup`]).
 //!
 //! Docs: https://documentation.bamboohr.com/reference/list-employees,
 //! https://documentation.bamboohr.com/docs/webhooks
 
+mod oauth;
 mod setup;
 
 use std::collections::{HashMap, HashSet};
@@ -22,15 +26,17 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::{Ended, check_plan, hook_answer, hook_started};
-use crate::connect::{self, Credential, Finish, HttpCall, HttpReply, Job, Step, http_error};
+use crate::connect::{self, Finish, HttpCall, HttpReply, Job, Step, http_error};
 use crate::db::{Db, DbExt, SqlValue};
 use crate::error::{ApiError, ApiResult};
 use crate::events::{Event, emit};
 use crate::util::{secure_eq, ts};
 use crate::{HostConfig, Outcome, Request, params};
 
+pub(crate) use oauth::{API_KEYS_REFUSED, Auth, app as sign_in_app, hosted, start_sign_in};
+pub use oauth::{CALLBACK_PATH, SCOPES, callback};
 pub use setup::PeopleSyncRemoved;
-pub(crate) use setup::{HOOK_PATH, removal_job, setup_job, webhook_problem};
+pub(crate) use setup::{HOOK_PATH, busy, removal_job, saving, setup_job, webhook_problem};
 
 pub const PROVIDER: &str = "bamboohr";
 pub(crate) const TABLE: &str = "people_sync";
@@ -114,13 +120,15 @@ pub struct PeopleSyncResult {
     pub not_found_count: usize,
     /// Active people here without an active BambooHR employee.
     pub without_record: usize,
-    /// BambooHR has more active employees than one sync reads (7,500); the rest weren't read.
+    /// BambooHR has more active employees than one sync reads (7,500, or 5,000 when it renewed the sign-in first); the rest weren't read.
     pub truncated: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 enum Phase {
     Start,
+    /// Waiting for BambooHR to renew the sign-in; the sync holds the renewal lease.
+    Renewing(String),
     Reading,
 }
 
@@ -149,11 +157,13 @@ enum Work {
 struct Run {
     lease: String,
     subdomain: String,
-    cred: Credential,
+    creds: oauth::Creds,
     owner_id: String,
     base_url: String,
     employees: Vec<Employee>,
     pages: usize,
+    /// Pages this sync may read: one fewer when it renewed the sign-in first.
+    max_pages: usize,
     phase: Phase,
 }
 
@@ -177,24 +187,22 @@ impl PeopleJob {
 /// Starts a sync, unless one is running. `Ok(None)` when one is.
 pub(crate) fn start(db: &dyn Db, cfg: &HostConfig, base_url: &str, now: DateTime<Utc>) -> ApiResult<Option<Job>> {
     let row = db.one("SELECT * FROM people_sync WHERE id = 1", &[])?.ok_or_else(|| ApiError::not_found("people sync (set it up first)"))?;
-    let cred = super::open(cfg, OWNER, PROVIDER, &row.str("secret"))?;
+    let creds = oauth::Creds::of_row(cfg, &row)?;
+    if creds.auth == Auth::ApiKey && hosted(cfg) {
+        return Err(ApiError::new(400, "api_key_not_allowed", API_KEYS_REFUSED));
+    }
     let Some(lease) = super::claim(db, TABLE, key(), now)? else { return Ok(None) };
     Ok(Some(Job::People(Box::new(PeopleJob::new(Work::Sync(Run {
         lease,
         subdomain: row.str("subdomain"),
-        cred,
+        creds,
         owner_id: row.str("owner_id"),
         base_url: base_url.to_string(),
         employees: vec![],
         pages: 0,
+        max_pages: MAX_PAGES,
         phase: Phase::Start,
     }))))))
-}
-
-/// A request to BambooHR's API for a company, with the API key.
-fn api_call(call: HttpCall, key: &str) -> HttpCall {
-    // BambooHR takes the API key as the user name, with any password.
-    call.basic(key, "x").header("accept", "application/json").header("user-agent", "DumbSlab")
 }
 
 fn api_url(subdomain: &str, path: &str) -> String {
@@ -206,7 +214,7 @@ fn page_call(j: &Run, after: Option<&str>) -> HttpCall {
     if let Some(cursor) = after {
         url.push_str(&format!("&page%5Bafter%5D={}", urlencoding::encode(cursor)));
     }
-    api_call(HttpCall::get(url), &j.cred.token)
+    j.creds.call(HttpCall::get(url))
 }
 
 /// A JSON value as text: BambooHR sends ids as strings or numbers.
@@ -219,19 +227,22 @@ fn text(v: &Value) -> String {
 }
 
 /// Why BambooHR refused to list employees.
-fn refusal(subdomain: &str, reply: &HttpReply) -> String {
+fn refusal(subdomain: &str, auth: Auth, reply: &HttpReply) -> String {
     match reply.status {
-        401 => "BambooHR rejected the API key. Check it was copied whole, then save it again.".into(),
-        403 => "BambooHR refused: the API key's user needs access to employee information, or BambooHR paused the key after failed attempts. Try again later.".into(),
+        401 => oauth::rejected(auth).into(),
+        403 => match auth {
+            Auth::ApiKey => "BambooHR refused: the API key's user needs access to employee information, or BambooHR paused the key after failed attempts. Try again later.".into(),
+            Auth::OAuth => "BambooHR refused: the BambooHR user who signed in needs access to employee information.".into(),
+        },
         404 => format!("BambooHR has no company at {subdomain}.bamboohr.com. Check the company domain."),
         _ => http_error("BambooHR", reply),
     }
 }
 
 /// One page of employees and the cursor for the next, if there is one.
-fn read_page(subdomain: &str, reply: &HttpReply) -> Result<(Vec<Employee>, Option<String>), String> {
+fn read_page(subdomain: &str, auth: Auth, reply: &HttpReply) -> Result<(Vec<Employee>, Option<String>), String> {
     if !reply.ok() {
-        return Err(refusal(subdomain, reply));
+        return Err(refusal(subdomain, auth, reply));
     }
     let v = reply.json();
     let Some(data) = v["data"].as_array() else {
@@ -269,7 +280,7 @@ pub fn step(db: &dyn Db, cfg: &HostConfig, job: &mut PeopleJob, replies: Vec<Htt
     match work {
         Work::Sync(run) => sync_step(db, cfg, run, staged, replies, now),
         Work::Setup(s) => setup::step(db, cfg, s, staged, replies, now),
-        Work::Remove(r) => Ok(setup::remove_step(r, replies)),
+        Work::Remove(r) => Ok(setup::remove_step(cfg, r, replies, now)),
     }
 }
 
@@ -281,21 +292,44 @@ fn sync_step(
     replies: Vec<HttpReply>,
     now: DateTime<Utc>,
 ) -> ApiResult<Step> {
-    match j.phase {
+    match j.phase.clone() {
         Phase::Start => {
+            if j.creds.needs_refresh(now) {
+                match oauth::renewal(db, &j.creds, now)? {
+                    oauth::Renewal::Refresh(lease) => match oauth::renew_call(cfg, &j.subdomain, &j.base_url, &j.creds) {
+                        Ok(call) => {
+                            // Renewing takes one of the job's steps.
+                            j.max_pages -= 1;
+                            j.phase = Phase::Renewing(lease);
+                            return Ok(Step::Fetch(vec![call]));
+                        }
+                        Err(message) => return fail(db, j, &message, now),
+                    },
+                    oauth::Renewal::UseCurrent => {}
+                    oauth::Renewal::Wait => return fail(db, j, oauth::RENEWING, now),
+                }
+            }
+            j.phase = Phase::Reading;
+            Ok(Step::Fetch(vec![page_call(j, None)]))
+        }
+        Phase::Renewing(lease) => {
+            let reply = replies.into_iter().next().unwrap_or_default();
+            if let Err(message) = oauth::apply_refresh(db, cfg, &mut j.creds, &lease, &reply, now)? {
+                return fail(db, j, &message, now);
+            }
             j.phase = Phase::Reading;
             Ok(Step::Fetch(vec![page_call(j, None)]))
         }
         Phase::Reading => {
             let reply = replies.into_iter().next().unwrap_or_default();
-            let (employees, next) = match read_page(&j.subdomain, &reply) {
+            let (employees, next) = match read_page(&j.subdomain, j.creds.auth, &reply) {
                 Ok(page) => page,
                 Err(message) => return fail(db, j, &message, now),
             };
             j.employees.extend(employees);
             j.pages += 1;
             match next {
-                Some(cursor) if j.pages < MAX_PAGES => Ok(Step::Fetch(vec![page_call(j, Some(&cursor))])),
+                Some(cursor) if j.pages < j.max_pages => Ok(Step::Fetch(vec![page_call(j, Some(&cursor))])),
                 more => apply(db, cfg, j, staged, more.is_some(), now),
             }
         }
@@ -413,8 +447,8 @@ fn apply(
     result.without_record = by_email.iter().filter(|(email, h)| h.active && !seen.contains(*email)).count();
     let value = serde_json::to_value(&result).map_err(|e| ApiError::internal(e.to_string()))?;
     let status = if truncated { "partial" } else { "ok" };
-    let error =
-        truncated.then(|| format!("BambooHR has more than {MAX_EMPLOYEES} active employees; only the first {MAX_EMPLOYEES} were read."));
+    let read = PAGE * j.max_pages;
+    let error = truncated.then(|| format!("BambooHR has more than {read} active employees; only the first {read} were read."));
     super::finish(db, TABLE, key(), &j.lease, Ended { status, error: error.as_deref(), result: Some(value.clone()) }, now)?;
     let mut ctx = super::ctx(db, cfg, &j.owner_id, &j.base_url, now)?;
     emit(
@@ -539,12 +573,14 @@ mod tests {
             ],
             "meta": { "page": { "nextCursor": "c2" } }
         });
-        let (employees, next) = read_page("acme", &HttpReply { status: 200, body: body.to_string() }).unwrap();
+        let (employees, next) = read_page("acme", Auth::ApiKey, &HttpReply { status: 200, body: body.to_string() }).unwrap();
         assert_eq!(next.as_deref(), Some("c2"));
         assert_eq!(employees[0].department, None, "restricted: left as it is");
         assert_eq!(employees[0].manager.as_deref(), Some("9"));
         assert_eq!(employees[0].email.as_deref(), Some("ADA@acme.test"));
         assert_eq!((employees[1].name.as_str(), employees[1].email.as_ref()), ("Bobby T", None));
-        assert!(read_page("acme", &HttpReply { status: 404, body: String::new() }).unwrap_err().contains("acme.bamboohr.com"));
+        assert!(
+            read_page("acme", Auth::ApiKey, &HttpReply { status: 404, body: String::new() }).unwrap_err().contains("acme.bamboohr.com")
+        );
     }
 }

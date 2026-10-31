@@ -98,44 +98,112 @@ function manualWebhook(s, reload) {
     automatic);
 }
 
+// What the codes in `?people_sync_error=` mean. The link carries only a code, never a message:
+// anyone can make a link to this page.
+const signInErrors = {
+  expired_link: 'That sign-in link is no longer valid. Start again.',
+  wrong_person: 'Finish signing in from the same browser and DumbSlab account that started it.',
+  not_admin: 'Only admins can set up the people sync.',
+  too_slow: 'Signing in took too long. Start again.',
+  unavailable: 'Sign in with BambooHR isn’t available on this server.',
+  declined: 'BambooHR didn’t allow access. Try again, and allow access when BambooHR asks.',
+  no_code: 'BambooHR didn’t finish signing in. Try again.',
+  busy: 'Another change to the people sync was being saved. Try again in a minute.',
+  refused: 'BambooHR didn’t accept the sign-in. Try again.',
+  no_access: 'The BambooHR user who signed in can’t see employee information. Sign in as a user who can.',
+  failed: 'Signing in with BambooHR didn’t work. Try again.',
+};
+
+/** How signing in went, from the link BambooHR sent the admin back with. Read once. */
+function signInOutcome() {
+  const query = new URLSearchParams(location.search);
+  const connected = query.get('people_sync') === 'connected';
+  const error = query.get('people_sync_error');
+  if (connected || error) history.replaceState(null, '', location.pathname);
+  if (connected) return { connected, note: h('p', { class: 'callout', role: 'status' }, icon('check', { size: 15 }), h('span', null, 'Signed in with BambooHR.')) };
+  if (error) {
+    const message = Object.hasOwn(signInErrors, error) ? signInErrors[error] : signInErrors.failed;
+    return { connected, note: h('p', { class: 'callout callout-warn', role: 'alert' }, icon('alert', { size: 15 }), h('span', null, message)) };
+  }
+  return { connected, note: null };
+}
+
 export async function peopleSyncSection(ctx) {
   const s = await api.get('/people-sync');
   if (!s.enabled) return off('People sync');
+  if (!s.sign_in_available && !s.api_key_allowed) {
+    return h('section', { class: 'panel' }, emptyState({ iconName: 'plug', title: 'People sync isn’t available yet on this host',
+      body: 'BambooHR’s terms let hosted services connect only through Sign in with BambooHR, and this host hasn’t registered its BambooHR app yet.' }));
+  }
   const reload = () => ctx.reload();
-  const subdomain = input({ required: true, value: s.subdomain || '', placeholder: 'acme', spellcheck: 'false', autocapitalize: 'off' });
-  const apiKey = input({ type: 'password', required: !s.configured, placeholder: s.configured ? 'Saved. Leave empty to keep it.' : '', spellcheck: 'false' });
-  const save = button(s.configured ? 'Save' : 'Save and sync', { variant: 'primary', type: 'submit' });
-  const f = h('form', { class: 'stack token-form', novalidate: true },
-    field('BambooHR company domain', subdomain, { hint: 'The acme in acme.bamboohr.com. Pasting the address you sign in at works too.' }),
-    field('API key', apiKey, { hint: 'In BambooHR: your name › API Keys › Add new key. Its user must be able to see employees’ work emails and job details. DumbSlab checks the key with BambooHR, then adds a webhook there so changes sync on their own. It’s encrypted and never shown again.' }),
-    h('div', null, save));
-  f.addEventListener('submit', (e) => {
-    e.preventDefault();
-    if (!f.checkValidity()) {
-      f.reportValidity();
-      return;
-    }
-    busy(save, async () => {
-      const body = { subdomain: subdomain.value.trim() };
-      if (apiKey.value.trim()) body.api_key = apiKey.value.trim();
-      const r = await request('PUT', '/people-sync', { body });
-      if (r.webhook) toast('People sync saved. Changes in BambooHR now start a sync.');
-      else toast('People sync saved, but changes in BambooHR don’t start a sync yet. See below.', { type: 'info' });
-      if (r.notice) toast(r.notice, { type: 'info' });
-      if (!s.configured) await runPeople();
-      reload();
-    }).catch(toastError);
-  });
-
+  const outcome = signInOutcome();
   const runPeople = async () => {
     const r = await api.post('/people-sync/run');
     toast(`Synced from BambooHR: ${plural(r.updated, 'profile')} updated`);
   };
+  // The first sync after signing in, as Save and sync does for API keys.
+  if (outcome.connected && s.configured && !s.last_started_at) {
+    runPeople().then(reload, (e) => { toastError(e); reload(); });
+  }
+
+  const subdomain = input({ required: true, value: s.subdomain || '', placeholder: 'acme', spellcheck: 'false', autocapitalize: 'off' });
+  const domainField = field('BambooHR company domain', subdomain, { hint: 'The acme in acme.bamboohr.com. Pasting the address you sign in at works too.' });
+  const checkDomain = () => {
+    if (subdomain.value.trim()) return true;
+    subdomain.reportValidity();
+    return false;
+  };
+
+  let signIn = null;
+  if (s.sign_in_available) {
+    signIn = button(s.auth === 'oauth' ? 'Sign in with BambooHR again' : 'Sign in with BambooHR', { variant: 'primary' });
+    signIn.addEventListener('click', () => {
+      if (!checkDomain()) return;
+      busy(signIn, async () => {
+        const r = await api.post('/people-sync/sign-in', { subdomain: subdomain.value.trim() });
+        location.assign(r.authorize_url);
+      }).catch(toastError);
+    });
+  }
+
+  let keyForm = null;
+  if (s.api_key_allowed) {
+    const apiKey = input({ type: 'password', required: !(s.configured && s.auth === 'api_key'), placeholder: s.configured && s.auth === 'api_key' ? 'Saved. Leave empty to keep it.' : '', spellcheck: 'false' });
+    const save = button(s.configured ? 'Save' : 'Save and sync', { variant: s.sign_in_available ? 'subtle' : 'primary', type: 'submit' });
+    keyForm = h('form', { class: 'stack token-form', novalidate: true },
+      field('API key', apiKey, { hint: 'In BambooHR: your name › API Keys › Add new key. Its user must be able to see employees’ work emails and job details. DumbSlab checks the key with BambooHR, then adds a webhook there so changes sync on their own. It’s encrypted and never shown again.' }),
+      h('div', null, save));
+    keyForm.addEventListener('submit', (e) => {
+      e.preventDefault();
+      if (!checkDomain()) return;
+      if (!keyForm.checkValidity()) {
+        keyForm.reportValidity();
+        return;
+      }
+      busy(save, async () => {
+        const body = { subdomain: subdomain.value.trim() };
+        if (apiKey.value.trim()) body.api_key = apiKey.value.trim();
+        const r = await request('PUT', '/people-sync', { body });
+        if (r.webhook) toast('People sync saved. Changes in BambooHR now start a sync.');
+        else toast('People sync saved, but changes in BambooHR don’t start a sync yet. See below.', { type: 'info' });
+        if (r.notice) toast(r.notice, { type: 'info' });
+        if (!s.configured) await runPeople();
+        reload();
+      }).catch(toastError);
+    });
+  }
+
+  const setup = h('div', { class: 'stack token-form' },
+    domainField,
+    signIn ? h('div', null, signIn) : null,
+    signIn ? h('p', { class: 'small muted' }, 'You approve DumbSlab in BambooHR, then come back here. DumbSlab adds a webhook in BambooHR so changes sync on their own.') : null,
+    keyForm && signIn ? h('details', { class: 'small', open: s.auth === 'api_key' }, h('summary', null, 'Use an API key instead'), keyForm) : keyForm);
+
   const run = button('Sync now', { icon: 'refresh', variant: 'subtle', size: 'sm' });
   run.addEventListener('click', () => busy(run, async () => { await runPeople(); reload(); }).catch((e) => { toastError(e); reload(); }));
   const remove = button('Remove', { variant: 'ghost', size: 'sm' });
   remove.addEventListener('click', async () => {
-    const ok = await confirmDialog({ title: 'Remove the people sync?', message: 'DumbSlab deletes the webhook it added in BambooHR and forgets the BambooHR key. Details already synced stay on people’s profiles.', confirmLabel: 'Remove', danger: true });
+    const ok = await confirmDialog({ title: 'Remove the people sync?', message: 'DumbSlab deletes the webhook it added in BambooHR and forgets its BambooHR credentials. Details already synced stay on people’s profiles.', confirmLabel: 'Remove', danger: true });
     if (!ok) return;
     busy(remove, async () => {
       const r = await api.del('/people-sync');
@@ -144,21 +212,33 @@ export async function peopleSyncSection(ctx) {
       reload();
     }).catch(toastError);
   });
+  // Saving again with the saved credentials: moves the webhook, or adds it once BambooHR allows.
+  let again = null;
+  if (s.configured && s.webhook_error) {
+    again = button('Save again', { variant: 'subtle', size: 'sm' });
+    again.addEventListener('click', () => busy(again, async () => {
+      const r = await request('PUT', '/people-sync', { body: { subdomain: s.subdomain } });
+      toast(r.webhook ? 'Saved. Changes in BambooHR now start a sync.' : 'Saved, but changes in BambooHR still don’t start a sync. See why below.', { type: r.webhook ? 'success' : 'info' });
+      reload();
+    }).catch(toastError));
+  }
 
+  const signedIn = s.auth === 'oauth' ? 'Signed in with BambooHR' : 'API key';
   const automatic = s.webhook
     ? h('span', null, icon('zap', { size: 13 }), s.automatic_webhook ? ' Syncs when BambooHR changes' : ' Syncs when BambooHR changes (webhook added by hand)')
     : null;
   const status = s.configured
     ? panel('Status', null,
-      h('div', { class: 'token-meta' }, stateLine(s), automatic),
+      h('div', { class: 'token-meta' }, stateLine(s), h('span', null, `${signedIn} · ${s.subdomain}.bamboohr.com`), automatic),
       s.webhook_error ? h('p', { class: 'callout callout-warn' }, icon('alert', { size: 15 }), h('span', null, s.webhook_error)) : null,
       stateNotes(s),
       peopleResult(s.last_result),
       manualWebhook(s, reload),
-      h('div', { class: 'plan-actions' }, run, remove))
+      h('div', { class: 'plan-actions' }, run, again, remove))
     : null;
   return frag(
-    panel('People sync', 'Fill in people’s title, department, location, work phone, pronouns and manager from BambooHR. People are matched by email to their BambooHR work email; a sync never adds, deactivates or removes anyone, and changes only those details.', f),
+    outcome.note,
+    panel('People sync', 'Fill in people’s title, department, location, work phone, pronouns and manager from BambooHR. People are matched by email to their BambooHR work email; a sync never adds, deactivates or removes anyone, and changes only those details.', setup),
     status);
 }
 

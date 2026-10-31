@@ -200,7 +200,8 @@ async fn root_site(req: Request, env: &Env, root: &str, path: &str) -> Result<Re
         (Method::Get, "/api/signup/check") => check_address(&req, env).await,
         (Method::Post, "/api/signup") => signup(req, env, root).await,
         (Method::Get, "/api/plans") => billing::offer(env),
-        (Method::Get, "/connect/callback") => connect::root_callback_redirect(&req.url()?, root),
+        (Method::Get, "/connect/callback") => connect::root_callback_redirect(&req.url()?, root, "/connect/callback"),
+        (Method::Get, p) if p == dumbslab_core::sync::people::CALLBACK_PATH => connect::root_callback_redirect(&req.url()?, root, p),
         (Method::Post, "/api/stripe/webhook") => billing::webhook(req, env).await,
         (_, p) if p.starts_with("/api/operator/") => operator(req, env, p).await,
         // Static files the sign-up page uses.
