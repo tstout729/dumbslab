@@ -57,15 +57,27 @@ struct UsageInput {
 #[derive(Deserialize)]
 struct SlackTeamInput {
     team_id: Option<String>,
+    #[serde(default)]
+    team_ids: Vec<String>,
     home: Option<String>,
     token_fingerprint: Option<String>,
+    /// The value of the workspace's Slack connection its change started from.
+    generation: Option<i64>,
+    /// Let go only of leftovers (see `tenancy::SLACK_LEFTOVER_SECS`).
+    #[serde(default)]
+    leftovers: bool,
 }
 
 #[derive(Deserialize)]
 struct SlackInstallInput {
     home: Option<String>,
+    generation: Option<i64>,
     #[serde(flatten)]
     install: tenancy::SlackInstall,
+}
+
+fn required_generation(g: Option<i64>) -> ApiResult<i64> {
+    g.ok_or_else(|| ApiError::bad_request("send the generation the change started from"))
 }
 
 #[derive(Deserialize)]
@@ -253,15 +265,20 @@ impl DurableObject for Directory {
                 self.run(move |db| {
                     let input = input?;
                     let home = input.home.ok_or_else(|| ApiError::bad_request("send the workspace's home"))?;
-                    tenancy::slack_install(db, &home, &input.install, Utc::now()).map(|_| json!({ "ok": true }))
+                    let generation = required_generation(input.generation)?;
+                    tenancy::slack_install(db, &home, &input.install, generation, Utc::now())
+                        .map(|generation| json!({ "ok": true, "generation": generation }))
                 })?
             }
             (Method::Post, "/slack/release") => {
                 let input: ApiResult<SlackTeamInput> = parse(&body);
                 self.run(move |db| {
                     let input = input?;
-                    let (team, home) = team_and_home(&input)?;
-                    tenancy::slack_release(db, team, home).map(|released| json!({ "ok": true, "released": released }))
+                    let home = input.home.as_deref().ok_or_else(|| ApiError::bad_request("send the workspace's home"))?;
+                    let generation = required_generation(input.generation)?;
+                    let (released, generation) =
+                        tenancy::slack_release(db, home, &input.team_ids, generation, input.leftovers, Utc::now())?;
+                    Ok(json!({ "ok": true, "released": released, "generation": generation }))
                 })?
             }
             (Method::Post, "/slack/token") => {
@@ -280,7 +297,7 @@ impl DurableObject for Directory {
                 self.run(move |db| {
                     let input = input?;
                     let home = input.home.as_deref().ok_or_else(|| ApiError::bad_request("send the workspace's home"))?;
-                    let status = tenancy::slack_status(db, input.team_id.as_deref(), home)?;
+                    let status = tenancy::slack_status(db, input.team_id.as_deref(), home, Utc::now())?;
                     serde_json::to_value(status).map_err(|e| ApiError::internal(e.to_string()))
                 })?
             }

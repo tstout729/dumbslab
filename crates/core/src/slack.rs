@@ -66,17 +66,30 @@
 //!   workspace's ID and name, and the settings. No token. Switching Slack workspaces then lets go of
 //!   the previous one. Disconnecting lets go first and forgets the reference only once the
 //!   directory has.
+//! - Changes to which Slack workspaces a workspace holds are fenced by the directory's value for
+//!   its connection (`generation`, per workspace): Add to Slack, a switch, a disconnect and letting
+//!   go of leftovers read it when they start and name it in each change, which moves it on; a
+//!   change naming an old value is refused (`slack_changed`). Forgetting a dead token moves it on
+//!   too. So a delayed step (an install holding an older token, a release from an earlier switch)
+//!   never undoes a newer one, and of two Add to Slack at once one wins and the other hears
+//!   `slack_busy`.
 //! - Every job that acts on Slack (a command's `users.info`, `chat.unfurl`, channel and test
 //!   messages) asks the directory for the token right before it acts. Only the workspace that holds
 //!   the Slack workspace gets it. A refusal stops the job, and the reference here, stale, is
 //!   forgotten. A restored backup, or a workspace whose Slack workspace was taken over, can't act.
+//!   The invariant, exactly: a workspace acts on Slack only with a token the directory gave it as
+//!   the holder; an action that already fetched the token may complete within seconds of a
+//!   transfer (the job's next Slack call follows the directory's answer at once), and the job's
+//!   next action asks again.
 //! - A token Slack calls dead is forgotten in the directory, only while the directory still holds
 //!   that very token (by its fingerprint): an install made since stays. The root domain checks
 //!   `app_uninstalled` and `tokens_revoked` itself, with `auth.test` ([`UninstallCheck`]); no
 //!   workspace is involved.
 //! - Settings › Slack asks the directory whether this workspace holds its Slack workspace, and lets
-//!   go of any other it still holds (a switch that stopped before letting go). So do requests the
-//!   root routed here for a Slack workspace this workspace doesn't hold.
+//!   go of any other it still holds (a switch that stopped before letting go), but only ones
+//!   installed more than 15 minutes ago (an Add to Slack may still be finishing) and only if the
+//!   connection didn't change since it asked. So do requests the root routed here for a Slack
+//!   workspace this workspace doesn't hold.
 //!
 //! Self-hosted servers have no directory: Add to Slack saves the token here, like a workspace's own
 //! app, and checks it with `auth.test` when Slack says the app was removed.
@@ -1028,6 +1041,10 @@ pub struct SlackJob {
     /// Settings › Slack, hosted: the directory said this workspace holds the Slack workspace it
     /// asked about.
     held: bool,
+    /// Hosted, a job that changes which Slack workspaces this workspace holds (Add to Slack,
+    /// disconnecting, letting go of leftovers): the directory's value for its connection when the
+    /// job started, moved on with each change it made. Each change names it.
+    generation: Option<i64>,
 }
 
 /// The connection a job is for: Add to Slack's or the workspace's own app's, and its Slack
@@ -1080,8 +1097,9 @@ enum Work {
     /// connection here.
     Disconnect { admin: String, via: Via },
     /// Hosted: ask the directory what this workspace holds. Forgets a connection it doesn't hold
-    /// any more, and lets go of any other Slack workspace it still holds. With `admin`, for
-    /// Settings › Slack, it answers with the settings.
+    /// any more, and lets go of leftovers: other Slack workspaces it has held for more than 15
+    /// minutes, if its connection didn't change meanwhile. With `admin`, for Settings › Slack, it
+    /// answers with the settings.
     Status { admin: Option<(String, Via)> },
     /// Hosted: Slack called the directory's token dead. The directory forgets it, only while it
     /// still holds that very token.
@@ -1166,6 +1184,7 @@ impl SlackJob {
             installed: None,
             then: None,
             held: false,
+            generation: None,
         }
     }
 

@@ -165,11 +165,14 @@ pub enum InstallError {
     EnterpriseInstall,
     /// Another DumbSlab workspace holds this Slack workspace.
     TeamTaken,
+    /// This workspace's Slack connection changed while it finished (another Add to Slack, a
+    /// disconnect, Slack removing the app): nothing was saved.
+    Busy,
     Failed,
 }
 
 impl InstallError {
-    pub const ALL: [InstallError; 10] = [
+    pub const ALL: [InstallError; 11] = [
         InstallError::NotAdmin,
         InstallError::Unavailable,
         InstallError::Expired,
@@ -179,6 +182,7 @@ impl InstallError {
         InstallError::SlackError,
         InstallError::EnterpriseInstall,
         InstallError::TeamTaken,
+        InstallError::Busy,
         InstallError::Failed,
     ];
 
@@ -193,6 +197,7 @@ impl InstallError {
             InstallError::SlackError => "slack_error",
             InstallError::EnterpriseInstall => "enterprise_install",
             InstallError::TeamTaken => "slack_team_taken",
+            InstallError::Busy => "slack_busy",
             InstallError::Failed => "failed",
         }
     }
@@ -398,8 +403,25 @@ pub(super) fn directory_call(path: &str, body: Value) -> HttpCall {
     HttpCall::post_json(format!("{DIRECTORY}{path}"), &body)
 }
 
-fn release_call(team_id: &str) -> HttpCall {
-    directory_call("/slack/release", json!({ "team_id": team_id }))
+/// Lets go of Slack workspaces this workspace holds, if its connection is still at `generation`.
+/// `leftovers`: only those installed long enough ago (see `tenancy::SLACK_LEFTOVER_SECS`).
+fn release_call(team_ids: &[String], generation: i64, leftovers: bool) -> HttpCall {
+    directory_call("/slack/release", json!({ "team_ids": team_ids, "generation": generation, "leftovers": leftovers }))
+}
+
+fn status_call(team_id: Option<&str>) -> HttpCall {
+    directory_call("/slack/status", json!({ "team_id": team_id }))
+}
+
+/// The directory's value for this workspace's connection, from its answer to a status, an install
+/// or a release.
+fn generation_of(reply: &HttpReply) -> Option<i64> {
+    (reply.status == 200).then(|| reply.json()["generation"].as_i64()).flatten()
+}
+
+/// The error code in the directory's refusal.
+fn refusal(reply: &HttpReply) -> String {
+    reply.json()["error"]["code"].as_str().unwrap_or_default().to_string()
 }
 
 /// The Slack workspace a request from Slack is for: a command's `team_id`; for an event, the
@@ -678,6 +700,10 @@ fn answer_slack(status: u16) -> ApiResult<Step> {
     Ok(Step::Done(Finish::Respond(response)))
 }
 
+fn not_disconnected() -> ApiError {
+    ApiError::new(503, "slack_unavailable", "DumbSlab couldn't disconnect Slack just now, so it's still connected. Try again in a minute.")
+}
+
 fn unreachable_directory() -> ApiError {
     ApiError::new(503, "slack_unavailable", "DumbSlab couldn't check the Slack connection just now. Try again in a minute.")
 }
@@ -696,7 +722,7 @@ pub(super) fn step(
     match (job.phase, job.work.clone()) {
         // Add to Slack: exchange the code; hosted, have the directory record the installation,
         // then save the reference here.
-        (Phase::Start, Work::Install { code, redirect_uri, .. }) => {
+        (Phase::Start, Work::Install { code, redirect_uri, home, .. }) => {
             let base = job.base_url.clone();
             let Some(app) = shared(cfg) else { return to_settings(&base, Err(InstallError::Unavailable)) };
             // Basic auth, as Slack prefers, with the client's credentials form-encoded first (RFC 6749, 2.3.1).
@@ -704,7 +730,12 @@ pub(super) fn step(
                 HttpCall::post_form(format!("{API}/oauth.v2.access"), &[("code", code.as_str()), ("redirect_uri", redirect_uri.as_str())])
                     .basic(&urlencoding::encode(app.client_id), &urlencoding::encode(app.client_secret));
             job.phase = Phase::Exchanging;
-            Ok(Step::Fetch(vec![call]))
+            // Hosted: alongside, where this workspace's connection is now. The install names it.
+            let mut calls = vec![call];
+            if home.is_some() {
+                calls.push(status_call(None));
+            }
+            Ok(Step::Fetch(calls))
         }
         (Phase::Exchanging, Work::Install { admin, via, home, .. }) => {
             let base = job.base_url.clone();
@@ -724,8 +755,10 @@ pub(super) fn step(
                 record_install(db, cfg, job, &inst, actor, now)?;
                 return to_settings(&base, Ok(()));
             }
+            let Some(generation) = replies.get(1).and_then(generation_of) else { return to_settings(&base, Err(InstallError::Failed)) };
             // One Slack workspace belongs to one DumbSlab workspace: the directory records the
-            // installation, token and all, unless another workspace holds it.
+            // installation, token and all, unless another workspace holds it, or this one's
+            // connection changed since the job started.
             let install = crate::tenancy::SlackInstall {
                 team_id: inst.team_id.clone(),
                 bot_token: seal_for_directory(cfg, &inst.team_id, &inst.token)?,
@@ -734,7 +767,8 @@ pub(super) fn step(
                 team_name: inst.team_name.clone(),
                 scopes: inst.scopes.join(","),
             };
-            let body = serde_json::to_value(install).map_err(|e| ApiError::internal(e.to_string()))?;
+            let mut body = serde_json::to_value(install).map_err(|e| ApiError::internal(e.to_string()))?;
+            body["generation"] = json!(generation);
             job.installed = Some(Box::new(inst));
             job.phase = Phase::Installing;
             Ok(Step::Fetch(vec![directory_call("/slack/install", body)]))
@@ -742,11 +776,14 @@ pub(super) fn step(
         (Phase::Installing, Work::Install { admin, via, .. }) => {
             let base = job.base_url.clone();
             let Some(inst) = job.installed.clone() else { return to_settings(&base, Err(InstallError::Failed)) };
-            match answer.status {
-                200 => {}
-                409 => return to_settings(&base, Err(InstallError::TeamTaken)),
+            match (answer.status, generation_of(&answer)) {
+                (200, Some(generation)) => job.generation = Some(generation),
+                // Something changed this workspace's connection since the job started: a newer
+                // Add to Slack, a disconnect, Slack removing the app. That one stays.
+                (409, _) if refusal(&answer) == "slack_changed" => return to_settings(&base, Err(InstallError::Busy)),
+                (409, _) => return to_settings(&base, Err(InstallError::TeamTaken)),
                 // Perhaps recorded: then this workspace holds it there, and Settings › Slack lets
-                // go of it (see `Work::Status`). Adding it again just records it again.
+                // go of it later (see `Work::Status`). Adding it again just records it again.
                 _ => return to_settings(&base, Err(InstallError::Failed)),
             }
             // The directory holds it for this workspace now: the reference here, without the token.
@@ -758,10 +795,10 @@ pub(super) fn step(
             record_install(db, cfg, job, &inst, actor.unwrap_or_else(slack_actor), now)?;
             // Switching Slack workspaces: let go of the previous one. If that doesn't happen, the
             // next visit to Settings › Slack does it.
-            let Some(previous) = previous else { return to_settings(&base, Ok(())) };
+            let (Some(previous), Some(generation)) = (previous, job.generation) else { return to_settings(&base, Ok(())) };
             job.then = Some(settings_url(&base, Ok(())));
             job.phase = Phase::Releasing;
-            Ok(Step::Fetch(vec![release_call(&previous)]))
+            Ok(Step::Fetch(vec![release_call(&[previous], generation, false)]))
         }
         (Phase::Releasing, Work::Install { .. }) => {
             let then = job.then.take().unwrap_or_else(|| settings_url(&job.base_url, Ok(())));
@@ -775,16 +812,22 @@ pub(super) fn step(
             let bound = job.bound.as_ref().is_some_and(|b| b.matches(Some(app)));
             let Some(team) = app.team_id.clone().filter(|_| bound && super::via_directory(cfg, app)) else { return fail(super::changed()) };
             job.version = app.version.clone();
+            job.phase = Phase::Asking;
+            Ok(Step::Fetch(vec![status_call(Some(&team))]))
+        }
+        (Phase::Asking, Work::Disconnect { .. }) => {
+            let (Some(generation), Some(team)) = (generation_of(&answer), job.bound.as_ref().and_then(|b| b.team_id.clone())) else {
+                return fail(not_disconnected());
+            };
             job.phase = Phase::Releasing;
-            Ok(Step::Fetch(vec![release_call(&team)]))
+            Ok(Step::Fetch(vec![release_call(&[team], generation, false)]))
         }
         (Phase::Releasing, Work::Disconnect { admin, via }) => {
+            if answer.status == 409 {
+                return fail(super::changed());
+            }
             if answer.status != 200 {
-                return fail(ApiError::new(
-                    503,
-                    "slack_unavailable",
-                    "DumbSlab couldn't disconnect Slack just now, so it's still connected. Try again in a minute.",
-                ));
+                return fail(not_disconnected());
             }
             let team = job.bound.as_ref().and_then(|b| b.team_id.clone()).unwrap_or_default();
             if !forget_connection(db, &team, job.version.as_deref())? {
@@ -808,7 +851,7 @@ pub(super) fn step(
             job.version = app.version.clone();
             job.bound = Some(super::Bound { shared: true, team_id: team.clone() });
             job.phase = Phase::Asking;
-            Ok(Step::Fetch(vec![directory_call("/slack/status", json!({ "team_id": team }))]))
+            Ok(Step::Fetch(vec![status_call(team.as_deref())]))
         }
         (Phase::Asking, Work::Status { admin }) => {
             let status = Some(&answer).filter(|a| a.status == 200).and_then(|a| serde_json::from_str::<SlackStatus>(&a.body).ok());
@@ -823,15 +866,16 @@ pub(super) fn step(
             {
                 forget_stale(db, cfg, job, &team, now)?;
             }
-            // Not one this workspace has just saved meanwhile.
-            let releases: Vec<HttpCall> =
-                status.others.iter().filter(|t| app.team_id.as_deref() != Some(t.as_str())).map(|t| release_call(t)).collect();
+            // Leftovers only (installed long enough ago that no Add to Slack is still finishing),
+            // never one this workspace has just saved meanwhile, and only if nothing changed this
+            // workspace's connection since the directory answered.
+            let leftovers: Vec<String> = status.leftovers.iter().filter(|t| app.team_id.as_deref() != Some(t.as_str())).cloned().collect();
             job.held = status.owned;
-            if releases.is_empty() {
+            if leftovers.is_empty() {
                 return status_view(db, cfg, job, admin, now);
             }
             job.phase = Phase::Releasing;
-            Ok(Step::Fetch(releases))
+            Ok(Step::Fetch(vec![release_call(&leftovers, status.generation, true)]))
         }
         (Phase::Releasing, Work::Status { admin }) => status_view(db, cfg, job, admin, now),
 

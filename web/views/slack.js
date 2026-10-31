@@ -25,6 +25,7 @@ const installErrors = {
   slack_error: 'Slack didn’t finish connecting. Try again.',
   enterprise_install: 'DumbSlab connects one Slack workspace at a time, not a whole Enterprise organization. An org admin can remove the org-wide install in Slack (Organization settings › Integrations › Installed apps). Then add DumbSlab to one workspace.',
   slack_team_taken: 'That Slack workspace is already connected to another DumbSlab workspace. Disconnect it there first, then try again.',
+  slack_busy: 'Slack’s connection changed while this finished (another Add to Slack, perhaps), so nothing was saved. Look below, then try again if you need to.',
   failed: 'Connecting Slack didn’t work. Try again.',
 };
 

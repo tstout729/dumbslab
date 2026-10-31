@@ -6031,7 +6031,7 @@ mod slack {
 // directory code, on its own database), and run each job's steps like a host.
 
 mod add_to_slack {
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::collections::BTreeMap;
 
     use super::*;
@@ -6063,6 +6063,11 @@ mod add_to_slack {
         directory: Store,
         /// Directory routes whose next call gets no answer (and changes nothing).
         down: RefCell<Vec<&'static str>>,
+        /// Seconds the directory's clock is ahead.
+        ahead: Cell<i64>,
+        /// Tokens a test lets finish the one action they were fetched for after a transfer: the
+        /// window the invariant allows (see `crate::slack`).
+        in_flight: RefCell<Vec<String>>,
         _dir: tempfile::TempDir,
     }
 
@@ -6073,7 +6078,14 @@ mod add_to_slack {
             let directory = Store::open(&dir.path().join("directory.db")).unwrap();
             let now = chrono::Utc::now();
             let limits = Limits { per_ip_per_day: 10, per_day: 10, max_workspaces: 10, free: ROOMY };
-            let world = World { slack: RefCell::default(), directory, down: RefCell::default(), _dir: dir };
+            let world = World {
+                slack: RefCell::default(),
+                directory,
+                down: RefCell::default(),
+                ahead: Cell::new(0),
+                in_flight: RefCell::default(),
+                _dir: dir,
+            };
             world
                 .dir(|db| {
                     tenancy::directory_migrate(db)?;
@@ -6100,6 +6112,17 @@ mod add_to_slack {
         /// The workspace the directory says holds a Slack workspace (Slack's requests go there).
         fn holder(&self, team: &str) -> Option<String> {
             self.dir(|db| tenancy::slack_team_home(db, team)).unwrap().map(|(home, _)| home)
+        }
+
+        /// The directory's value for a workspace's Slack connection.
+        fn generation(&self, home: &str) -> i64 {
+            self.dir(|db| tenancy::slack_status(db, None, home, chrono::Utc::now())).unwrap().generation
+        }
+
+        /// Moves the directory's clock past the time an install is left alone as a possible one
+        /// still finishing.
+        fn later(&self) {
+            self.ahead.set(self.ahead.get() + tenancy::SLACK_LEFTOVER_SECS + 60);
         }
 
         /// The fingerprint of the token the directory holds for a Slack workspace.
@@ -6155,6 +6178,7 @@ mod add_to_slack {
             let acting = |what: &str| {
                 if let Some(home) = home
                     && !token.starts_with("xoxb-own")
+                    && !self.in_flight.borrow().iter().any(|t| t == token)
                 {
                     assert!(self.holds(home, token), "{home} called {what} with a token it doesn't hold");
                 }
@@ -6220,19 +6244,26 @@ mod add_to_slack {
                     let named = body["team_id"].as_str().map(str::to_string);
                     let team = || named.clone().expect("a team_id");
                     let fp = body["token_fingerprint"].as_str().map(str::to_string);
-                    let now = chrono::Utc::now();
+                    let generation = body["generation"].as_i64();
+                    let now = chrono::Utc::now() + chrono::Duration::seconds(self.ahead.get());
                     let r: dumbslab_core::ApiResult<Value> = self.dir(|db| match (home, path) {
                         (Some(home), "/slack/install") => {
                             let install: tenancy::SlackInstall = serde_json::from_value(body.clone()).unwrap();
-                            tenancy::slack_install(db, home, &install, now).map(|_| json!({ "ok": true }))
+                            tenancy::slack_install(db, home, &install, generation.unwrap(), now)
+                                .map(|g| json!({ "ok": true, "generation": g }))
                         }
-                        (Some(home), "/slack/release") => tenancy::slack_release(db, &team(), home).map(|r| json!({ "released": r })),
+                        (Some(home), "/slack/release") => {
+                            let teams: Vec<String> = serde_json::from_value(body["team_ids"].clone()).unwrap();
+                            let leftovers = body["leftovers"].as_bool().unwrap();
+                            tenancy::slack_release(db, home, &teams, generation.unwrap(), leftovers, now)
+                                .map(|(r, g)| json!({ "released": r, "generation": g }))
+                        }
                         (Some(home), "/slack/token") => match tenancy::slack_token(db, &team(), home)? {
                             Some(t) => Ok(serde_json::to_value(t).unwrap()),
                             None => Err(dumbslab_core::ApiError::not_found("that Slack workspace")),
                         },
                         (Some(home), "/slack/status") => {
-                            tenancy::slack_status(db, named.as_deref(), home).map(|s| serde_json::to_value(s).unwrap())
+                            tenancy::slack_status(db, named.as_deref(), home, now).map(|s| serde_json::to_value(s).unwrap())
                         }
                         (_, "/slack/forget") => {
                             tenancy::slack_forget_if(db, &team(), &fp.clone().unwrap(), home).map(|f| json!({ "forgot": f }))
@@ -6666,9 +6697,13 @@ mod add_to_slack {
         // Beta adds T1: the directory gets the token sealed, and its fingerprint.
         let (to, calls) = install(&beta, &beta_admin, &world, "T1");
         assert!(to.ends_with("slack=connected"), "{to}");
-        assert_eq!(urls(&calls), vec!["https://slack.com/api/oauth.v2.access", "dumbslab-directory:/slack/install"]);
+        assert_eq!(
+            urls(&calls),
+            vec!["https://slack.com/api/oauth.v2.access", "dumbslab-directory:/slack/status", "dumbslab-directory:/slack/install"]
+        );
         let token = world.live("T1").unwrap();
-        let recorded = body(&calls[1]);
+        let recorded = body(&calls[2]);
+        assert_eq!(recorded["generation"], 0, "names where beta's connection was when it started");
         assert!(!recorded.to_string().contains(&token), "{recorded}");
         assert_eq!(recorded["token_fingerprint"].as_str(), Some(sha256_hex(&token).as_str()));
         assert_eq!((recorded["team_id"].as_str(), recorded["home"].as_str()), (Some("T1"), None), "the host names the workspace");
@@ -6680,7 +6715,10 @@ mod add_to_slack {
         // get T1's token from the directory.
         let (to, calls) = install(&acme, &admin, &world, "T1");
         assert!(to.ends_with("/settings/slack?slack_error=slack_team_taken"), "{to}");
-        assert_eq!(urls(&calls), vec!["https://slack.com/api/oauth.v2.access", "dumbslab-directory:/slack/install"]);
+        assert_eq!(
+            urls(&calls),
+            vec!["https://slack.com/api/oauth.v2.access", "dumbslab-directory:/slack/status", "dumbslab-directory:/slack/install"]
+        );
         assert!(settings(&acme, &world, &admin)["mode"].is_null());
         assert_eq!((world.holder("T1").as_deref(), world.held_token("T1")), (Some("beta"), Some(sha256_hex(&token))));
         let asked = world
@@ -6725,16 +6763,29 @@ mod add_to_slack {
         assert!(to.ends_with("slack=connected"));
         assert_eq!(
             urls(&calls),
-            vec!["https://slack.com/api/oauth.v2.access", "dumbslab-directory:/slack/install", "dumbslab-directory:/slack/release"]
+            vec![
+                "https://slack.com/api/oauth.v2.access",
+                "dumbslab-directory:/slack/status",
+                "dumbslab-directory:/slack/install",
+                "dumbslab-directory:/slack/release"
+            ]
         );
-        assert_eq!(body(&calls[2])["team_id"], "T2");
+        // The install names where acme's connection was (T2's install moved it to 1), and the
+        // release the value the install moved it on to.
+        assert_eq!(
+            (&body(&calls[2])["generation"], &body(&calls[3])["team_ids"], &body(&calls[3])["generation"]),
+            (&json!(1), &json!(["T2"]), &json!(2))
+        );
         let s = settings(&acme, &world, &admin);
         assert_eq!((s["slack_workspace_id"].as_str(), s["channels"].as_array().unwrap().len()), (Some("T3"), 0), "{s}");
         assert_eq!((world.holder("T2"), world.holder("T3").as_deref()), (None, Some("acme")));
         // Adding T3 again is just another install: recorded again, channels kept, nothing let go of.
         acme.ok("POST", "/api/v1/slack/channels", Some(json!({ "channel": "C0CHANNEL02" })), &admin);
         let (_, calls) = install(&acme, &admin, &world, "T3");
-        assert_eq!(urls(&calls), vec!["https://slack.com/api/oauth.v2.access", "dumbslab-directory:/slack/install"]);
+        assert_eq!(
+            urls(&calls),
+            vec!["https://slack.com/api/oauth.v2.access", "dumbslab-directory:/slack/status", "dumbslab-directory:/slack/install"]
+        );
         assert_eq!(settings(&acme, &world, &admin)["channels"].as_array().unwrap().len(), 1);
         assert_eq!(activity(&acme, &admin, "slack.installed").len(), 3);
 
@@ -6744,7 +6795,7 @@ mod add_to_slack {
         let (to, calls) = install(&acme, &admin, &world, "E1");
         world.slack.borrow_mut().org_wide = false;
         assert!(to.ends_with("slack_error=enterprise_install"));
-        assert_eq!(urls(&calls), vec!["https://slack.com/api/oauth.v2.access"]);
+        assert_eq!(urls(&calls), vec!["https://slack.com/api/oauth.v2.access", "dumbslab-directory:/slack/status"]);
         assert_eq!(saved_team(&acme).as_deref(), Some("T3"), "nothing changed");
 
         // The directory doesn't answer: nothing is saved here.
@@ -6819,7 +6870,8 @@ mod add_to_slack {
 
         let (done, calls) = disconnect(&acme, &world, &admin);
         assert!(done.is_ok(), "{done:?}");
-        assert_eq!((urls(&calls), body(&calls[0])["team_id"].as_str()), (vec!["dumbslab-directory:/slack/release"], Some("T1")));
+        assert_eq!(urls(&calls), vec!["dumbslab-directory:/slack/status", "dumbslab-directory:/slack/release"]);
+        assert_eq!((&body(&calls[1])["team_ids"], &body(&calls[1])["leftovers"]), (&json!(["T1"]), &json!(false)));
         assert_eq!((world.holder("T1"), saved_team(&acme)), (None, None));
         assert_eq!(activity(&acme, &admin, "slack.disconnected").len(), 1);
 
@@ -6970,7 +7022,8 @@ mod add_to_slack {
 
     /// Switching Slack workspaces records the new one, saves it, then lets go of the old. A switch
     /// that stopped before letting go leaves the old one held: Settings, or Slack's next request
-    /// for it, lets go of it.
+    /// for it, lets go of it once it's been there 15 minutes (until then it may be an install
+    /// still finishing).
     #[test]
     fn a_switch_that_stopped_before_letting_go_is_repaired() {
         let world = World::new();
@@ -6984,6 +7037,11 @@ mod add_to_slack {
             let last = advance(&acme, &mut job, answers(&acme, &world, &calls));
             assert_eq!(urls(&last), vec!["dumbslab-directory:/slack/release"]);
         };
+        let stray = || {
+            let r = acme.send(&signed("/slack/commands", &command("T1")));
+            assert!(r.body.to_string().contains("isn't connected"), "{}", r.body);
+            run_later(&acme, &world, &r.effects)
+        };
 
         stops_before_letting_go("T2");
         assert_eq!(saved_team(&acme).as_deref(), Some("T2"), "saved: T1 is no longer acted on");
@@ -6991,29 +7049,197 @@ mod add_to_slack {
         assert!(install(&beta, &beta_admin, &world, "T1").0.ends_with("slack_error=slack_team_taken"));
 
         // Slack's next request for T1, which the root still sends to acme: acme asks the directory
-        // what it holds, and lets go of T1.
-        let r = acme.send(&signed("/slack/commands", &command("T1")));
-        assert!(r.body.to_string().contains("isn't connected"), "{}", r.body);
-        let calls = run_later(&acme, &world, &r.effects);
+        // what it holds. Right away T1 is left alone; 15 minutes on, it's let go of.
+        assert_eq!(urls(&stray()), vec!["dumbslab-directory:/slack/status"]);
+        world.later();
+        let calls = stray();
         assert_eq!(urls(&calls), vec!["dumbslab-directory:/slack/status", "dumbslab-directory:/slack/release"]);
-        assert_eq!(body(&calls[1])["team_id"], "T1");
+        assert_eq!((&body(&calls[1])["team_ids"], &body(&calls[1])["leftovers"]), (&json!(["T1"]), &json!(true)));
         assert_eq!((world.holder("T1"), world.holder("T2").as_deref()), (None, Some("acme")));
         assert!(install(&beta, &beta_admin, &world, "T1").0.ends_with("slack=connected"));
 
-        // Or Settings › Slack does it.
+        // Or Settings › Slack does it (T2 was installed more than 15 minutes ago by now).
         stops_before_letting_go("T3");
         let (s, calls) = settings_calls(&acme, &world, &admin);
         assert_eq!(urls(&calls), vec!["dumbslab-directory:/slack/status", "dumbslab-directory:/slack/release"]);
         assert_eq!((s["slack_workspace_id"].as_str(), s["connected"].as_bool()), (Some("T3"), Some(true)), "{s}");
         assert_eq!((world.holder("T2"), world.holder("T3").as_deref()), (None, Some("acme")));
-        // An install acme never saved (its job stopped once the directory recorded it) goes too.
+        // An install acme never saved (its job stopped once the directory recorded it) goes too,
+        // once it's old enough.
         let mut job = install_job(&acme, &admin, "T4");
         let calls = advance(&acme, &mut job, vec![]);
         let recorded = advance(&acme, &mut job, answers(&acme, &world, &calls));
         answers(&acme, &world, &recorded);
         assert_eq!(world.holder("T4").as_deref(), Some("acme"));
+        assert_eq!(urls(&settings_calls(&acme, &world, &admin).1), vec!["dumbslab-directory:/slack/status"]);
+        world.later();
         assert_eq!(urls(&settings_calls(&acme, &world, &admin).1)[1], "dumbslab-directory:/slack/release");
         assert_eq!((world.holder("T4"), saved_team(&acme).as_deref()), (None, Some("T3")));
+    }
+
+    /// Round 7, S2: Settings looks while a switch has recorded the new Slack workspace but not yet
+    /// saved it. The new one is too new to be a leftover, so it survives; the switch then lets go
+    /// of the old one, and the workspace stays connected.
+    #[test]
+    fn settings_during_a_switch_leaves_the_new_slack_workspace() {
+        let world = World::new();
+        let (acme, admin) = hosted_at("acme");
+        install(&acme, &admin, &world, "T1");
+        world.later();
+        let mut switch = install_job(&acme, &admin, "T2");
+        let calls = advance(&acme, &mut switch, vec![]);
+        let record = advance(&acme, &mut switch, answers(&acme, &world, &calls));
+        let recorded = answers(&acme, &world, &record);
+        assert_eq!(world.holder("T2").as_deref(), Some("acme"), "recorded, not saved yet");
+
+        let (s, calls) = settings_calls(&acme, &world, &admin);
+        assert_eq!(urls(&calls), vec!["dumbslab-directory:/slack/status"], "T2 isn't a leftover yet");
+        assert_eq!((s["slack_workspace_id"].as_str(), s["connected"].as_bool()), (Some("T1"), Some(true)), "{s}");
+
+        let release = advance(&acme, &mut switch, recorded);
+        let Step::Done(Finish::Redirect(to)) = step(&acme, &mut switch, answers(&acme, &world, &release)).unwrap() else { panic!() };
+        assert!(to.ends_with("slack=connected"), "{to}");
+        assert_eq!((world.holder("T1"), world.holder("T2").as_deref()), (None, Some("acme")));
+        let s = settings(&acme, &world, &admin);
+        assert_eq!((s["slack_workspace_id"].as_str(), s["connected"].as_bool()), (Some("T2"), Some(true)), "{s}");
+    }
+
+    /// Round 7, S1: an Add to Slack delayed with an older token, after Slack removed the app and a
+    /// newer Add to Slack recorded a new token, is refused: the newer one stays, and nothing is
+    /// saved.
+    #[test]
+    fn a_delayed_install_cant_undo_a_newer_one() {
+        let world = World::new();
+        let (acme, admin) = hosted_at("acme");
+        let mut delayed = install_job(&acme, &admin, "T1");
+        let calls = advance(&acme, &mut delayed, vec![]);
+        let exchanged = answers(&acme, &world, &calls);
+        let old = world.live("T1").unwrap();
+
+        // Slack's admin removes the app, and adds DumbSlab again from acme: a new token.
+        world.uninstall("T1");
+        assert!(install(&acme, &admin, &world, "T1").0.ends_with("slack=connected"));
+        let new = world.live("T1").unwrap();
+        assert_ne!(old, new);
+
+        let record = advance(&acme, &mut delayed, exchanged);
+        assert_eq!(body(&record[0])["generation"], 0);
+        let refused = answers(&acme, &world, &record);
+        assert_eq!((refused[0].status, refused[0].json()["error"]["code"].as_str()), (409, Some("slack_changed")));
+        let Step::Done(Finish::Redirect(to)) = step(&acme, &mut delayed, refused).unwrap() else { panic!() };
+        assert!(to.ends_with("slack_error=slack_busy"), "{to}");
+        assert_eq!(world.held_token("T1"), Some(sha256_hex(&new)));
+        assert_eq!(settings(&acme, &world, &admin)["connected"], true);
+        assert_eq!(activity(&acme, &admin, "slack.installed").len(), 1, "nothing saved for the delayed one");
+    }
+
+    /// Round 7: Slack removing the app moves the holder's connection on, so an Add to Slack that
+    /// started before can't record a token from before either.
+    #[test]
+    fn an_uninstall_moves_the_connection_on() {
+        let world = World::new();
+        let (acme, admin) = hosted_at("acme");
+        install(&acme, &admin, &world, "T1");
+        assert_eq!(world.generation("acme"), 1);
+        let mut started = install_job(&acme, &admin, "T2");
+        let calls = advance(&acme, &mut started, vec![]);
+        let exchanged = answers(&acme, &world, &calls);
+
+        world.uninstall("T1");
+        assert_eq!(world.uninstall_check("T1").0, 200);
+        assert_eq!((world.holder("T1"), world.generation("acme")), (None, 2));
+        let (to, _, _) = {
+            let record = advance(&acme, &mut started, exchanged);
+            let refused = answers(&acme, &world, &record);
+            let Step::Done(Finish::Redirect(to)) = step(&acme, &mut started, refused).unwrap() else { panic!() };
+            (to, (), ())
+        };
+        assert!(to.ends_with("slack_error=slack_busy"), "{to}");
+        assert_eq!(world.holder("T2"), None);
+        // A stale check (another token) moves nothing.
+        install(&acme, &admin, &world, "T1");
+        assert_eq!(world.generation("acme"), 3);
+        assert!(!world.dir(|db| tenancy::slack_forget_if(db, "T1", "not-this-token", None)).unwrap());
+        assert_eq!(world.generation("acme"), 3);
+    }
+
+    /// Round 7: a release delayed from an earlier switch away from T1 is refused once a newer switch
+    /// picked T1 again.
+    #[test]
+    fn a_delayed_release_leaves_a_slack_workspace_picked_again() {
+        let world = World::new();
+        let (acme, admin) = hosted_at("acme");
+        install(&acme, &admin, &world, "T1");
+        // Switching to T2; its release of T1 is delayed.
+        let mut away = install_job(&acme, &admin, "T2");
+        let calls = advance(&acme, &mut away, vec![]);
+        let calls = advance(&acme, &mut away, answers(&acme, &world, &calls));
+        let late_release = advance(&acme, &mut away, answers(&acme, &world, &calls));
+        assert_eq!(body(&late_release[0])["team_ids"], json!(["T1"]));
+        // Switching back to T1, all the way.
+        let (to, calls) = install(&acme, &admin, &world, "T1");
+        assert!(to.ends_with("slack=connected"), "{to}");
+        assert_eq!(urls(&calls)[3], "dumbslab-directory:/slack/release");
+
+        let refused = answers(&acme, &world, &late_release);
+        assert_eq!((refused[0].status, refused[0].json()["error"]["code"].as_str()), (409, Some("slack_changed")));
+        let Step::Done(Finish::Redirect(_)) = step(&acme, &mut away, refused).unwrap() else { panic!() };
+        assert_eq!((world.holder("T1").as_deref(), world.holder("T2")), (Some("acme"), None));
+        let s = settings(&acme, &world, &admin);
+        assert_eq!((s["slack_workspace_id"].as_str(), s["connected"].as_bool()), (Some("T1"), Some(true)), "{s}");
+    }
+
+    /// Round 7: two Add to Slack for one workspace at once. The first to reach the directory wins;
+    /// the other hears `slack_busy` and saves nothing.
+    #[test]
+    fn of_two_installs_at_once_one_wins() {
+        let world = World::new();
+        let (acme, admin) = hosted_at("acme");
+        let started = |team: &str| {
+            let mut job = install_job(&acme, &admin, team);
+            let calls = advance(&acme, &mut job, vec![]);
+            (job, answers(&acme, &world, &calls))
+        };
+        let ((mut first, a), (mut second, b)) = (started("T1"), started("T2"));
+        let finish = |job: &mut Job, replies: Vec<HttpReply>| -> String {
+            let mut replies = replies;
+            loop {
+                match step(&acme, job, replies).unwrap() {
+                    Step::Done(Finish::Redirect(to)) => return to,
+                    Step::Fetch(calls) => replies = answers(&acme, &world, &calls),
+                    other => panic!("{other:?}"),
+                }
+            }
+        };
+        assert!(finish(&mut first, a).ends_with("slack=connected"));
+        assert!(finish(&mut second, b).ends_with("slack_error=slack_busy"));
+        assert_eq!((world.holder("T1").as_deref(), world.holder("T2")), (Some("acme"), None));
+        assert_eq!(saved_team(&acme).as_deref(), Some("T1"));
+    }
+
+    /// Round 7, S3: the window the invariant allows. A job that already has the token finishes the
+    /// one action it fetched it for, though acme disconnected meanwhile; its next action asks again
+    /// and gets nothing.
+    #[test]
+    fn an_action_that_has_its_token_finishes_once() {
+        let world = World::new();
+        let (acme, admin) = hosted_at("acme");
+        install(&acme, &admin, &world, "T1");
+        acme.ok("POST", "/api/v1/slack/channels", Some(json!({ "channel": "C0CHANNEL01" })), &admin);
+        let mut post = later_of(&publish(&acme, &admin, "News").effects).remove(0);
+        let asked = advance(&acme, &mut post, vec![]);
+        let sent = advance(&acme, &mut post, answers(&acme, &world, &asked));
+        assert_eq!(urls(&sent), vec!["https://slack.com/api/chat.postMessage"]);
+
+        assert!(disconnect(&acme, &world, &admin).0.is_ok());
+        // The directory no longer gives acme T1's token; this one message, already on its way, goes.
+        world.in_flight.borrow_mut().push(world.live("T1").unwrap());
+        let posted = answers(&acme, &world, &sent);
+        world.in_flight.borrow_mut().clear();
+        assert!(posted[0].ok());
+        assert!(matches!(step(&acme, &mut post, posted).unwrap(), Step::Done(_)));
+        // Nothing after it.
+        assert_eq!(messages(&acme, &world, &publish(&acme, &admin, "More").effects), 0);
     }
 
     /// A workspace restored from a backup still names the Slack workspace it held, with no token.
@@ -7155,26 +7381,15 @@ mod add_to_slack {
     }
 
     /// The directory holds each Slack workspace's installation, for one workspace (by its first
-    /// address), and gives its token only to that workspace.
+    /// address), and gives its token only to that workspace. Every change to what a workspace
+    /// holds names the value it started from and moves it on.
     #[test]
     fn the_directory_holds_one_installation_per_slack_workspace() {
-        use chrono::Utc;
+        use chrono::{Duration, Utc};
         let world = World::new();
         let now = Utc::now();
-        world
-            .dir(|db| {
-                tenancy::reserve(
-                    db,
-                    "gamma",
-                    "Name",
-                    "gamma",
-                    now,
-                    tenancy::Limits { per_ip_per_day: 10, per_day: 10, max_workspaces: 10, free: ROOMY },
-                )
-                .map(|_| ())
-            })
-            .unwrap();
-        let err = |r: dumbslab_core::ApiResult<()>| r.err().map(|e| e.code);
+        let limits = tenancy::Limits { per_ip_per_day: 10, per_day: 10, max_workspaces: 10, free: ROOMY };
+        world.dir(|db| tenancy::reserve(db, "gamma", "Name", "gamma", now, limits).map(|_| ())).unwrap();
         let token = |n: &str| tenancy::SlackInstall {
             team_id: "T1".into(),
             bot_token: format!("sealed-{n}"),
@@ -7183,44 +7398,61 @@ mod add_to_slack {
             team_name: "T1 Slack".into(),
             scopes: "commands".into(),
         };
-        let install = |home: &str, i: tenancy::SlackInstall| err(world.dir(|db| tenancy::slack_install(db, home, &i, now)));
+        let install =
+            |home: &str, i: tenancy::SlackInstall, g: i64| world.dir(|db| tenancy::slack_install(db, home, &i, g, now)).map_err(|e| e.code);
+        let release = |home: &str, g: i64, leftovers: bool, at| {
+            world.dir(|db| tenancy::slack_release(db, home, &["T1".to_string()], g, leftovers, at)).map_err(|e| e.code)
+        };
         let held = |home: &str| world.dir(|db| tenancy::slack_token(db, "T1", home)).unwrap().map(|t| t.bot_token);
+        let status = |team: Option<&str>, home: &str, at| world.dir(|db| tenancy::slack_status(db, team, home, at)).unwrap();
 
-        assert_eq!(install("acme", token("a")), None);
-        assert_eq!(install("beta", token("b")), Some("slack_team_taken"));
+        assert_eq!(install("acme", token("a"), 0), Ok(1));
+        assert_eq!(install("beta", token("b"), 0), Err("slack_team_taken"));
         assert_eq!((held("acme").as_deref(), held("beta")), (Some("sealed-a"), None));
-        // The same workspace again: the newest install wins.
-        assert_eq!(install("acme", token("a2")), None);
+        // The same workspace again, from where it is now: the newest install wins. From an older
+        // value: refused, whatever it holds.
+        assert_eq!(install("acme", token("a2"), 0), Err("slack_changed"));
+        assert_eq!(install("acme", token("a2"), 1), Ok(2));
         assert_eq!(held("acme").as_deref(), Some("sealed-a2"));
-        let status = |team: Option<&str>, home: &str| world.dir(|db| tenancy::slack_status(db, team, home)).unwrap();
-        assert_eq!(status(Some("T1"), "acme"), tenancy::SlackStatus { owned: true, team_name: Some("T1 Slack".into()), others: vec![] });
-        assert_eq!(status(Some("T1"), "beta"), tenancy::SlackStatus::default());
-        assert_eq!(status(None, "acme").others, vec!["T1".to_string()]);
-        // Only the holder lets go; a forget names the token it found dead, and the holder if a
-        // workspace asks.
-        assert!(!world.dir(|db| tenancy::slack_release(db, "T1", "beta")).unwrap());
+        assert_eq!(
+            status(Some("T1"), "acme", now),
+            tenancy::SlackStatus { owned: true, team_name: Some("T1 Slack".into()), leftovers: vec![], generation: 2 }
+        );
+        assert_eq!(status(Some("T1"), "beta", now), tenancy::SlackStatus::default());
+        // Another workspace's: a leftover only once it's been there a while.
+        assert_eq!(status(None, "acme", now).leftovers, Vec::<String>::new());
+        let later = now + Duration::seconds(tenancy::SLACK_LEFTOVER_SECS + 1);
+        assert_eq!(status(None, "acme", later).leftovers, vec!["T1".to_string()]);
+        assert_eq!(release("acme", 2, true, now), Ok((0, 2)), "too new to be a leftover: nothing changes");
+        // Only the holder lets go, from where it is now.
+        assert_eq!(release("beta", 0, false, now), Ok((0, 0)));
+        assert_eq!(release("acme", 1, false, now), Err("slack_changed"));
+        // A forget names the token it found dead, and the holder if a workspace asks; it moves the
+        // holder on.
         assert!(!world.dir(|db| tenancy::slack_forget_if(db, "T1", "fp-a", None)).unwrap());
         assert!(!world.dir(|db| tenancy::slack_forget_if(db, "T1", "fp-a2", Some("beta"))).unwrap());
         assert_eq!(world.dir(|db| tenancy::slack_row(db, "T1")).unwrap().map(|t| t.token_fingerprint).as_deref(), Some("fp-a2"));
         assert!(world.dir(|db| tenancy::slack_forget_if(db, "T1", "fp-a2", None)).unwrap());
-        assert_eq!(world.holder("T1"), None);
-        assert_eq!(install("beta", token("b")), None);
-        assert!(world.dir(|db| tenancy::slack_release(db, "T1", "beta")).unwrap());
+        assert_eq!((world.holder("T1"), world.generation("acme")), (None, 3));
+        assert_eq!(install("beta", token("b"), 0), Ok(1));
+        assert_eq!(release("beta", 1, false, now), Ok((1, 2)));
+        assert_eq!(install("acme", token("a3"), 3), Ok(4));
+        assert_eq!(release("acme", 4, true, later), Ok((1, 5)), "a leftover by then");
         // Requests go to the address the workspace lives at now.
-        assert_eq!(install("acme", token("a3")), None);
+        assert_eq!(install("acme", token("a4"), 5), Ok(6));
         world.dir(|db| tenancy::move_address(db, "acme", "wiki", now)).unwrap();
         assert_eq!(world.dir(|db| tenancy::slack_team_home(db, "T1")).unwrap(), Some(("acme".into(), "wiki".into())));
         // A reservation nobody set up, a bad ID or a missing token can't install.
-        assert_eq!(install("gamma", tenancy::SlackInstall { team_id: "T2".into(), ..token("g") }), Some("not_found"));
-        assert_eq!(install("acme", tenancy::SlackInstall { team_id: "T<2>".into(), ..token("x") }), Some("bad_request"));
+        assert_eq!(install("gamma", tenancy::SlackInstall { team_id: "T2".into(), ..token("g") }, 0), Err("not_found"));
+        assert_eq!(install("acme", tenancy::SlackInstall { team_id: "T<2>".into(), ..token("x") }, 6), Err("bad_request"));
         assert_eq!(
-            install("acme", tenancy::SlackInstall { team_id: "T2".into(), bot_token: String::new(), ..token("x") }),
-            Some("bad_request")
+            install("acme", tenancy::SlackInstall { team_id: "T2".into(), bot_token: String::new(), ..token("x") }, 6),
+            Err("bad_request")
         );
         // Deleting a workspace forgets its installations.
         world.dir(|db| tenancy::remove(db, "acme")).unwrap();
         assert_eq!((world.holder("T1"), held("acme")), (None, None));
-        assert_eq!(install("acme", token("a4")), Some("not_found"));
+        assert_eq!(install("acme", token("a5"), 6), Err("not_found"));
     }
 
     #[test]
