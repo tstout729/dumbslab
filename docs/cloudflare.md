@@ -116,6 +116,10 @@ To try it locally, create a Stripe sandbox, run `scripts/stripe-setup.sh local` 
 
 Set the `CONNECTOR_KEY` secret to let people connect GitHub, Google Drive, Jira and other apps; register OAuth apps to let them sign in instead of pasting tokens. The redirect URL is `https://<root domain>/connect/callback` for every workspace. See [connected-apps.md](connected-apps.md). The same key turns on [single sign-on](sso.md), which each workspace's admins set up in Settings › Single sign-on; its redirect URI is the workspace's own `https://<workspace>.<root domain>/sso/callback`.
 
+### Docs sync through DumbSlab's GitHub App
+
+Register one GitHub App for the whole service and set `GITHUB_APP_ID`, `GITHUB_APP_SLUG` and `GITHUB_APP_CLIENT_ID` in `[vars]` and the `GITHUB_APP_CLIENT_SECRET`, `GITHUB_APP_PRIVATE_KEY` and `GITHUB_APP_WEBHOOK_SECRET` secrets. Admins then sync docs with **Connect GitHub**, without tokens or webhooks. Its callback is `https://<root domain>/sync/github/callback` and its webhook `https://<root domain>/hooks/github`; the root domain forwards each delivery to the workspaces that connected its installation. See [hosting/github-app.md](hosting/github-app.md).
+
 ### Operator API
 
 Manage workspaces with `Authorization: Bearer $OPERATOR_TOKEN` on the root domain:

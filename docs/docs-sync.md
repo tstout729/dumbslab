@@ -2,6 +2,8 @@
 
 Docs sync keeps the Markdown files in a repository folder as posts in a topic. Write docs next to the code in GitHub or GitLab, and people find them in DumbSlab, with search, comments and verification. It's one way: the repository is the source of truth.
 
+On GitHub, there's nothing to copy: choose **Connect GitHub**, install DumbSlab's app on the repositories you want, and pick one. Pushes sync by themselves. See [set it up](#set-it-up).
+
 - **Each file is a published post.** Files ending in `.md` or `.markdown`, in the folder and its sub-folders. Hidden folders (like `.github`) and `node_modules` are skipped.
 - **Titles.** A post's title comes from the file's front matter (`title:`), or from a `# heading` at the very top (which then leaves the body, since the post shows its title), or from the file name: `getting-started.md` becomes "Getting started". A `README.md` or `index.md` is named after its folder.
 - **Folders become sub-topics** of the topic you choose, with the same visibility. In a private topic, they're private and start with the topic's members. The sync remembers those memberships. When someone leaves the chosen topic, the next sync removes the membership it gave them. Memberships people add stay, but if they make the sub-topic wider, the check below applies. A sub-topic is named after its folder, cut to 120 characters, and numbered ("Guides (2)") when a sibling topic already has that name. Each post sits in the chosen topic and in its folder's sub-topic.
@@ -18,9 +20,31 @@ Docs sync keeps the Markdown files in a repository folder as posts in a topic. W
 - **Removed files.** When a file is gone from the repository, its post is **archived, never deleted**. It stays linked to the repository: if the file comes back at the same path, the post is published again once the file has been synced, even if that takes several runs.
 - **Read-only here.** A synced post's title and content can only change in the repository. Saving, `edit_post` and restoring an old version are refused with a `synced_post` error that links to the file. The post shows "Synced from …; edit it there". Topics, status, pins, verification, comments and reactions still work. To edit a synced post here, duplicate it, or remove the source (its posts then become ordinary posts).
 
-Only admins can set up, run or change a source (Settings › Docs sync, or the `list_docs_sources`, `create_docs_source`, `update_docs_source`, `sync_docs_source` and `delete_docs_source` operations). It's available on every plan. It needs the server's connector key (`CONNECTOR_KEY` on Cloudflare, `DUMBSLAB_CONNECTOR_KEY` self-hosted; see [connected apps](connected-apps.md)): tokens and webhook secrets are encrypted with it, and no operation returns a token. Synced posts are written as the admin who added the source, while they're still an active admin; otherwise as the workspace's first active admin. If that admin stops being one, at the next sync their synced posts and images pass to the admin it now writes as, and they keep no membership the sync gave them unless they're still in the chosen topic, so they keep no access through the source.
+Only admins can set up, run or change a source (Settings › Docs sync, or the `list_docs_sources`, `list_github_repositories`, `create_docs_source`, `update_docs_source`, `sync_docs_source` and `delete_docs_source` operations). It's available on every plan. It needs the server's connector key (`CONNECTOR_KEY` on Cloudflare, `DUMBSLAB_CONNECTOR_KEY` self-hosted; see [connected apps](connected-apps.md)): tokens and webhook secrets are encrypted with it, and no operation returns a token. Synced posts are written as the admin who added the source, while they're still an active admin; otherwise as the workspace's first active admin. If that admin stops being one, at the next sync their synced posts and images pass to the admin it now writes as, and they keep no membership the sync gave them unless they're still in the chosen topic, so they keep no access through the source.
 
 ## Set it up
+
+### GitHub: Connect GitHub
+
+This works when the server has DumbSlab's GitHub App. Hosted DumbSlab does; a self-hosted server needs its own (see [the operator steps](hosting/github-app.md)). Without it, use [a token](#with-a-token).
+
+1. In DumbSlab, open **Settings › Docs sync** and choose **Connect GitHub**.
+2. GitHub asks where to install DumbSlab's app: your account or an organization, and all repositories or just some. Choose, then **Install & Authorize**. In an organization you don't own, GitHub asks an owner to approve it; once they have, choose Connect GitHub again.
+3. Back in DumbSlab, pick the repository. Then the branch (it starts as the repository's default branch), the folder (leave it empty for the whole repository) and the topic.
+4. Choose **Add and sync**. The first sync runs right away, and repeats until every file is in.
+
+That's all. Every push to the branch syncs.
+
+- **Which repositories you can pick.** Those the app can read that your own GitHub account can read too, as of when you connected. To add one, choose Connect GitHub again and give the app access to it. Another admin's repositories, or another workspace's, never show up for you, even when the app is installed on the same organization.
+- **What the app can do.** Read files, nothing more (GitHub's "Contents: Read-only"). Each sync gets a token that reads only that one repository and lasts an hour. DumbSlab keeps no token.
+- **Renamed repositories** keep syncing: DumbSlab follows the repository, not its name.
+- **When a folder can't sync.** If the app is uninstalled or suspended on GitHub, or the repository is taken out of it, the folder says so in Settings and stops syncing. Its posts stay. It picks up again by itself when the app is unsuspended or the repository is put back. After an uninstall, Connect GitHub again: folders on repositories you can pick there pick up where they were.
+
+Agents can do the same: `list_github_repositories` lists the repositories (and the `connect_url` an admin opens in a browser for step 2). Then `create_docs_source` with the repository's `installation_id` and `full_name`.
+
+### With a token
+
+For GitLab, self-managed GitLab, and GitHub without DumbSlab's app. In Settings › Docs sync, **Use a token instead** shows this form.
 
 1. Make a read-only token, unless the repository is public:
    - **GitHub:** a [fine-grained personal access token](https://github.com/settings/personal-access-tokens/new) with access to just that repository and the **Contents: Read-only** permission (Metadata: Read-only is added automatically). A classic token with `repo` works too, but gives far more access.
@@ -35,19 +59,20 @@ After that, every push to the branch syncs. **Sync now** syncs any time. **New w
 
 ## Webhooks
 
-- **GitHub:** DumbSlab checks `X-Hub-Signature-256` (`sha256=` + hex HMAC-SHA256 of the raw body, keyed with the secret) in constant time. A ping gets `pong`. A push to another branch, or another event, is ignored.
+- **DumbSlab's GitHub App:** GitHub sends every push to the app's own address. DumbSlab checks its signature, and syncs the folders on that repository and branch in workspaces whose admins connected the installation. Pushes to other branches, tags, and repositories no folder syncs are ignored. The sync starts right after the answer, so GitHub never waits for it.
+- **GitHub with a token:** DumbSlab checks `X-Hub-Signature-256` (`sha256=` + hex HMAC-SHA256 of the raw body, keyed with the secret) in constant time. A ping gets `pong`. A push to another branch, or another event, is ignored.
 - **GitLab:** DumbSlab compares `X-Gitlab-Token` with the secret in constant time. Only `Push Hook` events to the branch start a sync.
-- **What a delivery is trusted for.** A delivery only means that something changed. Apart from the branch name used to ignore other branches, nothing in it is used: the sync reads the repository itself.
+- **What a delivery is trusted for.** A delivery only means that something changed. Apart from the repository and branch, used to pick the folders it's about, nothing in it is used: the sync reads the repository itself.
 - **Errors.** A delivery with a wrong or missing signature gets a 401. If a sync is already running, the delivery is noted, and Settings says to sync again.
-- **Timing.** A delivery's response waits for its sync, which is usually a second or two. GitHub and GitLab give up after 10 seconds, but the sync's progress is kept either way.
-- **Moving the workspace.** Webhook addresses are on the workspace's own address. If the workspace moves to a new address, update the webhooks.
+- **Timing.** With a token, a delivery's response waits for its sync, which is usually a second or two. GitHub and GitLab give up after 10 seconds, but the sync's progress is kept either way.
+- **Moving the workspace.** Webhooks you added with a token are on the workspace's own address. If the workspace moves to a new address, update them. The GitHub App's address doesn't change.
 
 ## Limits
 
 | Limit | Value | Why |
 | --- | --- | --- |
 | Markdown files per source | 500 | Keeps one listing and its bookkeeping small; split a larger folder into several sources |
-| Changed files per sync | 20 | A sync is one job of at most 4 steps; `remaining` says what's left, and the next sync carries on |
+| Changed files per sync | 20 | A sync is one job of at most 5 steps; `remaining` says what's left, and the next sync carries on |
 | Images uploaded per sync | 10 | Same; a file whose images don't fit waits for the next sync |
 | Post size after links are rewritten | 2 MB | A file whose rewritten links make it longer is skipped until it changes; the rest of the run goes on |
 | Markdown file size | 1 MB | Larger files are skipped and listed. GitLab's listing has no sizes, so there a file turns out too large when it's read; it's then skipped until it changes, so it doesn't hold up other files |
@@ -62,11 +87,11 @@ If a listing has no Markdown files at all (a renamed folder or a deleted branch,
 ## How it works
 
 - **Requests.** The core builds every request and the host only sends it: over https, without following redirects, within 8 seconds, reading at most 4 MB.
-  - GitHub: `GET /repos/{owner}/{repo}/git/trees/{branch}:{folder}?recursive=1` lists the folder, and `GET /repos/{owner}/{repo}/git/blobs/{sha}` reads each changed file and image.
+  - GitHub: `GET /repos/{owner}/{repo}/git/trees/{branch}:{folder}?recursive=1` lists the folder, and `GET /repos/{owner}/{repo}/git/blobs/{sha}` reads each changed file and image. Through DumbSlab's GitHub App, a sync first signs the app's token request (a JWT) and asks for a token: `POST /app/installations/{id}/access_tokens`, for this repository and Contents: Read-only only. The app's private key stays with the server; it's never in a workspace's database.
   - GitLab: `GET /projects/{path}/repository/tree` and `.../repository/blobs/{sha}`.
   - The self-hosted server refuses private network addresses, as it does for connected apps.
 - **What changed.** Files are compared by their git blob id, so unchanged files aren't read again. A file is also read again when a file it links to appears, or when an image it shows changes.
-- **Where things are kept.** The `docs_items` table remembers each file's post, each image's upload and each folder's topic. A new file's post id is chosen when it's first listed, so links to it work while a large first sync is still running.
+- **Where things are kept.** The `docs_items` table remembers each file's post, each image's upload and each folder's topic. `github_installations` and `github_repositories` keep the app installations admins here connected, and the repositories their GitHub accounts could read there. A new file's post id is chosen when it's first listed, so links to it work while a large first sync is still running.
 - **One sync at a time** per source.
 - **Plans.** Every post, version and upload counts against the plan's daily writes and storage, like any change.
 - **Removing.** Deleting the chosen topic removes its sources too. Its posts stay, as ordinary posts.

@@ -157,9 +157,16 @@ function showSecret(source, secret) {
   return secretDialog({ title: 'Sync on every push', intro: 'Add a webhook so each push to the branch syncs. Use this secret:', secret, extra: webhookHelp(source) });
 }
 
+/** How a source connects, for its card. */
+function connectionMeta(source) {
+  if (source.connection === 'github_app') return h('span', null, icon('plug', { size: 13 }), ' Through DumbSlab’s GitHub App');
+  return source.has_token ? h('span', null, icon('key', { size: 13 }), ' Token saved') : h('span', null, 'No token (public repository)');
+}
+
 function sourceCard(source, reload) {
   const where = `${source.repository}${source.folder ? `/${source.folder}` : ''}`;
-  const run = button('Sync now', { icon: 'refresh', variant: 'subtle', size: 'sm' });
+  const app = source.connection !== 'token';
+  const run = button('Sync now', { icon: 'refresh', variant: 'subtle', size: 'sm', disabled: Boolean(source.disconnected) });
   const progress = h('span', { class: 'small muted', role: 'status' });
   run.addEventListener('click', () => busy(run, async () => {
     const r = await syncAll(source, (text) => { progress.textContent = text; });
@@ -190,7 +197,7 @@ function sourceCard(source, reload) {
   });
   const remove = button('Remove', { variant: 'ghost', size: 'sm' });
   remove.addEventListener('click', async () => {
-    const ok = await confirmDialog({ title: `Stop syncing ${where}?`, message: 'DumbSlab forgets the token. The synced posts and topics stay, and become ordinary posts anyone with access can edit.', confirmLabel: 'Stop syncing', danger: true });
+    const ok = await confirmDialog({ title: `Stop syncing ${where}?`, message: app ? 'The synced posts and topics stay, and become ordinary posts anyone with access can edit.' : 'DumbSlab forgets the token. The synced posts and topics stay, and become ordinary posts anyone with access can edit.', confirmLabel: 'Stop syncing', danger: true });
     if (!ok) return;
     busy(remove, async () => { await api.del(`/docs-sources/${enc(source.id)}`); toast('Docs sync removed'); reload(); }).catch(toastError);
   });
@@ -203,13 +210,14 @@ function sourceCard(source, reload) {
           source.topic ? h('a', { href: new URL(source.topic.url).pathname }, source.topic.name) : 'a deleted topic')),
       h('span', { class: 'badge' }, plural(source.synced_files, 'post'))),
     h('div', { class: 'app-body' },
-      h('div', { class: 'token-meta' }, stateLine(source), source.has_token ? h('span', null, icon('key', { size: 13 }), ' Token saved') : h('span', null, 'No token (public repository)')),
+      h('div', { class: 'token-meta' }, stateLine(source), connectionMeta(source)),
+      source.disconnected ? h('p', { class: 'form-error small' }, source.disconnected) : null,
       stateNotes(source),
       docsResult(source.last_result),
-      h('details', { class: 'small' }, h('summary', null, 'Sync on every push'), webhookHelp(source),
+      app ? null : h('details', { class: 'small' }, h('summary', null, 'Sync on every push'), webhookHelp(source),
         h('p', { class: 'muted' }, 'The secret was shown when the source was added. Make a new one if you don’t have it.')),
-      h('div', { class: 'plan-actions' }, run, token, rotate, remove, progress),
-      tokenForm));
+      h('div', { class: 'plan-actions' }, run, app ? null : token, app ? null : rotate, remove, progress),
+      app ? null : tokenForm));
 }
 
 function tokenHint(provider) {
@@ -218,14 +226,31 @@ function tokenHint(provider) {
     : 'A personal, group or project access token with the read_api scope. Leave out for public projects.';
 }
 
-function addSourceForm(topics, reload) {
+function topicSelect(topics) {
+  return select([{ value: '', label: 'Choose a topic…' }, ...topics.map((t) => ({ value: t.id, label: t.label }))], { required: true });
+}
+
+/** Syncs a new source, then reloads. A token source shows its webhook secret afterwards. */
+async function firstSync(created, progress, reload) {
+  progress.textContent = 'Syncing…';
+  try {
+    const done = await syncAll(created.source, (text) => { progress.textContent = text; });
+    toast(done ? `Synced ${plural(done.created, 'post')}` : 'Synced part of the folder; sync again to continue');
+  } catch (err) {
+    toastError(err);
+  }
+  if (created.webhook_secret) await showSecret(created.source, created.webhook_secret);
+  reload();
+}
+
+function tokenSourceForm(topics, reload) {
   const provider = select([{ value: 'github', label: 'GitHub' }, { value: 'gitlab', label: 'GitLab' }]);
   const repository = input({ required: true, placeholder: 'acme/handbook', spellcheck: 'false', autocapitalize: 'off' });
   const host = input({ placeholder: 'https://gitlab.example.com', spellcheck: 'false', type: 'url' });
   const hostField = field('GitLab address (self-managed only)', host, { hint: 'Leave empty for gitlab.com.' });
   const branch = input({ value: 'main', required: true, spellcheck: 'false' });
   const folder = input({ placeholder: 'docs', spellcheck: 'false' });
-  const topic = select([{ value: '', label: 'Choose a topic…' }, ...topics.map((t) => ({ value: t.id, label: t.label }))], { required: true });
+  const topic = topicSelect(topics);
   const token = input({ type: 'password', spellcheck: 'false' });
   const tokenField = field('Token (private repositories)', token, { hint: tokenHint('github') });
   const sync = () => {
@@ -257,19 +282,80 @@ function addSourceForm(topics, reload) {
       const body = { provider: provider.value, repository: repository.value.trim(), branch: branch.value.trim(), folder: folder.value.trim(), topic_id: topic.value };
       if (token.value.trim()) body.token = token.value.trim();
       if (provider.value === 'gitlab' && host.value.trim()) body.host = host.value.trim();
-      const r = await api.post('/docs-sources', body);
-      progress.textContent = 'Syncing…';
-      try {
-        const done = await syncAll(r.source, (text) => { progress.textContent = text; });
-        toast(done ? `Synced ${plural(done.created, 'post')}` : 'Synced part of the folder; sync again to continue');
-      } catch (err) {
-        toastError(err);
-      }
-      await showSecret(r.source, r.webhook_secret);
-      reload();
+      await firstSync(await api.post('/docs-sources', body), progress, reload);
     }).catch(toastError);
   });
   return f;
+}
+
+/** Picking a repository DumbSlab's GitHub App reads: no token, no webhook. */
+function githubSourceForm(github, topics, reload) {
+  const picks = new Map();
+  const repository = h('select', { class: 'input select', required: true }, h('option', { value: '' }, 'Choose a repository…'));
+  for (const i of github.installations.filter((x) => !x.suspended && x.repositories.length)) {
+    const group = h('optgroup', { label: i.account });
+    for (const r of i.repositories) {
+      const value = `${i.installation_id}/${r.id}`;
+      picks.set(value, { installation: i, repo: r });
+      group.appendChild(h('option', { value }, `${r.full_name}${r.private ? ' (private)' : ''}`));
+    }
+    repository.appendChild(group);
+  }
+  const branch = input({ value: 'main', required: true, spellcheck: 'false' });
+  repository.addEventListener('change', () => {
+    const picked = picks.get(repository.value);
+    if (picked) branch.value = picked.repo.default_branch;
+  });
+  const folder = input({ placeholder: 'docs', spellcheck: 'false' });
+  const topic = topicSelect(topics);
+  const submit = button('Add and sync', { variant: 'primary', type: 'submit' });
+  const progress = h('span', { class: 'small muted', role: 'status' });
+  const more = github.installations.some((i) => i.more_repositories)
+    ? h('p', { class: 'small muted' }, 'Your GitHub account can read more repositories than are listed here; the first 500 are.')
+    : null;
+  const f = h('form', { class: 'stack token-form', novalidate: true },
+    field('Repository', repository, { hint: 'Repositories DumbSlab’s GitHub App can read that your GitHub account can read too. To add one, choose Connect GitHub and give the app access to it.' }),
+    more,
+    field('Branch', branch),
+    field('Folder', folder, { hint: 'The folder whose Markdown files to sync, with its sub-folders. Leave empty for the whole repository.' }),
+    field('Topic', topic, { hint: 'Posts go here; sub-folders become sub-topics with the same visibility.' }),
+    h('div', { class: 'plan-actions' }, submit, progress));
+  f.addEventListener('submit', (e) => {
+    e.preventDefault();
+    if (!f.checkValidity()) {
+      f.reportValidity();
+      return;
+    }
+    const picked = picks.get(repository.value);
+    busy(submit, async () => {
+      const body = { provider: 'github', installation_id: picked.installation.installation_id, repository: picked.repo.full_name, branch: branch.value.trim(), folder: folder.value.trim(), topic_id: topic.value };
+      await firstSync(await api.post('/docs-sources', body), progress, reload);
+    }).catch(toastError);
+  });
+  return f;
+}
+
+/** Connect GitHub: a page on the server, so the browser goes there rather than this app routing it. */
+function connectLink(url, label, variant) {
+  return h('a', { class: ['btn', `btn-${variant}`, 'btn-sm'], href: new URL(url).pathname }, icon('plug'), h('span', null, label));
+}
+
+/** Adding a folder: through DumbSlab's GitHub App when the server has it, or with a token. */
+function addSource(github, topics, reload) {
+  const tokenForm = tokenSourceForm(topics, reload);
+  if (!github || !github.available) return tokenForm;
+  const usable = github.installations.some((i) => !i.suspended && i.repositories.length);
+  tokenForm.hidden = true;
+  const useToken = button('Use a token instead', { variant: 'ghost', size: 'sm' });
+  useToken.addEventListener('click', () => { tokenForm.hidden = false; useToken.remove(); });
+  const intro = usable
+    ? h('p', { class: 'small muted' }, 'Pick a repository from GitHub. Choose Connect GitHub to install DumbSlab’s app on another account, or to give it more repositories.')
+    : h('p', { class: 'small muted' }, 'Choose Connect GitHub, install DumbSlab’s app on the repositories you want, and come back here to pick one. No token or webhook needed: pushes sync by themselves. For GitLab, or a GitHub repository without the app, use a token.');
+  return h('div', { class: 'stack' },
+    intro,
+    usable ? githubSourceForm(github, topics, reload) : null,
+    h('div', { class: 'plan-actions' }, connectLink(github.connect_url, 'Connect GitHub', usable ? 'subtle' : 'primary'), useToken),
+    tokenForm);
 }
 
 /** Topics as an indented list, for choosing one. */
@@ -291,16 +377,45 @@ function topicOptions(list) {
   return out;
 }
 
+// What the codes in `?connect_error=` mean, after Connect GitHub. The link carries only a code,
+// never a message: anyone can make a link to this page.
+const connectErrors = {
+  expired_link: () => 'That link is no longer valid. Choose Connect GitHub again.',
+  too_slow: () => 'Connecting took too long. Choose Connect GitHub again.',
+  wrong_person: () => 'Finish connecting in the same browser, signed in as the admin who started it. Choose Connect GitHub again.',
+  not_admin: () => 'Only admins can connect GitHub for docs sync.',
+  unavailable: () => 'DumbSlab’s GitHub App isn’t set up on this server. Use a token instead.',
+  approval_requested: () => 'An owner of the GitHub organization has to approve DumbSlab’s app first; GitHub has asked them. Once they have, choose Connect GitHub again.',
+  declined: () => 'GitHub didn’t allow access. Choose Connect GitHub again, and authorize DumbSlab when GitHub asks.',
+  no_code: () => 'GitHub didn’t finish connecting. Choose Connect GitHub again.',
+  not_yours: () => 'Your GitHub account can’t access that installation of DumbSlab’s app. Install it on an account or organization you manage, then try again.',
+  failed: () => 'Connecting GitHub didn’t work. Try again.',
+};
+
+function connectNotes() {
+  const query = new URLSearchParams(location.search);
+  if (query.get('connected') === 'github') {
+    return h('p', { class: 'callout', role: 'status' }, icon('check', { size: 15 }), h('span', null, 'GitHub is connected. Pick a repository below.'));
+  }
+  const code = query.get('connect_error');
+  if (!code) return null;
+  const say = Object.hasOwn(connectErrors, code) ? connectErrors[code]() : 'Connecting didn’t work. Try again.';
+  return h('p', { class: 'callout callout-warn', role: 'alert' }, icon('alert', { size: 15 }), h('span', null, say));
+}
+
 export async function docsSyncSection(ctx) {
   const [list, topics] = await Promise.all([api.get('/docs-sources'), api.get('/topics')]);
   if (!list.enabled) return off('Docs sync');
+  const github = list.github_app ? await api.get('/docs-sources/github') : null;
   const reload = () => ctx.reload();
-  const add = addSourceForm(topicOptions(topics.items), reload);
-  add.hidden = list.items.length > 0;
+  const add = addSource(github, topicOptions(topics.items), reload);
+  const justConnected = new URLSearchParams(location.search).get('connected') === 'github';
+  add.hidden = list.items.length > 0 && !justConnected;
   const show = button('Add a folder', { icon: 'plus', variant: 'primary', size: 'sm', onClick: () => { add.hidden = false; show.remove(); } });
   return frag(
+    connectNotes(),
     panel('Docs sync', 'Keep a GitHub or GitLab folder’s Markdown files as posts in a topic. Each file is a post, sub-folders become sub-topics, and relative links and images keep working. It’s one way: synced posts are edited in the repository, and each push brings the change here.',
       list.items.length ? h('div', { class: 'app-list' }, list.items.map((s) => sourceCard(s, reload))) : null,
-      list.items.length ? h('div', null, show) : null,
+      list.items.length && add.hidden ? h('div', null, show) : null,
       add));
 }
