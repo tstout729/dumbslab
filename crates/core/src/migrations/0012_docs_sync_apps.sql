@@ -21,7 +21,11 @@ CREATE TABLE IF NOT EXISTS docs_source_links (
   -- the source's `secret` expires (it's refreshed during a sync, under the sync's lease).
   project_id INTEGER,
   hook_id INTEGER,
-  token_expires_at TEXT
+  token_expires_at TEXT,
+  -- A refresh of its GitLab tokens under way, or refused: `<when>|<the sync's lease, or refused>|<the
+  -- spent refresh token's hash>`. Another sync doesn't spend that token meanwhile, and a refusal
+  -- of it doesn't count while it might still land.
+  refreshing TEXT
 );
 CREATE INDEX IF NOT EXISTS docs_source_links_installation ON docs_source_links(installation_id, repo_id);
 
