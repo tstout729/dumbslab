@@ -7656,19 +7656,30 @@ mod syncs {
         assert!(h.ok("GET", "/api/v1/activity?limit=200", None, &admin).to_string().contains("github.uninstalled"));
     }
 
-    /// GitHub's view of installation 42 now, for checks of it: `active`, `suspended` or `gone`, and
-    /// the repositories it can see.
+    /// GitHub's view of installation 42 now, for checks of it: `active`, `suspended` or `gone`; the
+    /// repositories it can reach; and repositories renamed since (old name → id).
     struct GitHubNow {
         state: RefCell<&'static str>,
         repos: RefCell<Vec<(i64, &'static str)>>,
+        renamed: RefCell<Vec<(&'static str, i64)>>,
+        /// Answers GitHub can't give just now (5xx), for a while.
+        down: RefCell<bool>,
     }
 
     impl GitHubNow {
         fn new() -> GitHubNow {
-            GitHubNow { state: RefCell::new("active"), repos: RefCell::new(vec![(7, "acme/docs"), (8, "acme/site")]) }
+            GitHubNow {
+                state: RefCell::new("active"),
+                repos: RefCell::new(vec![(7, "acme/docs"), (8, "acme/site")]),
+                renamed: RefCell::new(vec![]),
+                down: RefCell::new(false),
+            }
         }
 
         fn answer(&self, c: &HttpCall) -> HttpReply {
+            if *self.down.borrow() {
+                return HttpReply { status: 503, body: "{}".into() };
+            }
             let state = *self.state.borrow();
             if c.url == "https://api.github.com/app/installations/42" {
                 assert!(c.headers.iter().any(|(k, v)| k == "authorization" && v.starts_with("Bearer ey")), "the App's JWT");
@@ -7691,10 +7702,27 @@ mod syncs {
                 };
             }
             assert!(c.headers.contains(&("authorization".into(), "Bearer ghs_list".into())), "{c:?}");
-            let items: Vec<Value> =
-                self.repos.borrow().iter().map(|(id, name)| json!({ "id": id, "full_name": name, "default_branch": "main" })).collect();
-            let first = c.url == "https://api.github.com/installation/repositories?per_page=100&page=1";
-            ok(json!({ "total_count": items.len(), "repositories": if first { json!(items) } else { json!([]) } }))
+            assert!(!c.url.contains("/installation/repositories"), "a check never lists the whole installation");
+            let repos = self.repos.borrow();
+            let found = |id: i64| repos.iter().find(|(r, _)| *r == id).map(|(id, name)| ok(json!({ "id": id, "full_name": name })));
+            if let Some(name) = c.url.strip_prefix("https://api.github.com/repos/") {
+                if let Some((_, id)) = self.renamed.borrow().iter().find(|(old, _)| *old == name) {
+                    return HttpReply {
+                        status: 301,
+                        body: json!({ "message": "Moved Permanently", "url": format!("https://api.github.com/repositories/{id}") })
+                            .to_string(),
+                    };
+                }
+                return repos
+                    .iter()
+                    .find(|(_, n)| *n == name)
+                    .and_then(|(id, _)| found(*id))
+                    .unwrap_or(HttpReply { status: 404, body: "{}".into() });
+            }
+            if let Some(id) = c.url.strip_prefix("https://api.github.com/repositories/") {
+                return found(id.parse().unwrap()).unwrap_or(HttpReply { status: 404, body: "{}".into() });
+            }
+            panic!("unexpected {c:?}");
         }
     }
 
@@ -7883,10 +7911,17 @@ mod syncs {
         assert_eq!(source_of(&h, &admin)["disconnected"], Value::Null);
         assert_eq!(picker(&h), vec!["acme/docs", "acme/site"]);
 
-        // A sync whose repository the installation can't reach (GitHub answers 422) waits too.
+        // A sync whose repository the installation can't reach (GitHub answers 422) doesn't decide
+        // that itself: it asks for a check, which does.
+        gh.repos.borrow_mut().retain(|(id, _)| *id != 7);
         let refused = |_: &HttpCall| HttpReply { status: 422, body: "{}".into() };
         let r = h.call("POST", &format!("/api/v1/docs-sources/{source}/sync"), None, &admin);
-        assert!(matches!(drive(&h, job_of(&r), &refused).0, Finish::Fail(_)));
+        let (finish, _, effects) = drive_all(&h, job_of(&r), &refused);
+        assert!(matches!(finish, Finish::Fail(ref e) if e.message.contains("checking")), "{finish:?}");
+        assert_eq!(source_of(&h, &admin)["disconnected"], Value::Null, "not by itself");
+        let checks: Vec<Job> = effects.into_iter().filter_map(|e| if let Effect::Background(j) = e { Some(j) } else { None }).collect();
+        assert_eq!(checks.len(), 1);
+        filled(drive(&h, checks[0].clone(), &|c| gh.answer(c)).0);
         assert!(source_of(&h, &admin)["disconnected"].as_str().unwrap().contains("taken out"));
 
         // Uninstalled, and redelivered: the second finds nothing left to do.
@@ -7897,8 +7932,24 @@ mod syncs {
         assert_eq!((again.status, again.body["status"].as_str()), (200, Some("ignored")));
     }
 
-    #[test]
-    fn only_the_newest_check_of_an_installation_applies() {
+    /// One step of a job like a host runs it: committed when it works, rolled back when it fails.
+    /// Returns its result and, when it failed, the notice the host sends.
+    fn step_with(h: &H, job: &mut Job, replies: Vec<HttpReply>) -> (dumbslab_core::ApiResult<Step>, Option<HttpCall>) {
+        let (out, next) = h
+            .store
+            .with_tx(|db| {
+                let mut j = job.clone();
+                let (step, notice) = connect::guarded_step(db, &h.cfg, &mut j, replies, chrono::Utc::now(), |_| None);
+                let ok = step.is_ok();
+                (((step, notice), j), ok)
+            })
+            .unwrap();
+        *job = next;
+        out
+    }
+
+    /// An installation connected here, with a source on acme/docs (repository 7).
+    fn github_with_a_source() -> (H, Auth, String) {
         let mut h = H::new();
         let (admin, _) = h.setup();
         with_key(&mut h);
@@ -7906,27 +7957,127 @@ mod syncs {
         connect_github(&h, &admin, "&installation_id=42&setup_action=install", &installer);
         let topic = h.ok("POST", "/api/v1/topics", Some(json!({ "name": "Handbook" })), &admin)["id"].as_str().unwrap().to_string();
         let input = json!({ "provider": "github", "installation_id": 42, "repository": "acme/docs", "topic_id": topic });
-        h.ok("POST", "/api/v1/docs-sources", Some(input), &admin);
+        let source = h.ok("POST", "/api/v1/docs-sources", Some(input), &admin)["source"]["id"].as_str().unwrap().to_string();
+        (h, admin, source)
+    }
 
-        // acme/docs is taken out, and put back. The first change's check is slow: by the time it
-        // reads GitHub's list (without acme/docs, as it was then), the second change's check has
-        // already found it back. The older check gives way, so acme/docs stays.
-        let removed =
-            json!({ "action": "removed", "installation": { "id": 42 }, "repositories_removed": [{ "id": 7, "full_name": "acme/docs" }] });
-        let older = check_of(&h, "installation_repositories", &removed);
+    fn gens(h: &H) -> (i64, i64) {
+        let r = db_run(h, |db| db.one("SELECT requested_gen, applied_gen FROM github_installations WHERE id = 42", &[])).unwrap();
+        (r.i64("requested_gen"), r.i64("applied_gen"))
+    }
+
+    fn checks_in(effects: Vec<Effect>) -> Vec<Job> {
+        effects.into_iter().filter_map(|e| if let Effect::Background(j) = e { Some(j) } else { None }).collect()
+    }
+
+    #[test]
+    fn checks_of_an_installation_run_one_at_a_time_and_none_is_lost() {
+        let (h, admin, _) = github_with_a_source();
+        let gh = GitHubNow::new();
+        let answer = |c: &HttpCall| gh.answer(c);
+        let change = json!({ "action": "removed", "installation": { "id": 42 }, "repositories_removed": [] });
+
+        // A burst of ten changes: the first starts a check, the rest only note there's more to
+        // read. The check applies what it read and chains one more, which catches up: two checks.
+        let mut started = vec![];
+        for _ in 0..10 {
+            let r = app_hook(&h, "installation_repositories", &change, "gh-hook-secret");
+            assert_eq!(r.body["status"], "checking");
+            started.extend(background(&r));
+        }
+        assert_eq!(started.len(), 1, "one check at a time");
+        let (finish, _, effects) = drive_all(&h, started.remove(0), &answer);
+        assert_eq!(filled(finish)["state"], "active");
+        assert_eq!(gens(&h), (10, 1), "what it read was at least as fresh as the change it started for");
+        let chained = checks_in(effects);
+        assert_eq!(chained.len(), 1, "one more for the changes that came in meanwhile");
+        let (_, _, effects) = drive_all(&h, chained[0].clone(), &answer);
+        assert_eq!(gens(&h), (10, 10));
+        assert!(checks_in(effects).is_empty(), "caught up: two checks in all");
+
+        // A check that took too long loses its hold. The change after it starts another, which
+        // fails (GitHub is down) and waits a while; the slow one, back, stops without asking
+        // GitHub anything. The change stays owed and is checked once the wait is over.
+        let slow = check_of(&h, "installation_repositories", &change);
+        db_run(&h, |db| db.execute("UPDATE github_installations SET checking_until = '2000-01-01T00:00:00.000Z x'", &[]));
+        let newer = check_of(&h, "installation_repositories", &change);
+        *gh.down.borrow_mut() = true;
+        assert!(matches!(drive(&h, newer, &answer).0, Finish::Fail(_)));
+        *gh.down.borrow_mut() = false;
+        let (finish, sent) = drive(&h, slow, &answer);
+        assert_eq!((filled(finish)["state"].clone(), sent.len()), (json!("superseded"), 0));
+        assert_eq!(gens(&h), (12, 10), "still owed");
+        let r = h.call("GET", "/api/v1/docs-sources/github", None, &admin);
+        assert!(background(&r).is_empty(), "not before the wait is over");
+        db_run(&h, |db| db.execute("UPDATE github_installations SET next_check_at = '2000-01-01T00:00:00.000Z'", &[]));
+        let r = h.call("GET", "/api/v1/docs-sources/github", None, &admin);
+        let retried = background(&r);
+        assert_eq!(retried.len(), 1, "Settings › Docs sync picks it up");
+        drive(&h, retried[0].clone(), &answer);
+        assert_eq!(gens(&h), (12, 12));
+    }
+
+    #[test]
+    fn a_late_422_never_disconnects_a_restored_repository() {
+        let (h, admin, source) = github_with_a_source();
+        let gh = GitHubNow::new();
+        // A sync asks for its token; before GitHub's 422 (from when acme/docs was out of the App)
+        // arrives, the repository is put back and a check finds it reachable.
+        let r = h.call("POST", &format!("/api/v1/docs-sources/{source}/sync"), None, &admin);
+        let mut sync = job_of(&r);
+        let Ok(Step::Fetch(_)) = step_with(&h, &mut sync, vec![]).0 else { panic!("the token request") };
         let added =
             json!({ "action": "added", "installation": { "id": 42 }, "repositories_added": [{ "id": 7, "full_name": "acme/docs" }] });
-        let newer = check_of(&h, "installation_repositories", &added);
-        let now = GitHubNow::new();
-        assert_eq!(filled(drive(&h, newer, &|c| now.answer(c)).0)["state"], "active");
-        let then = GitHubNow::new();
-        then.repos.borrow_mut().retain(|(id, _)| *id != 7);
-        assert_eq!(filled(drive(&h, older, &|c| then.answer(c)).0)["state"], "superseded");
+        check(&h, "installation_repositories", &added, &gh);
+        let (result, _) = step_with(&h, &mut sync, vec![HttpReply { status: 422, body: "{}".into() }]);
+        assert!(matches!(result, Ok(Step::Done(Finish::Fail(_)))), "{result:?}");
+        assert_eq!(source_of(&h, &admin)["disconnected"], Value::Null, "the late 422 decides nothing");
+        // It asked for a check, which finds the repository reachable: still connected.
+        let asked = checks_in(sync.take_effects());
+        assert_eq!(asked.len(), 1);
+        let (finish, _, effects) = drive_all(&h, asked[0].clone(), &|c| gh.answer(c));
+        assert_eq!(filled(finish)["state"], "active");
+        assert!(checks_in(effects).is_empty());
         assert_eq!(source_of(&h, &admin)["disconnected"], Value::Null);
-        assert_eq!(
-            h.ok("GET", "/api/v1/docs-sources/github", None, &admin)["installations"][0]["repositories"].as_array().unwrap().len(),
-            2
-        );
+        assert_eq!(gens(&h), (2, 2));
+    }
+
+    #[test]
+    fn checks_read_each_sources_repository_whatever_the_installations_size() {
+        let (h, admin, _) = github_with_a_source();
+        // A repository far down a large installation (not among the first 500 it lists), which the
+        // admin's account could read when they connected.
+        db_run(&h, |db| {
+            db.execute("INSERT INTO github_repositories (installation_id, id, full_name, default_branch, private) VALUES (42, 777, 'acme/zz-big', 'main', 1)", &[])
+        });
+        let topic = h.ok("POST", "/api/v1/topics", Some(json!({ "name": "Big" })), &admin)["id"].as_str().unwrap().to_string();
+        let input = json!({ "provider": "github", "installation_id": 42, "repository": "acme/zz-big", "topic_id": topic });
+        let big = h.ok("POST", "/api/v1/docs-sources", Some(input), &admin)["source"]["id"].as_str().unwrap().to_string();
+        let disconnected = |h: &H, id: &str| -> Value {
+            h.ok("GET", "/api/v1/docs-sources", None, &admin)["items"].as_array().unwrap().iter().find(|s| s["id"] == id).unwrap()["disconnected"].clone()
+        };
+        let gh = GitHubNow::new();
+        let change = json!({ "action": "removed", "installation": { "id": 42 }, "repositories_removed": [] });
+        // Out of reach: it waits.
+        check(&h, "installation_repositories", &change, &gh);
+        assert!(disconnected(&h, &big).as_str().unwrap().contains("taken out"));
+        // Back, among hundreds of others: GitHub is asked about it alone, and it comes back.
+        gh.repos.borrow_mut().push((777, "acme/zz-big"));
+        check(&h, "installation_repositories", &change, &gh);
+        assert_eq!(disconnected(&h, &big), Value::Null);
+        // Renamed on GitHub: the check follows GitHub's pointer and keeps it connected.
+        gh.repos.borrow_mut().retain(|(id, _)| *id != 777);
+        gh.repos.borrow_mut().push((777, "acme/huge"));
+        gh.renamed.borrow_mut().push(("acme/zz-big", 777));
+        check(&h, "installation_repositories", &change, &gh);
+        assert_eq!(disconnected(&h, &big), Value::Null);
+        let names: Vec<String> = h.ok("GET", "/api/v1/docs-sources/github", None, &admin)["installations"][0]["repositories"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["full_name"].as_str().unwrap().to_string())
+            .collect();
+        assert!(names.contains(&"acme/huge".to_string()), "{names:?}");
     }
 
     #[test]

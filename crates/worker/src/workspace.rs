@@ -27,6 +27,9 @@ use worker::*;
 
 use crate::sql::{DoDb, api_error_response, call_object, error_response, flag, json_response, read_body, transaction, var};
 
+/// Background jobs one request runs in a row, counting those they leave.
+const MAX_CHAINED_JOBS: usize = 6;
+
 /// How often, at most, a busy workspace reports its usage to the directory.
 const REPORT_EVERY_SECS: i64 = 300;
 
@@ -303,7 +306,14 @@ impl Workspace {
     /// [`drive_job`]).
     async fn run_job(&self, job: Job, cfg: &HostConfig) -> Result<Finish> {
         let (finish, effects, written) = drive_job(&self.state, &self.env, job, cfg).await?;
+        // A job can leave another to run after the answer (a check of a GitHub App installation).
+        let (later, effects): (Vec<Effect>, Vec<Effect>) = effects.into_iter().partition(|e| matches!(e, Effect::Background(_)));
         send_effects(&self.state, &self.env, cfg, effects);
+        for effect in later {
+            if let Effect::Background(job) = effect {
+                self.run_job_later(job, cfg.clone());
+            }
+        }
         if let Some(h) = cfg.hosting.as_ref().filter(|_| written > 0) {
             self.report_usage(&h.home, false);
         }
@@ -319,14 +329,31 @@ impl Workspace {
         let state = State::from(raw.clone().unchecked_into::<worker::worker_sys::DurableObjectState>());
         let env = self.env.clone();
         self.state.wait_until(async move {
-            match drive_job(&state, &env, job, &cfg).await {
-                Ok((finish, effects, _)) => {
-                    if let Finish::Fail(e) = finish {
-                        console_warn!("a background job failed: {} ({})", e.message, e.code);
-                    }
-                    send_effects(&state, &env, &cfg, effects);
+            // Jobs it leaves run after it, a few at most (a check chains one more when changes
+            // arrived while it ran).
+            let mut queue = vec![job];
+            let mut ran = 0;
+            while let Some(job) = queue.pop() {
+                if ran == MAX_CHAINED_JOBS {
+                    console_warn!("a background job left more jobs than run in a row; the rest wait for their next trigger");
+                    break;
                 }
-                Err(e) => console_error!("a background job failed: {e}"),
+                ran += 1;
+                match drive_job(&state, &env, job, &cfg).await {
+                    Ok((finish, effects, _)) => {
+                        if let Finish::Fail(e) = finish {
+                            console_warn!("a background job failed: {} ({})", e.message, e.code);
+                        }
+                        let (later, effects): (Vec<Effect>, Vec<Effect>) =
+                            effects.into_iter().partition(|e| matches!(e, Effect::Background(_)));
+                        queue.extend(later.into_iter().filter_map(|e| match e {
+                            Effect::Background(j) => Some(j),
+                            _ => None,
+                        }));
+                        send_effects(&state, &env, &cfg, effects);
+                    }
+                    Err(e) => console_error!("a background job failed: {e}"),
+                }
             }
         });
     }
