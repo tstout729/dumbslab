@@ -1,15 +1,28 @@
 //! Jira Cloud: issues the connected account can see on one Atlassian site. People connect with an
 //! Atlassian API token for their site, or by signing in with Atlassian (OAuth 2.0 3LO), after
-//! which requests go through Atlassian's gateway with the site's cloud id. Signing in needs the
-//! host's Atlassian app to include the User identity API (`read:me`). The Atlassian parts here
-//! (sites, signing in, times, search words) are shared with Confluence.
+//! which requests go through Atlassian's gateway with the site's cloud id. The Atlassian parts
+//! here (sites, signing in, times, search words, personal data) are shared with Confluence.
+//!
+//! **No personal data is kept.** Atlassian requires an app that stores its users' personal data
+//! (email, name, avatar and the like) to report the accounts to its personal data reporting API
+//! every 7 days and to erase data for closed accounts; an app that fetches such data when it's
+//! needed and doesn't store it has no such duty. So a connection keeps only the site: its label is
+//! the site's address, and its settings hold the site and, when signed in, the site's cloud id
+//! (both name the site, not a person). Signing in doesn't ask for the person's profile at all (no
+//! `read:me`), and nobody's account id, email or name is saved: search results and previews read
+//! reporters' and assignees' names when they're shown, and nothing keeps them (connected apps
+//! record no activity events, and the web app's preview cache is in the browser's memory only).
+//! An API-token connection's credential does hold the email the person typed, sealed with the
+//! token, because Atlassian's Basic auth needs both; it's the person's own sign-in, not data read
+//! from Atlassian through DumbSlab's app. Atlassian's guide doesn't speak to credentials like that.
+//! https://developer.atlassian.com/cloud/jira/platform/user-privacy-developer-guide/
 //!
 //! Atlassian's docs:
 //! - Issue search, `GET /rest/api/3/search/jql` (`/rest/api/3/search` is being removed):
 //!   https://developer.atlassian.com/cloud/jira/platform/rest/v3/api-group-issue-search/
 //! - Issues: https://developer.atlassian.com/cloud/jira/platform/rest/v3/api-group-issues/
 //! - Current user: https://developer.atlassian.com/cloud/jira/platform/rest/v3/api-group-myself/
-//! - Signing in, cloud ids, the gateway, rotating refresh tokens and `/me`:
+//! - Signing in, cloud ids (`accessible-resources`), the gateway and rotating refresh tokens:
 //!   https://developer.atlassian.com/cloud/jira/platform/oauth-2-3lo-apps/
 //! - Scopes (classic ones are recommended): https://developer.atlassian.com/cloud/jira/platform/scopes-for-oauth-2-3LO-and-forge-apps/
 //! - API tokens (scoped ones only work through the gateway):
@@ -31,8 +44,8 @@ pub struct Jira;
 /// Atlassian's API gateway, for accounts connected by signing in.
 const GATEWAY: &str = "https://api.atlassian.com";
 const TOKEN_URL: &str = "https://auth.atlassian.com/oauth/token";
-/// Search issues and read them; who the person is; refresh tokens.
-const SCOPES: &[&str] = &["read:jira-work", "read:me", "offline_access"];
+/// Search issues and read them; refresh tokens. Not `read:me`: DumbSlab keeps no one's profile.
+const SCOPES: &[&str] = &["read:jira-work", "offline_access"];
 /// What search and previews read of an issue. Search answers with only ids unless asked.
 const SEARCH_FIELDS: &str = "summary,status,project,updated,reporter,description";
 const ISSUE_FIELDS: &str = "summary,status,assignee,reporter,created,updated,description,issuetype,project,priority";
@@ -48,6 +61,8 @@ pub const fn oauth(scopes: &'static [&'static str]) -> OAuthSpec {
         scope_separator: " ",
         extra: &[("audience", "api.atlassian.com"), ("prompt", "consent")],
         pkce: false,
+        site: None,
+        refresh_revokes: false,
     }
 }
 
@@ -133,20 +148,18 @@ pub fn site_get(product: &str, cred: &Credential, account: &Account, path: &str)
     Some(call.header("accept", "application/json"))
 }
 
-/// Requests that check a connection and say whose it is. With an API token: the person on the
-/// site (`me_path`). Signed in: the sites the token reaches, and the person's Atlassian profile.
+/// Requests that check a connection and find its site. With an API token: the person on the site
+/// (`me_path`), which only checks the token. Signed in: the sites the token reaches.
 pub fn profile_calls(product: &str, me_path: &str, cred: &Credential) -> Vec<HttpCall> {
     if token_mode(cred) {
         return site_get(product, cred, &Account::default(), me_path).into_iter().collect();
     }
-    ["/oauth/token/accessible-resources", "/me"]
-        .iter()
-        .map(|p| HttpCall::get(format!("{GATEWAY}{p}")).bearer(&cred.token).header("accept", "application/json"))
-        .collect()
+    vec![HttpCall::get(format!("{GATEWAY}/oauth/token/accessible-resources")).bearer(&cred.token).header("accept", "application/json")]
 }
 
 /// Reads the answers to [`profile_calls`]. Atlassian lists each site once per product, so `scope`
-/// (one only this product has) picks the product's sites.
+/// (one only this product has) picks the product's sites. The account is labeled with its site
+/// only: nothing personal is kept (see the module docs).
 pub fn read_account(name: &str, scope: &str, cred: &Credential, replies: &[HttpReply]) -> Result<Account, String> {
     let first = replies.first().cloned().unwrap_or_default();
     if token_mode(cred) {
@@ -159,13 +172,12 @@ pub fn read_account(name: &str, scope: &str, cred: &Credential, replies: &[HttpR
             });
         }
         let me = first.json();
-        // Confluence answers with an anonymous person, rather than refusing, when it doesn't know them.
+        // Confluence answers with an anonymous person, rather than refusing, when it doesn't know
+        // them. The answer only checks the token; none of it is kept.
         if opt(&me["accountId"]).is_none() || me["type"] == "anonymous" {
             return Err(format!("Atlassian didn't accept that email and API token for {host}."));
         }
-        // People can hide their email; the one they typed signed in, so it's theirs.
-        let who = opt(&me["emailAddress"]).or_else(|| opt(&me["email"])).unwrap_or_else(|| cred.field("email").to_string());
-        return Ok(Account { label: format!("{who} on {host}"), settings: json!({ "site": host }) });
+        return Ok(Account { label: host.clone(), settings: json!({ "site": host }) });
     }
     if !first.ok() {
         return Err(http_error(name, &first));
@@ -184,20 +196,15 @@ pub fn read_account(name: &str, scope: &str, cred: &Credential, replies: &[HttpR
     let Some((host, cloud_id)) = sites.into_iter().next() else {
         return Err(format!("Atlassian didn't give access to a site with {name}. Connect again and choose a site that has {name}."));
     };
-    let me = replies.get(1).filter(|r| r.ok()).map(|r| r.json()).unwrap_or_default();
-    let label = match opt(&me["email"]).or_else(|| opt(&me["name"])) {
-        Some(who) => format!("{who} on {host}"),
-        None => host.clone(),
-    };
-    Ok(Account { label, settings: json!({ "site": host, "cloud_id": cloud_id }) })
+    Ok(Account { label: host.clone(), settings: json!({ "site": host, "cloud_id": cloud_id }) })
 }
 
 /// Atlassian takes token requests as JSON.
-pub fn token_call(app: &OAuthApp, form: Vec<(String, String)>) -> HttpCall {
+pub fn token_call(app: &OAuthApp, token_url: &str, form: Vec<(String, String)>) -> HttpCall {
     let mut body: Map<String, Value> = form.into_iter().map(|(k, v)| (k, Value::String(v))).collect();
     body.insert("client_id".into(), app.client_id.clone().into());
     body.insert("client_secret".into(), app.client_secret.clone().into());
-    HttpCall::post_json(TOKEN_URL, &Value::Object(body)).header("accept", "application/json")
+    HttpCall::post_json(token_url, &Value::Object(body)).header("accept", "application/json")
 }
 
 /// An Atlassian time (`2026-10-01T09:30:00.000+0000`, or RFC 3339) the way DumbSlab writes times.
@@ -382,8 +389,8 @@ impl Connector for Jira {
         })
     }
 
-    fn token_request(&self, app: &OAuthApp, form: Vec<(String, String)>) -> HttpCall {
-        token_call(app, form)
+    fn token_request(&self, app: &OAuthApp, token_url: &str, form: Vec<(String, String)>) -> HttpCall {
+        token_call(app, token_url, form)
     }
 }
 
@@ -412,7 +419,7 @@ mod tests {
     }
 
     fn site_account() -> Account {
-        Account { label: "ada@acme.com on acme.atlassian.net".into(), settings: json!({ "site": "acme.atlassian.net" }) }
+        Account { label: "acme.atlassian.net".into(), settings: json!({ "site": "acme.atlassian.net" }) }
     }
 
     fn header<'a>(call: &'a HttpCall, name: &str) -> Option<&'a str> {
@@ -460,11 +467,12 @@ mod tests {
         assert_eq!(header(&calls[0], "authorization"), Some(basic.as_str()));
         let me = json!({ "accountId": "5b10", "emailAddress": "ada@acme.com", "displayName": "Ada" });
         let account = Jira.read_profile(&cred, &[reply(200, me)]).unwrap();
-        assert_eq!(account.label, "ada@acme.com on acme.atlassian.net");
+        // Only the site is kept: no account id, email or name (Atlassian's personal data rules).
+        assert_eq!(account.label, "acme.atlassian.net");
         assert_eq!(account.settings, json!({ "site": "acme.atlassian.net" }));
-        // A hidden email falls back to the one typed.
-        let account = Jira.read_profile(&cred, &[reply(200, json!({ "accountId": "5b10", "displayName": "Ada" }))]).unwrap();
-        assert_eq!(account.label, "ada@acme.com on acme.atlassian.net");
+        for personal in ["5b10", "ada@acme.com", "Ada"] {
+            assert!(!format!("{} {}", account.label, account.settings).contains(personal), "{personal}");
+        }
         assert!(Jira.read_profile(&cred, &[reply(401, json!({}))]).unwrap_err().contains("rejected that email and API token"));
         assert!(Jira.read_profile(&cred, &[reply(404, json!({}))]).unwrap_err().contains("acme.atlassian.net has no Jira"));
         assert!(Jira.read_profile(&cred, &[reply(0, json!(null))]).unwrap_err().contains("in time"));
@@ -483,7 +491,11 @@ mod tests {
         assert!(spec.extra.contains(&("audience", "api.atlassian.com")) && spec.extra.contains(&("prompt", "consent")));
         assert!(spec.scopes.contains(&"offline_access") && spec.scopes.contains(&"read:jira-work"));
         let app = OAuthApp { client_id: "cid".into(), client_secret: "sec".into() };
-        let call = Jira.token_request(&app, vec![("grant_type".into(), "refresh_token".into()), ("refresh_token".into(), "rt".into())]);
+        let call = Jira.token_request(
+            &app,
+            INFO.oauth.unwrap().token_url,
+            vec![("grant_type".into(), "refresh_token".into()), ("refresh_token".into(), "rt".into())],
+        );
         assert_eq!(call.url, "https://auth.atlassian.com/oauth/token");
         assert_eq!(header(&call, "content-type"), Some("application/json"));
         let body: Value = serde_json::from_str(call.body.as_deref().unwrap()).unwrap();
@@ -497,24 +509,23 @@ mod tests {
         assert_eq!((tokens.access_token.as_str(), tokens.refresh_token.as_deref()), ("at2", Some("rt2")));
 
         let cred = signed_in();
+        // Only the sites the token reaches: never the person's profile.
         let calls = Jira.profile(&cred);
+        assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].url, "https://api.atlassian.com/oauth/token/accessible-resources");
-        assert_eq!(calls[1].url, "https://api.atlassian.com/me");
-        assert!(calls.iter().all(|c| header(c, "authorization") == Some("Bearer at")));
+        assert_eq!(header(&calls[0], "authorization"), Some("Bearer at"));
+        assert!(!spec.scopes.contains(&"read:me"));
         let sites = json!([
             { "id": CLOUD, "url": "https://zeta.atlassian.net", "name": "Zeta", "scopes": ["search:confluence"] },
             { "id": "../../evil", "url": "https://bad.atlassian.net", "scopes": ["read:jira-work"] },
-            { "id": CLOUD, "url": "https://acme.atlassian.net", "name": "Acme", "scopes": ["read:jira-work", "read:me"] }
+            { "id": CLOUD, "url": "https://acme.atlassian.net", "name": "Acme", "scopes": ["read:jira-work"] }
         ]);
-        let me = json!({ "account_id": "1122", "email": "ada@acme.com", "name": "Ada" });
-        let account = Jira.read_profile(&cred, &[reply(200, sites.clone()), reply(200, me)]).unwrap();
-        assert_eq!(account.label, "ada@acme.com on acme.atlassian.net");
+        let account = Jira.read_profile(&cred, &[reply(200, sites)]).unwrap();
+        assert_eq!(account.label, "acme.atlassian.net");
         assert_eq!(account.settings, json!({ "site": "acme.atlassian.net", "cloud_id": CLOUD }));
-        // Without the profile, the site still says which account it is.
-        assert_eq!(Jira.read_profile(&cred, &[reply(200, sites), reply(403, json!({}))]).unwrap().label, "acme.atlassian.net");
         let confluence_only = json!([{ "id": CLOUD, "url": "https://zeta.atlassian.net", "scopes": ["search:confluence"] }]);
-        assert!(Jira.read_profile(&cred, &[reply(200, confluence_only), reply(200, json!({}))]).unwrap_err().contains("site with Jira"));
-        assert!(Jira.read_profile(&cred, &[reply(401, json!({})), reply(401, json!({}))]).unwrap_err().contains("Reconnect"));
+        assert!(Jira.read_profile(&cred, &[reply(200, confluence_only)]).unwrap_err().contains("site with Jira"));
+        assert!(Jira.read_profile(&cred, &[reply(401, json!({}))]).unwrap_err().contains("Reconnect"));
 
         // Signed in, requests go through the gateway with the cloud id.
         let calls = Jira.search(&cred, &account, "deploy", 5);
