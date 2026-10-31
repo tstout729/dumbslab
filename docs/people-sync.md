@@ -51,7 +51,8 @@ The result shows how many people were matched and updated, and which employees w
 ## The webhook DumbSlab adds
 
 - It posts to the workspace's webhook address, `https://<your workspace>/hooks/people`, in JSON.
-- It's called "DumbSlab people sync (<your workspace's address>)".
+- It's called "DumbSlab people sync (<your workspace's address>) ds-…". The `ds-…` tag is your workspace's own.
+- It posts only which employee changed and the names of the fields that changed, never their values.
 - It watches the fields a sync reads: work email, job title, department, location, work phone, reporting to, pronouns and status. It watches only those its BambooHR user can see.
 - It belongs to the BambooHR user whose sign-in or API key added it. Only their credentials can delete it, and it stops working if that user is deactivated in BambooHR.
 - Its private key is encrypted like the other credentials. No operation returns the key or the webhook's id.
@@ -61,15 +62,18 @@ The result shows how many people were matched and updated, and which employees w
 
 ### Old webhooks DumbSlab still has to delete
 
-DumbSlab doesn't lose track of a webhook it added. It keeps a cleanup record, with the credentials that can delete the webhook (encrypted, refresh token included), when:
+A webhook DumbSlab couldn't delete is harmless. It's event-based with no post fields, so a delivery carries only an employee's id and the names of the fields that changed, never their values. DumbSlab turns it away once the sync, or the webhook's private key, is gone.
 
-- BambooHR won't delete the old webhook during a save. For example, the old sign-in has expired, or you switched to another company.
-- A save stops partway after BambooHR added the new webhook. For example, the admin lost the admin role meanwhile. A save also checks the admin may still save before it changes anything in BambooHR.
-- The sync is removed.
+DumbSlab still cleans these webhooks up. It doesn't rely on remembering each webhook's id, since a step that stops partway can lose one. Instead:
 
-After saves, syncs and removals, DumbSlab works through these records. It renews an expired sign-in first, then deletes the webhook. A record goes once BambooHR deletes the webhook or says it's gone. After 5 failed tries DumbSlab gives up and says so in the activity log. Until then, it turns that webhook's calls away.
+- Every webhook DumbSlab adds is named for the workspace: "DumbSlab people sync (<address>) ds-…", where the `ds-…` tag is the workspace's own and stays the same when the address changes.
+- Before a save changes anything in BambooHR, DumbSlab keeps the credentials it's about to use and the ones it replaces (encrypted, refresh token included). Removing the sync keeps its credentials too.
+- A cleanup pass lists the webhooks each set of credentials can see, and deletes every one with the workspace's tag that posts to `/hooks/people`, except the live one. Then it forgets those credentials.
+- Passes run after saves, sign-ins and syncs, when Settings › People sync opens, and when a webhook DumbSlab doesn't recognize calls. So an orphaned webhook prompts its own deletion, even after the sync was removed.
+- After a failed pass DumbSlab waits before the next: a minute, then twice as long each time, up to a day. Timeouts, rate limits (429) and BambooHR errors (5xx) never make it give up.
+- It gives up only when the credentials are dead (BambooHR refuses to renew a sign-in, refuses fresh credentials with 401 or 403, or the company is gone), or after 30 days. Then it says so in the activity log for admins, with the company and the webhook ids it knows, so someone can delete them in BambooHR by hand. It forgets the credentials.
 
-Settings › People sync shows how many old webhooks are left to delete. After signing in, it says when the webhook it replaced is still to be deleted (the `people_sync_notice=old_webhook` code).
+Settings › People sync says when old webhooks are still being cleaned up. After signing in, it says when the webhook it replaced is still to be deleted (the `people_sync_notice=old_webhook` code).
 
 If a save stops after BambooHR deleted the old webhook, Settings says so. Save again to add a new one.
 
@@ -77,7 +81,7 @@ If a save stops after BambooHR deleted the old webhook, Settings says so. Save a
 
 One change is saved at a time. While a save is under way, another save, or removing the sync, is refused with "try again in a minute". Removing the sync also waits while DumbSlab is renewing the BambooHR sign-in.
 
-Saving with new credentials (a new sign-in or API key) or another company stops the syncs and renewals under way with the old ones. They save nothing, so a sync can't fill in profiles from the old company after you switched.
+Saving with new credentials (a new sign-in or API key) or another company starts a new connection. Syncs and renewals begun with the old one stop, even one that was only queued: they save nothing. So a sync can't fill in profiles, or store tokens, from the old company after you switched.
 
 ### If DumbSlab can't add the webhook
 

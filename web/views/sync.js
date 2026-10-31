@@ -238,7 +238,7 @@ export async function peopleSyncSection(ctx) {
       h('div', { class: 'token-meta' }, stateLine(s), h('span', null, `${signedIn} · ${s.subdomain}.bamboohr.com`), automatic),
       s.webhook_error ? h('p', { class: 'callout callout-warn' }, icon('alert', { size: 15 }), h('span', null, s.webhook_error)) : null,
       stateNotes(s),
-      s.webhook_cleanup ? h('p', { class: 'small muted' }, `DumbSlab still has ${plural(s.webhook_cleanup, 'old webhook')} to delete in BambooHR. It tries again after syncs and saves, and turns their calls away meanwhile.`) : null,
+      s.webhook_cleanup ? h('p', { class: 'small muted' }, 'DumbSlab is still deleting its old webhooks in BambooHR. It tries again after syncs and saves, and when you open this page. Meanwhile it turns their calls away; they carry no employee details.') : null,
       peopleResult(s.last_result),
       manualWebhook(s, reload),
       h('div', { class: 'plan-actions' }, run, again, remove))

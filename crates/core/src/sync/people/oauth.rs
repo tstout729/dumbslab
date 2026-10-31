@@ -44,7 +44,7 @@ const REFRESH_MARGIN_SECS: i64 = 300;
 const REFRESH_LEASE_SECS: i64 = 30;
 
 pub(crate) const RENEWING: &str = "BambooHR is renewing DumbSlab's sign-in. Try again in a moment.";
-const CHANGED: &str = "The people sync's BambooHR sign-in changed while this was under way, so it stopped. Try again.";
+pub(crate) const CHANGED: &str = "The people sync's BambooHR sign-in changed while this was under way, so it stopped. Try again.";
 const SIGNED_OUT: &str = "BambooHR no longer accepts DumbSlab's sign-in. Sign in with BambooHR again in Settings › People sync.";
 pub(crate) const API_KEYS_REFUSED: &str = "Hosted DumbSlab can't use BambooHR API keys: BambooHR's developer terms allow them only in systems a company runs itself. Use Sign in with BambooHR instead (Settings › People sync, or connect_people_sync).";
 
@@ -174,28 +174,41 @@ pub(crate) fn read_exchange(reply: &HttpReply) -> Result<(TokenSet, Option<Strin
     Ok((tokens, company))
 }
 
-/// What a request does about a sign-in that expires soon.
-#[derive(Debug, PartialEq)]
+/// What a request does about a sign-in that expires soon. Each answer that goes on carries the
+/// credentials as stored now: another request may have renewed them since this one read them.
+#[derive(Debug)]
 pub(crate) enum Renewal {
-    /// Renew it with this request: the lease it holds.
-    Refresh(String),
-    /// Another request is renewing it, and the current token still works.
-    UseCurrent,
-    /// Another request is renewing it, and the current token has expired.
+    /// Renew them with this request: the lease it holds.
+    Refresh(String, Creds),
+    /// They still work: another request renewed them, or is renewing them.
+    UseCurrent(Creds),
+    /// Another request is renewing them, and they've expired.
     Wait,
+    /// Not the same connection any more (new credentials or another company were saved, or the
+    /// sync was removed), or the sync lost its lease: stop.
+    Changed,
 }
 
-/// Lets one request at a time renew the saved sign-in: BambooHR may hand out a new refresh token
-/// each time and refuse the old one.
-pub(crate) fn renewal(db: &dyn Db, creds: &Creds, now: DateTime<Utc>) -> ApiResult<Renewal> {
+/// Lets one request at a time renew the saved sign-in of `connection`: BambooHR may hand out a new
+/// refresh token each time and refuse the old one. A sync passes its lease: it renews only while it
+/// still holds it. The claim names the connection, so work begun before a new connection was saved
+/// can never renew, or store, another company's tokens.
+pub(crate) fn renewal(db: &dyn Db, cfg: &HostConfig, connection: &str, sync_lease: Option<&str>, now: DateTime<Utc>) -> ApiResult<Renewal> {
+    let same = "id = 1 AND auth = 'oauth' AND connection = ? AND (? IS NULL OR running_until = ?)";
+    let current = db.one(&format!("SELECT * FROM people_sync WHERE {same}"), &params![connection, sync_lease, sync_lease])?;
+    let Some(row) = current else { return Ok(Renewal::Changed) };
+    let creds = Creds::of_row(cfg, &row)?;
+    if !creds.needs_refresh(now) {
+        return Ok(Renewal::UseCurrent(creds));
+    }
     let lease = format!("{} {}", ts(now + Duration::seconds(REFRESH_LEASE_SECS)), crate::util::new_id());
     let claimed = db.execute(
-        "UPDATE people_sync SET refreshing_until = ? WHERE id = 1 AND auth = 'oauth' AND (refreshing_until IS NULL OR refreshing_until <= ?)",
-        &params![lease.clone(), ts(now)],
+        &format!("UPDATE people_sync SET refreshing_until = ? WHERE {same} AND (refreshing_until IS NULL OR refreshing_until <= ?)"),
+        &params![lease.clone(), connection, sync_lease, sync_lease, ts(now)],
     )? > 0;
     Ok(match claimed {
-        true => Renewal::Refresh(lease),
-        false if creds.expires_at.is_some_and(|e| e > now) => Renewal::UseCurrent,
+        true => Renewal::Refresh(lease, creds),
+        false if creds.expires_at.is_some_and(|e| e > now) => Renewal::UseCurrent(creds),
         false => Renewal::Wait,
     })
 }
@@ -216,6 +229,7 @@ pub(crate) fn apply_refresh(
     db: &dyn Db,
     cfg: &HostConfig,
     creds: &mut Creds,
+    connection: &str,
     lease: &str,
     reply: &HttpReply,
     now: DateTime<Utc>,
@@ -232,8 +246,12 @@ pub(crate) fn apply_refresh(
     creds.take(tokens, now);
     // Cleanup records holding the same sign-in follow it: BambooHR may have spent their refresh token.
     super::cleanup::hand_over(db, cfg, &spent, creds)?;
-    // Only while this request still holds the lease: a new sign-in or API key replaces the tokens.
-    let Some(row) = db.one("SELECT secret FROM people_sync WHERE id = 1 AND auth = 'oauth' AND refreshing_until = ?", &params![lease])?
+    // Only into the same connection, while this request still holds the lease: a new sign-in or API
+    // key replaces the tokens.
+    let Some(row) = db.one(
+        "SELECT secret FROM people_sync WHERE id = 1 AND auth = 'oauth' AND connection = ? AND refreshing_until = ?",
+        &params![connection, lease],
+    )?
     else {
         return Ok(Err(CHANGED.into()));
     };
@@ -242,8 +260,8 @@ pub(crate) fn apply_refresh(
     stored.refresh_token = creds.cred.refresh_token.clone();
     let secret = crate::sync::seal(cfg, OWNER, PROVIDER, &stored)?;
     db.execute(
-        "UPDATE people_sync SET secret = ?, expires_at = ?, refreshing_until = NULL WHERE id = 1 AND refreshing_until = ?",
-        &params![secret, creds.expires_at.map(ts), lease],
+        "UPDATE people_sync SET secret = ?, expires_at = ?, refreshing_until = NULL WHERE id = 1 AND connection = ? AND refreshing_until = ?",
+        &params![secret, creds.expires_at.map(ts), connection, lease],
     )?;
     Ok(Ok(()))
 }

@@ -34,7 +34,7 @@ use crate::events::{Event, emit};
 use crate::util::{secure_eq, ts};
 use crate::{HostConfig, Outcome, Request, params};
 
-pub(crate) use cleanup::{cleanup_job, record_removed, waiting as cleanup_waiting};
+pub(crate) use cleanup::{cleanup_job, due as cleanup_due, record_removed, waiting as cleanup_waiting};
 pub(crate) use oauth::{API_KEYS_REFUSED, Auth, RENEWING, app as sign_in_app, hosted, renewing, start_sign_in};
 pub use oauth::{CALLBACK_PATH, SCOPES, callback};
 pub use setup::PeopleSyncRemoved;
@@ -158,6 +158,8 @@ enum Work {
 #[derive(Clone, Debug)]
 struct Run {
     lease: String,
+    /// The connection this sync reads with (see `people_sync.connection`).
+    connection: String,
     subdomain: String,
     creds: oauth::Creds,
     owner_id: String,
@@ -196,6 +198,7 @@ pub(crate) fn start(db: &dyn Db, cfg: &HostConfig, base_url: &str, now: DateTime
     let Some(lease) = super::claim(db, TABLE, key(), now)? else { return Ok(None) };
     Ok(Some(Job::People(Box::new(PeopleJob::new(Work::Sync(Run {
         lease,
+        connection: row.str("connection"),
         subdomain: row.str("subdomain"),
         creds,
         owner_id: row.str("owner_id"),
@@ -297,18 +300,23 @@ fn sync_step(
     match j.phase.clone() {
         Phase::Start => {
             if j.creds.needs_refresh(now) {
-                match oauth::renewal(db, &j.creds, now)? {
-                    oauth::Renewal::Refresh(lease) => match oauth::renew_call(cfg, &j.subdomain, &j.base_url, &j.creds) {
-                        Ok(call) => {
-                            // Renewing takes one of the job's steps.
-                            j.max_pages -= 1;
-                            j.phase = Phase::Renewing(lease);
-                            return Ok(Step::Fetch(vec![call]));
+                // Only while this sync holds its lease, for the connection it began with.
+                match oauth::renewal(db, cfg, &j.connection, Some(&j.lease), now)? {
+                    oauth::Renewal::Refresh(lease, creds) => {
+                        j.creds = creds;
+                        match oauth::renew_call(cfg, &j.subdomain, &j.base_url, &j.creds) {
+                            Ok(call) => {
+                                // Renewing takes one of the job's steps.
+                                j.max_pages -= 1;
+                                j.phase = Phase::Renewing(lease);
+                                return Ok(Step::Fetch(vec![call]));
+                            }
+                            Err(message) => return fail(db, j, &message, now),
                         }
-                        Err(message) => return fail(db, j, &message, now),
-                    },
-                    oauth::Renewal::UseCurrent => {}
+                    }
+                    oauth::Renewal::UseCurrent(creds) => j.creds = creds,
                     oauth::Renewal::Wait => return fail(db, j, oauth::RENEWING, now),
+                    oauth::Renewal::Changed => return fail(db, j, oauth::CHANGED, now),
                 }
             }
             j.phase = Phase::Reading;
@@ -316,7 +324,7 @@ fn sync_step(
         }
         Phase::Renewing(lease) => {
             let reply = replies.into_iter().next().unwrap_or_default();
-            if let Err(message) = oauth::apply_refresh(db, cfg, &mut j.creds, &lease, &reply, now)? {
+            if let Err(message) = oauth::apply_refresh(db, cfg, &mut j.creds, &j.connection, &lease, &reply, now)? {
                 return fail(db, j, &message, now);
             }
             j.phase = Phase::Reading;
@@ -485,9 +493,18 @@ fn sent_at(raw: &str) -> Option<i64> {
 /// The timestamp must be within [`HOOK_WINDOW_SECS`] of now, and each signature works once, so a
 /// captured delivery can't be replayed.
 pub(crate) fn hook(db: &dyn Db, cfg: &HostConfig, req: &Request, base_url: &str, now: DateTime<Utc>) -> ApiResult<Outcome> {
+    // A delivery DumbSlab doesn't recognize may come from a webhook it failed to delete: it prompts a
+    // cleanup pass, when one is due (see [`cleanup`]), also after the sync was removed.
+    let refuse = |e: ApiError| -> ApiResult<Outcome> {
+        let mut out = crate::http::failed(&e);
+        if cleanup::due(db, now)? {
+            out.effects.push(crate::Effect::Background(cleanup::cleanup_job(base_url, None)));
+        }
+        Ok(out)
+    };
     let row = db.one("SELECT secret, webhook FROM people_sync WHERE id = 1", &[])?;
     let Some(row) = row.filter(|r| r.bool("webhook")) else {
-        return Err(ApiError::not_found("people sync webhook"));
+        return refuse(ApiError::not_found("people sync webhook"));
     };
     let cred = super::open(cfg, OWNER, PROVIDER, &row.str("secret"))?;
     let private_key = cred.field("webhook_key");
@@ -495,7 +512,7 @@ pub(crate) fn hook(db: &dyn Db, cfg: &HostConfig, req: &Request, base_url: &str,
     let signature = req.header("x-bamboohr-signature").unwrap_or_default().trim().to_ascii_lowercase();
     let expected = super::hmac_hex(private_key, &[&req.body, timestamp.as_bytes()]);
     if private_key.is_empty() || !secure_eq(&signature, &expected) {
-        return Err(ApiError::unauthorized("the webhook's signature doesn't match its private key"));
+        return refuse(ApiError::unauthorized("the webhook's signature doesn't match its private key"));
     }
     match sent_at(timestamp) {
         Some(sent) if now.timestamp().abs_diff(sent) <= HOOK_WINDOW_SECS => {}
@@ -515,7 +532,7 @@ pub(crate) fn hook(db: &dyn Db, cfg: &HostConfig, req: &Request, base_url: &str,
     match start(db, cfg, base_url, now)? {
         Some(job) => {
             let mut out = hook_started(job);
-            if cleanup::waiting(db)? > 0 {
+            if cleanup::due(db, now)? {
                 out.effects.push(crate::Effect::Background(cleanup::cleanup_job(base_url, None)));
             }
             Ok(out)

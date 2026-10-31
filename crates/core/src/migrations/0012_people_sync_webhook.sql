@@ -28,23 +28,32 @@ CREATE TABLE IF NOT EXISTS people_sync_sign_ins (
   created_at TEXT NOT NULL
 );
 
--- Webhooks DumbSlab added in BambooHR and still has to delete: one a save replaced when BambooHR
--- wouldn't delete it then, one a save added before it stopped partway, or a removed sync's.
+-- Which connection the people sync uses: a random id that changes whenever new credentials or
+-- another company are saved, so work begun with the old ones (a sync, a renewal) can tell it's stale.
+ALTER TABLE people_sync ADD COLUMN connection TEXT;
+
+-- Credentials DumbSlab still has to look through for its own webhooks in BambooHR, one row per
+-- connection: those a save replaced or was about to use, and a removed sync's. A cleanup pass lists
+-- the webhooks they can see and deletes every one of this workspace's except the live one, then
+-- drops the row. So a webhook whose id was lost (a step rolled back) is still found.
 CREATE TABLE IF NOT EXISTS people_sync_cleanup (
-  id TEXT PRIMARY KEY,
-  webhook_id TEXT NOT NULL,
-  -- The BambooHR company domain the webhook is in.
+  connection TEXT PRIMARY KEY,
+  -- The BambooHR company domain.
   subdomain TEXT NOT NULL,
-  -- `api_key` or `oauth`, and the credentials that may delete it, sealed: the API key, or the
-  -- sign-in's tokens (refresh token included).
+  -- `api_key` or `oauth`, and the credentials, sealed: the API key, or the sign-in's tokens
+  -- (refresh token included).
   auth TEXT NOT NULL,
   secret TEXT NOT NULL,
   expires_at TEXT,
   -- SHA-256 of the refresh token, so a renewal of the same sign-in can hand over its new tokens.
   refresh_hash TEXT,
-  -- Failed attempts so far. DumbSlab gives up after 5, and says so in the activity log.
-  attempts INTEGER NOT NULL DEFAULT 0,
-  -- A job deleting it holds this lease: when it runs out, then a random id.
+  -- Webhook ids known to be among them, comma-separated, for the activity log if DumbSlab gives up.
+  known_ids TEXT NOT NULL DEFAULT '',
+  -- Failed passes in a row, which space out the next one (timeouts, 429 and 5xx never end it), and
+  -- when the next may run.
+  failures INTEGER NOT NULL DEFAULT 0,
+  next_attempt_at TEXT,
+  -- A pass working on it holds this lease: when it runs out, then a random id.
   working_until TEXT,
   created_at TEXT NOT NULL
 );

@@ -114,7 +114,7 @@ pub struct PeopleSync {
     #[serde(flatten)]
     pub state: SyncState,
     pub last_result: Option<PeopleSyncResult>,
-    /// Old webhooks DumbSlab added in BambooHR and still has to delete (it tries again after syncs and saves).
+    /// Sets of credentials (old sign-ins or API keys) DumbSlab still has to look through for its old webhooks in BambooHR, to delete them. It tries again after saves and syncs, and when Settings › People sync opens.
     pub webhook_cleanup: i64,
     /// Only in set_people_sync's answer: something to know about this change, such as an old webhook BambooHR wouldn't let DumbSlab delete.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -148,6 +148,10 @@ pub(crate) fn people_view(ctx: &Ctx) -> ApiResult<PeopleSync> {
 }
 
 fn get_people_sync(ctx: &mut Ctx, _: NoInput) -> ApiResult<PeopleSync> {
+    // Opening Settings › People sync also runs a cleanup pass that's due (old webhooks to delete).
+    if people::cleanup_due(ctx.db, ctx.now)? {
+        ctx.effects.push(Effect::Background(people::cleanup_job(&ctx.base_url, None)));
+    }
     people_view(ctx)
 }
 
@@ -200,7 +204,7 @@ fn sync_people(ctx: &mut Ctx, _: NoInput) -> ApiResult<Deferred<PeopleSyncResult
     match people::start(ctx.db, ctx.cfg, &ctx.base_url, Utc::now())? {
         Some(job) => {
             ctx.effects.push(Effect::Connect(job));
-            if people::cleanup_waiting(ctx.db)? > 0 {
+            if people::cleanup_due(ctx.db, ctx.now)? {
                 ctx.effects.push(Effect::Background(people::cleanup_job(&ctx.base_url, None)));
             }
             Ok(Deferred::Pending)

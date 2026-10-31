@@ -12,10 +12,12 @@
 //! - One save at a time: a save holds a lease (in `settings`) from when it starts until it ends,
 //!   and a second one, or removing the sync meanwhile, is refused.
 //! - No webhook is lost when a save stops partway: the save checks the admin may still save before
-//!   it changes anything in BambooHR, records an old webhook BambooHR wouldn't delete, and records
-//!   the new one until the save is done (see [`super::cleanup`]).
-//! - New credentials or another company end the syncs and renewals under way with the old ones:
-//!   their leases are cleared, so they store nothing.
+//!   it changes anything in BambooHR, and first records the credentials it's about to add a
+//!   webhook with, and those of the webhook it replaces, for a cleanup pass (see
+//!   [`super::cleanup`]). The pass finds every webhook of this workspace's those credentials can
+//!   see, even one whose id a rolled-back step lost.
+//! - Each save stores a connection id, new whenever the credentials or the company change. Work
+//!   begun with the old ones (a sync, a renewal) checks it and stops: it stores nothing.
 //!
 //! A webhook added through BambooHR's API belongs to the BambooHR user whose API key or sign-in
 //! added it: it watches only fields they can see, only their credentials may delete it, it stops
@@ -34,7 +36,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::oauth::{self, Auth, Creds, Renewal};
-use super::{OWNER, PROVIDER, PeopleJob, Work, api_url, cleanup, refusal, text};
+use super::{OWNER, PROVIDER, PeopleJob, Work, api_url, refusal, text};
 use crate::auth::{Actor, Role, Via};
 use crate::connect::{Finish, HttpCall, HttpReply, Job, Step, http_error};
 use crate::db::{Db, DbExt, Row};
@@ -95,17 +97,18 @@ fn get_webhook_call(subdomain: &str, creds: &Creds, id: &str) -> HttpCall {
     creds.call(HttpCall::get(webhook_url(subdomain, id)))
 }
 
-fn create_call(subdomain: &str, creds: &Creds, base_url: &str, fields: &[String]) -> HttpCall {
-    let host = base_url.split_once("://").map_or(base_url, |(_, h)| h);
-    let name: String = format!("DumbSlab people sync ({host})").chars().take(100).collect();
-    // Event-based, as BambooHR recommends: the delivery only says an employee changed, and the sync
-    // reads BambooHR itself. `employee.updated` also fires when an employee is added.
+fn create_call(subdomain: &str, creds: &Creds, base_url: &str, fields: &[String], tag: &str) -> HttpCall {
+    // Event-based, as BambooHR recommends, with no post fields: a delivery says only which employee
+    // changed and the names of the fields that did, and the sync reads BambooHR itself. So a webhook
+    // DumbSlab failed to delete posts nothing useful. `employee.updated` also fires when an employee
+    // is added. The name carries the workspace's tag, so a cleanup pass can find it.
     let body = json!({
-        "name": name,
+        "name": super::cleanup::webhook_name(base_url, tag),
         "url": hook_url(base_url),
         "format": "json",
         "events": ["employee.updated"],
         "monitorFields": fields,
+        "postFields": {},
     });
     creds.call(HttpCall::post_json(api_url(subdomain, "webhooks"), &body))
 }
@@ -317,6 +320,16 @@ pub(crate) struct Setup {
     code: Option<String>,
     /// This save uses the saved credentials (no new API key or sign-in).
     reuses_saved: bool,
+    /// The connection this save stores: the saved one when it keeps the same credentials for the
+    /// same company, otherwise a new one.
+    connection: String,
+    /// The saved connection, when there is one.
+    saved_connection: Option<String>,
+    same_connection: bool,
+    /// The workspace's tag, in the webhook's name (see [`super::cleanup`]).
+    tag: String,
+    /// The replaced connection's cleanup record was made by this save, not before it.
+    old_recorded_now: bool,
     /// The save lease.
     lease: String,
     old: Option<OldHook>,
@@ -338,8 +351,6 @@ pub(crate) struct Setup {
     notice_code: Option<&'static str>,
     /// BambooHR deleted the old webhook.
     old_deleted: bool,
-    /// The cleanup record for the webhook this save added, forgotten once the save is done.
-    added_record: Option<String>,
     /// A sign-in: finish by sending the browser back to Settings, with a code when it failed.
     sign_in: bool,
 }
@@ -357,7 +368,7 @@ struct Start<'a> {
     lease: String,
 }
 
-fn begin(cfg: &HostConfig, row: Option<&Row>, start: Start) -> ApiResult<Job> {
+fn begin(db: &dyn Db, cfg: &HostConfig, row: Option<&Row>, start: Start) -> ApiResult<Job> {
     // Unreadable (the connector key changed): new credentials must be given.
     let saved = row.and_then(|r| Creds::of_row(cfg, r).ok());
     let reuses_saved = start.new.is_none();
@@ -406,6 +417,12 @@ fn begin(cfg: &HostConfig, row: Option<&Row>, start: Start) -> ApiResult<Job> {
         Plan::Cannot(why) => Some(why.clone()),
         _ => None,
     };
+    let saved_connection = row.and_then(|r| r.opt_str("connection"));
+    let same_connection = reuses_saved && saved_connection.is_some() && row.is_some_and(|r| r.str("subdomain") == start.subdomain);
+    let connection = match (&saved_connection, same_connection) {
+        (Some(c), true) => c.clone(),
+        _ => crate::util::new_id(),
+    };
     Ok(Job::People(Box::new(PeopleJob::new(Work::Setup(Box::new(Setup {
         admin: start.admin.user_id.clone(),
         via: start.admin.via,
@@ -415,6 +432,11 @@ fn begin(cfg: &HostConfig, row: Option<&Row>, start: Start) -> ApiResult<Job> {
         sign_in: start.code.is_some(),
         code: start.code,
         reuses_saved,
+        connection,
+        saved_connection,
+        same_connection,
+        tag: super::cleanup::tag(db)?,
+        old_recorded_now: false,
         lease: start.lease,
         old,
         keep,
@@ -429,7 +451,6 @@ fn begin(cfg: &HostConfig, row: Option<&Row>, start: Start) -> ApiResult<Job> {
         notice: None,
         notice_code: None,
         old_deleted: false,
-        added_record: None,
     }))))))
 }
 
@@ -457,7 +478,7 @@ pub(crate) fn setup_job(ctx: &Ctx, subdomain: String, api_key: Option<String>, w
     };
     let Some(lease) = claim_save(ctx.db, ctx.now)? else { return Err(busy()) };
     let start = Start { admin: &ctx.actor, base_url: &ctx.base_url, subdomain, new, code: None, webhook_key, lease };
-    begin(ctx.cfg, row.as_ref(), start)
+    begin(ctx.db, ctx.cfg, row.as_ref(), start)
 }
 
 /// Finishes a Sign in with BambooHR: exchanges `code` for tokens, then saves like [`setup_job`],
@@ -474,7 +495,7 @@ pub(crate) fn sign_in_job(
     let row = db.one("SELECT * FROM people_sync WHERE id = 1", &[])?;
     let new = Creds { auth: Auth::OAuth, cred: Default::default(), expires_at: None };
     let start = Start { admin, base_url, subdomain, new: Some(new), code: Some(code), webhook_key: None, lease };
-    begin(cfg, row.as_ref(), start)
+    begin(db, cfg, row.as_ref(), start)
 }
 
 pub(super) fn step(
@@ -495,16 +516,21 @@ pub(super) fn step(
                 return Ok(Step::Fetch(vec![oauth::exchange_call(app, &s.subdomain, &oauth::redirect_uri(cfg, &s.base_url), &code)]));
             }
             if s.creds.needs_refresh(now) {
-                match oauth::renewal(db, &s.creds, now)? {
-                    Renewal::Refresh(lease) => match oauth::renew_call(cfg, &s.subdomain, &s.base_url, &s.creds) {
-                        Ok(call) => {
-                            s.phase = Phase::Renewing(lease);
-                            return Ok(Step::Fetch(vec![call]));
+                let connection = s.saved_connection.clone().unwrap_or_default();
+                match oauth::renewal(db, cfg, &connection, None, now)? {
+                    Renewal::Refresh(lease, stored) => {
+                        take_tokens(&mut s.creds, stored);
+                        match oauth::renew_call(cfg, &s.subdomain, &s.base_url, &s.creds) {
+                            Ok(call) => {
+                                s.phase = Phase::Renewing(lease);
+                                return Ok(Step::Fetch(vec![call]));
+                            }
+                            Err(why) => return fail(db, s, "refused", ApiError::new(400, "bamboohr_refused", why)),
                         }
-                        Err(why) => return fail(db, s, "refused", ApiError::new(400, "bamboohr_refused", why)),
-                    },
-                    Renewal::UseCurrent => {}
+                    }
+                    Renewal::UseCurrent(stored) => take_tokens(&mut s.creds, stored),
                     Renewal::Wait => return fail(db, s, "busy", ApiError::conflict(oauth::RENEWING)),
+                    Renewal::Changed => return fail(db, s, "busy", ApiError::conflict(oauth::CHANGED)),
                 }
             }
             Ok(checking(s))
@@ -522,7 +548,8 @@ pub(super) fn step(
         },
         Phase::Renewing(lease) => {
             let reply = replies.into_iter().next().unwrap_or_default();
-            match oauth::apply_refresh(db, cfg, &mut s.creds, &lease, &reply, now)? {
+            let connection = s.saved_connection.clone().unwrap_or_default();
+            match oauth::apply_refresh(db, cfg, &mut s.creds, &connection, &lease, &reply, now)? {
                 Ok(()) => Ok(checking(s)),
                 Err(why) => fail(db, s, "refused", ApiError::new(400, "bamboohr_refused", why)),
             }
@@ -549,18 +576,30 @@ pub(super) fn step(
             }
             let mut calls = s.old.as_ref().map(|o| o.delete_calls(&s.subdomain, &s.creds, now)).unwrap_or_default();
             s.deleting = calls.len();
-            if s.old.is_some() && calls.is_empty() {
-                // No credentials that may delete it now (an expired sign-in, or another company's
-                // credentials): the cleanup does it later.
-                record_old(db, cfg, s, now)?;
-            }
-            match fields {
-                Some(Ok(fields)) => {
-                    calls.push(create_call(&s.subdomain, &s.creds, &s.base_url, &fields));
-                    s.adding = true;
+            let fields = match fields {
+                Some(Ok(fields)) => Some(fields),
+                Some(Err(why)) => {
+                    s.webhook_error = Some(why);
+                    None
                 }
-                Some(Err(why)) => s.webhook_error = Some(why),
-                None => {}
+                None => None,
+            };
+            s.adding = fields.is_some();
+            // Before anything changes in BambooHR: the credentials this save adds a webhook with,
+            // and the replaced webhook's, are kept for a cleanup pass. If a later step rolls back,
+            // the pass still finds what it left in BambooHR.
+            if s.adding {
+                super::cleanup::record(db, cfg, &s.connection, &s.subdomain, &s.creds, None, now)?;
+            }
+            record_old(db, cfg, s, now)?;
+            if s.old.is_some() && s.deleting == 0 {
+                // No credentials that may delete it now (an expired sign-in, or another company's
+                // credentials): the cleanup does it.
+                s.notice = Some(NOT_DELETED_YET.into());
+                s.notice_code = Some("old_webhook");
+            }
+            if let Some(fields) = fields {
+                calls.push(create_call(&s.subdomain, &s.creds, &s.base_url, &fields, &s.tag));
             }
             if calls.is_empty() {
                 return save(db, cfg, s, staged, now);
@@ -570,18 +609,17 @@ pub(super) fn step(
         }
         Phase::Adding => {
             let (deletions, added) = replies.split_at(s.deleting.min(replies.len()));
-            // First, so nothing is lost if this save stops: the webhook just added, until it's saved.
             if s.adding {
                 match read_created(&added.first().cloned().unwrap_or_default()) {
                     Ok((id, key)) => {
                         s.creds.cred.fields.insert("webhook_key".into(), key);
-                        s.added_record = Some(cleanup::record(db, cfg, &id, &s.subdomain, &s.creds, now)?);
+                        super::cleanup::know(db, &s.connection, &id)?;
                         s.webhook_id = Some(id);
                     }
                     Err((id, why)) => {
-                        // Added without a private key: no use, so it's deleted later.
+                        // Added without a private key, it's of no use: the cleanup pass deletes it.
                         if let Some(id) = id {
-                            cleanup::record(db, cfg, &id, &s.subdomain, &s.creds, now)?;
+                            super::cleanup::know(db, &s.connection, &id)?;
                         }
                         s.webhook_error = Some(why);
                     }
@@ -589,7 +627,12 @@ pub(super) fn step(
             }
             s.old_deleted = deletions.iter().any(deleted);
             if s.deleting > 0 && !s.old_deleted {
-                record_old(db, cfg, s, now)?;
+                s.notice = Some(NOT_DELETED_YET.into());
+                s.notice_code = Some("old_webhook");
+            }
+            if s.old_deleted && s.old_recorded_now {
+                // Done already: the replaced credentials have nothing left to clean up.
+                super::cleanup::drop_record(db, &old_connection(s))?;
             }
             save(db, cfg, s, staged, now)
         }
@@ -630,11 +673,7 @@ fn may_save(db: &dyn Db, s: &Setup) -> ApiResult<Option<Step>> {
         if s.old_deleted
             && let Some(old) = &s.old
         {
-            db.execute(
-                "UPDATE people_sync SET webhook = 0, webhook_id = NULL, webhook_url = NULL, webhook_error = ?
-                 WHERE id = 1 AND webhook_id = ? AND subdomain = ?",
-                &params![LOST, old.id.clone(), old.subdomain.clone()],
-            )?;
+            lost(db, &old.id, &old.subdomain)?;
         }
         Ok(Some(match s.sign_in {
             true => Step::Done(Finish::Redirect(oauth::settings_url(&s.base_url, Err(code)))),
@@ -651,27 +690,50 @@ fn may_save(db: &dyn Db, s: &Setup) -> ApiResult<Option<Step>> {
     Ok(None)
 }
 
-/// Records the old webhook for the cleanup, with the credentials stored now (a sync may have
-/// renewed them since this save began), or else the ones it had, or the new ones for the same
-/// company. Without any, it can never be deleted.
-fn record_old(db: &dyn Db, cfg: &HostConfig, s: &mut Setup, now: DateTime<Utc>) -> ApiResult<()> {
-    let Some(old) = &s.old else { return Ok(()) };
-    let stored = db
-        .one(
-            "SELECT * FROM people_sync WHERE id = 1 AND subdomain = ? AND webhook_id = ?",
-            &params![old.subdomain.clone(), old.id.clone()],
-        )?
-        .and_then(|r| Creds::of_row(cfg, &r).ok());
-    let creds = stored.or_else(|| old.creds.clone()).or_else(|| (old.subdomain == s.subdomain).then(|| s.creds.clone()));
-    match creds {
-        Some(c) => {
-            cleanup::record(db, cfg, &old.id, &old.subdomain, &c, now)?;
-            s.notice = Some(NOT_DELETED_YET.into());
-            s.notice_code = Some("old_webhook");
-        }
-        None => s.notice = Some(NOT_DELETED.into()),
-    }
+/// The webhook DumbSlab added is gone from BambooHR but still saved (a save stopped partway after
+/// deleting it): Settings says to save again, and its calls are turned away.
+pub(super) fn lost(db: &dyn Db, id: &str, subdomain: &str) -> ApiResult<()> {
+    db.execute(
+        "UPDATE people_sync SET webhook = 0, webhook_id = NULL, webhook_url = NULL, webhook_error = ?
+         WHERE id = 1 AND webhook_id = ? AND subdomain = ?",
+        &params![LOST, id, subdomain],
+    )?;
     Ok(())
+}
+
+/// The saved connection this save replaces, as its cleanup record names it.
+fn old_connection(s: &Setup) -> String {
+    s.saved_connection.clone().unwrap_or_else(|| format!("unnamed-{}", s.connection))
+}
+
+/// Takes the stored tokens (renewed by another request, maybe) into `creds`, keeping the rest.
+fn take_tokens(creds: &mut Creds, stored: Creds) {
+    creds.cred.token = stored.cred.token;
+    creds.cred.refresh_token = stored.cred.refresh_token;
+    creds.expires_at = stored.expires_at;
+}
+
+/// Records the replaced webhook's credentials for a cleanup pass, as stored now (a sync may have
+/// renewed them since this save began), or else as this save read them, or the new ones for the
+/// same company. Without any, its webhook can never be deleted. Nothing to record when this save
+/// keeps the connection: the new record covers it.
+fn record_old(db: &dyn Db, cfg: &HostConfig, s: &mut Setup, now: DateTime<Utc>) -> ApiResult<()> {
+    let Some(old) = s.old.clone() else { return Ok(()) };
+    if s.same_connection {
+        if !s.adding {
+            super::cleanup::record(db, cfg, &s.connection, &s.subdomain, &s.creds, Some(&old.id), now)?;
+        }
+        return super::cleanup::know(db, &s.connection, &old.id);
+    }
+    let connection = old_connection(s);
+    let stored = db.one("SELECT * FROM people_sync WHERE id = 1", &[])?.and_then(|r| Creds::of_row(cfg, &r).ok());
+    let creds = stored.or(old.creds).or_else(|| (old.subdomain == s.subdomain).then(|| s.creds.clone()));
+    let Some(creds) = creds else {
+        s.notice = Some(NOT_DELETED.into());
+        return Ok(());
+    };
+    s.old_recorded_now = !super::cleanup::exists(db, &connection)?;
+    super::cleanup::record(db, cfg, &connection, &old.subdomain, &creds, Some(&old.id), now)
 }
 
 fn save(db: &dyn Db, cfg: &HostConfig, s: &mut Setup, staged: &mut Vec<crate::Effect>, now: DateTime<Utc>) -> ApiResult<Step> {
@@ -685,7 +747,7 @@ fn save(db: &dyn Db, cfg: &HostConfig, s: &mut Setup, staged: &mut Vec<crate::Ef
     actor.via = s.via;
     let row = db.one("SELECT auth, secret, expires_at, subdomain FROM people_sync WHERE id = 1", &[])?;
     // The same company with the saved credentials: syncs and renewals under way stay valid.
-    let same_connection = s.reuses_saved && row.as_ref().is_some_and(|r| r.str("subdomain") == s.subdomain);
+    let same_connection = s.same_connection;
     if s.reuses_saved && s.creds.auth == Auth::OAuth {
         // Saved again with the saved sign-in: a sync may have renewed its tokens meanwhile.
         if let Some(r) = row.filter(|r| r.str("auth") == Auth::OAuth.as_str())
@@ -705,10 +767,11 @@ fn save(db: &dyn Db, cfg: &HostConfig, s: &mut Setup, staged: &mut Vec<crate::Ef
     // without their leases they store nothing. Saved again with the same sign-in, a renewal under
     // way may still store the tokens it gets (keeping this save's webhook key).
     db.execute(
-        "INSERT INTO people_sync (id, provider, subdomain, secret, auth, expires_at, webhook, webhook_id, webhook_url, webhook_error, owner_id,
-           created_at, updated_at)
-         VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        "INSERT INTO people_sync (id, provider, subdomain, secret, auth, connection, expires_at, webhook, webhook_id, webhook_url,
+           webhook_error, owner_id, created_at, updated_at)
+         VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(id) DO UPDATE SET subdomain = excluded.subdomain, secret = excluded.secret, auth = excluded.auth,
+           connection = excluded.connection,
            expires_at = excluded.expires_at, webhook = excluded.webhook, webhook_id = excluded.webhook_id,
            webhook_url = excluded.webhook_url, webhook_error = excluded.webhook_error, owner_id = excluded.owner_id,
            updated_at = excluded.updated_at, refreshing_until = CASE WHEN ? THEN people_sync.refreshing_until ELSE NULL END,
@@ -718,6 +781,7 @@ fn save(db: &dyn Db, cfg: &HostConfig, s: &mut Setup, staged: &mut Vec<crate::Ef
             s.subdomain.clone(),
             secret,
             s.creds.auth.as_str(),
+            s.connection.clone(),
             s.creds.expires_at.map(ts),
             webhook,
             s.webhook_id.clone(),
@@ -730,9 +794,6 @@ fn save(db: &dyn Db, cfg: &HostConfig, s: &mut Setup, staged: &mut Vec<crate::Ef
             same_connection
         ],
     )?;
-    if let Some(record) = &s.added_record {
-        cleanup::forget(db, record)?;
-    }
     release_save(db, &s.lease)?;
     let mut ctx = Ctx { db, actor, now, cfg, base_url: s.base_url.clone(), effects: vec![] };
     let how = if s.creds.auth == Auth::OAuth { "signed in with BambooHR for" } else { "set up the people sync from" };
@@ -815,13 +876,13 @@ mod tests {
 
     #[test]
     fn the_webhook_posts_json_to_the_workspace() {
-        let call = create_call("acme", &key("k"), "https://kb.test", &["workEmail".into()]);
+        let call = create_call("acme", &key("k"), "https://kb.test", &["workEmail".into()], "ds-abc");
         assert_eq!((call.method, call.url.as_str()), ("POST", "https://acme.bamboohr.com/api/v1/webhooks"));
         let body: Value = serde_json::from_str(call.body.as_deref().unwrap()).unwrap();
         assert_eq!(
             body,
-            json!({ "name": "DumbSlab people sync (kb.test)", "url": "https://kb.test/hooks/people", "format": "json",
-                    "events": ["employee.updated"], "monitorFields": ["workEmail"] })
+            json!({ "name": "DumbSlab people sync (kb.test) ds-abc", "url": "https://kb.test/hooks/people", "format": "json",
+                    "events": ["employee.updated"], "monitorFields": ["workEmail"], "postFields": {} })
         );
         let delete = delete_call("acme", &key("k"), "41");
         assert_eq!((delete.method, delete.url.as_str()), ("DELETE", "https://acme.bamboohr.com/api/v1/webhooks/41"));
