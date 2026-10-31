@@ -53,8 +53,9 @@ This works when the server has DumbSlab's GitLab app (see [the operator steps](h
 
 - **What DumbSlab can do.** GitLab only offers full API access (`api`) for adding webhooks, so that's what you approve. DumbSlab uses it to list your projects, add and remove its own webhook, and read files. The tokens are encrypted, belong to that one folder, and are refreshed as GitLab requires.
 - **Another folder** needs another approval: choose Connect GitLab again.
-- **If GitLab stops accepting the approval** (you revoked it, or you lost access), the folder says so and stops syncing. Its posts stay. Choose Connect GitLab, then **Reconnect** on the folder.
-- **Removing the folder** removes the webhook DumbSlab added.
+- **One request at a time.** An approval is used by one request at a time (listing projects, adding or reconnecting a folder): GitLab replaces its tokens whenever they're refreshed. Another request meanwhile is refused with "try again in a moment".
+- **When a folder can't sync** because GitLab stopped accepting its approval (you revoked it), or whoever approved it lost access to the project, the folder says so. Its posts stay. Any admin who maintains the project chooses Connect GitLab, then **Reconnect** on the folder. Reconnecting also puts the webhook right: it points it at the workspace's address now, gives it the folder's secret, and adds it again if someone deleted it.
+- **Removing the folder**, or its topic, removes the webhook DumbSlab added. While a sync of it runs, removing it waits: it's refused until the sync is done, so the removal uses the folder's current tokens.
 
 Agents can do the same: `list_gitlab_projects` lists the projects (and the `connect_url` an admin opens in a browser first). Then `create_docs_source` with `gitlab_connection: true`.
 
@@ -81,7 +82,7 @@ After that, every push to the branch syncs. **Sync now** syncs any time. **New w
 - **What a delivery is trusted for.** A delivery only means that something changed. Apart from the repository and branch, used to pick the folders it's about, nothing in it is used: the sync reads the repository itself.
 - **Errors.** A delivery with a wrong or missing signature gets a 401. If a sync is already running, the delivery is noted, and Settings says to sync again.
 - **Timing.** With a token, a delivery's response waits for its sync, which is usually a second or two. GitHub and GitLab give up after 10 seconds, but the sync's progress is kept either way.
-- **Moving the workspace.** Webhooks you added with a token, and those DumbSlab added to GitLab projects, are on the workspace's own address. If the workspace moves to a new address, update yours, and remove and add again folders that came through Connect GitLab. The GitHub App's address doesn't change.
+- **Moving the workspace.** Webhooks you added with a token, and those DumbSlab added to GitLab projects, are on the workspace's own address. If the workspace moves to a new address, update yours, and choose Connect GitLab, then Reconnect, on folders that came through Connect GitLab. The GitHub App's address doesn't change.
 
 ## Limits
 

@@ -164,9 +164,14 @@ function connectionMeta(source) {
   return source.has_token ? h('span', null, icon('key', { size: 13 }), ' Token saved') : h('span', null, 'No token (public repository)');
 }
 
-/** A GitLab app source GitLab stopped accepting: reconnect it with a new approval. */
+/**
+ * A GitLab app folder that can't sync (GitLab stopped accepting its approval, or whoever approved it
+ * lost access to the project): reconnect it with a new approval, perhaps another maintainer's.
+ * Reconnecting also puts its webhook right.
+ */
 function reconnect(source, gitlab, reload) {
-  if (source.connection !== 'gitlab_oauth' || !source.disconnected || !gitlab || !gitlab.available) return null;
+  const stuck = source.disconnected || source.last_status === 'failed';
+  if (source.connection !== 'gitlab_oauth' || !stuck || !gitlab || !gitlab.available) return null;
   if (!gitlab.connected) return connectLink(gitlab.connect_url, 'Connect GitLab', 'subtle');
   const b = button(`Reconnect with ${gitlab.account}`, { variant: 'primary', size: 'sm' });
   b.addEventListener('click', () => busy(b, async () => {

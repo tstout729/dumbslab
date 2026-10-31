@@ -33,9 +33,10 @@ The connector key must be set too. With both, Settings › Docs sync offers **Co
 ## How it works
 
 - **Each folder has its own approval.** Picking a project moves the approval's tokens onto that folder. GitLab's tokens last two hours, and each refresh replaces both tokens, so tokens shared between folders would break each other. For the next folder, the admin connects again.
-- **Refreshing** happens at the start of a sync, under the sync's lease, so only one refresh runs at a time.
-- **If GitLab stops accepting a folder's tokens** (someone revoked the app, or the approving admin lost access), the folder says so and stops syncing. Its posts stay. An admin chooses Connect GitLab, then **Reconnect** on the folder. The webhook stays as it was.
-- **The webhook** points at the workspace's `/hooks/docs/<source id>` and carries the folder's own secret in `X-Gitlab-Token`. If the workspace moves to a new address, remove the folder and add it again, so the webhook follows.
+- **Refreshing** happens at the start of a sync, under the sync's lease, so only one refresh runs at a time. An approval still waiting for a project is held by one request at a time (`docs_connections.claimed_until`), so it's refreshed once and never ends up in two folders.
+- **If a folder can't sync** (someone revoked the app, or the approving admin lost access to the project), it says so. Its posts stay. An admin who maintains the project chooses Connect GitLab, then **Reconnect** on the folder. Reconnecting edits the webhook (`PUT /projects/:id/hooks/:hook_id`) to the workspace's address now and the folder's secret, or adds it again if it's gone. After a connector key change, the folder's secret can't be read, so it gets a new one, on GitLab too.
+- **The webhook** points at the workspace's `/hooks/docs/<source id>` and carries the folder's own secret in `X-Gitlab-Token`. If the workspace moves to a new address, Reconnect points it at the new one.
+- **Removing** a folder, or deleting its topic, removes its webhook. It waits for a running sync, so the removal uses the folder's current tokens. If saving a new folder fails after GitLab added its webhook, even when the host rolls the save back, the webhook comes off again.
 
 ## Facts this relies on
 

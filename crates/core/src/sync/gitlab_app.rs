@@ -133,7 +133,11 @@ pub(crate) fn read_refresh(reply: &HttpReply) -> Result<TokenSet, String> {
 // ---------------------------------------------------------------------------
 // Approvals waiting for a project
 
-/// An admin's approval of DumbSlab's GitLab app, waiting for them to pick a project.
+/// How long one request may hold an approval (`docs_connections.claimed_until`): a job takes at
+/// most [`connect::MAX_STEPS`] steps of at most [`connect::FETCH_TIMEOUT_SECS`] each.
+const CLAIM_SECS: i64 = 90;
+
+/// An admin's approval of DumbSlab's GitLab app, held by one request (see [`claim`]).
 #[derive(Clone)]
 pub(crate) struct Pending {
     pub account: String,
@@ -152,10 +156,33 @@ fn pending_owner(user_id: &str) -> String {
     format!("docs-connection:{user_id}")
 }
 
-/// The admin's waiting approval, if they have one that can still be read.
-pub(crate) fn pending(db: &dyn Db, cfg: &HostConfig, user_id: &str) -> ApiResult<Option<Pending>> {
-    let Some(r) =
-        db.one("SELECT account, secret, expires_at FROM docs_connections WHERE provider = 'gitlab' AND user_id = ?", &params![user_id])?
+/// Claims the admin's approval for one request (listing projects, adding or reconnecting a
+/// folder), so only that request refreshes or takes it: GitLab replaces both tokens at each
+/// refresh, so two requests using one approval would break each other, or end up with one
+/// approval in two sources. `Ok(None)` when they have none; a conflict while another request
+/// holds it.
+pub(crate) fn claim(db: &dyn Db, user_id: &str, now: DateTime<Utc>) -> ApiResult<Option<String>> {
+    if db.one("SELECT 1 AS ok FROM docs_connections WHERE provider = 'gitlab' AND user_id = ?", &params![user_id])?.is_none() {
+        return Ok(None);
+    }
+    let claim = format!("{} {}", ts(now + Duration::seconds(CLAIM_SECS)), crate::util::new_id());
+    let claimed = db.execute(
+        "UPDATE docs_connections SET claimed_until = ? WHERE provider = 'gitlab' AND user_id = ? AND (claimed_until IS NULL OR claimed_until <= ?)",
+        &params![claim.clone(), user_id, ts(now)],
+    )? > 0;
+    if !claimed {
+        return Err(ApiError::conflict("Your GitLab approval is in use by another request. Try again in a moment."));
+    }
+    Ok(Some(claim))
+}
+
+/// The approval `claim` holds, unless it was replaced (connected again) or taken meanwhile, or
+/// can't be read (the connector key changed).
+fn held(db: &dyn Db, cfg: &HostConfig, user_id: &str, claim: &str) -> ApiResult<Option<Pending>> {
+    let Some(r) = db.one(
+        "SELECT account, secret, expires_at FROM docs_connections WHERE provider = 'gitlab' AND user_id = ? AND claimed_until = ?",
+        &params![user_id, claim],
+    )?
     else {
         return Ok(None);
     };
@@ -166,19 +193,58 @@ pub(crate) fn pending(db: &dyn Db, cfg: &HostConfig, user_id: &str) -> ApiResult
     }))
 }
 
-fn save_pending(db: &dyn Db, cfg: &HostConfig, user_id: &str, p: &Pending, now: DateTime<Utc>) -> ApiResult<()> {
+/// Saves the held approval's refreshed tokens. `false` when `claim` doesn't hold it any more.
+fn save_held(db: &dyn Db, cfg: &HostConfig, user_id: &str, claim: &str, p: &Pending) -> ApiResult<bool> {
+    let secret = super::seal(cfg, &pending_owner(user_id), "gitlab", &p.cred)?;
+    Ok(db.execute(
+        "UPDATE docs_connections SET secret = ?, expires_at = ? WHERE provider = 'gitlab' AND user_id = ? AND claimed_until = ?",
+        &params![secret, p.expires_at.map(ts), user_id, claim],
+    )? > 0)
+}
+
+/// Lets go of the approval, for the next request.
+fn release(db: &dyn Db, user_id: &str, claim: &str) -> ApiResult<()> {
+    db.execute(
+        "UPDATE docs_connections SET claimed_until = NULL WHERE provider = 'gitlab' AND user_id = ? AND claimed_until = ?",
+        &params![user_id, claim],
+    )?;
+    Ok(())
+}
+
+/// Takes the held approval (its tokens move to a source, or GitLab refused them). `false` when
+/// `claim` doesn't hold it any more.
+fn take(db: &dyn Db, user_id: &str, claim: &str) -> ApiResult<bool> {
+    Ok(db.execute(
+        "DELETE FROM docs_connections WHERE provider = 'gitlab' AND user_id = ? AND claimed_until = ?",
+        &params![user_id, claim],
+    )? > 0)
+}
+
+/// Keeps a new approval, in place of any earlier one: whoever held that one finds it gone.
+fn save_new(db: &dyn Db, cfg: &HostConfig, user_id: &str, p: &Pending, now: DateTime<Utc>) -> ApiResult<()> {
     let secret = super::seal(cfg, &pending_owner(user_id), "gitlab", &p.cred)?;
     db.execute(
         "INSERT INTO docs_connections (id, provider, user_id, account, secret, expires_at, created_at) VALUES (?, 'gitlab', ?, ?, ?, ?, ?)
-         ON CONFLICT(provider, user_id) DO UPDATE SET account = excluded.account, secret = excluded.secret, expires_at = excluded.expires_at",
+         ON CONFLICT(provider, user_id) DO UPDATE SET account = excluded.account, secret = excluded.secret, expires_at = excluded.expires_at,
+           claimed_until = NULL, created_at = excluded.created_at",
         &params![crate::util::new_id(), user_id, p.account.clone(), secret, p.expires_at.map(ts), ts(now)],
     )?;
     Ok(())
 }
 
-/// Takes the admin's waiting approval: its tokens move to a source.
-pub(crate) fn take_pending(db: &dyn Db, user_id: &str) -> ApiResult<()> {
-    db.execute("DELETE FROM docs_connections WHERE provider = 'gitlab' AND user_id = ?", &params![user_id])?;
+/// Holds a source like a sync does (`running_until`), so no sync refreshes its tokens while it's
+/// reconnected. Its sync history stays as it was.
+pub(crate) fn hold_source(db: &dyn Db, source_id: &str, now: DateTime<Utc>) -> ApiResult<Option<String>> {
+    let lease = format!("{} {}", ts(now + Duration::seconds(super::LEASE_SECS)), crate::util::new_id());
+    let held = db.execute(
+        "UPDATE docs_sources SET running_until = ? WHERE id = ? AND (running_until IS NULL OR running_until <= ?)",
+        &params![lease.clone(), source_id, ts(now)],
+    )? > 0;
+    Ok(held.then_some(lease))
+}
+
+fn let_go_source(db: &dyn Db, source_id: &str, lease: &str) -> ApiResult<()> {
+    db.execute("UPDATE docs_sources SET running_until = NULL WHERE id = ? AND running_until = ?", &params![source_id, lease])?;
     Ok(())
 }
 
@@ -256,6 +322,16 @@ pub(crate) fn read_hook(reply: &HttpReply) -> Result<i64, String> {
         (404, _) => Err("GitLab can't find that project for your account.".into()),
         _ => Err(http_error("GitLab", reply)),
     }
+}
+
+/// The request that points an existing webhook at `url`, with `secret` as its token.
+pub(crate) fn edit_hook_call(token: &str, project_id: i64, hook_id: i64, url: &str, secret: &str) -> HttpCall {
+    let body = json!({ "name": HOOK_NAME, "url": url, "push_events": true, "token": secret, "enable_ssl_verification": true });
+    HttpCall { method: "PUT", url: format!("{API}/projects/{project_id}/hooks/{hook_id}"), headers: vec![], body: Some(body.to_string()) }
+        .header("content-type", "application/json")
+        .header("accept", "application/json")
+        .header("user-agent", "DumbSlab")
+        .bearer(token)
 }
 
 pub(crate) fn remove_hook_call(token: &str, project_id: i64, hook_id: i64) -> HttpCall {
@@ -348,6 +424,20 @@ pub struct Draft {
     pub webhook_url: String,
 }
 
+/// A source to reconnect with the admin's newest approval.
+#[derive(Clone)]
+pub struct Rejoin {
+    pub source_id: String,
+    /// The source's lease (see [`hold_source`]).
+    pub lease: String,
+    pub project_id: i64,
+    pub hook_id: Option<i64>,
+    /// Where its webhook should point: the workspace's address now.
+    pub webhook_url: String,
+    /// The webhook's secret: the source's, or a new one when the stored one can't be read.
+    pub secret: String,
+}
+
 /// Work with DumbSlab's GitLab app that needs requests to GitLab.
 #[derive(Clone)]
 pub struct GitLabJob {
@@ -363,10 +453,13 @@ pub struct GitLabJob {
 enum Kind {
     /// Finishing Connect GitLab: exchange the code, read whose account it is, keep the approval.
     Connect { code: String, verifier: String, redirect_uri: String, approval: Option<Pending> },
-    /// The projects the admin can maintain (`list_gitlab_projects`).
-    Projects { conn: Option<Pending> },
-    /// Adding a folder: find the project, add its webhook, then save the source.
-    Create { draft: Draft, conn: Option<Pending>, project: Option<Project>, secret: String },
+    /// The projects the admin can maintain (`list_gitlab_projects`), with their held approval.
+    Projects { claim: String, approval: Option<Pending> },
+    /// Adding a folder: find the project, add its webhook, then save the source with the approval.
+    Create { claim: String, approval: Option<Pending>, draft: Draft, project: Option<Project>, secret: String, hook_id: Option<i64> },
+    /// Reconnecting a folder: make sure its webhook is there with its secret and address, then
+    /// move the approval onto it. `added` is a webhook this job had to add again.
+    Reconnect { claim: String, approval: Option<Pending>, rejoin: Rejoin, added: Option<i64> },
     /// A source was removed: take its webhook off the project, best effort.
     RemoveHook { project_id: i64, hook_id: i64, cred: Credential, expires_at: Option<DateTime<Utc>> },
 }
@@ -386,6 +479,7 @@ impl std::fmt::Debug for GitLabJob {
             Kind::Connect { .. } => "connect",
             Kind::Projects { .. } => "projects",
             Kind::Create { .. } => "create",
+            Kind::Reconnect { .. } => "reconnect",
             Kind::RemoveHook { .. } => "remove-hook",
         };
         write!(f, "GitLabJob({kind}, {:?})", self.phase)
@@ -397,15 +491,20 @@ impl GitLabJob {
         GitLabJob { user_id: user_id.into(), base_url: base_url.into(), kind, phase: Phase::Start, effects: vec![], staged: vec![] }
     }
 
-    /// Lists the projects `user_id` can maintain, with their waiting approval.
-    pub(crate) fn projects(user_id: &str, base_url: &str) -> GitLabJob {
-        GitLabJob::new(user_id, base_url, Kind::Projects { conn: None })
+    /// Lists the projects `user_id` can maintain, with the approval `claim` holds.
+    pub(crate) fn projects(user_id: &str, base_url: &str, claim: String) -> GitLabJob {
+        GitLabJob::new(user_id, base_url, Kind::Projects { claim, approval: None })
     }
 
-    /// Adds a folder from a project, with `user_id`'s waiting approval.
-    pub(crate) fn create(user_id: &str, base_url: &str, draft: Draft) -> GitLabJob {
+    /// Adds a folder from a project, with the approval `claim` holds.
+    pub(crate) fn create(user_id: &str, base_url: &str, claim: String, draft: Draft) -> GitLabJob {
         let secret = crate::util::new_secret("whsec_");
-        GitLabJob::new(user_id, base_url, Kind::Create { draft, conn: None, project: None, secret })
+        GitLabJob::new(user_id, base_url, Kind::Create { claim, approval: None, draft, project: None, secret, hook_id: None })
+    }
+
+    /// Reconnects a folder with the approval `claim` holds.
+    pub(crate) fn reconnect(user_id: &str, base_url: &str, claim: String, rejoin: Rejoin) -> GitLabJob {
+        GitLabJob::new(user_id, base_url, Kind::Reconnect { claim, approval: None, rejoin, added: None })
     }
 
     /// Removes a deleted source's webhook.
@@ -421,6 +520,22 @@ impl GitLabJob {
         let staged = std::mem::take(&mut self.staged);
         if committed {
             self.effects.extend(staged);
+        }
+    }
+
+    /// A step that saves a folder failed or was rolled back (say, it grew a full workspace past
+    /// its storage): the webhook this job added comes off again, or GitLab would keep sending
+    /// pushes for a folder that isn't here. Asked of the job as the failed step left it, which
+    /// knows the webhook (see [`crate::connect::guarded_step`]).
+    pub(crate) fn failure_notice(&self) -> Option<HttpCall> {
+        match &self.kind {
+            Kind::Create { approval: Some(a), project: Some(p), hook_id: Some(hook), .. } => {
+                Some(remove_hook_call(&a.cred.token, p.id, *hook))
+            }
+            Kind::Reconnect { approval: Some(a), rejoin, added: Some(hook), .. } => {
+                Some(remove_hook_call(&a.cred.token, rejoin.project_id, *hook))
+            }
+            _ => None,
         }
     }
 }
@@ -439,8 +554,42 @@ fn failed(message: impl Into<String>) -> ApiResult<Step> {
     Ok(Step::Done(Finish::Fail(ApiError::new(400, "gitlab_failed", message.into()))))
 }
 
-fn reconnect() -> String {
+fn reconnect_message() -> String {
     "Your GitLab approval can't be used any more. Choose Connect GitLab again.".into()
+}
+
+/// What a 401, 403 or 404 from GitLab means while working on a project.
+fn project_error(reply: &HttpReply, path: &str) -> String {
+    match reply.status {
+        401 => reconnect_message(),
+        403 => format!("GitLab refused: you need the Maintainer role in {path} for DumbSlab to manage its webhook."),
+        404 => format!("GitLab can't find {path} for your account."),
+        _ => http_error("GitLab", reply),
+    }
+}
+
+/// The claim a job holds on an approval, and the approval once loaded.
+fn approval_of(kind: &mut Kind) -> Option<(&str, &mut Option<Pending>)> {
+    match kind {
+        Kind::Projects { claim, approval } | Kind::Create { claim, approval, .. } | Kind::Reconnect { claim, approval, .. } => {
+            Some((claim.as_str(), approval))
+        }
+        _ => None,
+    }
+}
+
+/// Ends a job that holds an approval without using it up: it's free for the next request, and a
+/// source being reconnected is let go.
+fn give_up(db: &dyn Db, j: &GitLabJob, message: impl Into<String>) -> ApiResult<Step> {
+    match &j.kind {
+        Kind::Projects { claim, .. } | Kind::Create { claim, .. } => release(db, &j.user_id, claim)?,
+        Kind::Reconnect { claim, rejoin, .. } => {
+            release(db, &j.user_id, claim)?;
+            let_go_source(db, &rejoin.source_id, &rejoin.lease)?;
+        }
+        _ => {}
+    }
+    failed(message)
 }
 
 /// Runs a GitLab job's next step (see [`crate::connect::step`]).
@@ -450,7 +599,7 @@ pub fn step(db: &dyn Db, cfg: &HostConfig, j: &mut GitLabJob, replies: Vec<HttpR
     let Some(app) = app(cfg) else {
         return match j.kind {
             Kind::Connect { .. } => back(&j.base_url, Problem::Unavailable),
-            _ => failed("DumbSlab's GitLab app isn't set up on this server any more."),
+            _ => give_up(db, j, "DumbSlab's GitLab app isn't set up on this server any more."),
         };
     };
     match (&mut j.kind, j.phase) {
@@ -484,7 +633,7 @@ pub fn step(db: &dyn Db, cfg: &HostConfig, j: &mut GitLabJob, replies: Vec<HttpR
                 return back(&j.base_url, Problem::NotAdmin);
             }
             p.account = account.label;
-            save_pending(db, cfg, &j.user_id, p, now)?;
+            save_new(db, cfg, &j.user_id, p, now)?;
             let mut ctx = super::ctx(db, cfg, &j.user_id, &j.base_url, now)?;
             crate::events::emit(
                 &mut ctx,
@@ -495,92 +644,138 @@ pub fn step(db: &dyn Db, cfg: &HostConfig, j: &mut GitLabJob, replies: Vec<HttpR
             Ok(Step::Done(Finish::Redirect(settings_url(&j.base_url, "gitlab", Ok(())))))
         }
 
-        // Listing projects, and adding a folder: with the admin's approval, refreshed if need be.
-        (Kind::Projects { conn } | Kind::Create { conn, .. }, Phase::Start) => {
-            let Some(p) = pending(db, cfg, &j.user_id)? else { return failed(reconnect()) };
-            let refresh = needs_refresh(&p.cred, p.expires_at, now);
-            let call = refresh_call(app, &p.cred);
-            *conn = Some(p);
-            if refresh {
+        // Listing projects, adding a folder and reconnecting one: with the held approval,
+        // refreshed first if it's about to expire. Only this job refreshes it.
+        (Kind::Projects { .. } | Kind::Create { .. } | Kind::Reconnect { .. }, Phase::Start) => {
+            let user_id = j.user_id.clone();
+            let (claim, approval) = approval_of(&mut j.kind).expect("holds an approval");
+            let Some(p) = held(db, cfg, &user_id, claim)? else {
+                // Replaced, taken, or unreadable: nothing here can use it.
+                take(db, &user_id, claim)?;
+                return give_up(db, j, reconnect_message());
+            };
+            let refresh = needs_refresh(&p.cred, p.expires_at, now).then(|| refresh_call(app, &p.cred));
+            *approval = Some(p);
+            if let Some(call) = refresh {
                 j.phase = Phase::Refreshing;
                 return Ok(Step::Fetch(vec![call]));
             }
             j.phase = Phase::Working;
             Ok(Step::Fetch(first_calls(&j.kind)))
         }
-        (Kind::Projects { conn: Some(p) } | Kind::Create { conn: Some(p), .. }, Phase::Refreshing) => {
+        (Kind::Projects { .. } | Kind::Create { .. } | Kind::Reconnect { .. }, Phase::Refreshing) => {
+            let user_id = j.user_id.clone();
+            let (claim, approval) = approval_of(&mut j.kind).expect("holds an approval");
+            let claim = claim.to_string();
             let tokens = match read_refresh(&reply) {
                 Ok(t) => t,
-                Err(message) => {
-                    if reply.status != 0 && reply.status < 500 && reply.status != 429 {
-                        take_pending(db, &j.user_id)?;
-                    }
-                    return failed(message);
+                // GitLab refused the approval itself: it's no use to anyone now.
+                Err(message) if reply.status != 0 && reply.status < 500 && reply.status != 429 => {
+                    take(db, &user_id, &claim)?;
+                    return give_up(db, j, message);
                 }
+                Err(message) => return give_up(db, j, message),
             };
+            let p = approval.as_mut().expect("loaded");
             p.expires_at = expiry(now, &tokens);
             apply_tokens(&mut p.cred, tokens);
-            save_pending(db, cfg, &j.user_id, p, now)?;
+            // GitLab has replaced the old tokens, so these are kept at once.
+            if !save_held(db, cfg, &user_id, &claim, p)? {
+                return give_up(db, j, reconnect_message());
+            }
             j.phase = Phase::Working;
             Ok(Step::Fetch(first_calls(&j.kind)))
         }
-        (Kind::Projects { conn: Some(p) }, Phase::Working) => match read_projects(&replies) {
-            Ok((projects, more)) => Ok(Step::Done(Finish::Fill(projects_value(&j.base_url, &p.account, &projects, more)))),
-            Err(_) if reply.status == 401 => failed(reconnect()),
-            Err(message) => failed(message),
-        },
-        (Kind::Create { draft, conn: Some(p), project, secret }, Phase::Working) => {
-            if !reply.ok() {
-                return failed(match reply.status {
-                    401 => reconnect(),
-                    404 => format!("GitLab can't find {} for your account.", draft.repo),
-                    _ => http_error("GitLab", &reply),
-                });
+        (Kind::Projects { claim, approval: Some(p) }, Phase::Working) => {
+            let listed = read_projects(&replies);
+            let (account, claim) = (p.account.clone(), claim.clone());
+            release(db, &j.user_id, &claim)?;
+            match listed {
+                Ok((projects, more)) => Ok(Step::Done(Finish::Fill(projects_value(&j.base_url, &account, &projects, more)))),
+                Err(_) if reply.status == 401 => failed(reconnect_message()),
+                Err(message) => failed(message),
             }
-            let Some(found) = read_project(&reply.json()) else { return failed("GitLab's answer had no project in it. Try again.") };
+        }
+
+        // Adding a folder.
+        (Kind::Create { draft, approval: Some(p), project, secret, .. }, Phase::Working) => {
+            if !reply.ok() {
+                let message = project_error(&reply, &draft.repo);
+                return give_up(db, j, message);
+            }
+            let Some(found) = read_project(&reply.json()) else {
+                return give_up(db, j, "GitLab's answer had no project in it. Try again.");
+            };
             let call = add_hook_call(&p.cred.token, found.id, &draft.webhook_url, secret);
             *project = Some(found);
             j.phase = Phase::Finishing;
             Ok(Step::Fetch(vec![call]))
         }
-        (Kind::Create { draft, conn: Some(p), project: Some(found), secret }, Phase::Finishing) => {
-            let hook_id = match read_hook(&reply) {
+        (Kind::Create { claim, draft, approval: Some(p), project: Some(found), secret, hook_id }, Phase::Finishing) => {
+            let hook = match read_hook(&reply) {
                 Ok(id) => id,
-                Err(message) => return failed(message),
+                Err(message) => return give_up(db, j, message),
             };
+            // Known from here on: if saving fails, or the host rolls this step back, it comes off
+            // again (see `GitLabJob::failure_notice`).
+            *hook_id = Some(hook);
             let mut cred = p.cred.clone();
             cred.fields.insert("webhook_secret".into(), secret.clone());
-            let link =
-                super::docs::Link::GitLabOAuth { project_id: found.id, hook_id: Some(hook_id), token_expires_at: p.expires_at.map(ts) };
-            let branch = draft.branch.clone().or_else(|| found.default_branch.clone()).unwrap_or_else(|| "main".into());
+            let link = super::docs::Link::GitLabOAuth { project_id: found.id, hook_id: Some(hook), token_expires_at: p.expires_at.map(ts) };
             let mut ctx = super::ctx(db, cfg, &j.user_id, &j.base_url, now)?;
+            if ctx.actor.user_id != j.user_id {
+                return Err(ApiError::forbidden("only an admin can add a folder"));
+            }
             let fresh = super::docs::NewSource {
                 id: draft.source_id.clone(),
                 provider: super::repo::Provider::GitLab,
                 host: HOST.into(),
                 repo: found.path.clone(),
-                branch,
+                branch: draft.branch.clone().or_else(|| found.default_branch.clone()).unwrap_or_else(|| "main".into()),
                 folder: draft.folder.clone(),
                 topic_id: draft.topic_id.clone(),
             };
-            // The checks again: the topic and other sources may have changed meanwhile. Undo the
-            // webhook if the source can't be saved.
-            let saved = if ctx.actor.user_id == j.user_id {
-                crate::ops::sync::insert_source(&mut ctx, &fresh, &cred, &link)
-            } else {
-                Err(ApiError::forbidden("only an admin can add a folder"))
-            };
-            if let Err(e) = saved {
-                j.kind = Kind::RemoveHook { project_id: found.id, hook_id, cred: p.cred.clone(), expires_at: p.expires_at };
-                j.phase = Phase::Finishing;
-                j.effects.push(Effect::Background(Job::GitLab(Box::new(j.clone()))));
-                return Ok(Step::Done(Finish::Fail(e)));
+            // Checked again: the topic and other sources may have changed meanwhile.
+            crate::ops::sync::insert_source(&mut ctx, &fresh, &cred, &link)?;
+            // The approval moves to the source, unless another request replaced it meanwhile.
+            if !take(db, &j.user_id, claim)? {
+                return Err(ApiError::conflict("Your GitLab approval changed while the folder was being added. Try again."));
             }
-            take_pending(db, &j.user_id)?;
             let created = crate::ops::sync::created_value(&ctx, &draft.source_id)?;
             j.staged.append(&mut ctx.effects);
             Ok(Step::Done(Finish::Fill(created)))
         }
+
+        // Reconnecting a folder: its webhook first (pointed at the workspace's address now, with the
+        // folder's secret), then the approval.
+        (Kind::Reconnect { approval: Some(p), rejoin, added, .. }, Phase::Working) => match rejoin.hook_id {
+            // It had none, so this was adding one.
+            None => match read_hook(&reply) {
+                Ok(id) => {
+                    *added = Some(id);
+                    finish_reconnect(db, cfg, j, now)
+                }
+                Err(message) => give_up(db, j, message),
+            },
+            Some(_) if reply.ok() => finish_reconnect(db, cfg, j, now),
+            // Someone deleted it on GitLab: add it again.
+            Some(_) if reply.status == 404 => {
+                let call = add_hook_call(&p.cred.token, rejoin.project_id, &rejoin.webhook_url, &rejoin.secret);
+                j.phase = Phase::Finishing;
+                Ok(Step::Fetch(vec![call]))
+            }
+            Some(_) => {
+                let message = project_error(&reply, "the project");
+                give_up(db, j, message)
+            }
+        },
+        (Kind::Reconnect { added, .. }, Phase::Finishing) => match read_hook(&reply) {
+            Ok(id) => {
+                *added = Some(id);
+                finish_reconnect(db, cfg, j, now)
+            }
+            Err(message) => give_up(db, j, message),
+        },
 
         // Removing a deleted source's webhook.
         (Kind::RemoveHook { project_id, hook_id, cred, expires_at }, Phase::Start) => {
@@ -599,11 +794,6 @@ pub fn step(db: &dyn Db, cfg: &HostConfig, j: &mut GitLabJob, replies: Vec<HttpR
             j.phase = Phase::Working;
             Ok(Step::Fetch(vec![remove_hook_call(&cred.token, *project_id, *hook_id)]))
         }
-        (Kind::RemoveHook { project_id, hook_id, cred, .. }, Phase::Finishing) => {
-            // A source that couldn't be saved: its new webhook comes off again.
-            j.phase = Phase::Working;
-            Ok(Step::Fetch(vec![remove_hook_call(&cred.token, *project_id, *hook_id)]))
-        }
         (Kind::RemoveHook { .. }, Phase::Working) => match reply.status {
             200..=299 | 404 => Ok(Step::Done(Finish::Fill(json!({ "ok": true })))),
             _ => failed(http_error("GitLab", &reply)),
@@ -612,11 +802,51 @@ pub fn step(db: &dyn Db, cfg: &HostConfig, j: &mut GitLabJob, replies: Vec<HttpR
     }
 }
 
-/// What listing projects or adding a folder asks GitLab first, once the approval's token is fresh.
+/// Saves a reconnected folder: the approval's tokens and the webhook's secret, sealed to it; its
+/// webhook; and it can sync again. Then lets it go.
+fn finish_reconnect(db: &dyn Db, cfg: &HostConfig, j: &mut GitLabJob, now: DateTime<Utc>) -> ApiResult<Step> {
+    let Kind::Reconnect { claim, approval: Some(p), rejoin, added } = &j.kind else { return Err(ApiError::internal("not reconnecting")) };
+    let mut cred = p.cred.clone();
+    cred.fields.insert("webhook_secret".into(), rejoin.secret.clone());
+    let sealed = super::seal(cfg, &super::docs::owner(&rejoin.source_id), "gitlab", &cred)?;
+    let saved = db.execute(
+        "UPDATE docs_sources SET secret = ?, running_until = NULL, updated_at = ? WHERE id = ? AND running_until = ?",
+        &params![sealed, ts(now), rejoin.source_id.clone(), rejoin.lease.clone()],
+    )?;
+    if saved == 0 {
+        return Err(ApiError::conflict("The folder changed while it was being reconnected. Try again."));
+    }
+    db.execute(
+        "UPDATE docs_source_links SET token_expires_at = ?, hook_id = ?, disconnected = NULL WHERE source_id = ?",
+        &params![p.expires_at.map(ts), added.or(rejoin.hook_id), rejoin.source_id.clone()],
+    )?;
+    if !take(db, &j.user_id, claim)? {
+        return Err(ApiError::conflict("Your GitLab approval changed while the folder was being reconnected. Try again."));
+    }
+    let mut ctx = super::ctx(db, cfg, &j.user_id, &j.base_url, now)?;
+    let repo = db
+        .one("SELECT repo FROM docs_sources WHERE id = ?", &params![rejoin.source_id.clone()])?
+        .map(|r| r.str("repo"))
+        .unwrap_or_default();
+    crate::events::emit(
+        &mut ctx,
+        crate::events::Event::new("docs_source.updated", "docs_source", &rejoin.source_id, format!("reconnected docs sync from {repo}"))
+            .admin_only(),
+    )?;
+    let created = crate::ops::sync::created_value(&ctx, &rejoin.source_id)?;
+    j.staged.append(&mut ctx.effects);
+    Ok(Step::Done(Finish::Fill(created)))
+}
+
+/// What a job holding an approval asks GitLab first, once its token is fresh.
 fn first_calls(kind: &Kind) -> Vec<HttpCall> {
     match kind {
-        Kind::Projects { conn: Some(p) } => project_calls(&p.cred.token),
-        Kind::Create { conn: Some(p), draft, .. } => vec![project_call(&p.cred.token, &draft.repo)],
+        Kind::Projects { approval: Some(p), .. } => project_calls(&p.cred.token),
+        Kind::Create { approval: Some(p), draft, .. } => vec![project_call(&p.cred.token, &draft.repo)],
+        Kind::Reconnect { approval: Some(p), rejoin, .. } => match rejoin.hook_id {
+            Some(hook) => vec![edit_hook_call(&p.cred.token, rejoin.project_id, hook, &rejoin.webhook_url, &rejoin.secret)],
+            None => vec![add_hook_call(&p.cred.token, rejoin.project_id, &rejoin.webhook_url, &rejoin.secret)],
+        },
         _ => vec![],
     }
 }

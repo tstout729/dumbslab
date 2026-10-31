@@ -294,7 +294,7 @@ fn source_view(ctx: &Ctx, r: &Row) -> ApiResult<DocsSource> {
         webhook_url: (source.link == Link::Token).then(|| ctx.url(&format!("/hooks/docs/{}", source.id))),
         synced_files,
         owner,
-        state: unreadable(sync::state_of(r, ctx.now), readable),
+        state: unreadable(sync::state_of(r, ctx.now), readable, &source.link),
         last_result: r.opt_str("last_result").and_then(|v| serde_json::from_str(&v).ok()),
         created_at: r.str("created_at"),
         id: source.id,
@@ -302,10 +302,13 @@ fn source_view(ctx: &Ctx, r: &Row) -> ApiResult<DocsSource> {
 }
 
 /// Says so when a source's credentials can't be read.
-fn unreadable(mut state: SyncState, readable: bool) -> SyncState {
+fn unreadable(mut state: SyncState, readable: bool, link: &Link) -> SyncState {
     if !readable {
         state.last_status = Some("failed".into());
-        state.last_error = Some("The saved token and webhook secret can't be read: the server's connector key changed. Save the token again (a new webhook secret is made) and update the webhook.".into());
+        state.last_error = Some(match link {
+            Link::GitLabOAuth { .. } => "The saved GitLab access can't be read: the server's connector key changed. Choose Connect GitLab, then Reconnect on this folder; its webhook gets a new secret by itself.".into(),
+            _ => "The saved token and webhook secret can't be read: the server's connector key changed. Save the token again (a new webhook secret is made) and update the webhook.".into(),
+        });
     }
     state
 }
@@ -363,8 +366,9 @@ pub struct GitLabProject {
 fn list_gitlab_projects(ctx: &mut Ctx, _: NoInput) -> ApiResult<Deferred<GitLabProjects>> {
     let available = gitlab_app::available(ctx.cfg);
     let connect_url = available.then(|| ctx.url(gitlab_app::START_PATH));
-    let pending = if available { gitlab_app::pending(ctx.db, ctx.cfg, &ctx.actor.user_id)? } else { None };
-    if pending.is_none() {
+    // Held for the listing, so only it refreshes the approval meanwhile.
+    let claim = if available { gitlab_app::claim(ctx.db, &ctx.actor.user_id, ctx.now)? } else { None };
+    let Some(claim) = claim else {
         return Ok(Deferred::Ready(GitLabProjects {
             available,
             connected: false,
@@ -373,8 +377,8 @@ fn list_gitlab_projects(ctx: &mut Ctx, _: NoInput) -> ApiResult<Deferred<GitLabP
             projects: vec![],
             more: false,
         }));
-    }
-    let job = gitlab_app::GitLabJob::projects(&ctx.actor.user_id, &ctx.base_url);
+    };
+    let job = gitlab_app::GitLabJob::projects(&ctx.actor.user_id, &ctx.base_url, claim);
     ctx.effects.push(Effect::Connect(Job::GitLab(Box::new(job))));
     Ok(Deferred::Pending)
 }
@@ -547,9 +551,9 @@ fn create_docs_source(ctx: &mut Ctx, input: CreateDocsSourceInput) -> ApiResult<
         if !gitlab_app::available(ctx.cfg) {
             return Err(ApiError::new(503, "gitlab_app_off", "DumbSlab's GitLab app isn't set up on this server; give a token instead."));
         }
-        if gitlab_app::pending(ctx.db, ctx.cfg, &ctx.actor.user_id)?.is_none() {
-            return Err(ApiError::conflict("Connect GitLab first (Settings › Docs sync), then pick the project."));
-        }
+        // Held until the folder is saved with it, so it never ends up in two folders.
+        let claim = gitlab_app::claim(ctx.db, &ctx.actor.user_id, ctx.now)?
+            .ok_or_else(|| ApiError::conflict("Connect GitLab first (Settings › Docs sync), then pick the project."))?;
         let draft = gitlab_app::Draft {
             webhook_url: ctx.url(&format!("/hooks/docs/{}", fresh.id)),
             source_id: fresh.id,
@@ -558,7 +562,7 @@ fn create_docs_source(ctx: &mut Ctx, input: CreateDocsSourceInput) -> ApiResult<
             folder: fresh.folder,
             topic_id: fresh.topic_id,
         };
-        let job = gitlab_app::GitLabJob::create(&ctx.actor.user_id, &ctx.base_url, draft);
+        let job = gitlab_app::GitLabJob::create(&ctx.actor.user_id, &ctx.base_url, claim, draft);
         ctx.effects.push(Effect::Connect(Job::GitLab(Box::new(job))));
         return Ok(Deferred::Pending);
     }
@@ -664,7 +668,7 @@ pub struct UpdateDocsSourceInput {
     pub gitlab_connection: Option<bool>,
 }
 
-fn update_docs_source(ctx: &mut Ctx, input: UpdateDocsSourceInput) -> ApiResult<DocsSourceCreated> {
+fn update_docs_source(ctx: &mut Ctx, input: UpdateDocsSourceInput) -> ApiResult<Deferred<DocsSourceCreated>> {
     key_needed(ctx)?;
     let row = load_source_row(ctx, &input.id)?;
     // Credentials that can't be read any more are replaced: a token, and a new webhook secret.
@@ -674,43 +678,84 @@ fn update_docs_source(ctx: &mut Ctx, input: UpdateDocsSourceInput) -> ApiResult<
             "this source is read through DumbSlab's GitHub or GitLab app: it has no token or webhook secret to change.",
         ));
     }
-    if input.gitlab_connection == Some(true) {
-        let Link::GitLabOAuth { .. } = source.link else {
-            return Err(ApiError::bad_request("`gitlab_connection` is for sources read through DumbSlab's GitLab app"));
-        };
-        let p = gitlab_app::pending(ctx.db, ctx.cfg, &ctx.actor.user_id)?
-            .ok_or_else(|| ApiError::conflict("Connect GitLab first (Settings › Docs sync), then reconnect this folder."))?;
-        // The webhook keeps its secret; only the tokens change.
-        source.cred.token = p.cred.token;
-        source.cred.refresh_token = p.cred.refresh_token;
-        gitlab_app::take_pending(ctx.db, &ctx.actor.user_id)?;
-        ctx.db.execute(
-            "UPDATE docs_source_links SET token_expires_at = ?, disconnected = NULL WHERE source_id = ?",
-            &params![p.expires_at.map(crate::util::ts), source.id.clone()],
-        )?;
+    let branch = clean(input.branch).map(|b| sync::checked_branch(&b)).transpose()?;
+    if let Link::GitLabOAuth { project_id, hook_id, .. } = source.link {
+        if input.gitlab_connection == Some(true) {
+            return reconnect_gitlab(ctx, &source, readable, branch, project_id, hook_id);
+        }
+        if !readable {
+            return Err(ApiError::conflict(
+                "This folder's saved GitLab access can't be read (the server's connector key changed). Choose Connect GitLab, then Reconnect on the folder.",
+            ));
+        }
+    } else if input.gitlab_connection == Some(true) {
+        return Err(ApiError::bad_request("`gitlab_connection` is for sources read through DumbSlab's GitLab app"));
     }
-    if let Some(t) = secret_input(input.token, "token")? {
-        source.cred.token = t;
+    if let Some(b) = branch {
+        source.repo.branch = b;
     }
-    if let Some(b) = clean(input.branch) {
-        source.repo.branch = sync::checked_branch(&b)?;
-    }
+    let token = secret_input(input.token, "token")?;
     // (A GitHub App source keeps no credentials, so it's always readable.)
     let webhook_secret = (input.new_webhook_secret.unwrap_or(false) || !readable).then(|| new_secret("whsec_"));
+    if let Some(t) = &token {
+        source.cred.token = t.clone();
+    }
     if let Some(s) = &webhook_secret {
         source.cred.fields.insert("webhook_secret".into(), s.clone());
     }
-    let secret = sync::seal(ctx.cfg, &docs::owner(&source.id), source.repo.provider.id(), &source.cred)?;
+    // Credentials are written only when they change: a sync may be saving refreshed ones.
+    if token.is_some() || webhook_secret.is_some() {
+        let secret = sync::seal(ctx.cfg, &docs::owner(&source.id), source.repo.provider.id(), &source.cred)?;
+        ctx.db.execute("UPDATE docs_sources SET secret = ? WHERE id = ?", &params![secret, source.id.clone()])?;
+    }
     ctx.db.execute(
-        "UPDATE docs_sources SET branch = ?, secret = ?, updated_at = ? WHERE id = ?",
-        &params![source.repo.branch.clone(), secret, ctx.now_s(), source.id.clone()],
+        "UPDATE docs_sources SET branch = ?, updated_at = ? WHERE id = ?",
+        &params![source.repo.branch.clone(), ctx.now_s(), source.id.clone()],
     )?;
     emit(
         ctx,
         Event::new("docs_source.updated", "docs_source", &source.id, format!("changed docs sync from {}", source.repo.repo)).admin_only(),
     )?;
     let row = load_source_row(ctx, &source.id)?;
-    Ok(DocsSourceCreated { source: source_view(ctx, &row)?, webhook_secret })
+    Ok(Deferred::Ready(DocsSourceCreated { source: source_view(ctx, &row)?, webhook_secret }))
+}
+
+/// Reconnects a GitLab app source with the admin's newest approval: after GitLab stopped
+/// accepting the old one, after the person who approved it lost access to the project, or after
+/// the server's connector key changed (then its webhook gets a new secret). A job makes sure the
+/// project's webhook is there, pointed at this workspace's address with the source's secret, and
+/// then moves the approval onto the source. No sync runs meanwhile.
+fn reconnect_gitlab(
+    ctx: &mut Ctx,
+    source: &Source,
+    readable: bool,
+    branch: Option<String>,
+    project_id: i64,
+    hook_id: Option<i64>,
+) -> ApiResult<Deferred<DocsSourceCreated>> {
+    if !gitlab_app::available(ctx.cfg) {
+        return Err(ApiError::new(503, "gitlab_app_off", "DumbSlab's GitLab app isn't set up on this server."));
+    }
+    if let Some(b) = branch {
+        ctx.db.execute("UPDATE docs_sources SET branch = ? WHERE id = ?", &params![b, source.id.clone()])?;
+    }
+    let lease = gitlab_app::hold_source(ctx.db, &source.id, ctx.now)?
+        .ok_or_else(|| ApiError::conflict("A sync of this folder is running. Try again in a moment, once it's done."))?;
+    let claim = gitlab_app::claim(ctx.db, &ctx.actor.user_id, ctx.now)?
+        .ok_or_else(|| ApiError::conflict("Connect GitLab first (Settings › Docs sync), then reconnect this folder."))?;
+    let secret =
+        Some(source.cred.field("webhook_secret").to_string()).filter(|s| readable && !s.is_empty()).unwrap_or_else(|| new_secret("whsec_"));
+    let rejoin = gitlab_app::Rejoin {
+        source_id: source.id.clone(),
+        lease,
+        project_id,
+        hook_id,
+        webhook_url: ctx.url(&format!("/hooks/docs/{}", source.id)),
+        secret,
+    };
+    let job = gitlab_app::GitLabJob::reconnect(&ctx.actor.user_id, &ctx.base_url, claim, rejoin);
+    ctx.effects.push(Effect::Connect(Job::GitLab(Box::new(job))));
+    Ok(Deferred::Pending)
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]

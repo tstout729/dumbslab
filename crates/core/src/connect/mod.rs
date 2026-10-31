@@ -986,14 +986,17 @@ impl Job {
     }
 
     /// A request to send when a step failed with `error` and was rolled back (or the host couldn't
-    /// run it), for someone waiting elsewhere: a Slack command's answer. Hosts send it once, best
-    /// effort. `None` for jobs whose failure answers the request itself.
+    /// run it): a Slack command's answer, for someone waiting elsewhere, or taking off again a
+    /// GitLab webhook a docs sync job added for a folder that wasn't saved. Hosts send it once,
+    /// best effort. `None` for jobs whose failure answers the request itself.
     ///
-    /// Ask the job as it was *before* the failed step: the rollback undoes whatever that step
-    /// decided, such as having prepared its answer (see [`guarded_step`], which does this).
+    /// Slack's is asked of the job as it was *before* the failed step: the rollback undoes whatever
+    /// that step decided, such as having prepared its answer. GitLab's is asked of the job as the
+    /// step left it, which knows the webhook it added. [`guarded_step`] does both.
     pub fn failure_notice(&self, error: &ApiError) -> Option<HttpCall> {
         match self {
             Job::Slack(j) => j.failure_notice(error),
+            Job::GitLab(j) => j.failure_notice(),
             _ => None,
         }
     }
@@ -1282,7 +1285,7 @@ pub fn guarded_step(
     now: DateTime<Utc>,
     guard: impl FnOnce(&dyn Db) -> Option<ApiError>,
 ) -> (ApiResult<Step>, Option<HttpCall>) {
-    // Only Slack's jobs have notices; the others needn't be copied.
+    // Only Slack's notices come from the job before the step; the others needn't be copied.
     let before = matches!(job, Job::Slack(_)).then(|| job.clone());
     let mut result = step(db, cfg, job, replies, now);
     if result.is_ok()
@@ -1290,9 +1293,10 @@ pub fn guarded_step(
     {
         result = Err(refused);
     }
-    let notice = match &result {
-        Err(e) => before.and_then(|b| b.failure_notice(e)),
-        Ok(_) => None,
+    let notice = match (&result, &before) {
+        (Err(e), Some(b)) => b.failure_notice(e),
+        (Err(e), None) => job.failure_notice(e),
+        (Ok(_), _) => None,
     };
     job.settle(result.is_ok());
     (result, notice)
