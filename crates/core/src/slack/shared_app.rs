@@ -666,15 +666,42 @@ fn still_admin(db: &dyn Db, user_id: &str, via: Via) -> ApiResult<Option<Actor>>
     }))
 }
 
-/// The directory call that undoes an install's claim: the claim this workspace had for that Slack
-/// workspace goes back, or, when it had none, the install's own is let go of. `None` before the
-/// install claimed anything, and off hosted DumbSlab.
+/// What undoing an install's claim does, when the install fails after claiming and before saving.
+/// Decided when it claims (see [`undo_for`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum Undo {
+    /// Let go of the install's own claim: this workspace had no claim on that Slack workspace.
+    Release,
+    /// Put this claim back: the one this workspace's connection holds, or the one a token waiting
+    /// to be revoked will let go of once Slack has answered.
+    Restore(String),
+    /// Leave the claim as it is: something here depends on it, under a claim id nobody knows.
+    Keep,
+}
+
+/// How to undo an install's claim on `team_id`. A claim is let go of only when nothing of this
+/// workspace's depends on it: never while a token for that Slack workspace waits to be revoked,
+/// or another workspace could claim it and be given that very token before the revoke lands.
+fn undo_for(db: &dyn Db, cfg: &HostConfig, app: &App, team_id: &str, now: DateTime<Utc>) -> ApiResult<Undo> {
+    let restore = |claim: Option<String>| claim.map(Undo::Restore).unwrap_or(Undo::Keep);
+    if app.shared && app.team_id.as_deref() == Some(team_id) {
+        return Ok(restore(app.claim.clone()));
+    }
+    Ok(match pending_row(db, cfg, team_id, now)? {
+        Some(row) => restore(row.claim),
+        None => Undo::Release,
+    })
+}
+
+/// The directory call that undoes an install's claim (see [`Undo`]). `None` before the install
+/// claimed anything, when the claim stays as it is, and off hosted DumbSlab.
 pub(super) fn undo_claim(job: &SlackJob) -> Option<HttpCall> {
     let (Work::Install { home: Some(home), .. }, Some(inst), Some(claim)) = (&job.work, &job.installed, &job.claim) else { return None };
-    Some(match &job.restore {
-        Some(old) => directory_call("/slack/claim", &inst.team_id, home, Some(old)),
-        None => directory_call("/slack/release", &inst.team_id, home, Some(claim)),
-    })
+    match &job.undo {
+        Undo::Release => Some(directory_call("/slack/release", &inst.team_id, home, Some(claim))),
+        Undo::Restore(old) => Some(directory_call("/slack/claim", &inst.team_id, home, Some(old))),
+        Undo::Keep => None,
+    }
 }
 
 /// Undoes the install's claim, then sends the admin to Settings with `error`.
@@ -745,15 +772,16 @@ pub(super) fn step(db: &dyn Db, cfg: &HostConfig, job: &mut SlackJob, app: &App,
             let Some(actor) = still_admin(db, &admin, via)? else { return to_settings(&base, Err(InstallError::NotAdmin)) };
             let Some(home) = home else { return finish_install(db, cfg, job, &inst, actor, now) };
             // One Slack workspace belongs to one DumbSlab workspace: the directory says whether this
-            // one may have it. The claim's id is this install's; a failure puts back the one this
-            // workspace had, if it held this Slack workspace already.
+            // one may have it. The claim's id is this install's; a failure before the save puts back
+            // the claim this workspace depended on, if any (see `undo_for`). A token waiting to be
+            // revoked for this Slack workspace is called off only by the save itself.
             let claim = crate::util::new_id();
             // One install at a time from here to the save: two at once could each claim, and the
             // one that saved first would hold a claim the directory no longer has.
             if !lock(db, &claim, now)? {
                 return to_settings(&base, Err(InstallError::Busy));
             }
-            job.restore = app.claim.clone().filter(|_| app.shared && app.team_id.as_deref() == Some(inst.team_id.as_str()));
+            job.undo = undo_for(db, cfg, app, &inst.team_id, now)?;
             let call = directory_call("/slack/claim", &inst.team_id, &home, Some(&claim));
             job.claim = Some(claim);
             job.installed = Some(inst);

@@ -5949,6 +5949,86 @@ mod add_to_slack {
         assert_eq!(world.holder("T1"), None);
     }
 
+    /// Re-adding a Slack workspace whose old token still waits to be revoked, and failing before
+    /// the save: the claim that protects the waiting revoke is put back, never let go of, so no
+    /// other workspace can be given that token before the revoke lands.
+    #[test]
+    fn a_failed_readd_keeps_the_claim_a_pending_revoke_needs() {
+        let world = World::new();
+        let (acme, admin) = hosted_at("acme");
+        let (beta, beta_admin) = hosted_at("beta");
+        acme.user(&admin, "bo@acme.test", "Bo", "admin");
+        let bo = login(&acme, "bo@acme.test", "password123");
+        let ada = db_run(&acme, |db| db.one("SELECT id FROM users WHERE email = 'ada@acme.test'", &[])).unwrap().str("id");
+        let set_role = |role: &str| acme.ok("PATCH", &format!("/api/v1/users/{ada}"), Some(json!({ "role": role })), &bo);
+        let directory_claim = || {
+            world
+                .directory
+                .with_tx(|db| (db.one("SELECT claim FROM slack_teams WHERE team_id = 'T1'", &[]), true))
+                .unwrap()
+                .unwrap()
+                .map(|r| r.str("claim"))
+        };
+        install(&acme, &admin, &world, "T1");
+        let first = world.live("T1").unwrap();
+        let held = directory_claim().unwrap();
+
+        // Disconnected; Slack never answers the revoke. The token waits, under the claim.
+        world.slack.borrow_mut().lost = 2;
+        drive(&acme, &world, disconnect(&acme, &admin).remove(0));
+        assert!(settings(&acme, &admin)["pending_revoke"].as_bool().unwrap());
+        let advance = |job: &mut Job, replies: Vec<HttpReply>| -> Vec<HttpReply> {
+            let (Ok(Step::Fetch(calls)), _) = step(&acme, job, replies, None) else { panic!() };
+            calls.iter().map(|c| world.answer(Some("acme"), c)).collect()
+        };
+
+        // Re-adding T1 claims it anew, then Ada stops being an admin: the waiting revoke's claim
+        // goes back.
+        let mut job = install_job(&acme, &admin, "T1");
+        let replies = advance(&mut job, vec![]);
+        let replies = advance(&mut job, replies);
+        assert_ne!(directory_claim().as_deref(), Some(held.as_str()), "the install claimed with its own id");
+        set_role("member");
+        let (Ok(Step::Fetch(undo)), _) = step(&acme, &mut job, replies, None) else { panic!() };
+        assert_eq!((urls(&undo), body(&undo[0])["claim"].as_str()), (vec!["dumbslab-directory:/slack/claim"], Some(held.as_str())));
+        let answered = world.answer(Some("acme"), &undo[0]);
+        let (Ok(Step::Done(Finish::Redirect(to))), _) = step(&acme, &mut job, vec![answered], None) else { panic!() };
+        assert!(to.ends_with("slack_error=not_admin"), "{to}");
+        assert_eq!((world.holder("T1").as_deref(), directory_claim()), (Some("acme"), Some(held.clone())));
+        set_role("admin");
+
+        // Again, and this time the save itself is refused: the host's notice puts the claim back.
+        let mut job = install_job(&acme, &admin, "T1");
+        let replies = advance(&mut job, vec![]);
+        let replies = advance(&mut job, replies);
+        let full = dumbslab_core::plan::storage_full(&plans(None), dumbslab_core::plan::Plan::Free, false);
+        let (failed, notice) = step(&acme, &mut job, replies, Some(full));
+        assert!(failed.is_err());
+        let notice = notice.expect("a notice that undoes the claim");
+        assert_eq!((notice.url.as_str(), body(&notice)["claim"].as_str()), ("dumbslab-directory:/slack/claim", Some(held.as_str())));
+        world.answer(Some("acme"), &notice);
+        assert_eq!((world.holder("T1").as_deref(), directory_claim()), (Some("acme"), Some(held.clone())));
+        assert!(settings(&acme, &admin)["pending_revoke"].as_bool().unwrap(), "only a save calls the revoke off");
+
+        // So beta can't take T1 and its still-live token meanwhile.
+        assert_eq!(world.live("T1").as_deref(), Some(first.as_str()));
+        assert!(install(&beta, &beta_admin, &world, "T1").0.ends_with("slack_team_taken"));
+
+        // The revoke is finished (Try again), and only then is T1 let go of. Beta's new token is
+        // one no revoke of acme's is aimed at.
+        for job in disconnect(&acme, &admin) {
+            let (_, calls, _) = drive(&acme, &world, job);
+            assert_eq!(urls(&calls), vec!["https://slack.com/api/auth.revoke", "dumbslab-directory:/slack/release"]);
+            assert_eq!(bearer(&calls[0]), Some(first.as_str()));
+        }
+        assert!(install(&beta, &beta_admin, &world, "T1").0.ends_with("slack=connected"));
+        let second = world.live("T1").unwrap();
+        assert_ne!(second, first);
+        assert!(!settings(&acme, &admin)["pending_revoke"].as_bool().unwrap());
+        assert_eq!(acme.call("DELETE", "/api/v1/slack", None, &admin).status, 404, "nothing of acme's left to revoke");
+        assert_eq!(world.live("T1"), Some(second));
+    }
+
     /// Two Add to Slack callbacks at once: one goes from claiming to saving at a time, so the
     /// directory and the saved connection can't fall out of step. The other is asked to try again.
     #[test]

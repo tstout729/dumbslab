@@ -63,7 +63,9 @@
 //!   the token the next workspace was given. An unanswered revoke keeps the claim until it's tried
 //!   again (Disconnect, Add to Slack, or Slack's next request for that Slack workspace).
 //! - Claims carry the install's own id, and letting go names it; one install at a time goes from
-//!   claiming to saving, and one that claimed but wasn't saved puts the claim back as it was.
+//!   claiming to saving, and one that claimed but wasn't saved puts the claim back as it was: the
+//!   connection's, or the one a token waiting to be revoked depends on. A claim is never let go
+//!   of while a token for its Slack workspace waits; only the save calls such a revoke off.
 //! - `app_uninstalled` and `tokens_revoked` are checked with `auth.test`, for the install
 //!   (`generation`) saved when they arrived: Slack's event times are whole seconds and out of order.
 
@@ -89,7 +91,7 @@ pub use shared_app::{
     InstallError, Routed, Shared, SharedApp, create_app_link, install_callback, install_callback_url, install_start, manifest_route, route,
     shared, shared_manifest, team_of, unknown_team,
 };
-use shared_app::{Installed, Pending, home, ours, stray};
+use shared_app::{Installed, Pending, Undo, home, ours, stray};
 pub(crate) use shared_app::{add_pending, pending_teams};
 
 /// Where Slack sends the slash command.
@@ -922,9 +924,8 @@ pub struct SlackJob {
     installed: Option<Installed>,
     /// Add to Slack: the id it claims the Slack workspace with.
     claim: Option<String>,
-    /// Add to Slack, re-adding the Slack workspace this workspace holds: the claim it had, which
-    /// goes back if this install fails. `None` when the claim is simply let go of on failure.
-    restore: Option<String>,
+    /// Add to Slack: what undoing its claim does if it fails before saving.
+    undo: Undo,
     /// Add to Slack: where to send the admin once the last request is answered.
     then: Option<String>,
     /// The token being revoked.
@@ -1020,7 +1021,7 @@ impl SlackJob {
             effects: vec![],
             installed: None,
             claim: None,
-            restore: None,
+            undo: Undo::Release,
             then: None,
             pending: None,
             attempt: 0,
