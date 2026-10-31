@@ -186,10 +186,11 @@ pub const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0010_sync.sql"),
     include_str!("migrations/0011_connections_without_personal_data.sql"),
     include_str!("migrations/0012_people_sync_webhook.sql"),
+    include_str!("migrations/0013_add_to_slack.sql"),
     // Docs sync through DumbSlab's GitHub and GitLab apps.
-    include_str!("migrations/0013_docs_sync_apps.sql"),
+    include_str!("migrations/0014_docs_sync_apps.sql"),
     // What docs sync through DumbSlab's GitLab app adds. Listed last.
-    include_str!("migrations/0014_docs_sync_gitlab.sql"),
+    include_str!("migrations/0015_docs_sync_gitlab.sql"),
 ];
 
 /// Brings the schema up to date. Safe to call on every start.
