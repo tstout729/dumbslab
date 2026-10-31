@@ -20,11 +20,11 @@ pub fn ops() -> Vec<Op> {
     vec![
         op("connections", "list_connections", "GET", "/connections", Access::Read, list_connections)
             .title("Connected apps")
-            .desc("The apps you can connect (GitHub, Google Drive…) and which you have. For each: whether this server lets you sign in to it (`sign_in`), and the fields for connecting with a personal token instead (`token_fields`). Everyone connects their own accounts; nobody else can use them.")
+            .desc("The apps you can connect (GitHub, Google Drive…) and which you have. For each: whether this server lets you sign in to it (`sign_in`), what to fill in first for apps on your company's own address (`sign_in_field`, e.g. Zendesk's subdomain), and the fields for connecting with a personal token instead (`token_fields`). Everyone connects their own accounts; nobody else can use them.")
             .build(),
         op("connections", "connect_app", "POST", "/connections", Access::Write, connect_app)
             .title("Connect an app")
-            .desc("Connect one of your accounts in another app, so search_connected can search it. Without `fields`, returns an `authorize_url` for a person to open and sign in to the app; they come back to Settings. With `fields` (at least `token`; list_connections names each app's fields), connects with a personal token right away. Credentials are encrypted and never shown again.")
+            .desc("Connect one of your accounts in another app, so search_connected can search it. Without `fields`, returns an `authorize_url` for a person to open and sign in to the app; they come back to Settings. Apps on your company's own address (Zendesk) also need `site`, as list_connections' `sign_in_field` describes. With `fields` (at least `token`; list_connections names each app's fields), connects with a personal token right away. Credentials are encrypted and never shown again.")
             .build(),
         op("connections", "disconnect_app", "DELETE", "/connections/{app}", Access::Write, disconnect_app)
             .title("Disconnect an app")
@@ -55,6 +55,9 @@ pub struct AppInfo {
     pub preview: bool,
     /// You can connect by signing in to the app: this server registered an OAuth app with it.
     pub sign_in: bool,
+    /// What to fill in before signing in, for apps on each company's own address (Zendesk's
+    /// subdomain). Send it to connect_app as `site`. None for other apps.
+    pub sign_in_field: Option<Field>,
     /// What to fill in to connect with a personal token instead. Empty when the app has none.
     pub token_fields: Vec<Field>,
     /// Where to make that token.
@@ -77,13 +80,15 @@ fn list_connections(ctx: &mut Ctx, _: NoInput) -> ApiResult<ConnectionList> {
         .iter()
         .map(|c| {
             let info = c.info();
+            let sign_in = info.oauth.is_some() && connect::oauth_app(ctx.cfg, info.id).is_some();
             AppInfo {
                 id: info.id.into(),
                 name: info.name.into(),
                 about: info.about.into(),
                 search: info.search,
                 preview: info.preview,
-                sign_in: info.oauth.is_some() && connect::oauth_app(ctx.cfg, info.id).is_some(),
+                sign_in,
+                sign_in_field: info.oauth.and_then(|o| o.site).filter(|_| sign_in),
                 token_fields: info.token_fields.to_vec(),
                 token_help: Some(info.token_help.to_string()).filter(|h| !h.is_empty()),
                 connected: mine.iter().find(|m| m.provider == info.id).map(|m| ConnectedAccount {
@@ -109,6 +114,8 @@ pub struct ConnectInput {
     pub app: String,
     /// To connect with a personal token: the app's `token_fields`, at least `token`. Leave out to sign in to the app instead.
     pub fields: Option<BTreeMap<String, String>>,
+    /// To sign in to an app on your company's own address: what its `sign_in_field` asks for, e.g. `acme` for acme.zendesk.com. Only for those apps, and only when signing in.
+    pub site: Option<String>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -126,9 +133,12 @@ fn connect_app(ctx: &mut Ctx, input: ConnectInput) -> ApiResult<Deferred<Connect
         return Err(ApiError::new(503, "connections_off", "Connected apps aren't set up on this server: it has no connector key."));
     }
     let Some(fields) = input.fields else {
-        let url = connect::start_sign_in(ctx.db, ctx.cfg, &ctx.base_url, &ctx.actor.user_id, connector, Utc::now())?;
+        let url = connect::start_sign_in(ctx.db, ctx.cfg, &ctx.base_url, &ctx.actor.user_id, connector, input.site.as_deref(), Utc::now())?;
         return Ok(Deferred::Ready(ConnectStart { authorize_url: Some(url), connection: None }));
     };
+    if input.site.is_some() {
+        return Err(ApiError::bad_request("`site` is for signing in; with a token, put it in `fields`"));
+    }
     if info.token_fields.is_empty() {
         return Err(ApiError::bad_request(format!("{} has no personal tokens; leave out `fields` to sign in instead", info.name)));
     }
