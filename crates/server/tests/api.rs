@@ -5755,6 +5755,66 @@ mod syncs {
     }
 
     #[test]
+    fn docs_sync_records_moves_between_folders() {
+        let (h, admin) = super::slack::connected();
+        h.ok("POST", "/api/v1/slack/channels", Some(json!({ "channel": "C0ALLPOSTS", "updated_posts": true })), &admin);
+        h.ok("POST", "/api/v1/webhooks", Some(json!({ "url": "https://hooks.example.com/dumbslab", "events": ["post.*"] })), &admin);
+        for (name, visibility) in [("Handbook", "org"), ("Ops", "private")] {
+            let topic = h.ok("POST", "/api/v1/topics", Some(json!({ "name": name, "visibility": visibility })), &admin)["id"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            let (source, _) = gitlab_source(&h, &admin, &topic);
+            let guide: &[u8] = b"# Guide\n\nThe same words.\n";
+            let lab = Lab::new(&[("a/guide.md", guide)]);
+            let answer = |c: &HttpCall| lab.answer(c);
+            let sync = || {
+                let r = h.call("POST", &format!("/api/v1/docs-sources/{source}/sync"), None, &admin);
+                run_to_end(&h, job_of(&r), &answer)
+            };
+            let (_, effects) = sync();
+            let announced = super::slack::slack_messages(&effects).len();
+            assert_eq!(announced, usize::from(visibility == "org"), "{name}: only an org-wide post is announced");
+            let post_id =
+                db_run(&h, |db| db.one("SELECT target_id FROM docs_items WHERE kind = 'doc' AND source_id = ?", &[source.as_str().into()]))
+                    .unwrap()
+                    .str("target_id");
+            let folder = |path: &str| {
+                db_run(&h, |db| {
+                    db.one(
+                        "SELECT target_id FROM docs_items WHERE kind = 'folder' AND source_id = ? AND path = ?",
+                        &[source.as_str().into(), path.into()],
+                    )
+                })
+                .map(|r| r.str("target_id"))
+            };
+
+            // The file moves to another folder, its title and text unchanged.
+            lab.files.borrow_mut().remove("a/guide.md");
+            lab.put("b/guide.md", guide);
+            let (v, effects) = sync();
+            assert_eq!((v["renamed"].as_i64(), v["unchanged"].as_i64()), (Some(1), Some(1)), "{name}: {v}");
+            assert_eq!(events(&effects), vec!["post.moved"], "{name}: one event, like any change of topics");
+            let payload: Value = effects
+                .iter()
+                .find_map(|e| match e {
+                    Effect::Webhook(d) if !d.webhook_id.starts_with("slack:") => serde_json::from_str(&d.body).ok(),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(payload["post_id"].as_str(), Some(post_id.as_str()));
+            assert_eq!(payload["data"]["added"], json!([folder("b").unwrap()]), "{name}: {payload}");
+            assert_eq!(payload["data"]["removed"], json!([folder("a").unwrap()]), "{name}: {payload}");
+            let recorded = format!("SELECT COUNT(*) FROM activity WHERE event = 'post.moved' AND post_id = '{post_id}'");
+            assert_eq!(count(&h, &recorded), 1, "{name}: in the activity log");
+            // Moves aren't announced in Slack, so nothing private reaches a channel for every post.
+            assert!(super::slack::slack_messages(&effects).is_empty(), "{name}");
+            // Nothing more to record when nothing changes.
+            assert!(events(&sync().1).is_empty(), "{name}");
+        }
+    }
+
+    #[test]
     fn docs_sync_takes_back_only_its_own_grants() {
         let mut h = H::new();
         let (admin, _) = h.setup();

@@ -633,6 +633,18 @@ pub(crate) fn synced_event(ctx: &mut Ctx, id: &str, synced: Synced) -> ApiResult
     Ok(())
 }
 
+/// Docs sync: records that a synced post changed topics, as [`update_post`] does.
+pub(crate) fn moved_event(ctx: &mut Ctx, id: &str, added: &[String], removed: &[String]) -> ApiResult<()> {
+    let title = ctx.db.one("SELECT title FROM posts WHERE id = ?", &params![id])?.map(|r| r.str("title")).unwrap_or_default();
+    emit(
+        ctx,
+        Event::new("post.moved", "post", id, format!("changed topics of “{title}”"))
+            .post(id)
+            .data(json!({ "added": added, "removed": removed, "synced": true })),
+    )?;
+    Ok(())
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct UpdatePostInput {

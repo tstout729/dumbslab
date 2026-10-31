@@ -960,7 +960,17 @@ fn topic_name(db: &dyn Db, parent: &str, folder: &str) -> ApiResult<String> {
 
 /// Puts a synced post in the source's topic and its folder's, and out of the source's other
 /// folders' topics. Topics people added it to stay.
-fn place(ctx: &Ctx, j: &DocsJob, plan: &Plan, post_id: &str, folder: &str) -> ApiResult<()> {
+/// Returns the topics it added and removed.
+fn place(ctx: &Ctx, j: &DocsJob, plan: &Plan, post_id: &str, folder: &str) -> ApiResult<(Vec<String>, Vec<String>)> {
+    let topics = || -> ApiResult<BTreeSet<String>> {
+        Ok(ctx
+            .db
+            .query("SELECT topic_id FROM post_topics WHERE post_id = ?", &params![post_id])?
+            .iter()
+            .map(|r| r.str("topic_id"))
+            .collect())
+    };
+    let before = topics()?;
     let wanted: BTreeSet<&str> = [j.source.topic_id.as_str(), folder].into_iter().collect();
     for t in plan.folders.values().filter(|t| !wanted.contains(t.as_str())) {
         ctx.db.execute("DELETE FROM post_topics WHERE post_id = ? AND topic_id = ?", &params![post_id, t.clone()])?;
@@ -971,7 +981,8 @@ fn place(ctx: &Ctx, j: &DocsJob, plan: &Plan, post_id: &str, folder: &str) -> Ap
             &params![post_id, t, ctx.now_s()],
         )?;
     }
-    Ok(())
+    let after = topics()?;
+    Ok((after.difference(&before).cloned().collect(), before.difference(&after).cloned().collect()))
 }
 
 /// A file's Markdown with its links and images pointed at what they are here, and the paths it
@@ -1061,11 +1072,16 @@ fn write(ctx: &mut Ctx, j: &mut DocsJob, mut plan: Plan, texts: Vec<Text>, ready
         }
         // Events only once the post is in its topics (and published again, if it came back): what
         // hears of them decides who may see the post from where it is.
-        place(ctx, j, &plan, &t.work.post_id, &folder)?;
+        let (added, removed) = place(ctx, j, &plan, &t.work.post_id, &folder)?;
         if t.work.revive && set_status(ctx, &t.work.post_id, "published")? {
             j.result.restored += 1;
         }
         posts::synced_event(ctx, &t.work.post_id, synced)?;
+        // A file that moved to another folder moved its post to another topic, whether or not its
+        // text changed: recorded like any change of topics (a new post's first topics aren't one).
+        if synced != Synced::Created && !(added.is_empty() && removed.is_empty()) {
+            posts::moved_event(ctx, &t.work.post_id, &added, &removed)?;
+        }
         // Images this sync stored earlier that belong to no post yet (the file showing them waited
         // for a later run) join this one. Only the sync's own records count: text naming some
         // other upload never attaches it (see `posts::Writer::Sync`).
