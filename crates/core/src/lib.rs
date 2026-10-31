@@ -30,6 +30,7 @@ pub mod search;
 pub mod seed;
 pub mod slack;
 pub mod sso;
+pub mod sync;
 pub mod telemetry;
 pub mod tenancy;
 pub mod util;

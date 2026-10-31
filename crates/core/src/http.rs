@@ -48,6 +48,7 @@ pub fn is_core_path(path: &str) -> bool {
         || path.starts_with("/connect/")
         || path.starts_with("/sso/")
         || path.starts_with("/slack/")
+        || path.starts_with("/hooks/")
 }
 
 /// Handles a request. `None` means the path isn't ours (the host serves static files).
@@ -78,6 +79,8 @@ pub fn handle(db: &dyn Db, cfg: &HostConfig, req: &Request) -> Option<Outcome> {
     } else if path.starts_with("/slack/") {
         // Slack's own requests: no session or token, only Slack's signature.
         crate::slack::handle(db, cfg, req)
+    } else if path.starts_with("/hooks/") {
+        no_store(crate::sync::hook(db, cfg, req))
     } else {
         let rest = path.strip_prefix(API_PREFIX)?;
         let r = api(db, cfg, req, rest);

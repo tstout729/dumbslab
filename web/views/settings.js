@@ -1,5 +1,5 @@
-// Settings: profile, connecting agents, API tokens, importing, and (for admins) people, single
-// sign-on, webhooks, workspace and, on hosted DumbSlab, the plan.
+// Settings: profile, connecting agents, API tokens, importing, and (for admins) people, people and
+// docs sync, single sign-on, webhooks, workspace and, on hosted DumbSlab, the plan.
 
 import { api, enc } from '/api.js';
 import {
@@ -11,6 +11,7 @@ import { connectionsSection } from '/views/connected.js';
 import { slackSection } from '/views/slack.js';
 import { importSection } from '/views/import.js';
 import { ssoMessage } from '/views/auth.js';
+import { peopleSyncSection, docsSyncSection } from '/views/sync.js';
 
 const SECTIONS = [
   { id: 'profile', label: 'Profile', icon: 'user' },
@@ -19,6 +20,8 @@ const SECTIONS = [
   { id: 'connections', label: 'Connected apps', icon: 'link' },
   { id: 'import', label: 'Import', icon: 'upload', edit: true },
   { id: 'people', label: 'People', icon: 'users', admin: true },
+  { id: 'people-sync', label: 'People sync', icon: 'refresh', admin: true },
+  { id: 'docs-sync', label: 'Docs sync', icon: 'folder', admin: true },
   { id: 'sso', label: 'Single sign-on', icon: 'lock', admin: true },
   { id: 'webhooks', label: 'Webhooks', icon: 'zap', admin: true },
   { id: 'slack', label: 'Slack', icon: 'hash', admin: true },
@@ -896,6 +899,8 @@ const RENDER = {
   connections: connectionsSection,
   import: importSection,
   people: peopleSection,
+  'people-sync': peopleSyncSection,
+  'docs-sync': docsSyncSection,
   sso: ssoSection,
   webhooks: webhooksSection,
   slack: slackSection,

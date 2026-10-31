@@ -110,6 +110,10 @@ pub struct Post {
     pub can_edit: bool,
     /// Topic ids where this post is pinned.
     pub pinned_in: Vec<String>,
+    /// Set when the post is kept in sync with a file in a repository (docs sync): its title and
+    /// content change only there, and edits here are refused. Topics, status, verification,
+    /// comments and reactions still work here.
+    pub synced_from: Option<crate::sync::docs::SyncedFrom>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -294,6 +298,7 @@ pub fn full_post(ctx: &Ctx, row: &Row, with_html: bool) -> ApiResult<Post> {
         reactions: reaction_groups(ctx, "post", &id)?,
         can_edit: ctx.actor.role >= Role::Member && row.opt_str("deleted_at").is_none(),
         pinned_in,
+        synced_from: crate::sync::docs::synced_from(ctx.db, &id)?,
         content,
         summary,
     })
@@ -395,7 +400,29 @@ fn on_first_publish(ctx: &Ctx, post_id: &str, title: &str, content: &str) -> Api
 }
 
 /// Saves a new version when the title or content changed. Returns whether anything changed.
+/// Synced posts change only in their repository.
 fn save_revision(ctx: &Ctx, post: &Row, title: &str, content: &str, note: &str) -> ApiResult<bool> {
+    if title != post.str("title") || content != post.str("content") {
+        crate::sync::docs::refuse_edit(ctx.db, &post.str("id"), &post.str("title"))?;
+    }
+    write_revision(ctx, post, title, content, note, Writer::Person)
+}
+
+/// Who changes a post's text.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum Writer {
+    /// Someone editing here: mentions and followers are notified, and the person's own unattached
+    /// uploads the text shows join the post.
+    Person,
+    /// Docs sync: the text was written in a repository by people who may not be able to see
+    /// anything here. Nobody is notified, and no upload joins the post because the text mentions
+    /// it; docs sync attaches only the images it stored itself.
+    Sync,
+}
+
+/// Saves a new version when the title or content changed: the path every change to a post's
+/// text takes, edits and docs sync alike (see [`Writer`]).
+pub(crate) fn write_revision(ctx: &Ctx, post: &Row, title: &str, content: &str, note: &str, writer: Writer) -> ApiResult<bool> {
     let old_title = post.str("title");
     let old_content = post.str("content");
     if title == old_title && content == old_content {
@@ -424,12 +451,14 @@ fn save_revision(ctx: &Ctx, post: &Row, title: &str, content: &str, note: &str) 
         &params![id.clone(), version, title, content, ctx.actor.user_id.clone(), note, ctx.now_s()],
     )?;
     update_links(ctx, &id, content)?;
-    crate::ops::files::attach_referenced(ctx, &id, content)?;
+    if writer == Writer::Person {
+        crate::ops::files::attach_referenced(ctx, &id, content)?;
+    }
     search::index_post(ctx.db, &id)?;
     if title != old_title {
         search::reindex_post_comments(ctx.db, &id)?;
     }
-    if post.str("status") == "published" {
+    if writer == Writer::Person && post.str("status") == "published" {
         let before: HashSet<String> = markdown::mentions(&old_content).into_iter().collect();
         let new: Vec<String> = markdown::mentions(content).into_iter().filter(|m| !before.contains(m)).collect();
         notify_mentions(ctx, &id, title, &new)?;
@@ -535,6 +564,87 @@ pub fn insert_post(ctx: &mut Ctx, input: CreatePostInput, notify: bool) -> ApiRe
     reload(ctx, &id)
 }
 
+/// What [`sync_post`] did.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum Synced {
+    Created,
+    Updated,
+    Unchanged,
+    /// The post is in the trash; it was left alone.
+    Trashed,
+}
+
+/// Docs sync: sets a post's title and content, creating it (published) with this id when there's
+/// no such post. Changes take the same path as edits ([`write_revision`]), so each one is a version
+/// in the history; but they notify nobody and attach no uploads ([`Writer::Sync`]). Their events
+/// come later, from [`synced_event`], once the post is in its topics.
+pub(crate) fn sync_post(ctx: &mut Ctx, id: &str, title: &str, content: &str, note: &str) -> ApiResult<Synced> {
+    let title = required(title, "title", 300)?;
+    if let Some(post) = ctx.db.one(&format!("SELECT {POST_COLS}, p.content FROM posts p WHERE p.id = ?"), &params![id])? {
+        if post.opt_str("deleted_at").is_some() {
+            return Ok(Synced::Trashed);
+        }
+        if !write_revision(ctx, &post, &title, content, note, Writer::Sync)? {
+            return Ok(Synced::Unchanged);
+        }
+        return Ok(Synced::Updated);
+    }
+    check_content(content)?;
+    let now = ctx.now_s();
+    ctx.db.execute(
+        "INSERT INTO posts (id, title, slug, content, excerpt, status, author_id, last_editor_id, version, word_count, created_at, updated_at, published_at)
+         VALUES (?, ?, ?, ?, ?, 'published', ?, ?, 1, ?, ?, ?, ?)",
+        &params![
+            id,
+            title.clone(),
+            slugify(&title),
+            content,
+            markdown::excerpt(content, 240),
+            ctx.actor.user_id.clone(),
+            ctx.actor.user_id.clone(),
+            markdown::word_count(content),
+            now.clone(),
+            now.clone(),
+            now.clone()
+        ],
+    )?;
+    ctx.db.execute(
+        "INSERT INTO post_versions (post_id, version, title, content, editor_id, note, created_at) VALUES (?, 1, ?, ?, ?, ?, ?)",
+        &params![id, title.clone(), content, ctx.actor.user_id.clone(), note, now],
+    )?;
+    // No upload joins the post because its text mentions one (see `Writer::Sync`).
+    update_links(ctx, id, content)?;
+    search::index_post(ctx.db, id)?;
+    Ok(Synced::Created)
+}
+
+/// Docs sync: records what [`sync_post`] did. Called once the post is in its topics, so whatever
+/// hears of it (webhooks, Slack channels) judges who may see it by where it ended up.
+pub(crate) fn synced_event(ctx: &mut Ctx, id: &str, synced: Synced) -> ApiResult<()> {
+    let Some(post) = ctx.db.one("SELECT title, version FROM posts WHERE id = ?", &params![id])? else { return Ok(()) };
+    let summary = format!("synced “{}”", post.str("title"));
+    let event = match synced {
+        Synced::Created => Event::new("post.created", "post", id, summary).data(json!({ "status": "published", "synced": true })),
+        Synced::Updated => Event::new("post.updated", "post", id, summary)
+            .data(json!({ "fields": ["content"], "version": post.i64("version"), "synced": true })),
+        Synced::Unchanged | Synced::Trashed => return Ok(()),
+    };
+    emit(ctx, event.post(id))?;
+    Ok(())
+}
+
+/// Docs sync: records that a synced post changed topics, as [`update_post`] does.
+pub(crate) fn moved_event(ctx: &mut Ctx, id: &str, added: &[String], removed: &[String]) -> ApiResult<()> {
+    let title = ctx.db.one("SELECT title FROM posts WHERE id = ?", &params![id])?.map(|r| r.str("title")).unwrap_or_default();
+    emit(
+        ctx,
+        Event::new("post.moved", "post", id, format!("changed topics of “{title}”"))
+            .post(id)
+            .data(json!({ "added": added, "removed": removed, "synced": true })),
+    )?;
+    Ok(())
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct UpdatePostInput {
@@ -557,7 +667,7 @@ pub struct UpdatePostInput {
     pub note: Option<String>,
 }
 
-fn update_post(ctx: &mut Ctx, input: UpdatePostInput) -> ApiResult<Post> {
+pub(crate) fn update_post(ctx: &mut Ctx, input: UpdatePostInput) -> ApiResult<Post> {
     let post = load_post(ctx, &input.id, false)?;
     require_post_edit(ctx, &post)?;
     let id = post.str("id");
@@ -584,6 +694,15 @@ fn update_post(ctx: &mut Ctx, input: UpdatePostInput) -> ApiResult<Post> {
         ids.extend(input.add_topic_ids.unwrap_or_default());
         let remove = input.remove_topic_ids.unwrap_or_default();
         ids.retain(|t| !remove.contains(t));
+        // A synced post stays in its source's topic, which no sub-topic shows to more people.
+        if let Some(keep) = crate::sync::docs::source_topic(ctx.db, &id)?
+            && !ids.contains(&keep)
+            && load_topic(ctx, &keep).is_ok()
+        {
+            return Err(ApiError::conflict(
+                "this post is synced from a repository and stays in its docs sync topic; add other topics instead, or remove the source in Settings › Docs sync",
+            ));
+        }
         let (added, removed) = set_topics(ctx, &id, &ids)?;
         if !added.is_empty() || !removed.is_empty() {
             fields.push("topics");

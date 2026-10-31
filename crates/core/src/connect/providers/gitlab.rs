@@ -96,7 +96,7 @@ fn host_for(account: &Account) -> Option<&str> {
 }
 
 /// One part of a group or project path.
-fn valid_segment(p: &str) -> bool {
+pub(crate) fn valid_segment(p: &str) -> bool {
     !p.is_empty()
         && p != "."
         && p != ".."
