@@ -49,6 +49,7 @@ pub fn is_core_path(path: &str) -> bool {
         || path.starts_with("/sso/")
         || path.starts_with("/slack/")
         || path.starts_with("/hooks/")
+        || path.starts_with("/sync/")
 }
 
 /// Handles a request. `None` means the path isn't ours (the host serves static files).
@@ -87,6 +88,10 @@ pub fn handle(db: &dyn Db, cfg: &HostConfig, req: &Request) -> Option<Outcome> {
         crate::slack::handle(db, cfg, req)
     } else if path.starts_with("/hooks/") {
         no_store(crate::sync::hook(db, cfg, req))
+    } else if path == crate::sync::people::CALLBACK_PATH && req.method == "GET" {
+        crate::sync::people::callback(db, cfg, req)
+    } else if path.starts_with("/sync/") {
+        failed(&ApiError::not_found("route"))
     } else {
         let rest = path.strip_prefix(API_PREFIX)?;
         let r = api(db, cfg, req, rest);

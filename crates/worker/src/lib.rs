@@ -209,6 +209,10 @@ async fn root_site(req: Request, env: &Env, root: &str, path: &str) -> Result<Re
         (Method::Get, "/connect/callback") => connect::root_callback_redirect(&req.url()?, root, "/connect/callback"),
         // Single sign-on with DumbSlab's own apps: every workspace's sign-ins come back here.
         (Method::Get, "/sso/callback") => connect::root_callback_redirect(&req.url()?, root, dumbslab_core::sso::CALLBACK_PATH),
+        // The people sync's Sign in with BambooHR: every workspace's sign-ins come back here too.
+        (Method::Get, "/sync/bamboohr/callback") => {
+            connect::root_callback_redirect(&req.url()?, root, dumbslab_core::sync::people::CALLBACK_PATH)
+        }
         // DumbSlab's own Slack app (Add to Slack): sign-ins come back here, and Slack sends every
         // Slack workspace's commands and events here.
         (Method::Get, slack::INSTALL_CALLBACK_PATH) => connect::root_callback_redirect(&req.url()?, root, slack::INSTALL_CALLBACK_PATH),
