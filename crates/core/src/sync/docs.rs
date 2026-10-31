@@ -1056,6 +1056,40 @@ fn refreshing_mark(db: &dyn Db, source_id: &str) -> ApiResult<Option<(DateTime<U
     }))
 }
 
+/// Every successful renewal of a GitLab app folder's tokens is kept here, whoever asked for it (a
+/// sync, or a cleanup pass borrowing the folder's tokens): GitLab spent the old refresh token, so
+/// the new tokens are kept if the folder still has the spent one, whether or not the asker still
+/// holds anything; only the token fields change, so newer webhook settings stay. A refusal of that
+/// same token (another renewal's, while this answer was on its way) is undone: the folder can sync
+/// again. If another renewal got there first, its tokens are newer and stay. The folder's tokens
+/// as stored now; `None` when it's gone or they can't be read.
+pub(crate) fn keep_renewal(
+    db: &dyn Db,
+    cfg: &HostConfig,
+    source_id: &str,
+    spent: &str,
+    tokens: crate::connect::TokenSet,
+    now: DateTime<Utc>,
+) -> ApiResult<Option<Credential>> {
+    let Some(r) = db.one("SELECT secret FROM docs_sources WHERE id = ?", &params![source_id])? else { return Ok(None) };
+    let Ok(mut current) = super::open(cfg, &owner(source_id), Provider::GitLab.id(), &r.str("secret")) else { return Ok(None) };
+    if current.refresh_token.as_deref() != Some(spent) {
+        return Ok(Some(current));
+    }
+    let hash = crate::util::sha256_hex(spent);
+    let expires_at = super::gitlab_app::expiry(now, &tokens).map(ts);
+    super::gitlab_app::apply_tokens(&mut current, tokens);
+    let sealed = super::seal(cfg, &owner(source_id), Provider::GitLab.id(), &current)?;
+    db.execute("UPDATE docs_sources SET secret = ?, updated_at = ? WHERE id = ?", &params![sealed, ts(now), source_id])?;
+    let refused_here = refreshing_mark(db, source_id)?.is_some_and(|(_, by, h)| by == "refused" && h == hash);
+    db.execute(
+        "UPDATE docs_source_links SET token_expires_at = ?, refreshing = NULL,
+           disconnected = CASE WHEN ? AND disconnected = ? THEN NULL ELSE disconnected END WHERE source_id = ?",
+        &params![expires_at, refused_here, super::gitlab_app::SIGNED_OUT, source_id],
+    )?;
+    Ok(Some(current))
+}
+
 /// Whether a sync renewed (or was refused renewing) the source's stored GitLab refresh token
 /// recently enough that an answer with new tokens may still come: GitLab may have replaced the
 /// stored tokens already.
@@ -1115,23 +1149,13 @@ fn refreshed(db: &dyn Db, cfg: &HostConfig, j: &mut DocsJob, replies: &[HttpRepl
             return fail(db, j, &message, now);
         }
     };
-    let Some(mut current) = stored else { return Ok(lost()) };
+    if stored.is_none() {
+        return Ok(lost());
+    }
     // From here this step writes nothing but the renewed tokens (and their expiry and marker), so
     // a full workspace keeps it: GitLab has spent the old refresh token.
     j.rotated = true;
-    if still_spent {
-        let expires_at = super::gitlab_app::expiry(now, &tokens).map(ts);
-        super::gitlab_app::apply_tokens(&mut current, tokens);
-        let sealed = super::seal(cfg, &owner(&j.source.id), j.source.repo.provider.id(), &current)?;
-        db.execute("UPDATE docs_sources SET secret = ?, updated_at = ? WHERE id = ?", &params![sealed, ts(now), j.source.id.clone()])?;
-        // A refusal of this same token (another sync's, while this answer was on its way) is undone.
-        let refused_here = refreshing_mark(db, &j.source.id)?.is_some_and(|(_, by, h)| by == "refused" && h == hash);
-        db.execute(
-            "UPDATE docs_source_links SET token_expires_at = ?, refreshing = NULL,
-               disconnected = CASE WHEN ? AND disconnected = ? THEN NULL ELSE disconnected END WHERE source_id = ?",
-            &params![expires_at, refused_here, super::gitlab_app::SIGNED_OUT, j.source.id.clone()],
-        )?;
-    }
+    let Some(current) = keep_renewal(db, cfg, &j.source.id, &spent, tokens, now)? else { return Ok(lost()) };
     // The tokens stored now are the newest: this sync uses them.
     j.source.cred.token = current.token;
     j.source.cred.refresh_token = current.refresh_token;

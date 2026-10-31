@@ -1122,32 +1122,6 @@ fn source_tokens(db: &dyn Db, cfg: &HostConfig, source_id: &str) -> ApiResult<Op
         .map(|cred| (cred, r.opt_str("token_expires_at").as_deref().and_then(parse_ts))))
 }
 
-/// A renewal of a folder's tokens that a cleanup pass made got its answer: GitLab spent the old
-/// refresh token, so the new tokens are kept if the folder still has the spent one (only its token
-/// fields change), as a sync keeps its own (see `docs::refreshed`). Otherwise newer ones landed
-/// meanwhile, and those are used. The folder's tokens as they are now.
-fn keep_renewed(
-    db: &dyn Db,
-    cfg: &HostConfig,
-    source_id: &str,
-    spent: &str,
-    tokens: TokenSet,
-    now: DateTime<Utc>,
-) -> ApiResult<Option<Credential>> {
-    let Some((mut stored, _)) = source_tokens(db, cfg, source_id)? else { return Ok(None) };
-    if stored.refresh_token.as_deref() == Some(spent) {
-        let expires_at = expiry(now, &tokens).map(ts);
-        apply_tokens(&mut stored, tokens);
-        let sealed = super::seal(cfg, &super::docs::owner(source_id), "gitlab", &stored)?;
-        db.execute("UPDATE docs_sources SET secret = ?, updated_at = ? WHERE id = ?", &params![sealed, ts(now), source_id])?;
-        db.execute(
-            "UPDATE docs_source_links SET token_expires_at = ?, refreshing = NULL WHERE source_id = ?",
-            &params![expires_at, source_id],
-        )?;
-    }
-    Ok(Some(stored))
-}
-
 /// How long a folder being added has to save itself before its webhook counts as left behind. An
 /// add takes a few steps of seconds each; this is far longer.
 const PENDING_GRACE_SECS: i64 = 600;
@@ -1517,7 +1491,7 @@ fn cleanup_pass(db: &dyn Db, cfg: &HostConfig, j: &mut GitLabJob, replies: &[Htt
                 Ok(tokens) => tokens,
                 Err(message) => return back_off(db, c, message, now),
             };
-            let current = keep_renewed(db, cfg, &source, &spent, tokens, now)?;
+            let current = super::docs::keep_renewal(db, cfg, &source, &spent, tokens, now)?;
             // This step stored only the folder's renewed tokens: a full workspace keeps it.
             j.rotated = true;
             let Some(current) = current else { return cleaned(0) };

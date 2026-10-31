@@ -13639,6 +13639,62 @@ mod syncs {
     }
 
     #[test]
+    fn a_borrowed_renewal_that_lands_late_reconnects_the_folder() {
+        let (h, admin, lab, topic) = gitlab_setup();
+        let answer = |c: &HttpCall| lab.answer(c);
+        let lost = |c: &HttpCall| {
+            let reply = lab.answer(c);
+            if c.method == "POST" && c.url.ends_with("/projects/3/hooks") { HttpReply { status: 0, body: String::new() } } else { reply }
+        };
+        let input = json!({ "provider": "gitlab", "gitlab_connection": true, "project_id": 3, "repository": "acme/handbook", "folder": "docs", "topic_id": topic });
+        let add = |reply: &dyn Fn(&HttpCall) -> HttpReply| {
+            drive(&h, job_of(&h.call("POST", "/api/v1/docs-sources", Some(input.clone()), &admin)), reply).0
+        };
+        let renewals = |sent: &[HttpCall]| sent.iter().filter(|c| c.url == "https://gitlab.com/oauth/token").count();
+        connect_gitlab(&h, &admin, &lab);
+        assert!(matches!(add(&lost), Finish::Fail(_)));
+        let folder = filled(add(&answer))["source"]["id"].as_str().unwrap().to_string();
+        let disconnected = || source_of(&h, &admin)["disconnected"].clone();
+        // The orphan's record borrows the folder's tokens; both its copy and the folder's expire.
+        db_run(&h, |db| {
+            db.execute(
+                "UPDATE docs_hook_cleanup SET expires_at = '2000-01-01T00:00:00.000Z', next_attempt_at = '2000-01-01T00:00:00.000Z'",
+                &[],
+            )
+        });
+        db_run(&h, |db| db.execute("UPDATE docs_source_links SET token_expires_at = '2000-01-01T00:00:00.000Z'", &[]));
+
+        // A pass holds the folder and asks GitLab to renew its tokens. GitLab does, but the answer
+        // is slow, past the pass's hold and the wait others give a renewal.
+        let mut pass = background(&h.call("GET", "/api/v1/docs-sources", None, &admin)).remove(0);
+        let Ok(Step::Fetch(calls)) = step_with(&h, &mut pass, vec![]).0 else { panic!("a renewal") };
+        assert_eq!(calls[0].url, "https://gitlab.com/oauth/token");
+        let renewed: Vec<HttpReply> = calls.iter().map(answer).collect();
+        db_run(&h, |db| {
+            db.execute(
+                "UPDATE docs_source_links SET refreshing = '2000-01-01T00:00:00.000Z' || substr(refreshing, instr(refreshing, '|'))",
+                &[],
+            )
+        });
+        db_run(&h, |db| db.execute("UPDATE docs_sources SET running_until = NULL", &[]));
+        // Meanwhile a sync spends the same refresh token, GitLab refuses it, and the folder waits
+        // for Reconnect.
+        let (finish, _) = drive(&h, job_of(&h.call("POST", &format!("/api/v1/docs-sources/{folder}/sync"), None, &admin)), &answer);
+        assert!(matches!(finish, Finish::Fail(_)));
+        assert!(disconnected().is_string(), "signed out");
+        // The pass's answer lands: the folder keeps the new tokens, and the refusal is undone.
+        let Ok(Step::Fetch(calls)) = step_with(&h, &mut pass, renewed).0 else { panic!("the webhooks' list") };
+        assert_eq!(disconnected(), Value::Null);
+        let Ok(Step::Fetch(calls)) = step_with(&h, &mut pass, calls.iter().map(answer).collect()).0 else { panic!("deletions") };
+        assert!(matches!(step_with(&h, &mut pass, calls.iter().map(answer).collect()).0, Ok(Step::Done(Finish::Fill(_)))));
+        // Sync now works, with the tokens the pass kept.
+        let (finish, sent, _) =
+            drive_all(&h, job_of(&h.call("POST", &format!("/api/v1/docs-sources/{folder}/sync"), None, &admin)), &answer);
+        assert_eq!(filled(finish)["created"], 2);
+        assert_eq!(renewals(&sent), 0);
+    }
+
+    #[test]
     fn a_refresh_that_lands_late_keeps_its_tokens() {
         let (h, admin, lab, topic) = gitlab_setup();
         let answer = |c: &HttpCall| lab.answer(c);
