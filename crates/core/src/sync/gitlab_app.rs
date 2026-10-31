@@ -342,21 +342,74 @@ pub(crate) fn list_hooks_calls(token: &str, project_id: i64) -> Vec<HttpCall> {
     (1..=HOOK_PAGES).map(|page| api_get(format!("{API}/projects/{project_id}/hooks?per_page=100&page={page}"), token)).collect()
 }
 
-/// Whether a webhook's address is this source's `/hooks/docs/<id>`, at any address the
-/// workspace has had.
-fn points_at(url: &str, source_id: &str) -> bool {
-    let path = url.split(['?', '#']).next().unwrap_or_default().trim_end_matches('/');
-    path.ends_with(&format!("/hooks/docs/{source_id}"))
+/// Earlier addresses of a source's webhook it keeps (`hook_urls`).
+const HOOK_HISTORY: usize = 10;
+
+/// Where a source's webhook may point: where DumbSlab pointed it last and before (`hook_url` and
+/// `hook_urls` in its credentials), and `current`, the workspace's address when the server knows
+/// it ([`crate::HostConfig::knows_its_address`]).
+pub(crate) fn hook_addresses(cred: &Credential, current: Option<&str>) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    current
+        .into_iter()
+        .chain(std::iter::once(cred.field("hook_url")))
+        .chain(cred.field("hook_urls").lines())
+        .filter(|u| !u.is_empty() && seen.insert(u.to_string()))
+        .map(str::to_string)
+        .collect()
 }
 
-/// The ids of the project's webhooks that point at this source, from the answers to
-/// [`list_hooks_calls`]. `Err` when GitLab didn't list them.
-pub(crate) fn source_hooks(replies: &[HttpReply], source_id: &str) -> Result<Vec<i64>, String> {
+/// Points a source's webhook at `url` in its credentials, after `earlier` addresses: the address
+/// it had joins them, as its history (see [`hook_addresses`]).
+pub(crate) fn set_hook_url(cred: &mut Credential, url: &str, earlier: &[String]) {
+    let mut history: Vec<String> = earlier.to_vec();
+    history.extend(cred.field("hook_urls").lines().map(str::to_string));
+    history.push(cred.field("hook_url").to_string());
+    let mut seen = BTreeSet::new();
+    history.retain(|u| !u.is_empty() && u != url && seen.insert(u.clone()));
+    let skip = history.len().saturating_sub(HOOK_HISTORY);
+    cred.fields.insert("hook_urls".into(), history[skip..].join("\n"));
+    cred.fields.insert("hook_url".into(), url.to_string());
+}
+
+/// A webhook address, to compare: its scheme, its host and port (lowercase, without the scheme's
+/// default port) and its path. `None` with user info, a query or a fragment, which DumbSlab's own
+/// never have.
+fn address(url: &str) -> Option<(String, String, String)> {
+    let (scheme, rest) = url.split_once("://")?;
+    let scheme = scheme.to_ascii_lowercase();
+    if !matches!(scheme.as_str(), "https" | "http") || rest.contains(['?', '#']) {
+        return None;
+    }
+    let (authority, path) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
+    if authority.is_empty() || authority.contains('@') {
+        return None;
+    }
+    let authority = authority.to_ascii_lowercase();
+    let default = if scheme == "https" { ":443" } else { ":80" };
+    let authority = authority.strip_suffix(default).unwrap_or(&authority).to_string();
+    Some((scheme, authority, path.to_string()))
+}
+
+/// Whether a webhook posts to exactly this source's `/hooks/docs/<id>` at one of `trusted`, the
+/// addresses DumbSlab pointed it at ([`hook_addresses`]): the same scheme, host and path, with no
+/// query. Someone's own webhook that merely ends the same way (on another host, under another
+/// path, or with a query) isn't the source's.
+fn points_at(url: &str, source_id: &str, trusted: &[String]) -> bool {
+    let Some(found) = address(url) else { return false };
+    found.2.ends_with(&format!("/hooks/docs/{source_id}")) && trusted.iter().any(|t| address(t).as_ref() == Some(&found))
+}
+
+/// The ids of the project's webhooks that point at this source (see [`points_at`]), from the
+/// answers to [`list_hooks_calls`]. `Err` when GitLab didn't list them.
+pub(crate) fn source_hooks(replies: &[HttpReply], source_id: &str, trusted: &[String]) -> Result<Vec<i64>, String> {
     let mut out = vec![];
     for r in replies {
         let v = r.json();
         let (true, Some(page)) = (r.ok(), v.as_array()) else { return Err(http_error("GitLab", r)) };
-        out.extend(page.iter().filter(|h| h["url"].as_str().is_some_and(|u| points_at(u, source_id))).filter_map(|h| h["id"].as_i64()));
+        out.extend(
+            page.iter().filter(|h| h["url"].as_str().is_some_and(|u| points_at(u, source_id, trusted))).filter_map(|h| h["id"].as_i64()),
+        );
     }
     out.sort_unstable();
     out.dedup();
@@ -463,6 +516,8 @@ pub struct Rejoin {
     pub hook_id: Option<i64>,
     /// Where its webhook should point: the workspace's address now.
     pub webhook_url: String,
+    /// Where its webhook pointed before ([`hook_addresses`]), kept as its history.
+    pub earlier: Vec<String>,
     /// The webhook's secret: the source's, or a new one when the stored one can't be read.
     pub secret: String,
 }
@@ -489,9 +544,8 @@ enum Kind {
     /// Reconnecting a folder: make sure its webhook is there with its secret and address, then
     /// move the approval onto it. `added` is a webhook this job had to add again.
     Reconnect { claim: String, approval: Option<Pending>, rejoin: Rejoin, added: Option<i64> },
-    /// A source was removed: take every webhook pointing at it off the project, best effort (the
-    /// one recorded, and any another sync left behind).
-    RemoveHook { source_id: String, project_id: i64, hook_id: Option<i64>, cred: Credential, expires_at: Option<DateTime<Utc>> },
+    /// A pass taking a removed source's webhooks off its project (see [`Cleanup`]).
+    Cleanup(Box<Cleanup>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -510,7 +564,7 @@ impl std::fmt::Debug for GitLabJob {
             Kind::Projects { .. } => "projects",
             Kind::Create { .. } => "create",
             Kind::Reconnect { .. } => "reconnect",
-            Kind::RemoveHook { .. } => "remove-hook",
+            Kind::Cleanup(_) => "cleanup",
         };
         write!(f, "GitLabJob({kind}, {:?})", self.phase)
     }
@@ -537,17 +591,6 @@ impl GitLabJob {
         GitLabJob::new(user_id, base_url, Kind::Reconnect { claim, approval: None, rejoin, added: None })
     }
 
-    /// Removes a deleted source's webhooks, with its credentials as they were stored.
-    pub(crate) fn remove_hook(
-        source_id: &str,
-        project_id: i64,
-        hook_id: Option<i64>,
-        cred: Credential,
-        expires_at: Option<DateTime<Utc>>,
-    ) -> GitLabJob {
-        GitLabJob::new("", "", Kind::RemoveHook { source_id: source_id.into(), project_id, hook_id, cred, expires_at })
-    }
-
     pub(crate) fn take_effects(&mut self) -> Vec<Effect> {
         std::mem::take(&mut self.effects)
     }
@@ -559,10 +602,6 @@ impl GitLabJob {
         }
     }
 
-    /// A step that saves a folder failed or was rolled back (say, it grew a full workspace past
-    /// its storage): the webhook this job added comes off again, or GitLab would keep sending
-    /// pushes for a folder that isn't here. Asked of the job as the failed step left it, which
-    /// knows the webhook (see [`crate::connect::guarded_step`]).
     /// Notes a webhook GitLab says it just added, before the step that saves it runs (see
     /// [`crate::connect::Job::note`]).
     pub(crate) fn note(&mut self, replies: &[HttpReply]) {
@@ -578,6 +617,10 @@ impl GitLabJob {
         }
     }
 
+    /// A step that saves a folder failed or was rolled back (say, it grew a full workspace past
+    /// its storage): the webhook this job added comes off again, or GitLab would keep sending
+    /// pushes for a folder that isn't here. Asked of the job as the failed step left it, which
+    /// knows the webhook (see [`crate::connect::guarded_step`]).
     pub(crate) fn failure_notice(&self) -> Option<HttpCall> {
         match &self.kind {
             Kind::Create { approval: Some(a), project: Some(p), hook_id: Some(hook), .. } => {
@@ -645,6 +688,9 @@ fn give_up(db: &dyn Db, j: &GitLabJob, message: impl Into<String>) -> ApiResult<
 
 /// Runs a GitLab job's next step (see [`crate::connect::step`]).
 pub fn step(db: &dyn Db, cfg: &HostConfig, j: &mut GitLabJob, replies: Vec<HttpReply>, now: DateTime<Utc>) -> ApiResult<Step> {
+    if matches!(j.kind, Kind::Cleanup(_)) {
+        return cleanup_step(db, cfg, j, &replies, now);
+    }
     let reply = replies.first().cloned().unwrap_or_default();
     let back = |base: &str, p: Problem| Ok(Step::Done(Finish::Redirect(settings_url(base, "gitlab", Err(p)))));
     let Some(app) = app(cfg) else {
@@ -829,39 +875,6 @@ pub fn step(db: &dyn Db, cfg: &HostConfig, j: &mut GitLabJob, replies: Vec<HttpR
             Err(message) => give_up(db, j, message),
         },
 
-        // Removing a deleted source's webhooks: every one pointing at it, found by listing the
-        // project's (the recorded one too, if GitLab didn't list them).
-        (Kind::RemoveHook { project_id, cred, expires_at, .. }, Phase::Start) => {
-            if needs_refresh(cred, *expires_at, now) {
-                j.phase = Phase::Refreshing;
-                return Ok(Step::Fetch(vec![refresh_call(app, cred)]));
-            }
-            j.phase = Phase::Working;
-            Ok(Step::Fetch(list_hooks_calls(&cred.token, *project_id)))
-        }
-        (Kind::RemoveHook { project_id, cred, .. }, Phase::Refreshing) => {
-            let Ok(tokens) = read_refresh(&reply) else {
-                return failed("GitLab no longer accepts DumbSlab's access; remove the webhook in the project's settings.");
-            };
-            apply_tokens(cred, tokens);
-            j.phase = Phase::Working;
-            Ok(Step::Fetch(list_hooks_calls(&cred.token, *project_id)))
-        }
-        (Kind::RemoveHook { source_id, project_id, hook_id, cred, .. }, Phase::Working) => {
-            let mut ids = source_hooks(&replies, source_id).unwrap_or_default();
-            ids.extend(*hook_id);
-            ids.sort_unstable();
-            ids.dedup();
-            if ids.is_empty() {
-                return Ok(Step::Done(Finish::Fill(json!({ "ok": true, "removed": 0 }))));
-            }
-            j.phase = Phase::Finishing;
-            Ok(Step::Fetch(ids.iter().map(|id| remove_hook_call(&cred.token, *project_id, *id)).collect()))
-        }
-        (Kind::RemoveHook { .. }, Phase::Finishing) => {
-            let removed = replies.iter().filter(|r| r.ok() || r.status == 404).count();
-            Ok(Step::Done(Finish::Fill(json!({ "ok": true, "removed": removed }))))
-        }
         _ => Err(ApiError::internal("a GitLab job got out of step")),
     }
 }
@@ -872,7 +885,7 @@ fn finish_reconnect(db: &dyn Db, cfg: &HostConfig, j: &mut GitLabJob, now: DateT
     let Kind::Reconnect { claim, approval: Some(p), rejoin, added } = &j.kind else { return Err(ApiError::internal("not reconnecting")) };
     let mut cred = p.cred.clone();
     cred.fields.insert("webhook_secret".into(), rejoin.secret.clone());
-    cred.fields.insert("hook_url".into(), rejoin.webhook_url.clone());
+    set_hook_url(&mut cred, &rejoin.webhook_url, &rejoin.earlier);
     let sealed = super::seal(cfg, &super::docs::owner(&rejoin.source_id), "gitlab", &cred)?;
     let saved = db.execute(
         "UPDATE docs_sources SET secret = ?, running_until = NULL, updated_at = ? WHERE id = ? AND running_until = ?",
@@ -882,7 +895,7 @@ fn finish_reconnect(db: &dyn Db, cfg: &HostConfig, j: &mut GitLabJob, now: DateT
         return Err(ApiError::conflict("The folder changed while it was being reconnected. Try again."));
     }
     db.execute(
-        "UPDATE docs_source_links SET token_expires_at = ?, hook_id = ?, disconnected = NULL WHERE source_id = ?",
+        "UPDATE docs_source_links SET token_expires_at = ?, hook_id = ?, disconnected = NULL, refreshing = NULL WHERE source_id = ?",
         &params![p.expires_at.map(ts), added.or(rejoin.hook_id), rejoin.source_id.clone()],
     )?;
     if !take(db, &j.user_id, claim)? {
@@ -916,12 +929,372 @@ fn first_calls(kind: &Kind) -> Vec<HttpCall> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Removed folders' webhooks
+
+/// How long DumbSlab keeps trying, with tokens that only ever fail for a while, to take a removed
+/// folder's webhooks off its project.
+pub(crate) const CLEANUP_RETENTION_DAYS: i64 = 30;
+/// Records one trigger starts passes on.
+const CLEANUP_BATCH: i64 = 5;
+/// How long one pass may hold a record before another may take it.
+const CLEANUP_LEASE_SECS: i64 = 90;
+/// The wait after the first failed pass; it doubles after each one, up to a day.
+const CLEANUP_FIRST_WAIT_SECS: i64 = 60;
+const CLEANUP_MAX_WAIT_SECS: i64 = 24 * 3600;
+
+/// What a cleanup record's tokens are sealed to: that record alone.
+fn cleanup_owner(source_id: &str) -> String {
+    format!("docs-hook-cleanup:{source_id}")
+}
+
+/// A removed GitLab app folder's webhooks, still to take off its project (`docs_hook_cleanup`), as
+/// one pass works on them.
+///
+/// - Removing the folder records them, with its tokens and every address its webhook had, in the
+///   same transaction that deletes it; a pass starts at once. Removal waits while a refresh of the
+///   folder's tokens may still land (see `ops::sync::remove_sources`), so the tokens recorded are
+///   the newest.
+/// - A pass renews the tokens if they're about to expire, saving the new ones first (GitLab has
+///   spent the old refresh token). It lists the project's webhooks and deletes every one that
+///   posts to exactly this folder's `/hooks/docs/<id>` at one of those addresses ([`points_at`]),
+///   and the one recorded. Then it drops the record.
+/// - A pass that fails (timeouts, 429, 5xx) lets go and waits longer each time (a minute,
+///   doubling up to a day). Passes start when a folder is removed, when Settings › Docs sync
+///   loads, and with Sync now.
+/// - DumbSlab gives up only when GitLab definitely won't let it (it refuses to renew the same
+///   tokens twice, answers 401 or 403, or no longer shows the project), or after
+///   [`CLEANUP_RETENTION_DAYS`]. Then it says so in the activity log, for admins, with the
+///   project and the webhook ids, so they can delete them by hand, and drops the tokens.
+#[derive(Clone)]
+pub struct Cleanup {
+    source_id: String,
+    lease: String,
+    project_id: i64,
+    repo: String,
+    known: Vec<i64>,
+    cred: Credential,
+    expires_at: Option<DateTime<Utc>>,
+    created_at: DateTime<Utc>,
+    /// The refresh token this pass spent, until its answer is in.
+    spent: Option<String>,
+    /// The webhooks this pass is deleting.
+    deleting: Vec<i64>,
+}
+
+/// Records a removed GitLab app folder's webhooks for cleanup (see [`Cleanup`]): its project, the
+/// webhook it knows, and its tokens with the addresses its webhook had (and the workspace's address
+/// now, when the server knows it), sealed to the record. The admin removing it owns the record.
+pub(crate) fn record_cleanup(
+    ctx: &crate::registry::Ctx,
+    source: &super::docs::Source,
+    project_id: i64,
+    hook_id: Option<i64>,
+    expires_at: Option<&str>,
+) -> ApiResult<()> {
+    let mut cred = source.cred.clone();
+    let current = ctx.cfg.knows_its_address().then(|| ctx.url(&format!("/hooks/docs/{}", source.id)));
+    let addresses = hook_addresses(&cred, current.as_deref());
+    cred.fields.insert("hook_urls".into(), addresses.join("\n"));
+    let secret = super::seal(ctx.cfg, &cleanup_owner(&source.id), "gitlab", &cred)?;
+    ctx.db.execute(
+        "INSERT INTO docs_hook_cleanup (source_id, project_id, repo, known_ids, secret, expires_at, refresh_hash, removed_by, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        &params![
+            source.id.clone(),
+            project_id,
+            source.repo.repo.clone(),
+            hook_id.map(|h| h.to_string()).unwrap_or_default(),
+            secret,
+            expires_at,
+            cred.refresh_token.as_deref().map(crate::util::sha256_hex),
+            ctx.actor.user_id.clone(),
+            ctx.now_s()
+        ],
+    )?;
+    Ok(())
+}
+
+/// Starts passes on removed folders' webhooks that are due, a few at a time (see [`Cleanup`]).
+pub(crate) fn resume_cleanups(db: &dyn Db, cfg: &HostConfig, base_url: &str, now: DateTime<Utc>) -> ApiResult<Vec<Job>> {
+    let due = db.query(
+        "SELECT * FROM docs_hook_cleanup WHERE (next_attempt_at IS NULL OR next_attempt_at <= ?)
+           AND (working_until IS NULL OR working_until <= ?) ORDER BY created_at LIMIT ?",
+        &params![ts(now), ts(now), CLEANUP_BATCH],
+    )?;
+    let mut jobs = vec![];
+    for r in due {
+        let source_id = r.str("source_id");
+        let lease = format!("{} {}", ts(now + Duration::seconds(CLEANUP_LEASE_SECS)), crate::util::new_id());
+        let claimed = db.execute(
+            "UPDATE docs_hook_cleanup SET working_until = ? WHERE source_id = ? AND (working_until IS NULL OR working_until <= ?)",
+            &params![lease.clone(), source_id.clone(), ts(now)],
+        )? > 0;
+        if !claimed {
+            continue;
+        }
+        let known: Vec<i64> = r.str("known_ids").split(',').filter_map(|i| i.parse().ok()).collect();
+        let mut c = Cleanup {
+            source_id: source_id.clone(),
+            lease,
+            project_id: r.i64("project_id"),
+            repo: r.str("repo"),
+            known,
+            cred: Credential::default(),
+            expires_at: r.opt_str("expires_at").as_deref().and_then(parse_ts),
+            created_at: parse_ts(&r.str("created_at")).unwrap_or(now),
+            spent: None,
+            deleting: vec![],
+        };
+        match super::open(cfg, &cleanup_owner(&source_id), "gitlab", &r.str("secret")) {
+            Ok(cred) => c.cred = cred,
+            Err(_) => {
+                let why = "its saved GitLab access can't be read (the server's connector key changed)";
+                abandon(db, cfg, base_url, &r.str("removed_by"), &c, why, now)?;
+                continue;
+            }
+        }
+        jobs.push(Job::GitLab(Box::new(GitLabJob::new(&r.str("removed_by"), base_url, Kind::Cleanup(Box::new(c))))));
+    }
+    Ok(jobs)
+}
+
+/// Whether the pass still holds its record.
+fn holds_cleanup(db: &dyn Db, c: &Cleanup) -> ApiResult<bool> {
+    Ok(db
+        .one(
+            "SELECT 1 AS ok FROM docs_hook_cleanup WHERE source_id = ? AND working_until = ?",
+            &params![c.source_id.clone(), c.lease.clone()],
+        )?
+        .is_some())
+}
+
+/// Says in the activity log, for admins, that DumbSlab gave up on a removed folder's webhooks, with
+/// the project and the webhook ids it knows, and drops the record and its tokens.
+fn abandon(db: &dyn Db, cfg: &HostConfig, base_url: &str, removed_by: &str, c: &Cleanup, why: &str, now: DateTime<Utc>) -> ApiResult<()> {
+    db.execute("DELETE FROM docs_hook_cleanup WHERE source_id = ? AND working_until = ?", &params![c.source_id.clone(), c.lease.clone()])?;
+    let mut ids: Vec<i64> = c.known.iter().chain(&c.deleting).copied().collect();
+    ids.sort_unstable();
+    ids.dedup();
+    let hooks = match ids.as_slice() {
+        [] => format!("the webhooks posting to …/hooks/docs/{}", c.source_id),
+        [one] => format!("webhook {one}"),
+        many => format!("webhooks {}", many.iter().map(i64::to_string).collect::<Vec<_>>().join(", ")),
+    };
+    let summary = format!(
+        "couldn't take DumbSlab's {hooks} off the GitLab project {} (id {}) after removing a docs sync folder: {why}. Delete them in the project's Settings › Webhooks",
+        c.repo, c.project_id
+    );
+    let mut ctx = super::ctx(db, cfg, removed_by, base_url, now)?;
+    crate::events::emit(
+        &mut ctx,
+        crate::events::Event::new("docs_source.webhook_abandoned", "docs_source", &c.source_id, summary)
+            .admin_only()
+            .data(json!({ "project_id": c.project_id, "hook_ids": ids })),
+    )?;
+    Ok(())
+}
+
+/// A pass that failed lets go, keeps the webhooks it knows, and waits longer before the next.
+fn back_off(db: &dyn Db, c: &Cleanup, message: String, now: DateTime<Utc>) -> ApiResult<Step> {
+    if let Some(r) = db.one(
+        "SELECT failures FROM docs_hook_cleanup WHERE source_id = ? AND working_until = ?",
+        &params![c.source_id.clone(), c.lease.clone()],
+    )? {
+        let failures = r.i64("failures").clamp(0, 20) as u32;
+        let wait = (CLEANUP_FIRST_WAIT_SECS << failures.min(12)).min(CLEANUP_MAX_WAIT_SECS);
+        let mut known: Vec<i64> = c.known.iter().chain(&c.deleting).copied().collect();
+        known.sort_unstable();
+        known.dedup();
+        let known = known.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
+        db.execute(
+            "UPDATE docs_hook_cleanup SET failures = failures + 1, next_attempt_at = ?, working_until = NULL, known_ids = ?
+             WHERE source_id = ? AND working_until = ?",
+            &params![ts(now + Duration::seconds(wait)), known, c.source_id.clone(), c.lease.clone()],
+        )?;
+    }
+    Ok(Step::Done(Finish::Fail(ApiError::new(502, "gitlab_failed", message))))
+}
+
+fn cleaned(removed: usize) -> ApiResult<Step> {
+    Ok(Step::Done(Finish::Fill(json!({ "ok": true, "removed": removed }))))
+}
+
+/// Runs a cleanup pass's next step (see [`Cleanup`]).
+fn cleanup_step(db: &dyn Db, cfg: &HostConfig, j: &mut GitLabJob, replies: &[HttpReply], now: DateTime<Utc>) -> ApiResult<Step> {
+    let (base_url, removed_by, phase) = (j.base_url.clone(), j.user_id.clone(), j.phase);
+    let Kind::Cleanup(c) = &mut j.kind else { return Err(ApiError::internal("not a cleanup")) };
+    let reply = replies.first().cloned().unwrap_or_default();
+    // Another pass took over (this one took too long): it's that one's now.
+    if !holds_cleanup(db, c)? && phase != Phase::Refreshing {
+        return cleaned(0);
+    }
+    let give_up = |c: &Cleanup, why: &str| -> ApiResult<Step> {
+        abandon(db, cfg, &base_url, &removed_by, c, why, now)?;
+        Ok(Step::Done(Finish::Fail(ApiError::new(400, "gitlab_failed", why.to_string()))))
+    };
+    match phase {
+        Phase::Start => {
+            if now - c.created_at > Duration::days(CLEANUP_RETENTION_DAYS) {
+                return give_up(c, &format!("DumbSlab tried for {CLEANUP_RETENTION_DAYS} days"));
+            }
+            if needs_refresh(&c.cred, c.expires_at, now) {
+                let Some(app) = app(cfg) else { return back_off(db, c, "DumbSlab's GitLab app isn't set up on this server.".into(), now) };
+                c.spent = c.cred.refresh_token.clone();
+                j.phase = Phase::Refreshing;
+                return Ok(Step::Fetch(vec![refresh_call(app, &c.cred)]));
+            }
+            j.phase = Phase::Working;
+            Ok(Step::Fetch(list_hooks_calls(&c.cred.token, c.project_id)))
+        }
+        Phase::Refreshing => {
+            let hash = crate::util::sha256_hex(&c.spent.take().unwrap_or_default());
+            match read_refresh(&reply) {
+                // GitLab spent the old refresh token, so the new tokens are kept whether or not this
+                // pass still holds the record, as long as it still has the tokens that were spent.
+                Ok(tokens) => {
+                    c.expires_at = expiry(now, &tokens);
+                    apply_tokens(&mut c.cred, tokens);
+                    let sealed = super::seal(cfg, &cleanup_owner(&c.source_id), "gitlab", &c.cred)?;
+                    let saved = db.execute(
+                        "UPDATE docs_hook_cleanup SET secret = ?, expires_at = ?, refresh_hash = ?, refused = 0 WHERE source_id = ? AND refresh_hash = ?",
+                        &params![
+                            sealed,
+                            c.expires_at.map(ts),
+                            c.cred.refresh_token.as_deref().map(crate::util::sha256_hex),
+                            c.source_id.clone(),
+                            hash
+                        ],
+                    )? > 0;
+                    if !saved || !holds_cleanup(db, c)? {
+                        return cleaned(0);
+                    }
+                    j.phase = Phase::Working;
+                    Ok(Step::Fetch(list_hooks_calls(&c.cred.token, c.project_id)))
+                }
+                Err(message) => {
+                    if !holds_cleanup(db, c)? {
+                        return cleaned(0);
+                    }
+                    let refused = reply.status != 0 && reply.status < 500 && reply.status != 429;
+                    if !refused {
+                        return back_off(db, c, message, now);
+                    }
+                    // The second refusal of the same tokens ends it: the first may have been of a
+                    // renewal whose answer, with new tokens, was still on its way.
+                    let again = db
+                        .one(
+                            "SELECT 1 AS ok FROM docs_hook_cleanup WHERE source_id = ? AND refused = 1 AND refresh_hash = ?",
+                            &params![c.source_id.clone(), hash.clone()],
+                        )?
+                        .is_some();
+                    if again {
+                        return give_up(c, "GitLab no longer accepts DumbSlab's access to the project");
+                    }
+                    db.execute(
+                        "UPDATE docs_hook_cleanup SET refused = 1 WHERE source_id = ? AND refresh_hash = ?",
+                        &params![c.source_id.clone(), hash],
+                    )?;
+                    back_off(db, c, message, now)
+                }
+            }
+        }
+        Phase::Working => {
+            if let Some(bad) = replies.iter().find(|r| !r.ok()) {
+                return match bad.status {
+                    401 => give_up(c, "GitLab no longer accepts DumbSlab's access to the project"),
+                    403 => give_up(c, "the person who connected the folder can no longer manage the project's webhooks"),
+                    404 => give_up(
+                        c,
+                        "GitLab no longer shows DumbSlab the project (it was deleted, or the person who connected the folder lost access)",
+                    ),
+                    _ => back_off(db, c, http_error("GitLab", bad), now),
+                };
+            }
+            let trusted = hook_addresses(&c.cred, None);
+            let mut ids = source_hooks(replies, &c.source_id, &trusted).unwrap_or_default();
+            ids.extend(c.known.iter().copied());
+            ids.sort_unstable();
+            ids.dedup();
+            if ids.is_empty() {
+                db.execute(
+                    "DELETE FROM docs_hook_cleanup WHERE source_id = ? AND working_until = ?",
+                    &params![c.source_id.clone(), c.lease.clone()],
+                )?;
+                return cleaned(0);
+            }
+            c.deleting = ids;
+            j.phase = Phase::Finishing;
+            Ok(Step::Fetch(c.deleting.iter().map(|id| remove_hook_call(&c.cred.token, c.project_id, *id)).collect()))
+        }
+        Phase::Finishing => {
+            let deleting = std::mem::take(&mut c.deleting);
+            let left: Vec<(i64, u16)> = deleting
+                .iter()
+                .zip(replies.iter().map(|r| r.status).chain(std::iter::repeat(0)))
+                .filter(|(_, status)| !((200..300).contains(status) || *status == 404))
+                .map(|(id, status)| (*id, status))
+                .collect();
+            if left.is_empty() {
+                db.execute(
+                    "DELETE FROM docs_hook_cleanup WHERE source_id = ? AND working_until = ?",
+                    &params![c.source_id.clone(), c.lease.clone()],
+                )?;
+                return cleaned(deleting.len());
+            }
+            c.known = left.iter().map(|(id, _)| *id).collect();
+            if left.iter().any(|(_, status)| matches!(status, 401 | 403)) {
+                return give_up(c, "GitLab refused to let DumbSlab delete them");
+            }
+            back_off(db, c, format!("GitLab didn't delete {} of the folder's webhooks just now.", left.len()), now)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn app() -> OAuthApp {
         OAuthApp { client_id: "gl-client".into(), client_secret: "gl-secret".into() }
+    }
+
+    #[test]
+    fn a_folders_webhooks_are_only_those_at_its_own_addresses() {
+        let trusted = vec!["https://kb.test/hooks/docs/s1".to_string(), "https://old.test/wiki/hooks/docs/s1".into()];
+        for ours in ["https://kb.test/hooks/docs/s1", "HTTPS://KB.test:443/hooks/docs/s1", "https://old.test/wiki/hooks/docs/s1"] {
+            assert!(points_at(ours, "s1", &trusted), "{ours}");
+        }
+        for theirs in [
+            "https://unrelated.example/custom/hooks/docs/s1?mode=other",
+            "https://unrelated.example/hooks/docs/s1",
+            "https://kb.test/custom/hooks/docs/s1",
+            "https://kb.test/hooks/docs/s1?mode=other",
+            "https://kb.test/hooks/docs/s1#x",
+            "https://someone@kb.test/hooks/docs/s1",
+            "http://kb.test/hooks/docs/s1",
+            "https://kb.test:8443/hooks/docs/s1",
+            "https://kb.test/hooks/docs/s1/",
+            "https://kb.test/hooks/docs/s2",
+        ] {
+            assert!(!points_at(theirs, "s1", &trusted), "{theirs}");
+        }
+        assert!(!points_at("https://kb.test/hooks/docs/s1", "s1", &[]), "no address is trusted by default");
+
+        // Each address the webhook had stays trusted, the latest 10.
+        let mut cred = Credential::default();
+        set_hook_url(&mut cred, "https://a.test/hooks/docs/s1", &[]);
+        set_hook_url(&mut cred, "https://b.test/hooks/docs/s1", &[]);
+        assert_eq!(
+            hook_addresses(&cred, Some("https://c.test/hooks/docs/s1")),
+            ["https://c.test/hooks/docs/s1", "https://b.test/hooks/docs/s1", "https://a.test/hooks/docs/s1"]
+        );
+        for i in 0..20 {
+            set_hook_url(&mut cred, &format!("https://w{i}.test/hooks/docs/s1"), &[]);
+        }
+        assert_eq!(cred.field("hook_urls").lines().count(), HOOK_HISTORY);
+        assert_eq!(cred.field("hook_url"), "https://w19.test/hooks/docs/s1");
+        assert!(cred.field("hook_urls").lines().last() == Some("https://w18.test/hooks/docs/s1"));
     }
 
     #[test]

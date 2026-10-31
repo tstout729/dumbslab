@@ -339,6 +339,10 @@ fn list_docs_sources(ctx: &mut Ctx, _: NoInput) -> ApiResult<DocsSourceList> {
         for r in ctx.db.query(&format!("{} ORDER BY s.created_at", docs::SOURCES_SQL), &[])? {
             items.push(source_view(ctx, &r)?);
         }
+        // Removed folders' GitLab webhooks still owed a cleanup are tried again.
+        for job in gitlab_app::resume_cleanups(ctx.db, ctx.cfg, &ctx.base_url, ctx.now)? {
+            ctx.effects.push(Effect::Background(job));
+        }
     }
     Ok(DocsSourceList {
         enabled,
@@ -626,6 +630,7 @@ fn check_new_source(ctx: &Ctx, s: &docs::NewSource, link: &Link) -> ApiResult<()
         repo: s.repo.clone(),
         branch: s.branch.clone(),
         folder: s.folder.clone(),
+        project_id: None,
     };
     if !docs::twins(ctx.db, &wanted, link, &s.topic_id, "")?.is_empty() {
         return Err(ApiError::conflict(ALREADY_SYNCED));
@@ -792,6 +797,7 @@ fn reconnect_gitlab(
         project_id,
         hook_id,
         webhook_url: ctx.url(&format!("/hooks/docs/{}", source.id)),
+        earlier: gitlab_app::hook_addresses(&source.cred, None),
         secret,
     };
     let job = gitlab_app::GitLabJob::reconnect(&ctx.actor.user_id, &ctx.base_url, claim, rejoin);
@@ -807,6 +813,9 @@ pub struct SourceIdInput {
 
 fn sync_docs_source(ctx: &mut Ctx, input: SourceIdInput) -> ApiResult<Deferred<DocsSyncResult>> {
     key_needed(ctx)?;
+    for job in gitlab_app::resume_cleanups(ctx.db, ctx.cfg, &ctx.base_url, ctx.now)? {
+        ctx.effects.push(Effect::Background(job));
+    }
     let row = load_source_row(ctx, &input.id)?;
     let source = Source::from_row(ctx.cfg, &row)?;
     if docs::has_older_twin(ctx.db, &source)? {
@@ -858,14 +867,37 @@ pub(crate) fn remove_sources(ctx: &mut Ctx, rows: &[Row]) -> ApiResult<()> {
         if sync::claim(ctx.db, docs::TABLE, id.as_str().into(), now)?.is_none() {
             return Err(ApiError::conflict(format!("A sync of {} is running. Try again in a moment, once it's done.", row.str("repo"))));
         }
-        // The webhook DumbSlab added to a GitLab project comes off too, once this is done. No sync
-        // holds the source, so its stored tokens are the current ones.
-        if let Ok(source) = Source::from_row(ctx.cfg, row)
-            && let Link::GitLabOAuth { project_id, hook_id, token_expires_at } = source.link
-        {
-            let expires_at = token_expires_at.as_deref().and_then(crate::util::parse_ts);
-            let job = gitlab_app::GitLabJob::remove_hook(&source.id, project_id, hook_id, source.cred, expires_at);
-            ctx.effects.push(Effect::Background(Job::GitLab(Box::new(job))));
+        // The webhooks DumbSlab added to a GitLab project come off too, until done (see
+        // `gitlab_app::Cleanup`). No sync holds the source, and none may still be renewing its
+        // tokens (GitLab may have replaced them already, with the answer on its way), so its stored
+        // tokens are the newest.
+        if row.opt_str("connection").as_deref() == Some("gitlab_oauth") {
+            let (project_id, hook_id) = (row.i64("project_id"), row.opt_i64("hook_id"));
+            if let Ok(source) = Source::from_row(ctx.cfg, row) {
+                if docs::renewing(ctx.db, &id, source.cred.refresh_token.as_deref().unwrap_or_default(), now)? {
+                    return Err(ApiError::conflict(format!(
+                        "A sync of {} is renewing its GitLab access. Try again in a moment.",
+                        row.str("repo")
+                    )));
+                }
+                gitlab_app::record_cleanup(ctx, &source, project_id, hook_id, row.opt_str("token_expires_at").as_deref())?;
+            } else {
+                let hook = hook_id.map(|h| format!("webhook {h}")).unwrap_or_else(|| "webhook".into());
+                emit(
+                    ctx,
+                    Event::new(
+                        "docs_source.webhook_abandoned",
+                        "docs_source",
+                        &id,
+                        format!(
+                            "couldn't take DumbSlab's {hook} off the GitLab project {} (id {project_id}): its saved GitLab access can't be read (the server's connector key changed). Delete it in the project's Settings › Webhooks",
+                            row.str("repo")
+                        ),
+                    )
+                    .admin_only()
+                    .data(json!({ "project_id": project_id, "hook_ids": hook_id.into_iter().collect::<Vec<_>>() })),
+                )?;
+            }
         }
         ctx.db.execute("DELETE FROM docs_items WHERE source_id = ?", &params![id.clone()])?;
         ctx.db.execute("DELETE FROM docs_sources WHERE id = ?", &params![id.clone()])?;
@@ -873,6 +905,9 @@ pub(crate) fn remove_sources(ctx: &mut Ctx, rows: &[Row]) -> ApiResult<()> {
             ctx,
             Event::new("docs_source.deleted", "docs_source", &id, format!("removed docs sync from {}", row.str("repo"))).admin_only(),
         )?;
+    }
+    for job in gitlab_app::resume_cleanups(ctx.db, ctx.cfg, &ctx.base_url, now)? {
+        ctx.effects.push(Effect::Background(job));
     }
     Ok(())
 }

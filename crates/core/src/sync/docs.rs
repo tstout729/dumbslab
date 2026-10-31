@@ -180,9 +180,13 @@ impl Source {
             },
             _ => return Err(ApiError::internal("a docs sync source's connection is incomplete")),
         };
+        let project_id = match link {
+            Link::GitLabOAuth { project_id, .. } => Some(project_id),
+            _ => None,
+        };
         Ok(Source {
             id: r.str("id"),
-            repo: Repo { provider, host: r.str("host"), repo: r.str("repo"), branch: r.str("branch"), folder: r.str("folder") },
+            repo: Repo { provider, host: r.str("host"), repo: r.str("repo"), branch: r.str("branch"), folder: r.str("folder"), project_id },
             topic_id: r.str("topic_id"),
             owner_id: r.str("owner_id"),
             cred: Credential::default(),
@@ -334,7 +338,8 @@ const SYNCED_SQL: &str = "SELECT i.path, i.removed_at, s.provider, s.host, s.rep
 pub fn synced_from(db: &dyn Db, post_id: &str) -> ApiResult<Option<SyncedFrom>> {
     let Some(r) = db.one(SYNCED_SQL, &params![post_id])? else { return Ok(None) };
     let Some(provider) = Provider::parse(&r.str("provider")) else { return Ok(None) };
-    let repo = Repo { provider, host: r.str("host"), repo: r.str("repo"), branch: r.str("branch"), folder: r.str("folder") };
+    let repo =
+        Repo { provider, host: r.str("host"), repo: r.str("repo"), branch: r.str("branch"), folder: r.str("folder"), project_id: None };
     let path = repo.repo_path(&r.str("path"));
     Ok(Some(SyncedFrom {
         provider: provider.id().into(),
@@ -433,9 +438,24 @@ enum HookCall {
 }
 
 impl DocsJob {
+    /// The requests that list the folder's files and, for a GitLab app source, read its project
+    /// (by id, like the files), whose path may have changed since (see [`listing`]).
+    fn listing_calls(&self) -> Vec<HttpCall> {
+        let mut calls = self.source.repo.tree_calls(self.source.token());
+        calls.extend(self.source.repo.project_call(self.source.token()));
+        calls
+    }
+
     /// Where the project's webhook should point: this workspace's address now.
     fn hook_url(&self) -> String {
         format!("{}/hooks/docs/{}", self.base_url, self.source.id)
+    }
+
+    /// Where the source's webhooks may point (see [`super::gitlab_app::hook_addresses`]): this
+    /// workspace's address only when the server knows it, since otherwise it's the request's.
+    fn hook_addresses(&self, cfg: &HostConfig) -> Vec<String> {
+        let current = cfg.knows_its_address().then(|| self.hook_url());
+        super::gitlab_app::hook_addresses(&self.source.cred, current.as_deref())
     }
 
     /// Adds the request about a GitLab app source's webhook, if one is due, to `calls`. Only Sync
@@ -660,7 +680,7 @@ pub fn step(db: &dyn Db, cfg: &HostConfig, j: &mut DocsJob, replies: Vec<HttpRep
             }
             Link::Token | Link::GitLabOAuth { .. } => {
                 j.phase = Phase::Listing;
-                let calls = j.source.repo.tree_calls(j.source.token());
+                let calls = j.listing_calls();
                 Ok(Step::Fetch(j.with_hook(cfg, calls)))
             }
         },
@@ -949,6 +969,14 @@ fn refreshing_mark(db: &dyn Db, source_id: &str) -> ApiResult<Option<(DateTime<U
     }))
 }
 
+/// Whether a sync renewed (or was refused renewing) the source's stored GitLab refresh token
+/// recently enough that an answer with new tokens may still come: GitLab may have replaced the
+/// stored tokens already.
+pub(crate) fn renewing(db: &dyn Db, source_id: &str, refresh_token: &str, now: DateTime<Utc>) -> ApiResult<bool> {
+    let hash = crate::util::sha256_hex(refresh_token);
+    Ok(refreshing_mark(db, source_id)?.is_some_and(|(at, _, h)| h == hash && now - at < chrono::Duration::seconds(REFRESH_GRACE_SECS)))
+}
+
 /// Whether another sync started spending this refresh token recently enough that its answer may
 /// still come.
 fn refreshing_elsewhere(db: &dyn Db, j: &DocsJob, hash: &str, now: DateTime<Utc>) -> ApiResult<bool> {
@@ -1021,7 +1049,7 @@ fn refreshed(db: &dyn Db, cfg: &HostConfig, j: &mut DocsJob, replies: &[HttpRepl
         return Ok(lost());
     }
     j.phase = Phase::Listing;
-    let calls = j.source.repo.tree_calls(j.source.token());
+    let calls = j.listing_calls();
     Ok(Step::Fetch(j.with_hook(cfg, calls)))
 }
 
@@ -1068,7 +1096,7 @@ fn take_hook_reply(db: &dyn Db, cfg: &HostConfig, j: &mut DocsJob, replies: &[Ht
     }
     // Every other webhook pointing at this source goes: not its own, and not one just added.
     if extra.lists > 0
-        && let Ok(found) = super::gitlab_app::source_hooks(&lists, &j.source.id)
+        && let Ok(found) = super::gitlab_app::source_hooks(&lists, &j.source.id, &j.hook_addresses(cfg))
     {
         let own = match j.source.link {
             Link::GitLabOAuth { hook_id, .. } => hook_id,
@@ -1100,12 +1128,12 @@ fn note_webhook(j: &mut DocsJob, what: &str) {
 fn save_hook(db: &dyn Db, cfg: &HostConfig, j: &mut DocsJob, added: Option<i64>, now: DateTime<Utc>) -> ApiResult<()> {
     let lost = || super::sync_failed("Another sync of this source took over before this one finished.");
     let mut current = stored_cred(db, cfg, j)?.ok_or_else(lost)?;
-    current.fields.insert("hook_url".into(), j.hook_target.clone());
+    super::gitlab_app::set_hook_url(&mut current, &j.hook_target, &[]);
     let sealed = super::seal(cfg, &owner(&j.source.id), j.source.repo.provider.id(), &current)?;
     if !update_held(db, j, "secret = ?, updated_at = ?", params![sealed, ts(now)])? {
         return Err(lost());
     }
-    j.source.cred.fields.insert("hook_url".into(), j.hook_target.clone());
+    super::gitlab_app::set_hook_url(&mut j.source.cred, &j.hook_target, &[]);
     if let (Some(id), Link::GitLabOAuth { hook_id, .. }) = (added, &mut j.source.link) {
         *hook_id = Some(id);
         db.execute("UPDATE docs_source_links SET hook_id = ? WHERE source_id = ?", &params![id, j.source.id.clone()])?;
@@ -1115,7 +1143,26 @@ fn save_hook(db: &dyn Db, cfg: &HostConfig, j: &mut DocsJob, added: Option<i64>,
 
 /// Reads the folder's listing, works out what changed, and asks for this run's files.
 fn listing(db: &dyn Db, cfg: &HostConfig, j: &mut DocsJob, replies: &[HttpReply], now: DateTime<Utc>) -> ApiResult<Step> {
-    let replies = &take_hook_reply(db, cfg, j, replies, now)?;
+    let all = take_hook_reply(db, cfg, j, replies, now)?;
+    let mut replies = all.as_slice();
+    // A GitLab app source's project, read by its id like its files: renamed or moved on GitLab, the
+    // source follows its new path, for links and Settings. (Another project that takes the old
+    // path is never read.)
+    if j.source.repo.project_id.is_some()
+        && let Some((project, tree)) = replies.split_last()
+    {
+        replies = tree;
+        if let Some(path) = j.source.repo.read_path(project).filter(|p| *p != j.source.repo.repo) {
+            if !update_held(db, j, "repo = ?, updated_at = ?", params![path.clone(), ts(now)])? {
+                return Ok(lost());
+            }
+            mark_renamed(db, &j.source.id)?;
+            j.source.repo.repo = path;
+            if has_older_twin(db, &j.source)? {
+                return fail(db, j, DUPLICATE, now);
+            }
+        }
+    }
     let source_id = j.source.id.clone();
     let has_token = !j.source.token().is_empty();
     let entries = match j.source.repo.read_tree(replies, has_token) {
@@ -1795,6 +1842,7 @@ mod tests {
             repo: "acme/docs".into(),
             branch: "main".into(),
             folder: "handbook".into(),
+            project_id: None,
         };
         assert_eq!(fallback_title(&repo, "getting-started.md"), "Getting started");
         assert_eq!(fallback_title(&repo, "guides/README.md"), "Guides");

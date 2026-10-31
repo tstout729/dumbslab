@@ -57,6 +57,10 @@ pub struct Repo {
     pub branch: String,
     /// Without slashes at either end; empty for the whole repository.
     pub folder: String,
+    /// GitLab: the project's id, when it's known (sources read through DumbSlab's GitLab app).
+    /// Reads go by it, not by the path: a rename or transfer changes the path, and another project
+    /// may take the old one. Without it (a token), reads follow the path.
+    pub project_id: Option<i64>,
 }
 
 /// A file in the folder.
@@ -170,7 +174,26 @@ impl Repo {
     }
 
     fn gitlab_project_url(&self) -> String {
-        format!("https://{}/api/v4/projects/{}", self.host, enc(&self.repo))
+        match self.project_id {
+            Some(id) => format!("https://{}/api/v4/projects/{id}", self.host),
+            None => format!("https://{}/api/v4/projects/{}", self.host, enc(&self.repo)),
+        }
+    }
+
+    /// GitLab, by the project's id: the request for the project itself, whose answer says its
+    /// path now ([`Repo::read_path`]).
+    pub fn project_call(&self, token: &str) -> Option<HttpCall> {
+        (self.provider == Provider::GitLab && self.project_id.is_some()).then(|| self.get(self.gitlab_project_url(), token))
+    }
+
+    /// The project's path now (`path_with_namespace`), from the answer to [`Repo::project_call`],
+    /// when it's this project's answer.
+    pub fn read_path(&self, reply: &HttpReply) -> Option<String> {
+        let v = reply.json();
+        if !reply.ok() || self.project_id.is_none() || v["id"].as_i64() != self.project_id {
+            return None;
+        }
+        gitlab_project(v["path_with_namespace"].as_str()?, "").ok().map(|(_, path)| path)
     }
 
     /// The requests that list the folder's files.
@@ -327,6 +350,7 @@ mod tests {
             repo: "acme/docs".into(),
             branch: "main".into(),
             folder: "handbook".into(),
+            project_id: None,
         }
     }
 
@@ -368,12 +392,32 @@ mod tests {
             repo: "g/p".into(),
             branch: "main".into(),
             folder: String::new(),
+            project_id: None,
         };
         let calls = gl.tree_calls("t");
         assert_eq!(calls.len(), GITLAB_PAGES);
         assert_eq!(calls[1].url, "https://gitlab.com/api/v4/projects/g%2Fp/repository/tree?ref=main&recursive=true&per_page=100&page=2");
         assert_eq!(gl.file_url("README.md", false), "https://gitlab.com/g/p/-/blob/main/README.md");
         assert_eq!(gl.folder_url(), "https://gitlab.com/g/p/-/tree/main");
+        assert!(gl.project_call("t").is_none(), "a token source follows the path");
+
+        // Known by id (DumbSlab's GitLab app): reads go by it; links use the path.
+        let by_id = Repo { project_id: Some(3), ..gl };
+        assert_eq!(
+            by_id.tree_calls("t")[0].url,
+            "https://gitlab.com/api/v4/projects/3/repository/tree?ref=main&recursive=true&per_page=100&page=1"
+        );
+        assert_eq!(
+            by_id.blob_call(&"a".repeat(40), "t").url,
+            format!("https://gitlab.com/api/v4/projects/3/repository/blobs/{}", "a".repeat(40))
+        );
+        assert_eq!(by_id.project_call("t").unwrap().url, "https://gitlab.com/api/v4/projects/3");
+        assert_eq!(by_id.file_url("README.md", false), "https://gitlab.com/g/p/-/blob/main/README.md");
+        let answer =
+            |id: i64, path: &str| HttpReply { status: 200, body: serde_json::json!({ "id": id, "path_with_namespace": path }).to_string() };
+        assert_eq!(by_id.read_path(&answer(3, "g/moved")).as_deref(), Some("g/moved"));
+        assert_eq!(by_id.read_path(&answer(4, "g/p")), None, "another project's answer");
+        assert_eq!(by_id.read_path(&HttpReply { status: 404, body: "{}".into() }), None);
     }
 
     #[test]
