@@ -88,6 +88,8 @@ pub fn handle(db: &dyn Db, cfg: &HostConfig, req: &Request) -> Option<Outcome> {
         crate::sync::gitlab_app::start(db, cfg, req)
     } else if path == crate::sync::gitlab_app::CALLBACK_PATH && req.method == "GET" {
         crate::sync::gitlab_app::callback(db, cfg, req)
+    } else if path == crate::sync::people::CALLBACK_PATH && req.method == "GET" {
+        crate::sync::people::callback(db, cfg, req)
     } else if path.starts_with("/sync/") {
         failed(&ApiError::not_found("route"))
     } else if path.starts_with("/hooks/") {

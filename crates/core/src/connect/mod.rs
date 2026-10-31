@@ -713,7 +713,9 @@ pub fn env_name(id: &str) -> String {
 /// The OAuth apps a host's settings register, read with `var` by name: `<APP>_CLIENT_ID` and
 /// `<APP>_CLIENT_SECRET` (hosts add their own prefix, like `DUMBSLAB_`). An app without both of
 /// its own uses a shared app's (see [`SHARED_APPS`]), so `ATLASSIAN_CLIENT_ID` and
-/// `ATLASSIAN_CLIENT_SECRET` cover Jira and Confluence at once.
+/// `ATLASSIAN_CLIENT_SECRET` cover Jira and Confluence at once. `BAMBOOHR_CLIENT_ID` and
+/// `BAMBOOHR_CLIENT_SECRET` are the people sync's Sign in with BambooHR (see
+/// [`crate::sync::people`] and docs/hosting/bamboohr-app.md).
 pub fn oauth_apps(var: impl Fn(&str) -> Option<String>) -> BTreeMap<String, OAuthApp> {
     let pair = |name: &str| match (var(&format!("{name}_CLIENT_ID")), var(&format!("{name}_CLIENT_SECRET"))) {
         (Some(client_id), Some(client_secret)) if !client_id.is_empty() && !client_secret.is_empty() => {
@@ -728,6 +730,10 @@ pub fn oauth_apps(var: impl Fn(&str) -> Option<String>) -> BTreeMap<String, OAut
         if let Some(app) = pair(&env_name(id)).or(shared) {
             apps.insert(id.to_string(), app);
         }
+    }
+    let people = crate::sync::people::PROVIDER;
+    if let Some(app) = pair(&env_name(people)) {
+        apps.insert(people.to_string(), app);
     }
     apps
 }
@@ -1150,6 +1156,23 @@ impl Job {
         }
     }
 
+    /// The step that just ran wrote nothing but renewed credentials: UPDATEs of rows that already
+    /// existed, setting their sealed tokens, expiry and renewal lease after the app renewed them. It
+    /// inserted nothing and recorded no event, so it can't grow storage meaningfully. And it must not
+    /// be rolled back: the app has already spent the old refresh token, so a rollback would leave
+    /// only a dead one, and the person would have to sign in again. [`guarded_step`] keeps such a
+    /// step even when the host's guard would refuse it (a full workspace).
+    ///
+    /// A job opts in by reading each renewal's answer in a step of its own that writes only that,
+    /// and reporting it here. Connected apps' refreshes ([`save_token`]) and docs sync's GitLab
+    /// tokens could adopt it the same way.
+    pub fn wrote_only_credentials(&self) -> bool {
+        match self {
+            Job::People(j) => j.wrote_only_credentials(),
+            _ => false,
+        }
+    }
+
     /// A request to send when a step failed with `error` and was rolled back (or the host couldn't
     /// run it): a Slack command's answer, for someone waiting elsewhere, or taking off again a
     /// GitLab webhook a docs sync job added for a folder that wasn't saved. Hosts send it once,
@@ -1534,7 +1557,9 @@ pub fn guarded_step(
     // Only Slack's notices come from the job before the step; the others needn't be copied.
     let before = matches!(job, Job::Slack(_)).then(|| job.clone());
     let mut result = step(db, cfg, job, replies, now);
+    // A step that only stored renewed credentials is kept: see [`Job::wrote_only_credentials`].
     if result.is_ok()
+        && !job.wrote_only_credentials()
         && let Some(refused) = guard(db)
     {
         result = Err(refused);
@@ -1907,6 +1932,19 @@ mod tests {
         assert_eq!(apps["google-drive"].client_secret, "g-s");
         assert!(!apps.contains_key("trello") && !apps.contains_key("zendesk"));
         assert!(env(&[("ATLASSIAN_CLIENT_ID", "atl"), ("ATLASSIAN_CLIENT_SECRET", "")]).is_empty());
+    }
+
+    #[test]
+    fn the_people_syncs_bamboohr_app_is_read_too() {
+        let map: BTreeMap<String, String> = [("BAMBOOHR_CLIENT_ID", "bhr"), ("BAMBOOHR_CLIENT_SECRET", "bhr-s")]
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let apps = oauth_apps(move |name| map.get(name).cloned());
+        assert_eq!(apps.keys().collect::<Vec<_>>(), ["bamboohr"]);
+        assert_eq!((apps["bamboohr"].client_id.as_str(), apps["bamboohr"].client_secret.as_str()), ("bhr", "bhr-s"));
+        // Not a connected app: nobody connects their own account with it.
+        assert!(providers::get("bamboohr").is_none());
     }
 
     #[test]
