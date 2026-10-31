@@ -70,7 +70,7 @@ pub fn ops() -> Vec<Op> {
             .build(),
         op("sync", "delete_docs_source", "DELETE", "/docs-sources/{id}", Access::Admin, delete_docs_source)
             .title("Remove a docs sync source")
-            .desc("Stop syncing a folder and forget its credentials. Its posts and topics stay, as ordinary posts anyone with access can edit. A webhook DumbSlab added to a GitLab project is removed too.")
+            .desc("Stop syncing a folder and forget its credentials. Its posts and topics stay, as ordinary posts anyone with access can edit. A webhook DumbSlab added to a GitLab project is removed too. Refused while a sync of it runs; try again once it's done.")
             .destructive()
             .build(),
     ]
@@ -737,17 +737,35 @@ fn sync_docs_source(ctx: &mut Ctx, input: SourceIdInput) -> ApiResult<Deferred<D
 
 fn delete_docs_source(ctx: &mut Ctx, input: SourceIdInput) -> ApiResult<Done> {
     let row = load_source_row(ctx, &input.id)?;
-    let id = row.str("id");
-    // The webhook DumbSlab added to a GitLab project comes off too, once this is done.
-    if let Ok(source) = Source::from_row(ctx.cfg, &row)
-        && let Link::GitLabOAuth { project_id, hook_id: Some(hook_id), token_expires_at } = source.link
-    {
-        let expires_at = token_expires_at.as_deref().and_then(crate::util::parse_ts);
-        let job = gitlab_app::GitLabJob::remove_hook(project_id, hook_id, source.cred, expires_at);
-        ctx.effects.push(Effect::Background(Job::GitLab(Box::new(job))));
-    }
-    ctx.db.execute("DELETE FROM docs_items WHERE source_id = ?", &params![id.clone()])?;
-    ctx.db.execute("DELETE FROM docs_sources WHERE id = ?", &params![id.clone()])?;
-    emit(ctx, Event::new("docs_source.deleted", "docs_source", &id, format!("removed docs sync from {}", row.str("repo"))).admin_only())?;
+    remove_sources(ctx, &[row])?;
     Ok(DONE)
+}
+
+/// Removes sources (rows of [`docs::SOURCES_SQL`]): removing one, or deleting the topic they sync
+/// into. Each must have no sync running: this takes the sync's lease, so none starts either, and
+/// whatever the source keeps elsewhere is cleaned up from what's stored now. Their posts stay.
+pub(crate) fn remove_sources(ctx: &mut Ctx, rows: &[Row]) -> ApiResult<()> {
+    let now = Utc::now();
+    for row in rows {
+        let id = row.str("id");
+        if sync::claim(ctx.db, docs::TABLE, id.as_str().into(), now)?.is_none() {
+            return Err(ApiError::conflict(format!("A sync of {} is running. Try again in a moment, once it's done.", row.str("repo"))));
+        }
+        // The webhook DumbSlab added to a GitLab project comes off too, once this is done. No sync
+        // holds the source, so its stored tokens are the current ones.
+        if let Ok(source) = Source::from_row(ctx.cfg, row)
+            && let Link::GitLabOAuth { project_id, hook_id: Some(hook_id), token_expires_at } = source.link
+        {
+            let expires_at = token_expires_at.as_deref().and_then(crate::util::parse_ts);
+            let job = gitlab_app::GitLabJob::remove_hook(project_id, hook_id, source.cred, expires_at);
+            ctx.effects.push(Effect::Background(Job::GitLab(Box::new(job))));
+        }
+        ctx.db.execute("DELETE FROM docs_items WHERE source_id = ?", &params![id.clone()])?;
+        ctx.db.execute("DELETE FROM docs_sources WHERE id = ?", &params![id.clone()])?;
+        emit(
+            ctx,
+            Event::new("docs_source.deleted", "docs_source", &id, format!("removed docs sync from {}", row.str("repo"))).admin_only(),
+        )?;
+    }
+    Ok(())
 }

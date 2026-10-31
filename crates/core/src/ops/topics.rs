@@ -452,6 +452,9 @@ fn delete_topic(ctx: &mut Ctx, input: TopicIdInput) -> ApiResult<Done> {
             )));
         }
     }
+    // Docs sync sources into this topic go with it, through the same removal as removing one.
+    let sources = ctx.db.query(&format!("{} WHERE s.topic_id = ?", crate::sync::docs::SOURCES_SQL), &params![id.clone()])?;
+    crate::ops::sync::remove_sources(ctx, &sources)?;
     ctx.db.execute("UPDATE topics SET parent_id = ? WHERE parent_id = ?", &params![row.opt_str("parent_id"), id.clone()])?;
     for table in ["post_topics", "topic_members"] {
         ctx.db.execute(&format!("DELETE FROM {table} WHERE topic_id = ?"), &params![id.clone()])?;
