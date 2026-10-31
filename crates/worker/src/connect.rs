@@ -1,10 +1,9 @@
 //! Connected apps on Cloudflare: settings from the environment, and the HTTP the core's jobs ask
 //! for (see `dumbslab_core::connect`).
 
-use std::collections::BTreeMap;
 use std::time::Duration;
 
-use dumbslab_core::connect::{self, Connectors, FETCH_TIMEOUT_SECS, HttpCall, HttpReply, MAX_REPLY_BYTES, OAuthApp};
+use dumbslab_core::connect::{self, Connectors, FETCH_TIMEOUT_SECS, HttpCall, HttpReply, MAX_REPLY_BYTES};
 use dumbslab_core::slack::{self, SharedApp};
 use futures_util::StreamExt;
 use futures_util::future::{Either, select};
@@ -15,17 +14,11 @@ use crate::sql::var;
 
 /// `CONNECTOR_KEY` (secret) encrypts people's credentials; `<APP>_CLIENT_ID` and the secret
 /// `<APP>_CLIENT_SECRET` (e.g. `GITHUB_CLIENT_ID`, `GOOGLE_DRIVE_CLIENT_SECRET`) let people sign in
-/// to that app. Hosted workspaces send sign-ins back through the root domain, which forwards them.
+/// to that app, and `ATLASSIAN_CLIENT_ID` with `ATLASSIAN_CLIENT_SECRET` to Jira and Confluence
+/// (see [`connect::oauth_apps`]). Hosted workspaces send sign-ins back through the root domain,
+/// which forwards them.
 pub fn connectors(env: &Env, origin: &str, hosted: bool) -> Connectors {
-    let mut apps = BTreeMap::new();
-    for c in connect::providers::ALL {
-        let id = c.info().id;
-        let name = id.to_ascii_uppercase().replace('-', "_");
-        if let (Some(client_id), Some(client_secret)) = (var(env, &format!("{name}_CLIENT_ID")), var(env, &format!("{name}_CLIENT_SECRET")))
-        {
-            apps.insert(id.to_string(), OAuthApp { client_id, client_secret });
-        }
-    }
+    let apps = connect::oauth_apps(|name| var(env, name));
     let callback_url = if hosted { root_callback(env, origin, "/connect/callback") } else { None };
     Connectors { key: var(env, "CONNECTOR_KEY"), apps, callback_url }
 }

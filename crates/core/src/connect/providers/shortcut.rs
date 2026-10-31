@@ -1,5 +1,12 @@
 //! Shortcut: previews of linked stories, from the connected workspace only. People connect with
-//! an API token; Shortcut has no sign-in for apps like this.
+//! an API token (the `Shortcut-Token` header), the only way Shortcut's REST API documents.
+//!
+//! A possible later change: Shortcut runs an OAuth server (authorization code with PKCE, refresh
+//! tokens, a `read` scope, and clients that register themselves, so no partner approval) for its
+//! hosted MCP server. Its docs don't say whether those tokens work with the REST API, so DumbSlab
+//! doesn't sign in with it yet. Metadata:
+//! https://api.app.shortcut.com/.well-known/oauth-authorization-server; MCP server:
+//! https://www.shortcut.com/help/integrations/mcp-server/
 //!
 //! Docs: https://developer.shortcut.com/api/rest/v3 (Authentication; Get Current Member Info,
 //! Get Story, List Workflows, List Members).

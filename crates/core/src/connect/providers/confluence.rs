@@ -1,13 +1,16 @@
 //! Confluence Cloud: pages and blog posts the connected account can see on one Atlassian site.
 //! People connect the same two ways as Jira (an API token for their site, or signing in with
-//! Atlassian); [`super::jira`] holds the shared parts. Search only, no previews.
+//! Atlassian); [`super::jira`] holds the shared parts. Search only, no previews. Like Jira, a
+//! connection keeps only its site, never anyone's account id, email or name, so DumbSlab has no
+//! duty to report personal data to Atlassian (see [`super::jira`] and
+//! https://developer.atlassian.com/cloud/confluence/user-privacy-developer-guide/).
 //!
 //! Atlassian's docs:
 //! - Search by CQL, `GET /wiki/rest/api/search` (excerpts mark matches with `@@@hl@@@`):
 //!   https://developer.atlassian.com/cloud/confluence/rest/v1/api-group-search/
 //! - CQL's `text` and `type` fields: https://developer.atlassian.com/cloud/confluence/cql-fields/
 //! - Current user, `GET /wiki/rest/api/user/current`: https://developer.atlassian.com/cloud/confluence/rest/v1/api-group-users/
-//! - Signing in, the gateway and `/me`: https://developer.atlassian.com/cloud/confluence/oauth-2-3lo-apps/
+//! - Signing in, cloud ids and the gateway: https://developer.atlassian.com/cloud/confluence/oauth-2-3lo-apps/
 //! - Scopes: https://developer.atlassian.com/cloud/confluence/scopes-for-oauth-2-3LO-and-forge-apps/
 
 use super::jira;
@@ -15,8 +18,8 @@ use crate::connect::{Account, Connector, Credential, Hit, HttpCall, HttpReply, O
 
 pub struct Confluence;
 
-/// Search pages; who the person is; refresh tokens.
-const SCOPES: &[&str] = &["search:confluence", "read:me", "offline_access"];
+/// Search pages; refresh tokens. Not `read:me`: DumbSlab keeps no one's profile.
+const SCOPES: &[&str] = &["search:confluence", "offline_access"];
 
 static INFO: ProviderInfo = ProviderInfo {
     id: "confluence",
@@ -120,8 +123,8 @@ impl Connector for Confluence {
             .collect())
     }
 
-    fn token_request(&self, app: &OAuthApp, form: Vec<(String, String)>) -> HttpCall {
-        jira::token_call(app, form)
+    fn token_request(&self, app: &OAuthApp, token_url: &str, form: Vec<(String, String)>) -> HttpCall {
+        jira::token_call(app, token_url, form)
     }
 }
 
@@ -160,7 +163,7 @@ mod tests {
         assert!(header(&calls[0], "authorization").unwrap().starts_with("Basic "));
         let me = json!({ "type": "known", "accountId": "5b10", "email": "", "publicName": "Ada" });
         let account = Confluence.read_profile(&cred, &[reply(200, me)]).unwrap();
-        assert_eq!(account.label, "ada@acme.com on acme.atlassian.net");
+        assert_eq!(account.label, "acme.atlassian.net", "the site only, nothing personal");
         assert_eq!(account.settings, json!({ "site": "acme.atlassian.net" }));
         // Confluence answers people it doesn't know as anonymous, rather than refusing them.
         let anonymous = json!({ "type": "anonymous", "displayName": "Anonymous" });
@@ -171,18 +174,20 @@ mod tests {
 
         let cred = signed_in();
         let calls = Confluence.profile(&cred);
+        assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].url, "https://api.atlassian.com/oauth/token/accessible-resources");
-        assert_eq!(header(&calls[1], "authorization"), Some("Bearer at"));
+        assert_eq!(header(&calls[0], "authorization"), Some("Bearer at"));
         // Atlassian lists a site once per product; Confluence takes its own.
         let sites = json!([
             { "id": CLOUD, "url": "https://acme.atlassian.net", "scopes": ["read:jira-work"] },
-            { "id": CLOUD, "url": "https://wiki.atlassian.net", "scopes": ["search:confluence", "read:me"] }
+            { "id": CLOUD, "url": "https://wiki.atlassian.net", "scopes": ["search:confluence"] }
         ]);
-        let account = Confluence.read_profile(&cred, &[reply(200, sites), reply(200, json!({ "name": "Ada" }))]).unwrap();
-        assert_eq!(account.label, "Ada on wiki.atlassian.net");
+        let account = Confluence.read_profile(&cred, &[reply(200, sites)]).unwrap();
+        assert_eq!(account.label, "wiki.atlassian.net");
         assert_eq!(account.settings, json!({ "site": "wiki.atlassian.net", "cloud_id": CLOUD }));
-        assert!(Confluence.read_profile(&cred, &[reply(0, json!(null)), reply(0, json!(null))]).unwrap_err().contains("in time"));
-        let call = Confluence.token_request(&OAuthApp { client_id: "c".into(), client_secret: "s".into() }, vec![]);
+        assert!(Confluence.read_profile(&cred, &[reply(0, json!(null))]).unwrap_err().contains("in time"));
+        let call =
+            Confluence.token_request(&OAuthApp { client_id: "c".into(), client_secret: "s".into() }, INFO.oauth.unwrap().token_url, vec![]);
         assert_eq!(
             (call.url.as_str(), header(&call, "content-type")),
             ("https://auth.atlassian.com/oauth/token", Some("application/json"))

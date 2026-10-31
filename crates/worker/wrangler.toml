@@ -76,6 +76,7 @@ FREE_TOTAL_WRITES_PER_DAY = "1000000"
 FREE_TOTAL_STORAGE_MB = "4096"
 # Connected apps (docs/connected-apps.md): the CONNECTOR_KEY secret turns them on; `<APP>_CLIENT_ID`
 # here and the `<APP>_CLIENT_SECRET` secret let people sign in to that app, e.g. GITHUB_CLIENT_ID.
+# ATLASSIAN_CLIENT_ID covers Jira and Confluence. How to register each: docs/hosting/connected-apps.md.
 # DumbSlab's Slack app (docs/hosting/slack-app.md): its client ID here, and the SLACK_CLIENT_SECRET
 # and SLACK_SIGNING_SECRET secrets, turn on Add to Slack, Slack search and signing in with Slack:
 # SLACK_CLIENT_ID = "1234567890.1234567890"
