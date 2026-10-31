@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use dumbslab_core::connect::{self, Connectors, FETCH_TIMEOUT_SECS, HttpCall, HttpReply, MAX_REPLY_BYTES};
 use dumbslab_core::slack::{self, SharedApp};
+use dumbslab_core::sso::SharedApps;
 use futures_util::StreamExt;
 use futures_util::future::{Either, select};
 use wasm_bindgen::JsValue;
@@ -29,6 +30,17 @@ pub fn connectors(env: &Env, origin: &str, hosted: bool) -> Connectors {
 pub fn slack_app(env: &Env, origin: &str, hosted: bool) -> SharedApp {
     let callback_url = if hosted { root_callback(env, origin, slack::INSTALL_CALLBACK_PATH) } else { None };
     SharedApp { signing_secret: var(env, "SLACK_SIGNING_SECRET"), callback_url }
+}
+
+/// DumbSlab's own sign-in apps for single sign-on: the vars `SSO_GOOGLE_CLIENT_ID`,
+/// `SSO_MICROSOFT_CLIENT_ID` and `SLACK_CLIENT_ID`, and the secrets `SSO_GOOGLE_CLIENT_SECRET`,
+/// `SSO_MICROSOFT_CLIENT_SECRET` and `SLACK_CLIENT_SECRET` (see `dumbslab_core::sso::SharedApps`).
+/// Hosted workspaces send sign-ins back through the root domain's `/sso/callback`, which forwards
+/// them.
+pub fn sso_apps(env: &Env, origin: &str, hosted: bool) -> SharedApps {
+    let mut apps = SharedApps::from_vars(|name| var(env, name));
+    apps.callback_url = if hosted { root_callback(env, origin, dumbslab_core::sso::CALLBACK_PATH) } else { None };
+    apps
 }
 
 /// `https://dumbslab.com{path}` for a workspace at `https://acme.dumbslab.com`.
@@ -101,9 +113,9 @@ pub async fn send(call: &HttpCall) -> HttpReply {
     }
 }
 
-/// `GET {path}` on the root domain (`/connect/callback`, `/slack/install/callback`): an app sent
-/// someone back after they signed in. The `state` starts with their workspace's address; send them
-/// on to the same path at the workspace, which checks it.
+/// `GET {path}` on the root domain (`/connect/callback`, `/sso/callback`, `/slack/install/callback`):
+/// an app sent someone back after they signed in. The `state` starts with their workspace's
+/// address; send them on to the same path at the workspace, which checks it.
 pub fn root_callback_redirect(url: &Url, root: &str, path: &str) -> Result<Response> {
     let query = url.query().unwrap_or_default();
     let state = url.query_pairs().find(|(k, _)| k == "state").map(|(_, v)| v.into_owned()).unwrap_or_default();
@@ -112,7 +124,7 @@ pub fn root_callback_redirect(url: &Url, root: &str, path: &str) -> Result<Respo
         return crate::sql::error_response(
             400,
             "bad_request",
-            "That sign-in link doesn't name a workspace. Start connecting again from your workspace.",
+            "That sign-in link doesn't name a workspace. Start again from your workspace.",
         );
     }
     let port = url.port().map(|p| format!(":{p}")).unwrap_or_default();

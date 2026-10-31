@@ -1,8 +1,6 @@
 # DumbSlab's Slack app (for operators)
 
-One Slack app serves every workspace on your server. With it, an admin clicks **Add to Slack** in Settings › Slack, approves in Slack, and is done (see [docs/slack.md](../slack.md)). The same app also lets people search Slack from DumbSlab ([connected apps](../connected-apps.md)) and sign in with Slack ([single sign-on](../sso.md)).
-
-Signing in with Slack through this app needs the shared sign-in feature ([docs/hosting/sign-in-apps.md](sign-in-apps.md)). That is what answers the manifest's `/sso/callback` redirect URL on the root domain.
+One Slack app serves every workspace on your server. With it, an admin clicks **Add to Slack** in Settings › Slack, approves in Slack, and is done (see [docs/slack.md](../slack.md)). The same app also lets people search Slack from DumbSlab ([connected apps](../connected-apps.md)) and sign in with Slack ([single sign-on](../sso.md); operator notes in [sign-in apps](sign-in-apps.md#slack)).
 
 Without it, admins can still connect their own Slack app by hand.
 

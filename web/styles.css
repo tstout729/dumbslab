@@ -1206,6 +1206,9 @@ a.stat:hover { background: var(--bg-hover); text-decoration: none; }
 .import-list { margin: 4px 0 6px; padding-left: 22px; display: flex; flex-direction: column; gap: 3px; font-size: 13.5px; color: var(--ink-2); overflow-wrap: anywhere; }
 .import-list code { font-size: 12.5px; }
 .import-details summary { font-size: 14px; font-weight: 600; }
+/* Settings › Single sign-on: the other ways to set it up. */
+.sso-more > summary { cursor: pointer; padding: 4px 0; font-size: 14px; font-weight: 600; }
+.sso-more > * + * { margin-top: 12px; }
 @media (max-width: 640px) {
   .import-sources { grid-template-columns: minmax(0, 1fr); }
   .import-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }

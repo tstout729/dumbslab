@@ -64,6 +64,9 @@ pub struct HostConfig {
     pub connectors: connect::Connectors,
     /// The host's own Slack app, which admins add with one click (see [`slack::SharedApp`]).
     pub slack: slack::SharedApp,
+    /// The host's own Google, Microsoft and Slack sign-in apps, so admins set up single sign-on by
+    /// signing in (see [`sso::SharedApps`]). None by default.
+    pub sso_apps: sso::SharedApps,
     /// The web app's session recordings and error reports. Off unless the host configures them.
     pub telemetry: telemetry::Telemetry,
 }

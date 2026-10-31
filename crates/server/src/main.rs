@@ -17,6 +17,7 @@ use dumbslab_core::connect::{self, Connectors, HttpCall, HttpReply};
 use dumbslab_core::db::DbExt;
 use dumbslab_core::mcp::Toolset;
 use dumbslab_core::registry::registry;
+use dumbslab_core::sso::SharedApps;
 use dumbslab_core::telemetry::Telemetry;
 use dumbslab_core::{Effect, HostConfig, Outcome, Request, WebhookDelivery, params};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -43,6 +44,13 @@ fn connectors_from_env() -> Connectors {
 fn slack_from_env() -> dumbslab_core::slack::SharedApp {
     let signing_secret = std::env::var("DUMBSLAB_SLACK_SIGNING_SECRET").ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
     dumbslab_core::slack::SharedApp { signing_secret, callback_url: None }
+}
+
+/// This server's own sign-in apps for single sign-on: `DUMBSLAB_SSO_GOOGLE_CLIENT_ID` /
+/// `_SECRET`, `DUMBSLAB_SSO_MICROSOFT_CLIENT_ID` / `_SECRET` and `DUMBSLAB_SLACK_CLIENT_ID` /
+/// `_SECRET` (see `dumbslab_core::sso::SharedApps`). Their redirect URI is `<public URL>/sso/callback`.
+fn sso_apps_from_env() -> SharedApps {
+    SharedApps::from_vars(|k| std::env::var(format!("DUMBSLAB_{k}")).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty()))
 }
 
 #[derive(Parser)]
@@ -218,6 +226,7 @@ fn local_config(base_url: Option<String>) -> HostConfig {
         base_url: base_url.map(|u| u.trim_end_matches('/').to_string()),
         connectors: connectors_from_env(),
         slack: slack_from_env(),
+        sso_apps: sso_apps_from_env(),
         ..Default::default()
     }
 }
@@ -354,6 +363,7 @@ async fn serve(
         telemetry,
         connectors: connectors_from_env(),
         slack: slack_from_env(),
+        sso_apps: sso_apps_from_env(),
         ..Default::default()
     };
     let app = App::new(store, cfg, allow_private_webhooks);

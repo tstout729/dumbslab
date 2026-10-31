@@ -207,6 +207,8 @@ async fn root_site(req: Request, env: &Env, root: &str, path: &str) -> Result<Re
         (Method::Post, "/api/signup") => signup(req, env, root).await,
         (Method::Get, "/api/plans") => billing::offer(env),
         (Method::Get, "/connect/callback") => connect::root_callback_redirect(&req.url()?, root, "/connect/callback"),
+        // Single sign-on with DumbSlab's own apps: every workspace's sign-ins come back here.
+        (Method::Get, "/sso/callback") => connect::root_callback_redirect(&req.url()?, root, dumbslab_core::sso::CALLBACK_PATH),
         // DumbSlab's own Slack app (Add to Slack): sign-ins come back here, and Slack sends every
         // Slack workspace's commands and events here.
         (Method::Get, slack::INSTALL_CALLBACK_PATH) => connect::root_callback_redirect(&req.url()?, root, slack::INSTALL_CALLBACK_PATH),
