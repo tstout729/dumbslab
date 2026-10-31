@@ -303,7 +303,7 @@ impl Workspace {
     /// [`drive_job`]).
     async fn run_job(&self, job: Job, cfg: &HostConfig) -> Result<Finish> {
         let (finish, effects, written) = drive_job(&self.state, job, cfg).await?;
-        send_webhooks(&self.state, effects);
+        send_effects(&self.state, &self.env, cfg, effects);
         if let Some(h) = cfg.hosting.as_ref().filter(|_| written > 0) {
             self.report_usage(&h.home, false);
         }
@@ -317,13 +317,14 @@ impl Workspace {
         // The object's state outlives this request; the job holds its own handle to it.
         let raw: &JsValue = self.state.as_raw().as_ref();
         let state = State::from(raw.clone().unchecked_into::<worker::worker_sys::DurableObjectState>());
+        let env = self.env.clone();
         self.state.wait_until(async move {
             match drive_job(&state, job, &cfg).await {
                 Ok((finish, effects, _)) => {
                     if let Finish::Fail(e) = finish {
                         console_warn!("a background job failed: {} ({})", e.message, e.code);
                     }
-                    send_webhooks(&state, effects);
+                    send_effects(&state, &env, &cfg, effects);
                 }
                 Err(e) => console_error!("a background job failed: {e}"),
             }
@@ -496,6 +497,7 @@ impl DurableObject for Workspace {
             workspace: workspace.clone(),
             hosting,
             connectors: crate::connect::connectors(&self.env, &origin, multi),
+            github_app: crate::connect::github_app(&self.env),
             // Session recordings and browser error reports; off unless these are set.
             telemetry: Telemetry::new(
                 var(&self.env, "QUILL_HOST").as_deref(),
@@ -594,7 +596,7 @@ impl DurableObject for Workspace {
 
         // The request's own webhooks, once each, and the jobs that run after the response.
         let (later, effects): (Vec<Effect>, Vec<Effect>) = effects.into_iter().partition(|e| matches!(e, Effect::Background(_)));
-        send_webhooks(&self.state, effects);
+        send_effects(&self.state, &self.env, &move_cfg, effects);
         for effect in later {
             if let Effect::Background(job) = effect {
                 self.run_job_later(job, move_cfg.clone());
@@ -672,6 +674,27 @@ async fn drive_job(state: &State, mut job: Job, cfg: &HostConfig) -> Result<(Fin
 async fn notify_failure(notice: Option<HttpCall>) {
     if let Some(call) = notice {
         crate::connect::send(&call).await;
+    }
+}
+
+/// Sends what a request or job left for after it: webhook deliveries, and (hosted workspaces) the
+/// GitHub App installations to record in the directory, so the root domain forwards their
+/// deliveries here. Best effort.
+fn send_effects(state: &State, env: &Env, cfg: &HostConfig, effects: Vec<Effect>) {
+    let (links, rest): (Vec<Effect>, Vec<Effect>) = effects.into_iter().partition(|e| matches!(e, Effect::GitHubInstallation(_)));
+    send_webhooks(state, rest);
+    let Some(home) = cfg.hosting.as_ref().map(|h| h.home.clone()) else { return };
+    for effect in links {
+        let Effect::GitHubInstallation(link) = effect else { continue };
+        let (env, home) = (env.clone(), home.clone());
+        state.wait_until(async move {
+            let body = json!({ "installation_id": link.installation_id, "home": home, "linked": link.linked });
+            match call_object(&env, "DIRECTORY", "directory", Method::Post, "/github/link", Some(&body)).await {
+                Ok((200, _)) => {}
+                Ok((status, reply)) => console_warn!("the directory didn't record a GitHub App installation ({status}): {reply}"),
+                Err(e) => console_error!("recording a GitHub App installation failed: {e}"),
+            }
+        });
     }
 }
 

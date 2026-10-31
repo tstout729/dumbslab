@@ -184,6 +184,8 @@ pub const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0008_sso.sql"),
     include_str!("migrations/0009_slack.sql"),
     include_str!("migrations/0010_sync.sql"),
+    // 0011 (Slack's shared app) is reserved for another change; this goes after it once both are in.
+    include_str!("migrations/0012_docs_sync_apps.sql"),
 ];
 
 /// Brings the schema up to date. Safe to call on every start.

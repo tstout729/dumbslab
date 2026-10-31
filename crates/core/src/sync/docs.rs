@@ -90,6 +90,30 @@ pub(crate) fn owner(source_id: &str) -> String {
     format!("docs-source:{source_id}")
 }
 
+/// Sources, with how each reads its repository (`docs_source_links`; none for a token). Add a
+/// `WHERE` on `s.` columns.
+pub(crate) const SOURCES_SQL: &str = "SELECT s.*, l.connection, l.installation_id, l.repo_id, l.disconnected
+    FROM docs_sources s LEFT JOIN docs_source_links l ON l.source_id = s.id";
+
+/// How a source reads its repository (`docs_source_links.connection`).
+#[derive(Clone, Debug, PartialEq)]
+pub enum Link {
+    /// A pasted token (none for a public repository), and a push webhook the admin added.
+    Token,
+    /// DumbSlab's GitHub App: each sync mints a token for this one repository (see
+    /// [`super::github_app`]), and the App's own webhook reports pushes.
+    GitHubApp { installation_id: i64, repo_id: i64 },
+}
+
+impl Link {
+    pub fn id(&self) -> &'static str {
+        match self {
+            Link::Token => "token",
+            Link::GitHubApp { .. } => "github_app",
+        }
+    }
+}
+
 /// A source, with its credentials.
 #[derive(Clone, Debug)]
 pub struct Source {
@@ -98,12 +122,18 @@ pub struct Source {
     pub topic_id: String,
     pub owner_id: String,
     pub cred: Credential,
+    pub link: Link,
+    /// Why it can't sync now (see [`super::github_app::disconnected_message`]).
+    pub disconnected: Option<String>,
 }
 
 impl Source {
     pub(crate) fn from_row(cfg: &HostConfig, r: &Row) -> ApiResult<Source> {
         let mut source = Source::without_credentials(r)?;
-        source.cred = super::open(cfg, &owner(&source.id), source.repo.provider.id(), &r.str("secret"))?;
+        // A GitHub App source keeps no credentials: its tokens are minted for each sync.
+        if source.link == Link::Token {
+            source.cred = super::open(cfg, &owner(&source.id), source.repo.provider.id(), &r.str("secret"))?;
+        }
         Ok(source)
     }
 
@@ -119,17 +149,24 @@ impl Source {
 
     fn without_credentials(r: &Row) -> ApiResult<Source> {
         let provider = Provider::parse(&r.str("provider")).ok_or_else(|| ApiError::internal("unknown docs sync provider"))?;
+        let link = match (r.opt_str("connection").as_deref(), r.opt_i64("installation_id"), r.opt_i64("repo_id")) {
+            (None, _, _) => Link::Token,
+            (Some("github_app"), Some(installation_id), Some(repo_id)) => Link::GitHubApp { installation_id, repo_id },
+            _ => return Err(ApiError::internal("a docs sync source's connection is incomplete")),
+        };
         Ok(Source {
             id: r.str("id"),
             repo: Repo { provider, host: r.str("host"), repo: r.str("repo"), branch: r.str("branch"), folder: r.str("folder") },
             topic_id: r.str("topic_id"),
             owner_id: r.str("owner_id"),
             cred: Credential::default(),
+            link,
+            disconnected: r.opt_str("disconnected"),
         })
     }
 
     pub(crate) fn load(db: &dyn Db, cfg: &HostConfig, id: &str) -> ApiResult<Option<Source>> {
-        match db.one("SELECT * FROM docs_sources WHERE id = ?", &params![id])? {
+        match db.one(&format!("{SOURCES_SQL} WHERE s.id = ?"), &params![id])? {
             Some(r) => Ok(Some(Source::from_row(cfg, &r)?)),
             None => Ok(None),
         }
@@ -279,6 +316,8 @@ impl DocsJob {
 #[derive(Clone, Debug)]
 enum Phase {
     Start,
+    /// GitHub App sources: waiting for this sync's installation token.
+    Minting,
     Listing,
     /// Waiting for this run's Markdown files.
     Reading(Plan),
@@ -349,10 +388,25 @@ pub(crate) fn start(db: &dyn Db, source: Source, base_url: &str, now: DateTime<U
 /// Runs a docs sync's next step (see [`crate::connect::step`]).
 pub fn step(db: &dyn Db, cfg: &HostConfig, j: &mut DocsJob, replies: Vec<HttpReply>, now: DateTime<Utc>) -> ApiResult<Step> {
     match std::mem::replace(&mut j.phase, Phase::Start) {
-        Phase::Start => {
-            j.phase = Phase::Listing;
-            Ok(Step::Fetch(j.source.repo.tree_calls(j.source.token())))
-        }
+        Phase::Start => match j.source.link {
+            Link::GitHubApp { installation_id, repo_id } => {
+                let Some(app) = super::github_app::app(cfg) else {
+                    return fail(db, j, "DumbSlab's GitHub App isn't set up on this server any more, so this folder can't sync.", now);
+                };
+                match super::github_app::token_call(app, installation_id, repo_id, now) {
+                    Ok(call) => {
+                        j.phase = Phase::Minting;
+                        Ok(Step::Fetch(vec![call]))
+                    }
+                    Err(message) => fail(db, j, &message, now),
+                }
+            }
+            Link::Token => {
+                j.phase = Phase::Listing;
+                Ok(Step::Fetch(j.source.repo.tree_calls(j.source.token())))
+            }
+        },
+        Phase::Minting => minted(db, j, &replies, now),
         Phase::Listing => listing(db, cfg, j, &replies, now),
         Phase::Reading(plan) => reading(db, cfg, j, plan, &replies, now),
         Phase::Images(plan, texts) => images(db, cfg, j, plan, texts, &replies, now),
@@ -570,6 +624,23 @@ fn set_status(ctx: &mut Ctx, post_id: &str, status: &str) -> ApiResult<bool> {
         },
     )?;
     Ok(true)
+}
+
+/// A GitHub App source's token arrived: list the folder with it. A repository renamed on GitHub
+/// keeps its id; the source follows its new name, so links point at the right place.
+fn minted(db: &dyn Db, j: &mut DocsJob, replies: &[HttpReply], now: DateTime<Utc>) -> ApiResult<Step> {
+    let Link::GitHubApp { repo_id, .. } = j.source.link else { return Err(ApiError::internal("only GitHub App sources mint tokens")) };
+    let minted = match super::github_app::read_token(&replies.first().cloned().unwrap_or_default(), repo_id) {
+        Ok(m) => m,
+        Err(message) => return fail(db, j, &message, now),
+    };
+    if let Some(name) = minted.full_name.filter(|n| *n != j.source.repo.repo) {
+        db.execute("UPDATE docs_sources SET repo = ?, updated_at = ? WHERE id = ?", &params![name.clone(), ts(now), j.source.id.clone()])?;
+        j.source.repo.repo = name;
+    }
+    j.source.cred.token = minted.token;
+    j.phase = Phase::Listing;
+    Ok(Step::Fetch(j.source.repo.tree_calls(j.source.token())))
 }
 
 /// Reads the folder's listing, works out what changed, and asks for this run's files.

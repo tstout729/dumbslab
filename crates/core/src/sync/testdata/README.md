@@ -1,0 +1,1 @@
+A throwaway RSA key made only for tests (`openssl genrsa -traditional 2048`): its PKCS#1, PKCS#8 and public forms as base64 without the PEM lines (tests add them back), and a JWT OpenSSL signed with it. It signs nothing real; never use it for an App.

@@ -62,6 +62,8 @@ pub struct HostConfig {
     pub hosting: Option<Hosting>,
     /// Connected apps (see [`connect`]): the key that encrypts credentials, and OAuth apps.
     pub connectors: connect::Connectors,
+    /// DumbSlab's own GitHub App, so docs sync needs no token (see [`sync::github_app`]).
+    pub github_app: Option<sync::github_app::GitHubApp>,
     /// The web app's session recordings and error reports. Off unless the host configures them.
     pub telemetry: telemetry::Telemetry,
 }
@@ -167,6 +169,17 @@ pub struct AddressMove {
     pub actor: auth::Actor,
 }
 
+/// Hosted workspaces only: this workspace connected (or stopped using) an installation of
+/// DumbSlab's GitHub App. The host records it in its directory, which the root domain reads to
+/// forward that installation's webhook deliveries here (see [`sync::github_app`]). Self-hosted
+/// servers get the deliveries directly and do nothing.
+#[derive(Clone, Debug, PartialEq)]
+pub struct InstallationLink {
+    pub installation_id: i64,
+    /// `false`: the workspace no longer uses it.
+    pub linked: bool,
+}
+
 #[derive(Clone, Debug)]
 pub enum Effect {
     Webhook(WebhookDelivery),
@@ -181,6 +194,8 @@ pub enum Effect {
     /// command or event is acknowledged first and handled here. Its writes count against the plan
     /// like any job's, and it delivers what [`connect::Job::take_effects`] leaves.
     Background(connect::Job),
+    /// See [`InstallationLink`]. Sent after the transaction commits, best effort.
+    GitHubInstallation(InstallationLink),
 }
 
 #[derive(Clone, Debug)]

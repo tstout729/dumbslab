@@ -24,13 +24,14 @@ pub use workspace::Workspace;
 
 use chrono::Utc;
 use dumbslab_core::http::{WORKSPACE_ROBOTS_TXT, is_core_path};
+use dumbslab_core::sync::github_app::{self, Routed};
 use dumbslab_core::tenancy::{self, HostKind};
 use dumbslab_core::util::{secure_eq, sha256_hex};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use worker::*;
 
-use crate::sql::{call_object, error_response, flag, json_response, read_body, var};
+use crate::sql::{api_error_response, call_object, error_response, flag, json_response, read_body, var};
 use crate::workspace::{ALIAS_HEADER, HOME_HEADER, WORKSPACE_HEADER};
 
 #[event(fetch)]
@@ -200,7 +201,9 @@ async fn root_site(req: Request, env: &Env, root: &str, path: &str) -> Result<Re
         (Method::Get, "/api/signup/check") => check_address(&req, env).await,
         (Method::Post, "/api/signup") => signup(req, env, root).await,
         (Method::Get, "/api/plans") => billing::offer(env),
-        (Method::Get, "/connect/callback") => connect::root_callback_redirect(&req.url()?, root),
+        (Method::Get, "/connect/callback") => connect::root_callback_redirect(&req.url()?, root, "/connect/callback"),
+        (Method::Get, github_app::CALLBACK_PATH) => connect::root_callback_redirect(&req.url()?, root, github_app::CALLBACK_PATH),
+        (Method::Post, "/hooks/github") => github_hook(req, env, root).await,
         (Method::Post, "/api/stripe/webhook") => billing::webhook(req, env).await,
         (_, p) if p.starts_with("/api/operator/") => operator(req, env, p).await,
         // Static files the sign-up page uses.
@@ -221,6 +224,60 @@ async fn root_site(req: Request, env: &Env, root: &str, path: &str) -> Result<Re
             Response::redirect(url)
         }
     }
+}
+
+/// `POST /hooks/github` on the root domain: GitHub sends every installation's deliveries for
+/// DumbSlab's GitHub App here. Once the signature checks out, each goes on unchanged to the
+/// workspaces that connected its installation (the directory knows which), and each checks it
+/// again. The core decides; this only carries.
+async fn github_hook(mut req: Request, env: &Env, root: &str) -> Result<Response> {
+    let Some(secret) = var(env, "GITHUB_APP_WEBHOOK_SECRET") else {
+        return error_response(404, "not_found", "not found");
+    };
+    let Some(body) = read_body(&mut req).await? else {
+        return error_response(413, "too_large", "request body too large");
+    };
+    let signature = req.headers().get("x-hub-signature-256")?;
+    let event = req.headers().get("x-github-event")?;
+    let installation_id = match github_app::route_delivery(&secret, signature.as_deref(), event.as_deref(), &body) {
+        Routed::Refused(e) => return api_error_response(&e),
+        Routed::Answer(v) => return json_response(200, &v),
+        Routed::Forward(id) => id,
+    };
+    let (status, found) =
+        call_object(env, "DIRECTORY", "directory", Method::Post, "/github/targets", Some(&json!({ "installation_id": installation_id })))
+            .await?;
+    if status != 200 {
+        return json_response(status, &found);
+    }
+    let targets: Vec<(String, String)> = found["workspaces"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|w| Some((w["home"].as_str()?.to_string(), w["address"].as_str()?.to_string())))
+        .filter(|(home, address)| tenancy::validate_slug(home).is_ok() && tenancy::validate_slug(address).is_ok())
+        .collect();
+    let url = req.url()?;
+    let port = url.port().map(|p| format!(":{p}")).unwrap_or_default();
+    let headers = Headers::new();
+    for name in ["content-type", "user-agent", "x-github-event", "x-github-delivery", "x-github-hook-id", "x-hub-signature-256"] {
+        if let Some(v) = req.headers().get(name)? {
+            headers.set(name, &v)?;
+        }
+    }
+    let sends = targets.iter().map(|(home, address)| {
+        let target = format!("{}://{address}.{root}{port}/hooks/github", url.scheme());
+        let (headers, body) = (headers.clone(), body.as_slice());
+        async move {
+            let mut init = RequestInit::new();
+            init.with_method(Method::Post).with_headers(headers);
+            let forwarded = Request::new_with_init(&target, &init)?;
+            send(env, &format!("ws:{home}"), &forwarded, Some(body), Some((address, home))).await.map(|r| r.status_code())
+        }
+    });
+    let delivered =
+        futures_util::future::join_all(sends).await.into_iter().filter(|r| matches!(r, Ok(s) if (200..300).contains(s))).count();
+    json_response(200, &json!({ "ok": true, "workspaces": targets.len(), "delivered": delivered }))
 }
 
 /// A plain-text file for crawlers and agents. It changes only when the Worker deploys.

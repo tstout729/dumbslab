@@ -44,6 +44,12 @@ fn connectors_from_env() -> Connectors {
     Connectors { key: var("DUMBSLAB_CONNECTOR_KEY"), apps, callback_url: None }
 }
 
+/// DumbSlab's GitHub App for docs sync, from `DUMBSLAB_GITHUB_APP_ID`, `_SLUG`, `_CLIENT_ID`,
+/// `_CLIENT_SECRET`, `_PRIVATE_KEY` and `_WEBHOOK_SECRET` (see docs/hosting/github-app.md).
+fn github_app_from_env() -> Option<dumbslab_core::sync::github_app::GitHubApp> {
+    dumbslab_core::sync::github_app::GitHubApp::from_env(|name| std::env::var(format!("DUMBSLAB_{name}")).ok())
+}
+
 #[derive(Parser)]
 #[command(name = "dumbslab", version, about = "An open-source team knowledge base for people and AI agents")]
 struct Cli {
@@ -213,7 +219,12 @@ fn local_actor(store: &Store, user: Option<&str>, via: Via) -> anyhow::Result<Ac
 
 /// Settings for commands that act on the database directly (`call`, `mcp`).
 fn local_config(base_url: Option<String>) -> HostConfig {
-    HostConfig { base_url: base_url.map(|u| u.trim_end_matches('/').to_string()), connectors: connectors_from_env(), ..Default::default() }
+    HostConfig {
+        base_url: base_url.map(|u| u.trim_end_matches('/').to_string()),
+        connectors: connectors_from_env(),
+        github_app: github_app_from_env(),
+        ..Default::default()
+    }
 }
 
 async fn call(
@@ -347,6 +358,7 @@ async fn serve(
         open_setup,
         telemetry,
         connectors: connectors_from_env(),
+        github_app: github_app_from_env(),
         ..Default::default()
     };
     let app = App::new(store, cfg, allow_private_webhooks);
@@ -470,8 +482,9 @@ fn deliver(app: Arc<App>, effects: Vec<Effect>) -> Vec<oneshot::Receiver<()>> {
             });
             None
         }
-        // Jobs for connected apps ran before the response was sent.
-        Effect::MoveAddress(_) | Effect::Stripe(_) | Effect::Connect(_) => None,
+        // Jobs for connected apps ran before the response was sent. This server gets its GitHub
+        // App's deliveries directly, so it has no directory to tell about installations.
+        Effect::MoveAddress(_) | Effect::Stripe(_) | Effect::Connect(_) | Effect::GitHubInstallation(_) => None,
     }) {
         let mut queues = app.webhooks.lock().unwrap_or_else(|e| e.into_inner());
         let queue = queues.entry(d.webhook_id.clone()).or_insert_with(|| webhook_queue(&app));

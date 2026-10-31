@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use dumbslab_core::connect::{self, Connectors, FETCH_TIMEOUT_SECS, HttpCall, HttpReply, MAX_REPLY_BYTES, OAuthApp};
+use dumbslab_core::sync::github_app::GitHubApp;
 use futures_util::StreamExt;
 use futures_util::future::{Either, select};
 use wasm_bindgen::JsValue;
@@ -27,6 +28,13 @@ pub fn connectors(env: &Env, origin: &str, hosted: bool) -> Connectors {
     }
     let callback_url = if hosted { root_callback(env, origin) } else { None };
     Connectors { key: var(env, "CONNECTOR_KEY"), apps, callback_url }
+}
+
+/// DumbSlab's GitHub App for docs sync: `GITHUB_APP_ID`, `GITHUB_APP_SLUG` and
+/// `GITHUB_APP_CLIENT_ID` in `[vars]`, and the secrets `GITHUB_APP_CLIENT_SECRET`,
+/// `GITHUB_APP_PRIVATE_KEY` and `GITHUB_APP_WEBHOOK_SECRET` (see docs/hosting/github-app.md).
+pub fn github_app(env: &Env) -> Option<GitHubApp> {
+    GitHubApp::from_env(|name| var(env, name))
 }
 
 /// `https://dumbslab.com/connect/callback` for a workspace at `https://acme.dumbslab.com`.
@@ -81,9 +89,10 @@ pub async fn send(call: &HttpCall) -> HttpReply {
     }
 }
 
-/// `GET /connect/callback` on the root domain: an app sent someone back after they signed in. The
-/// `state` starts with their workspace's address; send them on to the workspace, which checks it.
-pub fn root_callback_redirect(url: &Url, root: &str) -> Result<Response> {
+/// `GET <path>` on the root domain (`/connect/callback`, `/sync/github/callback`): an app sent
+/// someone back after they signed in. The `state` starts with their workspace's address; send them
+/// on to the same path at the workspace, which checks it.
+pub fn root_callback_redirect(url: &Url, root: &str, path: &str) -> Result<Response> {
     let query = url.query().unwrap_or_default();
     let state = url.query_pairs().find(|(k, _)| k == "state").map(|(_, v)| v.into_owned()).unwrap_or_default();
     let address = state.split_once('.').map(|(a, _)| a).unwrap_or_default();
@@ -95,7 +104,7 @@ pub fn root_callback_redirect(url: &Url, root: &str) -> Result<Response> {
         );
     }
     let port = url.port().map(|p| format!(":{p}")).unwrap_or_default();
-    let target = Url::parse(&format!("{}://{address}.{root}{port}/connect/callback?{query}", url.scheme()))?;
+    let target = Url::parse(&format!("{}://{address}.{root}{port}{path}?{query}", url.scheme()))?;
     // Built with all its headers: a `Response::redirect`'s headers can't be changed afterwards.
     let headers = Headers::new();
     headers.set("location", target.as_str())?;

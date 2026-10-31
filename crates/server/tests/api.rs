@@ -1151,6 +1151,67 @@ fn directory_moves_addresses() {
 // ---------------------------------------------------------------------------
 // Security review regressions (October 2026).
 
+#[test]
+fn directory_forwards_github_installations_to_the_workspaces_that_connected_them() {
+    use chrono::Utc;
+    use dumbslab_core::tenancy::{self, Limits};
+    let h = H::new();
+    let limits = Limits { per_ip_per_day: 50, per_day: 50, max_workspaces: 50, free: ROOMY };
+    let now = Utc::now();
+    let run = |f: &dyn Fn(&dyn dumbslab_core::Db) -> dumbslab_core::ApiResult<()>| {
+        h.store
+            .with_tx(|db| {
+                let r = f(db);
+                let ok = r.is_ok();
+                (r, ok)
+            })
+            .unwrap()
+    };
+    let link = |id: i64, home: &'static str, linked: bool| run(&move |db| tenancy::link_installation(db, id, home, linked, now));
+    let targets = |id: i64| h.store.with_tx(|db| (tenancy::installation_targets(db, id), true)).unwrap().unwrap();
+    let pair = |home: &str, address: &str| (home.to_string(), address.to_string());
+    run(&|db| tenancy::directory_migrate(db)).unwrap();
+    for slug in ["acme", "beta", "gamma"] {
+        run(&move |db| tenancy::reserve(db, slug, "Name", "ip", now, limits).map(|_| ())).unwrap();
+        run(&move |db| tenancy::activate(db, slug, now)).unwrap();
+    }
+    run(&|db| tenancy::reserve(db, "pending", "Name", "ip", now, limits).map(|_| ())).unwrap();
+
+    // One installation can serve several workspaces; linking twice changes nothing.
+    link(42, "acme", true).unwrap();
+    link(42, "acme", true).unwrap();
+    link(42, "beta", true).unwrap();
+    link(7, "gamma", true).unwrap();
+    assert_eq!(targets(42), vec![pair("acme", "acme"), pair("beta", "beta")]);
+    assert_eq!(targets(99), vec![], "nobody connected it");
+    assert_eq!(link(42, "pending", true).unwrap_err().status, 404, "only set-up workspaces");
+    assert_eq!(link(0, "acme", true).unwrap_err().status, 400);
+    assert_eq!(link(5, "../x", true).unwrap_err().status, 400);
+
+    // Deliveries go to the workspace's current address, and not to a disabled one.
+    run(&|db| tenancy::move_address(db, "acme", "acme-wiki", now)).unwrap();
+    assert_eq!(targets(42), vec![pair("acme", "acme-wiki"), pair("beta", "beta")]);
+    run(&|db| tenancy::set_status(db, "beta", "disabled")).unwrap();
+    assert_eq!(targets(42), vec![pair("acme", "acme-wiki")]);
+
+    // Stopping, and deleting a workspace, remove its links.
+    link(42, "acme", false).unwrap();
+    assert_eq!(targets(42), vec![]);
+    run(&|db| tenancy::remove(db, "gamma")).unwrap();
+    assert_eq!(targets(7), vec![]);
+
+    // At most so many workspaces per installation: each delivery wakes them all.
+    for i in 0..tenancy::MAX_WORKSPACES_PER_INSTALLATION {
+        let slug: &'static str = Box::leak(format!("ws-{i:02}").into_boxed_str());
+        run(&move |db| tenancy::reserve(db, slug, "Name", "ip", now, limits).map(|_| ())).unwrap();
+        run(&move |db| tenancy::activate(db, slug, now)).unwrap();
+        link(8, slug, true).unwrap();
+    }
+    run(&|db| tenancy::reserve(db, "late", "Name", "ip", now, Limits { max_workspaces: 100, ..limits }).map(|_| ())).unwrap();
+    run(&|db| tenancy::activate(db, "late", now)).unwrap();
+    assert_eq!(link(8, "late", true).unwrap_err().status, 409);
+}
+
 fn count(h: &H, sql: &str) -> i64 {
     h.store.with_tx(|db| (db.scalar_i64(sql, &[]), true)).unwrap().unwrap()
 }
@@ -4839,7 +4900,13 @@ mod syncs {
     }
 
     /// Runs a job like a host: at most MAX_STEPS steps, each in its own transaction.
-    fn drive(h: &H, mut job: Job, answer: &dyn Fn(&HttpCall) -> HttpReply) -> (Finish, Vec<HttpCall>) {
+    fn drive(h: &H, job: Job, answer: &dyn Fn(&HttpCall) -> HttpReply) -> (Finish, Vec<HttpCall>) {
+        let (finish, sent, _) = drive_all(h, job, answer);
+        (finish, sent)
+    }
+
+    /// Like [`drive`], with the effects the job left for the host.
+    fn drive_all(h: &H, mut job: Job, answer: &dyn Fn(&HttpCall) -> HttpReply) -> (Finish, Vec<HttpCall>, Vec<Effect>) {
         let mut replies = vec![];
         let mut sent = vec![];
         for _ in 0..connect::MAX_STEPS {
@@ -4853,7 +4920,7 @@ mod syncs {
                 .unwrap();
             job = next;
             match step.unwrap() {
-                Step::Done(f) => return (f, sent),
+                Step::Done(f) => return (f, sent, job.take_effects()),
                 Step::Fetch(calls) => {
                     replies = calls.iter().map(answer).collect();
                     sent.extend(calls);
@@ -5999,5 +6066,349 @@ mod syncs {
         lab.put("big-00.md", b"# Big 0, smaller now\n");
         let (v, read) = sync();
         assert_eq!((v["created"].as_i64(), read), (Some(1), 1), "{v}");
+    }
+
+    // -----------------------------------------------------------------------
+    // Docs through DumbSlab's GitHub App
+
+    /// The throwaway key in the core's test data, with its PEM lines put back.
+    fn app_key() -> String {
+        let body = include_str!("../../core/src/sync/testdata/github-app-test-key.b64");
+        format!("-----BEGIN RSA PRIVATE KEY-----\n{}\n-----END RSA PRIVATE KEY-----\n", body.trim())
+    }
+
+    fn with_app(h: &mut H) {
+        h.cfg.github_app = Some(dumbslab_core::sync::github_app::GitHubApp {
+            app_id: "123".into(),
+            slug: "dumbslab-test".into(),
+            client_id: "Iv23liTEST".into(),
+            client_secret: "gh-client-secret".into(),
+            private_key: app_key(),
+            webhook_secret: "gh-hook-secret".into(),
+        });
+    }
+
+    fn location(r: &Res) -> String {
+        assert_eq!(r.status, 302, "{} {}", r.status, r.body);
+        r.header("location").unwrap().to_string()
+    }
+
+    /// Starts Connect GitHub in `who`'s browser session and returns the state GitHub hands back.
+    fn start_install(h: &H, who: &Auth) -> String {
+        let to = location(&h.raw("GET", "/sync/github/install", vec![], "", who));
+        let state = to.strip_prefix("https://github.com/apps/dumbslab-test/installations/new?state=").unwrap_or_else(|| panic!("{to}"));
+        urlencoding::decode(state).unwrap().into_owned()
+    }
+
+    fn callback(h: &H, who: &Auth, query: &str) -> Res {
+        h.raw("GET", &format!("/sync/github/callback?{query}"), vec![], "", who)
+    }
+
+    /// GitHub, for the installer `ghu_admin`: they can access installation 42 (acme), whose
+    /// repositories they can read are acme/docs and acme/site, and installation 43 once reinstalled.
+    fn installer(call: &HttpCall) -> HttpReply {
+        if call.url == "https://github.com/login/oauth/access_token" {
+            let body = call.body.clone().unwrap_or_default();
+            assert!(body.contains("client_id=Iv23liTEST") && body.contains("client_secret=gh-client-secret"), "{body}");
+            return ok(json!({ "access_token": "ghu_admin", "token_type": "bearer" }));
+        }
+        assert!(call.headers.contains(&("authorization".into(), "Bearer ghu_admin".into())), "{call:?} uses the installer's token");
+        if call.url == "https://api.github.com/user/installations?per_page=100" {
+            return ok(json!({ "total_count": 2, "installations": [
+                { "id": 42, "account": { "login": "acme", "type": "Organization" }, "target_type": "Organization", "suspended_at": null },
+                { "id": 43, "account": { "login": "acme", "type": "Organization" }, "target_type": "Organization", "suspended_at": null },
+            ] }));
+        }
+        for id in ["42", "43"] {
+            if call.url == format!("https://api.github.com/user/installations/{id}/repositories?per_page=100&page=1") {
+                return ok(json!({ "total_count": 2, "repositories": [
+                    { "id": 7, "full_name": "acme/docs", "default_branch": "main", "private": true },
+                    { "id": 8, "full_name": "acme/site", "default_branch": "trunk", "private": false },
+                ] }));
+            }
+        }
+        ok(json!({ "total_count": 2, "repositories": [] }))
+    }
+
+    fn redirect_of(finish: Finish) -> String {
+        match finish {
+            Finish::Redirect(url) => url,
+            other => panic!("expected a redirect, got {other:?}"),
+        }
+    }
+
+    fn background(r: &Res) -> Vec<Job> {
+        r.effects
+            .iter()
+            .filter_map(|e| match e {
+                Effect::Background(j) => Some(j.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn links(effects: &[Effect]) -> Vec<(i64, bool)> {
+        effects
+            .iter()
+            .filter_map(|e| match e {
+                Effect::GitHubInstallation(l) => Some((l.installation_id, l.linked)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A delivery from DumbSlab's GitHub App, signed with `secret`.
+    fn app_hook(h: &H, event: &str, body: &Value, secret: &str) -> Res {
+        let body = body.to_string();
+        let sig = format!("sha256={}", hmac_sha256_hex(secret, &body));
+        hook(h, "/hooks/github", &body, &[("x-github-event", event), ("x-hub-signature-256", &sig), ("x-github-delivery", "d-1")])
+    }
+
+    fn source_of(h: &H, admin: &Auth) -> Value {
+        h.ok("GET", "/api/v1/docs-sources", None, admin)["items"][0].clone()
+    }
+
+    #[test]
+    fn github_app_connects_without_tokens_and_syncs_on_push() {
+        let mut h = H::new();
+        let (admin, admin_token) = h.setup();
+        let (_, mo) = h.user(&admin, "mo@acme.test", "Mo", "member");
+        let mo_cookie = sign_in(&h, "mo@acme.test", "password123");
+        with_key(&mut h);
+
+        // Without the App, Connect GitHub says so.
+        assert_eq!(h.ok("GET", "/api/v1/docs-sources", None, &admin)["github_app"], false);
+        let to = location(&h.raw("GET", "/sync/github/install", vec![], "", &admin));
+        assert_eq!(to, "https://kb.test/settings/docs-sync?connect_error=unavailable&app=github");
+        with_app(&mut h);
+        assert_eq!(h.ok("GET", "/api/v1/docs-sources", None, &admin)["github_app"], true);
+
+        // Only an admin, in their own browser session, starts it.
+        let to = location(&h.raw("GET", "/sync/github/install", vec![], "", &mo_cookie));
+        assert!(to.ends_with("connect_error=not_admin&app=github"), "{to}");
+        let to = location(&h.raw("GET", "/sync/github/install", vec![], "", &admin_token));
+        assert!(to.ends_with("connect_error=wrong_person&app=github"), "a token has no browser session: {to}");
+        assert!(
+            location(&h.raw("GET", "/sync/github/install", vec![], "", &Auth::None)).ends_with("connect_error=wrong_person&app=github")
+        );
+
+        // The state works once, for the session that started it.
+        assert!(location(&callback(&h, &admin, "state=nope&code=c&installation_id=42")).ends_with("connect_error=expired_link&app=github"));
+        let state = start_install(&h, &admin);
+        let stored =
+            count(&h, &format!("SELECT COUNT(*) FROM docs_connect_requests WHERE state_hash = '{}'", hex(&Sha256::digest(&state))));
+        assert_eq!(stored, 1, "kept hashed");
+        let other_session = sign_in(&h, "ada@acme.test", "correct horse");
+        let q = format!("state={}&code=c&installation_id=42&setup_action=install", urlencoding::encode(&state));
+        assert!(location(&callback(&h, &other_session, &q)).ends_with("connect_error=wrong_person&app=github"));
+        assert!(location(&callback(&h, &admin, &q)).ends_with("connect_error=expired_link&app=github"), "used up");
+        let state = start_install(&h, &admin);
+        let r = callback(&h, &admin, &format!("state={}&setup_action=request", urlencoding::encode(&state)));
+        assert!(location(&r).ends_with("connect_error=approval_requested&app=github"));
+        let state = start_install(&h, &admin);
+        assert!(
+            location(&callback(&h, &admin, &format!("state={}&error=access_denied", urlencoding::encode(&state))))
+                .ends_with("connect_error=declined&app=github")
+        );
+
+        // A forged installation id: GitHub doesn't list it for the installer, so it's refused.
+        let state = start_install(&h, &admin);
+        let r = callback(&h, &admin, &format!("state={}&code=c&installation_id=99&setup_action=install", urlencoding::encode(&state)));
+        assert!(location(&r).ends_with("connect_error=failed&app=github"), "while the job runs, failing is the default");
+        let (finish, _) = drive(&h, job_of(&r), &installer);
+        assert_eq!(redirect_of(finish), "https://kb.test/settings/docs-sync?connect_error=not_yours&app=github");
+        assert_eq!(count(&h, "SELECT COUNT(*) FROM github_installations"), 0);
+
+        // The real one: installed, checked against the installer's own account, saved.
+        let state = start_install(&h, &admin);
+        let r = callback(&h, &admin, &format!("state={}&code=c&installation_id=42&setup_action=install", urlencoding::encode(&state)));
+        let (finish, sent, effects) = drive_all(&h, job_of(&r), &installer);
+        assert_eq!(redirect_of(finish), "https://kb.test/settings/docs-sync?connected=github");
+        assert_eq!(sent.len(), 2 + dumbslab_core::sync::github_app::REPO_PAGES, "a code, the installations, and pages of repositories");
+        // The job leaves the directory link for the host (hosted workspaces forward deliveries by it).
+        assert_eq!(links(&effects), vec![(42, true)]);
+        let repos = h.ok("GET", "/api/v1/docs-sources/github", None, &admin);
+        assert_eq!(repos["available"], true);
+        assert_eq!(repos["connect_url"], "https://kb.test/sync/github/install");
+        let inst = &repos["installations"][0];
+        assert_eq!((inst["installation_id"].as_i64(), inst["account"].as_str()), (Some(42), Some("acme")));
+        let names: Vec<&str> = inst["repositories"].as_array().unwrap().iter().map(|r| r["full_name"].as_str().unwrap()).collect();
+        assert_eq!(names, vec!["acme/docs", "acme/site"]);
+        assert_eq!(h.call("GET", "/api/v1/docs-sources/github", None, &mo).status, 403, "admins only");
+        assert!(!h.ok("GET", "/api/v1/activity", None, &admin).to_string().contains("ghu_admin"), "the installer's token is never kept");
+        assert_eq!(count(&h, "SELECT COUNT(*) FROM activity WHERE event = 'github.connected'"), 1);
+
+        // Adding a folder: only a repository the admin's account can read there, and no token.
+        let topic = h.ok("POST", "/api/v1/topics", Some(json!({ "name": "Handbook" })), &admin)["id"].as_str().unwrap().to_string();
+        let input =
+            json!({ "provider": "github", "installation_id": 42, "repository": "acme/docs", "folder": "handbook", "topic_id": topic });
+        let refused = |change: Value| {
+            let mut i = input.clone();
+            i.as_object_mut().unwrap().extend(change.as_object().unwrap().clone());
+            h.call("POST", "/api/v1/docs-sources", Some(i), &admin).status
+        };
+        assert_eq!(refused(json!({ "repository": "acme/secret" })), 404, "not one the admin showed they can read");
+        assert_eq!(refused(json!({ "installation_id": 77 })), 404, "an installation nobody here connected");
+        assert_eq!(refused(json!({ "token": "ghp_x" })), 400);
+        assert_eq!(refused(json!({ "provider": "gitlab", "repository": "acme/docs" })), 400);
+        assert_eq!(h.call("POST", "/api/v1/docs-sources", Some(input.clone()), &mo).status, 403);
+        let created = h.call("POST", "/api/v1/docs-sources", Some(input.clone()), &admin);
+        assert_eq!(created.status, 200, "{}", created.body);
+        assert_eq!(links(&created.effects), vec![(42, true)], "the directory link is asked for again");
+        let c = &created.body;
+        assert_eq!((c["webhook_secret"].clone(), c["source"]["webhook_url"].clone()), (Value::Null, Value::Null), "no webhook to add");
+        assert_eq!((c["source"]["connection"].as_str(), c["source"]["installation_id"].as_i64()), (Some("github_app"), Some(42)));
+        assert_eq!((c["source"]["branch"].as_str(), c["source"]["has_token"].as_bool()), (Some("main"), Some(false)));
+        let source = c["source"]["id"].as_str().unwrap().to_string();
+        assert_eq!(h.call("POST", "/api/v1/docs-sources", Some(input), &admin).status, 409, "the same folder twice");
+        let site = json!({ "provider": "github", "installation_id": 42, "repository": "ACME/site", "topic_id": topic });
+        let site = h.ok("POST", "/api/v1/docs-sources", Some(site), &admin);
+        assert_eq!(
+            (site["source"]["repository"].as_str(), site["source"]["branch"].as_str()),
+            (Some("acme/site"), Some("trunk")),
+            "the default branch"
+        );
+        h.ok("DELETE", &format!("/api/v1/docs-sources/{}", site["source"]["id"].as_str().unwrap()), None, &admin);
+
+        // Each sync mints a token that reads only this repository, then syncs with it.
+        let repo = Repo::new(&[("README.md", b"# Handbook\n\nHello.\n"), ("guide.md", b"# Guide\n")]);
+        let minted = RefCell::new(vec![]);
+        let github = |c: &HttpCall| -> HttpReply {
+            if c.url == "https://api.github.com/app/installations/42/access_tokens" {
+                minted.borrow_mut().push(c.clone());
+                return HttpReply {
+                    status: 201,
+                    body: json!({ "token": "ghs_installation", "expires_at": "2099-01-01T00:00:00Z",
+                                  "repositories": [{ "id": 7, "full_name": "acme/docs" }] })
+                    .to_string(),
+                };
+            }
+            assert!(c.headers.contains(&("authorization".into(), "Bearer ghs_installation".into())), "{c:?}");
+            repo.github(c)
+        };
+        let r = h.call("POST", &format!("/api/v1/docs-sources/{source}/sync"), None, &admin);
+        let (finish, sent) = drive(&h, job_of(&r), &github);
+        let v = filled(finish);
+        assert_eq!((v["created"].as_i64(), v["done"].as_bool()), (Some(2), Some(true)), "{v}");
+        assert_eq!(sent[0].url, "https://api.github.com/app/installations/42/access_tokens");
+        let mint = minted.borrow()[0].clone();
+        assert_eq!(
+            serde_json::from_str::<Value>(mint.body.as_deref().unwrap()).unwrap(),
+            json!({ "repository_ids": [7], "permissions": { "contents": "read" } })
+        );
+        let jwt = mint.headers.iter().find(|(k, _)| k == "authorization").unwrap().1.strip_prefix("Bearer ").unwrap().to_string();
+        let claims: Value =
+            serde_json::from_slice(&base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(jwt.split('.').nth(1).unwrap()).unwrap())
+                .unwrap();
+        let now = chrono::Utc::now().timestamp();
+        assert_eq!(claims["iss"], "Iv23liTEST");
+        assert!(
+            (now - 70..=now - 50).contains(&claims["iat"].as_i64().unwrap()) && claims["exp"].as_i64().unwrap() <= now + 600,
+            "{claims}"
+        );
+        assert_eq!(count(&h, "SELECT COUNT(*) FROM docs_sources WHERE secret LIKE '%ghs_%'"), 0, "tokens aren't kept");
+        assert_eq!(post(&h, &doc_ids(&h)["README.md"], &mo)["title"], "Handbook");
+
+        // No token or webhook secret to change; the branch can.
+        for change in [json!({ "token": "ghp_x" }), json!({ "new_webhook_secret": true })] {
+            assert_eq!(h.call("PATCH", &format!("/api/v1/docs-sources/{source}"), Some(change), &admin).status, 400);
+        }
+        h.ok("PATCH", &format!("/api/v1/docs-sources/{source}"), Some(json!({ "branch": "main" })), &admin);
+        // Its own per-source webhook has no secret, so nothing can sign for it.
+        let push = json!({ "ref": "refs/heads/main" }).to_string();
+        let empty = format!("sha256={}", hmac_sha256_hex("", &push));
+        assert_eq!(
+            hook(&h, &format!("/hooks/docs/{source}"), &push, &[("x-github-event", "push"), ("x-hub-signature-256", &empty)]).status,
+            401
+        );
+
+        // The App's webhook: signed with the App's secret, for installations connected here.
+        let push = |installation: i64, repo_id: i64, branch: &str, name: &str| json!({ "ref": format!("refs/heads/{branch}"), "repository": { "id": repo_id, "full_name": name }, "installation": { "id": installation } });
+        assert_eq!(app_hook(&h, "push", &push(42, 7, "main", "acme/docs"), "wrong").status, 401);
+        assert_eq!(app_hook(&h, "ping", &json!({ "zen": "hi" }), "gh-hook-secret").body["status"], "pong");
+        for (body, why) in [
+            (push(77, 7, "main", "acme/docs"), "an installation nobody here connected"),
+            (push(42, 8, "main", "acme/site"), "a repository no source syncs"),
+            (push(42, 7, "feature", "acme/docs"), "another branch"),
+        ] {
+            let r = app_hook(&h, "push", &body, "gh-hook-secret");
+            assert_eq!((r.status, r.body["status"].as_str(), r.effects.len()), (200, Some("ignored"), 0), "{why}: {}", r.body);
+        }
+        repo.put("guide.md", b"# Guide\n\nNew steps.\n");
+        let r = app_hook(&h, "push", &push(42, 7, "main", "acme/docs"), "gh-hook-secret");
+        assert_eq!((r.status, r.body["status"].as_str()), (200, Some("started")), "{}", r.body);
+        let jobs = background(&r);
+        assert_eq!(jobs.len(), 1, "the sync runs after the answer");
+        let v = filled(drive(&h, jobs[0].clone(), &github).0);
+        assert_eq!(v["updated"], 1, "{v}");
+        // A second push while a sync runs is noted.
+        let running = background(&app_hook(&h, "push", &push(42, 7, "main", "acme/docs"), "gh-hook-secret"));
+        let r = app_hook(&h, "push", &push(42, 7, "main", "acme/docs"), "gh-hook-secret");
+        assert!(background(&r).is_empty());
+        drive(&h, running[0].clone(), &github);
+        assert_eq!(source_of(&h, &admin)["pending"], true);
+
+        // A repository taken out of the App: the source waits, its posts stay.
+        let removed =
+            json!({ "action": "removed", "installation": { "id": 42 }, "repositories_removed": [{ "id": 7, "full_name": "acme/docs" }] });
+        assert_eq!(app_hook(&h, "installation_repositories", &removed, "gh-hook-secret").body["status"], "updated");
+        let s = source_of(&h, &admin);
+        assert!(s["disconnected"].as_str().unwrap().contains("taken out"), "{s}");
+        let r = h.call("POST", &format!("/api/v1/docs-sources/{source}/sync"), None, &admin);
+        assert_eq!((r.status, r.body["error"]["code"].as_str()), (409, Some("disconnected")));
+        assert!(background(&app_hook(&h, "push", &push(42, 7, "main", "acme/docs"), "gh-hook-secret")).is_empty());
+        let listed = h.ok("GET", "/api/v1/docs-sources/github", None, &admin);
+        assert_eq!(listed["installations"][0]["repositories"].as_array().unwrap().len(), 1, "no longer offered");
+        let added = json!({ "action": "added", "installation": { "id": 42 }, "repositories_added": [{ "id": 7, "full_name": "acme/docs" }, { "id": 9, "full_name": "acme/new" }] });
+        app_hook(&h, "installation_repositories", &added, "gh-hook-secret");
+        assert_eq!(source_of(&h, &admin)["disconnected"], Value::Null, "back");
+        let listed = h.ok("GET", "/api/v1/docs-sources/github", None, &admin);
+        let names: Vec<&str> =
+            listed["installations"][0]["repositories"].as_array().unwrap().iter().map(|r| r["full_name"].as_str().unwrap()).collect();
+        assert_eq!(names, vec!["acme/docs", "acme/site"], "a new repository waits until an admin here shows they can read it");
+
+        // Suspended, then unsuspended.
+        let lifecycle = |action: &str| json!({ "action": action, "installation": { "id": 42, "account": { "login": "acme" } } });
+        app_hook(&h, "installation", &lifecycle("suspend"), "gh-hook-secret");
+        assert!(source_of(&h, &admin)["disconnected"].as_str().unwrap().contains("suspended"));
+        assert_eq!(h.ok("GET", "/api/v1/docs-sources/github", None, &admin)["installations"][0]["suspended"], true);
+        app_hook(&h, "installation", &lifecycle("unsuspend"), "gh-hook-secret");
+        assert_eq!(source_of(&h, &admin)["disconnected"], Value::Null);
+
+        // Uninstalled: the source waits, the installation is forgotten, nothing is deleted.
+        let posts_before = count(&h, "SELECT COUNT(*) FROM posts WHERE deleted_at IS NULL");
+        let r = app_hook(&h, "installation", &lifecycle("deleted"), "gh-hook-secret");
+        assert_eq!(links(&r.effects), vec![(42, false)], "the directory stops forwarding its deliveries here");
+        assert!(source_of(&h, &admin)["disconnected"].as_str().unwrap().contains("uninstalled"));
+        assert_eq!(count(&h, "SELECT COUNT(*) FROM github_installations"), 0);
+        assert_eq!(count(&h, "SELECT COUNT(*) FROM posts WHERE deleted_at IS NULL"), posts_before, "posts stay");
+        assert_eq!(app_hook(&h, "push", &push(42, 7, "main", "acme/docs"), "gh-hook-secret").body["status"], "ignored");
+        // Installing again (a new installation) picks the source back up.
+        let state = start_install(&h, &admin);
+        let r = callback(&h, &admin, &format!("state={}&code=c&installation_id=43&setup_action=install", urlencoding::encode(&state)));
+        drive(&h, job_of(&r), &installer);
+        let s = source_of(&h, &admin);
+        assert_eq!((s["disconnected"].clone(), s["installation_id"].as_i64()), (Value::Null, Some(43)), "{s}");
+
+        // Activity about the App is for admins only.
+        let feed = h.ok("GET", "/api/v1/activity?limit=200", None, &mo).to_string();
+        assert!(!feed.contains("github.") && !feed.contains("docs_source"), "{feed}");
+        assert!(h.ok("GET", "/api/v1/activity?limit=200", None, &admin).to_string().contains("github.uninstalled"));
+    }
+
+    #[test]
+    fn github_app_routes_need_the_app() {
+        let mut h = H::new();
+        let (admin, _) = h.setup();
+        with_key(&mut h);
+        let body = json!({ "installation": { "id": 42 } }).to_string();
+        assert_eq!(hook(&h, "/hooks/github", &body, &[("x-github-event", "push")]).status, 404, "no App, no webhook");
+        assert!(location(&callback(&h, &admin, "state=x&code=c")).ends_with("connect_error=expired_link&app=github"));
+        let topic = h.ok("POST", "/api/v1/topics", Some(json!({ "name": "Docs" })), &admin)["id"].clone();
+        let input = json!({ "provider": "github", "installation_id": 42, "repository": "acme/docs", "topic_id": topic });
+        assert_eq!(h.call("POST", "/api/v1/docs-sources", Some(input), &admin).status, 503);
+        let repos = h.ok("GET", "/api/v1/docs-sources/github", None, &admin);
+        assert_eq!((repos["available"].as_bool(), repos["connect_url"].clone()), (Some(false), Value::Null));
+        assert_eq!(h.call("GET", "/sync/github/other", None, &admin).status, 404);
     }
 }
