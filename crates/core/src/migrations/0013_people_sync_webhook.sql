@@ -27,3 +27,24 @@ CREATE TABLE IF NOT EXISTS people_sync_sign_ins (
   subdomain TEXT NOT NULL,
   created_at TEXT NOT NULL
 );
+
+-- Webhooks DumbSlab added in BambooHR and still has to delete: one a save replaced when BambooHR
+-- wouldn't delete it then, one a save added before it stopped partway, or a removed sync's.
+CREATE TABLE IF NOT EXISTS people_sync_cleanup (
+  id TEXT PRIMARY KEY,
+  webhook_id TEXT NOT NULL,
+  -- The BambooHR company domain the webhook is in.
+  subdomain TEXT NOT NULL,
+  -- `api_key` or `oauth`, and the credentials that may delete it, sealed: the API key, or the
+  -- sign-in's tokens (refresh token included).
+  auth TEXT NOT NULL,
+  secret TEXT NOT NULL,
+  expires_at TEXT,
+  -- SHA-256 of the refresh token, so a renewal of the same sign-in can hand over its new tokens.
+  refresh_hash TEXT,
+  -- Failed attempts so far. DumbSlab gives up after 5, and says so in the activity log.
+  attempts INTEGER NOT NULL DEFAULT 0,
+  -- A job deleting it holds this lease: when it runs out, then a random id.
+  working_until TEXT,
+  created_at TEXT NOT NULL
+);

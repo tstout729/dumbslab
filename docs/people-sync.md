@@ -58,11 +58,26 @@ The result shows how many people were matched and updated, and which employees w
 - **Saving again keeps it** when nothing changed: same company, same credentials, same workspace address, and BambooHR still has it. DumbSlab asks BambooHR before keeping it.
 - **Otherwise saving replaces it.** A new API key, a new sign-in, another company, a moved workspace, or a webhook someone deleted in BambooHR all get a new webhook. DumbSlab deletes the old one.
 - Removing the sync deletes it.
-- If DumbSlab can't delete an old webhook (its key was revoked, say), the answer says so. That webhook's calls are turned away.
+
+### Old webhooks DumbSlab still has to delete
+
+DumbSlab doesn't lose track of a webhook it added. It keeps a cleanup record, with the credentials that can delete the webhook (encrypted, refresh token included), when:
+
+- BambooHR won't delete the old webhook during a save. For example, the old sign-in has expired, or you switched to another company.
+- A save stops partway after BambooHR added the new webhook. For example, the admin lost the admin role meanwhile. A save also checks the admin may still save before it changes anything in BambooHR.
+- The sync is removed.
+
+After saves, syncs and removals, DumbSlab works through these records. It renews an expired sign-in first, then deletes the webhook. A record goes once BambooHR deletes the webhook or says it's gone. After 5 failed tries DumbSlab gives up and says so in the activity log. Until then, it turns that webhook's calls away.
+
+Settings › People sync shows how many old webhooks are left to delete. After signing in, it says when the webhook it replaced is still to be deleted (the `people_sync_notice=old_webhook` code).
+
+If a save stops after BambooHR deleted the old webhook, Settings says so. Save again to add a new one.
 
 **If the workspace moves to another address**, the webhook still posts to the old one, which no longer works. Settings › People sync says so. Choose **Save again** to move the webhook.
 
-One change is saved at a time. While a save is under way, another save, or removing the sync, is refused with "try again in a minute".
+One change is saved at a time. While a save is under way, another save, or removing the sync, is refused with "try again in a minute". Removing the sync also waits while DumbSlab is renewing the BambooHR sign-in.
+
+Saving with new credentials (a new sign-in or API key) or another company stops the syncs and renewals under way with the old ones. They save nothing, so a sync can't fill in profiles from the old company after you switched.
 
 ### If DumbSlab can't add the webhook
 

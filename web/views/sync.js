@@ -120,7 +120,13 @@ function signInOutcome() {
   const connected = query.get('people_sync') === 'connected';
   const error = query.get('people_sync_error');
   if (connected || error) history.replaceState(null, '', location.pathname);
-  if (connected) return { connected, note: h('p', { class: 'callout', role: 'status' }, icon('check', { size: 15 }), h('span', null, 'Signed in with BambooHR.')) };
+  if (connected) {
+    // `old_webhook`: the webhook DumbSlab had added before is still to be deleted.
+    const more = query.get('people_sync_notice') === 'old_webhook'
+      ? ' DumbSlab couldn’t delete the webhook it had added in BambooHR before yet; it tries again after the next syncs.'
+      : '';
+    return { connected, note: h('p', { class: 'callout', role: 'status' }, icon('check', { size: 15 }), h('span', null, `Signed in with BambooHR.${more}`)) };
+  }
   if (error) {
     const message = Object.hasOwn(signInErrors, error) ? signInErrors[error] : signInErrors.failed;
     return { connected, note: h('p', { class: 'callout callout-warn', role: 'alert' }, icon('alert', { size: 15 }), h('span', null, message)) };
@@ -232,6 +238,7 @@ export async function peopleSyncSection(ctx) {
       h('div', { class: 'token-meta' }, stateLine(s), h('span', null, `${signedIn} · ${s.subdomain}.bamboohr.com`), automatic),
       s.webhook_error ? h('p', { class: 'callout callout-warn' }, icon('alert', { size: 15 }), h('span', null, s.webhook_error)) : null,
       stateNotes(s),
+      s.webhook_cleanup ? h('p', { class: 'small muted' }, `DumbSlab still has ${plural(s.webhook_cleanup, 'old webhook')} to delete in BambooHR. It tries again after syncs and saves, and turns their calls away meanwhile.`) : null,
       peopleResult(s.last_result),
       manualWebhook(s, reload),
       h('div', { class: 'plan-actions' }, run, again, remove))

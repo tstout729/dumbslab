@@ -44,6 +44,7 @@ const REFRESH_MARGIN_SECS: i64 = 300;
 const REFRESH_LEASE_SECS: i64 = 30;
 
 pub(crate) const RENEWING: &str = "BambooHR is renewing DumbSlab's sign-in. Try again in a moment.";
+const CHANGED: &str = "The people sync's BambooHR sign-in changed while this was under way, so it stopped. Try again.";
 const SIGNED_OUT: &str = "BambooHR no longer accepts DumbSlab's sign-in. Sign in with BambooHR again in Settings › People sync.";
 pub(crate) const API_KEYS_REFUSED: &str = "Hosted DumbSlab can't use BambooHR API keys: BambooHR's developer terms allow them only in systems a company runs itself. Use Sign in with BambooHR instead (Settings › People sync, or connect_people_sync).";
 
@@ -64,7 +65,7 @@ impl Auth {
         }
     }
 
-    fn parse(s: &str) -> Auth {
+    pub(crate) fn parse(s: &str) -> Auth {
         if s == "oauth" { Auth::OAuth } else { Auth::ApiKey }
     }
 }
@@ -208,7 +209,9 @@ pub(crate) fn renew_call(cfg: &HostConfig, subdomain: &str, base_url: &str, cred
 
 /// Takes the renewed tokens into `creds`, and saves them into the stored credentials (keeping the
 /// rest: a save may have stored a new webhook key meanwhile). Lets go of the lease either way.
-/// `Err` says why BambooHR refused.
+/// `Err` says why BambooHR refused, or that the request lost the lease: new credentials or another
+/// company were saved meanwhile, so whatever started this must stop. The renewed tokens then go to
+/// the cleanup records that hold the spent refresh token (see [`super::cleanup::hand_over`]).
 pub(crate) fn apply_refresh(
     db: &dyn Db,
     cfg: &HostConfig,
@@ -225,19 +228,29 @@ pub(crate) fn apply_refresh(
             return Ok(Err(if busy { http_error("BambooHR", reply) } else { SIGNED_OUT.into() }));
         }
     };
+    let spent = creds.cred.refresh_token.clone().unwrap_or_default();
     creds.take(tokens, now);
+    // Cleanup records holding the same sign-in follow it: BambooHR may have spent their refresh token.
+    super::cleanup::hand_over(db, cfg, &spent, creds)?;
     // Only while this request still holds the lease: a new sign-in or API key replaces the tokens.
-    if let Some(row) = db.one("SELECT secret FROM people_sync WHERE id = 1 AND auth = 'oauth' AND refreshing_until = ?", &params![lease])? {
-        let mut stored = crate::sync::open(cfg, OWNER, PROVIDER, &row.str("secret"))?;
-        stored.token = creds.cred.token.clone();
-        stored.refresh_token = creds.cred.refresh_token.clone();
-        let secret = crate::sync::seal(cfg, OWNER, PROVIDER, &stored)?;
-        db.execute(
-            "UPDATE people_sync SET secret = ?, expires_at = ?, refreshing_until = NULL WHERE id = 1 AND refreshing_until = ?",
-            &params![secret, creds.expires_at.map(ts), lease],
-        )?;
-    }
+    let Some(row) = db.one("SELECT secret FROM people_sync WHERE id = 1 AND auth = 'oauth' AND refreshing_until = ?", &params![lease])?
+    else {
+        return Ok(Err(CHANGED.into()));
+    };
+    let mut stored = crate::sync::open(cfg, OWNER, PROVIDER, &row.str("secret"))?;
+    stored.token = creds.cred.token.clone();
+    stored.refresh_token = creds.cred.refresh_token.clone();
+    let secret = crate::sync::seal(cfg, OWNER, PROVIDER, &stored)?;
+    db.execute(
+        "UPDATE people_sync SET secret = ?, expires_at = ?, refreshing_until = NULL WHERE id = 1 AND refreshing_until = ?",
+        &params![secret, creds.expires_at.map(ts), lease],
+    )?;
     Ok(Ok(()))
+}
+
+/// Another request is renewing the saved sign-in now.
+pub(crate) fn renewing(row: &Row, now: DateTime<Utc>) -> bool {
+    row.opt_str("refreshing_until").and_then(|l| l.split(' ').next().and_then(parse_ts)).is_some_and(|until| until > now)
 }
 
 // ---------------------------------------------------------------------------
@@ -278,11 +291,13 @@ pub(crate) fn start_sign_in(ctx: &Ctx, subdomain: &str) -> ApiResult<String> {
     Ok(format!("https://{subdomain}.bamboohr.com/authorize.php?{qs}&scope={scope}"))
 }
 
-/// Settings › People sync, with how signing in went. Only a code goes in the link, never text:
-/// anyone can make a link to Settings, and the page says what the code means.
-pub(crate) fn settings_url(base_url: &str, outcome: Result<(), &str>) -> String {
+/// Settings › People sync, with how signing in went, and something to know (`old_webhook`: the
+/// webhook DumbSlab had added before is still to be deleted). Only codes go in the link, never
+/// text: anyone can make a link to Settings, and the page says what the code means.
+pub(crate) fn settings_url(base_url: &str, outcome: Result<Option<&str>, &str>) -> String {
     match outcome {
-        Ok(()) => format!("{base_url}/settings/people-sync?people_sync=connected"),
+        Ok(None) => format!("{base_url}/settings/people-sync?people_sync=connected"),
+        Ok(Some(notice)) => format!("{base_url}/settings/people-sync?people_sync=connected&people_sync_notice={notice}"),
         Err(code) => format!("{base_url}/settings/people-sync?people_sync_error={code}"),
     }
 }
@@ -337,6 +352,8 @@ pub fn callback(db: &dyn Db, cfg: &HostConfig, req: &Request) -> Outcome {
         let job = setup::sign_in_job(db, cfg, &base, &actor, row.str("subdomain"), code, lease)?;
         let mut out = back("failed");
         out.effects.push(crate::Effect::Connect(job));
+        // Then, after the response, the webhooks still to delete, the one this replaced included.
+        out.effects.push(crate::Effect::Background(super::cleanup::cleanup_job(&base, None)));
         Ok(out)
     };
     run().unwrap_or_else(|_| back("failed"))

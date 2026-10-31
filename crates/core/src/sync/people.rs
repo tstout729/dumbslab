@@ -15,6 +15,7 @@
 //! Docs: https://documentation.bamboohr.com/reference/list-employees,
 //! https://documentation.bamboohr.com/docs/webhooks
 
+mod cleanup;
 mod oauth;
 mod setup;
 
@@ -33,10 +34,11 @@ use crate::events::{Event, emit};
 use crate::util::{secure_eq, ts};
 use crate::{HostConfig, Outcome, Request, params};
 
-pub(crate) use oauth::{API_KEYS_REFUSED, Auth, app as sign_in_app, hosted, start_sign_in};
+pub(crate) use cleanup::{cleanup_job, record_removed, waiting as cleanup_waiting};
+pub(crate) use oauth::{API_KEYS_REFUSED, Auth, RENEWING, app as sign_in_app, hosted, renewing, start_sign_in};
 pub use oauth::{CALLBACK_PATH, SCOPES, callback};
 pub use setup::PeopleSyncRemoved;
-pub(crate) use setup::{HOOK_PATH, busy, removal_job, saving, setup_job, webhook_problem};
+pub(crate) use setup::{HOOK_PATH, NOT_DELETED, busy, saving, setup_job, webhook_problem};
 
 pub const PROVIDER: &str = "bamboohr";
 pub(crate) const TABLE: &str = "people_sync";
@@ -148,8 +150,8 @@ enum Work {
     Sync(Run),
     /// An admin saved the settings: check the key, then add BambooHR's webhook.
     Setup(Box<setup::Setup>),
-    /// The sync was removed: delete the webhook DumbSlab added in BambooHR.
-    Remove(setup::Removal),
+    /// Delete the webhooks DumbSlab added in BambooHR and still has to (see [`cleanup`]).
+    Cleanup(cleanup::Cleanup),
 }
 
 /// A sync under way.
@@ -280,7 +282,7 @@ pub fn step(db: &dyn Db, cfg: &HostConfig, job: &mut PeopleJob, replies: Vec<Htt
     match work {
         Work::Sync(run) => sync_step(db, cfg, run, staged, replies, now),
         Work::Setup(s) => setup::step(db, cfg, s, staged, replies, now),
-        Work::Remove(r) => Ok(setup::remove_step(cfg, r, replies, now)),
+        Work::Cleanup(c) => cleanup::step(db, cfg, c, staged, replies, now),
     }
 }
 
@@ -359,7 +361,10 @@ fn apply(
     now: DateTime<Utc>,
 ) -> ApiResult<Step> {
     if !super::holds(db, TABLE, key(), &j.lease)? {
-        return Ok(Step::Done(Finish::Fail(super::sync_failed("Another sync took over before this one finished."))));
+        // Another sync took over, or the sync was saved with new credentials or another company, or removed.
+        return Ok(Step::Done(Finish::Fail(super::sync_failed(
+            "The people sync changed, or another sync took over, before this one finished. Sync again.",
+        ))));
     }
     if !j.employees.is_empty() && j.employees.iter().all(|e| e.email.is_none()) {
         return fail(
@@ -508,7 +513,13 @@ pub(crate) fn hook(db: &dyn Db, cfg: &HostConfig, req: &Request, base_url: &str,
     }
     check_plan(db, cfg, now)?;
     match start(db, cfg, base_url, now)? {
-        Some(job) => Ok(hook_started(job)),
+        Some(job) => {
+            let mut out = hook_started(job);
+            if cleanup::waiting(db)? > 0 {
+                out.effects.push(crate::Effect::Background(cleanup::cleanup_job(base_url, None)));
+            }
+            Ok(out)
+        }
         None => {
             super::mark_pending(db, TABLE, key(), now)?;
             Ok(hook_answer("queued"))

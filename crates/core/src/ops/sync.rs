@@ -114,6 +114,8 @@ pub struct PeopleSync {
     #[serde(flatten)]
     pub state: SyncState,
     pub last_result: Option<PeopleSyncResult>,
+    /// Old webhooks DumbSlab added in BambooHR and still has to delete (it tries again after syncs and saves).
+    pub webhook_cleanup: i64,
     /// Only in set_people_sync's answer: something to know about this change, such as an old webhook BambooHR wouldn't let DumbSlab delete.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub notice: Option<String>,
@@ -140,6 +142,7 @@ pub(crate) fn people_view(ctx: &Ctx) -> ApiResult<PeopleSync> {
         webhook_url,
         state: row.as_ref().map(|r| sync::state_of(r, ctx.now)).unwrap_or_default(),
         last_result: row.as_ref().and_then(|r| r.opt_str("last_result")).and_then(|v| serde_json::from_str(&v).ok()),
+        webhook_cleanup: people::cleanup_waiting(ctx.db)?,
         notice: None,
     })
 }
@@ -167,6 +170,9 @@ fn set_people_sync(ctx: &mut Ctx, input: SetPeopleSyncInput) -> ApiResult<Deferr
     // The host checks the key with BambooHR and adds its webhook, then saves (see sync::people).
     let job = people::setup_job(ctx, subdomain, api_key, webhook_key)?;
     ctx.effects.push(Effect::Connect(job));
+    // Then, after the response, it deletes the webhooks DumbSlab still has to (the one this save
+    // replaced, when BambooHR wouldn't delete it now).
+    ctx.effects.push(Effect::Background(people::cleanup_job(&ctx.base_url, None)));
     Ok(Deferred::Pending)
 }
 
@@ -194,6 +200,9 @@ fn sync_people(ctx: &mut Ctx, _: NoInput) -> ApiResult<Deferred<PeopleSyncResult
     match people::start(ctx.db, ctx.cfg, &ctx.base_url, Utc::now())? {
         Some(job) => {
             ctx.effects.push(Effect::Connect(job));
+            if people::cleanup_waiting(ctx.db)? > 0 {
+                ctx.effects.push(Effect::Background(people::cleanup_job(&ctx.base_url, None)));
+            }
             Ok(Deferred::Pending)
         }
         None => Err(ApiError::conflict("A people sync is already running. Try again in a minute.")),
@@ -205,16 +214,24 @@ fn remove_people_sync(ctx: &mut Ctx, _: NoInput) -> ApiResult<Deferred<PeopleSyn
     if people::saving(ctx.db, ctx.now)? {
         return Err(people::busy());
     }
+    // A renewal under way would spend the refresh token the webhook's deletion needs.
+    if people::renewing(&row, ctx.now) {
+        return Err(ApiError::conflict(people::RENEWING));
+    }
     ctx.db.execute("DELETE FROM people_sync WHERE id = 1", &[])?;
     emit(ctx, Event::new("people_sync.removed", "people_sync", "1", "removed the people sync").admin_only())?;
-    // Then the host deletes the webhook DumbSlab added in BambooHR. The sync is gone either way.
-    match people::removal_job(ctx.cfg, &row, &ctx.base_url) {
-        Ok(Some(job)) => {
-            ctx.effects.push(Effect::Connect(job));
+    // Then the host deletes the webhook DumbSlab added in BambooHR, kept as a cleanup record (with
+    // the credentials that may delete it) until it's gone. The sync is gone either way.
+    match people::record_removed(ctx.db, ctx.cfg, &row, ctx.now)? {
+        Some(record) => {
+            ctx.effects.push(Effect::Connect(people::cleanup_job(&ctx.base_url, Some(record))));
             Ok(Deferred::Pending)
         }
-        Ok(None) => Ok(Deferred::Ready(PeopleSyncRemoved { ok: true, notice: None })),
-        Err(notice) => Ok(Deferred::Ready(PeopleSyncRemoved { ok: true, notice: Some(notice) })),
+        // Its credentials can't be read any more (the connector key changed).
+        None if row.opt_str("webhook_id").is_some() => {
+            Ok(Deferred::Ready(PeopleSyncRemoved { ok: true, notice: Some(people::NOT_DELETED.into()) }))
+        }
+        None => Ok(Deferred::Ready(PeopleSyncRemoved { ok: true, notice: None })),
     }
 }
 
