@@ -441,11 +441,13 @@ fn blocked_by(plan: &Plan, path: &str) -> Option<String> {
 /// A synced post is never visible to more people than the source's topic. A folder's topic that
 /// is, now (made public, or given members the source's topic lacks since the last sync), gets
 /// none of the source's posts: each goes back in the source's topic first, so taking it out never
-/// leaves it in fewer or wider topics, and then comes out of that one. Such folders are blocked
+/// leaves it in fewer or wider topics, and then comes out of that one; each repaired post's change
+/// of topics is recorded as `post.moved`. Such folders are blocked
 /// (`plan.blocked`) and their files wait, marked to be synced again, until it's fixed. No topic's
 /// visibility is changed. Runs before reading, and again in the step that writes, since topics can
 /// change while files are fetched. `Some` says why the sync can't go on.
-fn guard(db: &dyn Db, j: &DocsJob, plan: &mut Plan, now: DateTime<Utc>) -> ApiResult<Option<String>> {
+fn guard(ctx: &mut Ctx, j: &DocsJob, plan: &mut Plan, now: DateTime<Utc>) -> ApiResult<Option<String>> {
+    let db = ctx.db;
     let Some(target) = Audience::of(db, &j.source.topic_id)? else {
         return Ok(Some("The source's topic was deleted.".into()));
     };
@@ -470,6 +472,11 @@ fn guard(db: &dyn Db, j: &DocsJob, plan: &mut Plan, now: DateTime<Utc>) -> ApiRe
         ),
         &params![writer, source_id.clone()],
     )?;
+    // Each repaired post's topics before its first repair, to record what changed once all are done.
+    let mut repaired: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let topics_of = |post: &str| -> ApiResult<BTreeSet<String>> {
+        Ok(db.query("SELECT topic_id FROM post_topics WHERE post_id = ?", &params![post])?.iter().map(|r| r.str("topic_id")).collect())
+    };
     for (folder, topic_id) in &plan.folders {
         // Memberships the sync gave when it made this topic go once their person has left the
         // source's topic. Any other membership is someone's choice and stays; if it lets more
@@ -494,6 +501,16 @@ fn guard(db: &dyn Db, j: &DocsJob, plan: &mut Plan, now: DateTime<Utc>) -> ApiRe
             continue;
         }
         let synced = "SELECT target_id FROM docs_items WHERE source_id = ? AND kind = 'doc'";
+        for p in db.query(
+            &format!("SELECT post_id FROM post_topics WHERE topic_id = ? AND post_id IN ({synced})"),
+            &params![topic_id.clone(), source_id.clone()],
+        )? {
+            let post = p.str("post_id");
+            if let std::collections::btree_map::Entry::Vacant(slot) = repaired.entry(post) {
+                let before = topics_of(slot.key())?;
+                slot.insert(before);
+            }
+        }
         db.execute(
             &format!(
                 "INSERT INTO post_topics (post_id, topic_id, pinned, added_at)
@@ -517,6 +534,16 @@ fn guard(db: &dyn Db, j: &DocsJob, plan: &mut Plan, now: DateTime<Utc>) -> ApiRe
             a.name, target.name
         );
         plan.blocked.insert(folder.clone(), why);
+    }
+    // Each repaired post's change of topics is recorded like any other (see `posts::moved_event`),
+    // once, on its topics after every repair.
+    for (post, before) in repaired {
+        let after = topics_of(&post)?;
+        let added: Vec<String> = after.difference(&before).cloned().collect();
+        let removed: Vec<String> = before.difference(&after).cloned().collect();
+        if !(added.is_empty() && removed.is_empty()) {
+            posts::moved_event(ctx, &post, &added, &removed)?;
+        }
     }
     Ok(None)
 }
@@ -581,7 +608,7 @@ fn listing(db: &dyn Db, cfg: &HostConfig, j: &mut DocsJob, replies: &[HttpReply]
     // event about them.
     let folders = items(db, &source_id, "folder")?.into_iter().map(|(p, i)| (p, i.target_id)).collect();
     let mut plan = Plan { folders, ..Plan::default() };
-    if let Some(message) = guard(db, j, &mut plan, now)? {
+    if let Some(message) = guard(&mut ctx, j, &mut plan, now)? {
         return fail(db, j, &message, now);
     }
     // Paths that files appeared at (new, back or moved there) and images that changed: files that
@@ -1030,7 +1057,7 @@ fn write(ctx: &mut Ctx, j: &mut DocsJob, mut plan: Plan, texts: Vec<Text>, ready
         return Ok(lost());
     }
     // Topics may have changed while the files were fetched.
-    if let Some(message) = guard(db, j, &mut plan, now)? {
+    if let Some(message) = guard(ctx, j, &mut plan, now)? {
         j.staged.append(&mut ctx.effects);
         return fail(db, j, &message, now);
     }

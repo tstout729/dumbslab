@@ -5815,6 +5815,54 @@ mod syncs {
     }
 
     #[test]
+    fn docs_sync_records_privacy_repairs() {
+        let (h, admin) = super::slack::connected();
+        h.ok("POST", "/api/v1/slack/channels", Some(json!({ "channel": "C0ALLPOSTS", "updated_posts": true })), &admin);
+        h.ok("POST", "/api/v1/webhooks", Some(json!({ "url": "https://hooks.example.com/dumbslab", "events": ["post.*"] })), &admin);
+        let (mo_id, _) = h.user(&admin, "mo@acme.test", "Mo", "member");
+        let ops = json!({ "name": "Ops", "visibility": "private", "members": [mo_id] });
+        let ops = h.ok("POST", "/api/v1/topics", Some(ops), &admin)["id"].as_str().unwrap().to_string();
+        let (source, _) = gitlab_source(&h, &admin, &ops);
+        let lab = Lab::new(&[("deploys/rollback.md", b"# Rollback\n"), ("deploys/restart.md", b"# Restart\n")]);
+        let answer = |c: &HttpCall| lab.answer(c);
+        let sync = || {
+            let r = h.call("POST", &format!("/api/v1/docs-sources/{source}/sync"), None, &admin);
+            run_to_end(&h, job_of(&r), &answer)
+        };
+        assert_eq!(sync().0["created"], 2);
+        let ids = doc_ids(&h);
+        let (rollback, restart) = (ids["deploys/rollback.md"].clone(), ids["deploys/restart.md"].clone());
+        let deploys = db_run(&h, |db| db.one("SELECT target_id FROM docs_items WHERE kind = 'folder' AND path = 'deploys'", &[]))
+            .unwrap()
+            .str("target_id");
+
+        // No file changes, but the folder's topic is made public, and one post had been taken out
+        // of Ops (S1's case). The repair is the run's only change, and it's recorded per post.
+        db_run(&h, |db| db.execute(&format!("DELETE FROM post_topics WHERE post_id = '{restart}' AND topic_id = '{ops}'"), &[]));
+        h.ok("PATCH", &format!("/api/v1/topics/{deploys}"), Some(json!({ "visibility": "org" })), &admin);
+        let (v, effects) = sync();
+        assert_eq!((v["created"].as_i64(), v["updated"].as_i64()), (Some(0), Some(0)), "{v}");
+        assert_eq!(events(&effects), vec!["post.moved", "post.moved"]);
+        let moves: BTreeMap<String, Value> = effects
+            .iter()
+            .filter_map(|e| match e {
+                Effect::Webhook(d) if !d.webhook_id.starts_with("slack:") => serde_json::from_str::<Value>(&d.body).ok(),
+                _ => None,
+            })
+            .map(|p| (p["post_id"].as_str().unwrap().to_string(), p["data"].clone()))
+            .collect();
+        assert_eq!((&moves[&rollback]["added"], &moves[&rollback]["removed"]), (&json!([]), &json!([deploys])), "{moves:?}");
+        assert_eq!((&moves[&restart]["added"], &moves[&restart]["removed"]), (&json!([ops]), &json!([deploys])), "{moves:?}");
+        for id in [&rollback, &restart] {
+            assert_eq!(count(&h, &format!("SELECT COUNT(*) FROM activity WHERE event = 'post.moved' AND post_id = '{id}'")), 1);
+        }
+        assert!(super::slack::slack_messages(&effects).is_empty(), "moves aren't announced");
+        // Repaired already: the next sync records nothing.
+        let (_, effects) = sync();
+        assert!(events(&effects).is_empty(), "{:?}", events(&effects));
+    }
+
+    #[test]
     fn docs_sync_takes_back_only_its_own_grants() {
         let mut h = H::new();
         let (admin, _) = h.setup();
