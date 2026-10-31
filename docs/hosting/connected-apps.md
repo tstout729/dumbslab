@@ -47,7 +47,7 @@ Self-hosted servers use the same names with `DUMBSLAB_` in front, in the environ
 | 8 | Box | `BOX` | minutes | some companies' Box admins must allow it |
 | 9 | Jira and Confluence | `ATLASSIAN` | under an hour | turn on sharing |
 | 10 | Trello | `TRELLO` | under an hour | nothing documented |
-| 11 | monday.com | `MONDAY` | under an hour | share the app; each account installs it |
+| 11 | monday.com | `MONDAY` | under an hour | share the app; an admin of each account installs it |
 | 12 | Dropbox | `DROPBOX` | minutes, then a review | production approval after 50 users |
 | 13 | Slack | `SLACK` | days to weeks | public distribution, then the Slack Marketplace |
 | 14 | Zendesk | `ZENDESK` | days to weeks | Zendesk approves a global OAuth client |
@@ -129,15 +129,14 @@ One Atlassian app covers both. Set `ATLASSIAN_CLIENT_ID` and `ATLASSIAN_CLIENT_S
 
 - **Register at:** [developer.atlassian.com/console/myapps](https://developer.atlassian.com/console/myapps/) › Create › **OAuth 2.0 integration**.
 - **Fill in:** Authorization › OAuth 2.0 (3LO) › Callback URL: the redirect URI.
-- **Scopes:** under Permissions, add three APIs and these classic scopes:
+- **Scopes:** under Permissions, add two APIs and these classic scopes:
   - **Jira API:** `read:jira-work`
   - **Confluence API:** `search:confluence`
-  - **User identity API:** `read:me`
   
-  `offline_access` isn't configured; sign-in asks for it to get refresh tokens. Each sign-in asks for both products' scopes (`read:jira-work search:confluence read:me offline_access`). Atlassian keeps one grant per person and app, and each new consent replaces its scopes, so connecting Confluence must not take away Jira's.
+  `offline_access` isn't configured; sign-in asks for it to get refresh tokens. The User identity API isn't needed: DumbSlab never reads the person's profile. Each sign-in asks for both products' scopes (`read:jira-work search:confluence offline_access`). Atlassian keeps one grant per person and app, and each new consent replaces its scopes, so connecting Confluence must not take away Jira's.
 - **Values:** from Settings: `ATLASSIAN_CLIENT_ID` and `ATLASSIAN_CLIENT_SECRET`.
 - **Before the public can use it:** a new app is private: only you can use it. Under **Distribution**, choose Edit and turn on **Enable sharing**. Atlassian asks for a vendor name, a privacy policy and whether the app stores personal data. Until Atlassian reviews the app, people see a warning that it hasn't been reviewed, but they can still approve. Sharing doesn't list the app in the Atlassian Marketplace. [OAuth 2.0 (3LO) apps](https://developer.atlassian.com/cloud/jira/platform/oauth-2-3lo-apps/), [managing apps](https://developer.atlassian.com/cloud/oauth/getting-started/managing-oauth-apps/).
-- **Personal data:** DumbSlab keeps the person's Atlassian email in the connection's label ("ada@acme.com on acme.atlassian.net"). Atlassian says an app that stores personal data must check its [personal data reporting API](https://developer.atlassian.com/cloud/jira/platform/user-privacy-developer-guide/) every 7 days and delete data for closed accounts. DumbSlab doesn't do that yet. Decide before you turn on sharing: answer that it stores personal data and add reporting, or change the label to show only the site.
+- **Personal data:** answer that the app does **not** store personal data. A connection keeps only its site: the label is the site's address ("acme.atlassian.net"), and the settings hold the site and its cloud id. DumbSlab never saves anyone's Atlassian account ID, email or name. Search results and previews read names when they're shown and keep none. Atlassian's duty to check its [personal data reporting API](https://developer.atlassian.com/cloud/jira/platform/user-privacy-developer-guide/) every 7 days applies to apps that store personal data, so it doesn't apply. One caveat: a connection made with an API token keeps the email the person typed, sealed with the token, because Atlassian needs both to sign in. That's the person's own sign-in, not data DumbSlab's app reads from Atlassian, and Atlassian's guide doesn't mention credentials like it.
 
 ## 10. Trello
 
@@ -147,7 +146,8 @@ Trello can't share the Atlassian app. Its OAuth 2.0 clients (new on September 15
 - **Fill in:** the app's **OAuth 2.0** tab: choose a **Confidential** client and add the redirect URI as a callback URL.
 - **Scopes:** check `read:member:trello` and `read:board:trello` there. Sign-in also asks for `offline_access`, which isn't in the list but brings refresh tokens.
 - **Values:** `TRELLO_CLIENT_ID` and `TRELLO_CLIENT_SECRET`.
-- **Review:** none documented. Clients that aren't Power-Ups aren't limited to one Trello Workspace. Trello is also Atlassian, so the [personal data note](#9-jira-and-confluence-one-atlassian-app) may apply: DumbSlab keeps the Trello username in the label. [Client configuration](https://developer.atlassian.com/cloud/trello/guides/rest-api/oauth-2-client-configuration/), [confidential clients](https://developer.atlassian.com/cloud/trello/guides/rest-api/oauth-2-confidential-client-usage/).
+- **Review:** none documented. Clients that aren't Power-Ups aren't limited to one Trello Workspace.
+- **Personal data:** Trello asks every app to register whether it stores personal data. Register DumbSlab's as **not** storing any. Connecting only checks the key and token or the sign-in; the label is just "Trello" and nothing about the member is saved. Previews read card members' names when they're shown and keep none. Apps that store personal data must poll Trello's compliance API at least every 14 days; apps that don't only register. [Personal data storage](https://developer.atlassian.com/cloud/trello/guides/compliance/personal-data-storage-gdpr/), [client configuration](https://developer.atlassian.com/cloud/trello/guides/rest-api/oauth-2-client-configuration/), [confidential clients](https://developer.atlassian.com/cloud/trello/guides/rest-api/oauth-2-confidential-client-usage/).
 
 ## 11. monday.com
 
@@ -155,7 +155,7 @@ Trello can't share the Atlassian app. Its OAuth 2.0 clients (new on September 15
 - **Fill in:** in the **OAuth** tab, add the redirect URI. Turn on the **new OAuth flow** (expiring tokens with refresh tokens); DumbSlab uses it.
 - **Scopes:** check these in the OAuth tab: `me:read`, `account:read`, `boards:read`, `users:read`. Sign-in asks for the same, and monday refuses any that aren't configured.
 - **Values:** from Basic Information: `MONDAY_CLIENT_ID` and `MONDAY_CLIENT_SECRET`.
-- **Before the public can use it:** promote the app version to live, then use the **Share** tab to share it with anyone who has the link. A monday.com account must install the app before its people can sign in; an admin installs it from the share link. No Marketplace listing is needed, but an app monday hasn't reviewed shows a "not vetted" notice. [OAuth](https://developer.monday.com/apps/docs/oauth), [sharing](https://developer.monday.com/apps/docs/install-and-share-your-apps), [new OAuth flow](https://developer.monday.com/apps/docs/migrating-to-the-new-oauth-flow).
+- **Before the public can use it:** promote the app version to live, then use the **Share** tab to share it with anyone who has the link. A monday.com account must install the app before its people can sign in. Sign-in passes `force_install_if_needed=true`, so an admin who signs in first sees monday's install screen and goes straight on. Anyone else needs an admin to install it first. No Marketplace listing is needed, but an app monday hasn't reviewed shows a "not vetted" notice. [OAuth](https://developer.monday.com/apps/docs/oauth), [sharing](https://developer.monday.com/apps/docs/install-and-share-your-apps), [new OAuth flow](https://developer.monday.com/apps/docs/migrating-to-the-new-oauth-flow).
 
 ## 12. Dropbox
 

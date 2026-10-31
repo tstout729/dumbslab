@@ -2956,12 +2956,107 @@ mod connected {
         h.cfg.connectors.apps = connect::oauth_apps(|name| vars.get(name).map(|v| v.to_string()));
         // Atlassian keeps one grant per person and app, replaced by each consent: each sign-in asks
         // for both products' scopes, so connecting one never takes away the other's.
-        assert_eq!(scope(&h, "jira"), "read:jira-work read:me offline_access search:confluence");
-        assert_eq!(scope(&h, "confluence"), "search:confluence read:me offline_access read:jira-work");
+        assert_eq!(scope(&h, "jira"), "read:jira-work offline_access search:confluence");
+        assert_eq!(scope(&h, "confluence"), "search:confluence offline_access read:jira-work");
         // Separate apps ask only for their own.
         h.cfg.connectors.apps.insert("confluence".into(), OAuthApp { client_id: "conf".into(), client_secret: "conf-secret".into() });
-        assert_eq!(scope(&h, "jira"), "read:jira-work read:me offline_access");
-        assert_eq!(scope(&h, "confluence"), "search:confluence read:me offline_access");
+        assert_eq!(scope(&h, "jira"), "read:jira-work offline_access");
+        assert_eq!(scope(&h, "confluence"), "search:confluence offline_access");
+    }
+
+    /// Atlassian, answering a sign-in and connections with personal data DumbSlab mustn't keep.
+    fn atlassian(call: &HttpCall) -> HttpReply {
+        let url = call.url.as_str();
+        if url == "https://auth.atlassian.com/oauth/token" {
+            ok(json!({ "access_token": "atl-at", "refresh_token": "atl-rt", "expires_in": 3600, "scope": "read:jira-work offline_access" }))
+        } else if url.ends_with("/oauth/token/accessible-resources") {
+            ok(json!([{ "id": "1324a887-45db-1bf4-1e99-ef0ff456d421", "url": "https://acme.atlassian.net", "name": "Acme",
+                "scopes": ["read:jira-work"], "avatarUrl": "https://x.test/a.png" }]))
+        } else if url.ends_with("/rest/api/3/myself") {
+            ok(json!({ "accountId": "5b10ac8d82e05b22cc7d4ef5", "emailAddress": "ada@acme.com", "displayName": "Ada Lovelace" }))
+        } else if url.starts_with("https://api.trello.com/1/members/me") {
+            ok(json!({ "id": "5abbe4b7ddc1b351ef961414", "username": "ada", "fullName": "Ada Lovelace" }))
+        } else {
+            HttpReply { status: 404, body: "{}".into() }
+        }
+    }
+
+    #[test]
+    fn monday_sign_in_lets_admins_install_on_the_way() {
+        let mut h = H::new();
+        let (admin, _) = h.setup();
+        with_key(&mut h);
+        h.cfg.connectors.apps.insert("monday".into(), OAuthApp { client_id: "mid".into(), client_secret: "msecret".into() });
+        let url =
+            h.ok("POST", "/api/v1/connections", Some(json!({ "app": "monday" })), &admin)["authorize_url"].as_str().unwrap().to_string();
+        assert!(url.starts_with("https://auth.monday.com/oauth2/authorize?"), "{url}");
+        let q = query_of(&url);
+        assert_eq!((q["force_install_if_needed"].as_str(), q["code_challenge_method"].as_str()), ("true", "S256"));
+    }
+
+    #[test]
+    fn atlassian_connections_keep_nothing_personal() {
+        let mut h = H::new();
+        let (admin, _) = h.setup();
+        with_key(&mut h);
+        let user_id = h.ok("GET", "/api/v1/me", None, &admin)["user"]["id"].as_str().unwrap().to_string();
+        h.cfg.connectors.apps.insert("jira".into(), OAuthApp { client_id: "atl".into(), client_secret: "atl-secret".into() });
+        // Everything stored for a connection: the row, and the credential sealed in it.
+        let stored = |h: &H, app: &str| {
+            let row = h
+                .store
+                .with_tx(|db| {
+                    let r = db
+                        .one("SELECT account, settings, secret FROM connections WHERE provider = ?", &dumbslab_core::params![app])
+                        .unwrap()
+                        .unwrap();
+                    ((r.str("account"), r.str("settings"), r.str("secret")), true)
+                })
+                .unwrap();
+            let cred = connect::open("connector-key", &user_id, app, &row.2).unwrap();
+            (row.0, row.1, format!("{} {:?} {:?}", cred.token, cred.refresh_token, cred.fields))
+        };
+        let personal = ["5b10ac8d82e05b22cc7d4ef5", "ada@acme.com", "Ada", "Lovelace", "5abbe4b7ddc1b351ef961414", "a.png"];
+
+        // Signing in to Jira: only the sites are asked for, and only the site is kept.
+        let url =
+            h.ok("POST", "/api/v1/connections", Some(json!({ "app": "jira" })), &admin)["authorize_url"].as_str().unwrap().to_string();
+        let state = query_of(&url)["state"].clone();
+        let r = h.call("GET", &format!("/connect/callback?code=c&state={}", urlencoding::encode(&state)), None, &admin);
+        let (finish, sent) = drive(&h, job_of(&r), &atlassian);
+        assert!(matches!(&finish, Finish::Redirect(u) if u.ends_with("connected=jira")), "{finish:?}");
+        assert!(!sent.iter().any(|c| c.url.ends_with("/me")), "{sent:?}");
+        let (label, settings, sealed) = stored(&h, "jira");
+        assert_eq!((label.as_str(), sealed.contains("atl-at")), ("acme.atlassian.net", true));
+        for p in personal {
+            assert!(!label.contains(p) && !settings.contains(p) && !sealed.contains(p), "{p} kept: {label} {settings} {sealed}");
+        }
+
+        // An API token: the person's answer only checks it. The email they typed stays sealed in
+        // the credential, which Basic auth needs, and nowhere else.
+        let token = json!({ "app": "confluence", "fields": { "site": "acme.atlassian.net", "email": "ada@acme.com", "token": "tok" } });
+        let r = h.call("POST", "/api/v1/connections", Some(token), &admin);
+        let (finish, _) = drive(&h, job_of(&r), &|_: &HttpCall| {
+            ok(json!({ "type": "known", "accountId": "5b10ac8d82e05b22cc7d4ef5", "email": "ada@acme.com", "displayName": "Ada Lovelace" }))
+        });
+        assert_eq!(filled(&r, finish)["connection"]["account"], "acme.atlassian.net");
+        let (label, settings, sealed) = stored(&h, "confluence");
+        assert!(sealed.contains("ada@acme.com"));
+        for p in personal {
+            assert!(!label.contains(p) && !settings.contains(p), "{p} kept: {label} {settings}");
+            assert!(p == "ada@acme.com" || !sealed.contains(p), "{p} sealed: {sealed}");
+        }
+
+        // Trello keeps no username or member id either.
+        let trello = json!({ "app": "trello", "fields": { "key": "k1", "token": "t1" } });
+        let r = h.call("POST", "/api/v1/connections", Some(trello), &admin);
+        let (finish, sent) = drive(&h, job_of(&r), &atlassian);
+        assert_eq!(sent[0].url, "https://api.trello.com/1/members/me?fields=id");
+        assert_eq!(filled(&r, finish)["connection"]["account"], "Trello");
+        let (label, settings, sealed) = stored(&h, "trello");
+        for p in personal {
+            assert!(!label.contains(p) && !settings.contains(p) && !sealed.contains(p), "{p} kept: {label} {settings} {sealed}");
+        }
     }
 
     #[test]

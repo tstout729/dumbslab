@@ -3,11 +3,19 @@
 //! tokens that expire, rotating refresh tokens), so the host's monday app needs "New OAuth Flow"
 //! turned on.
 //!
+//! A monday.com account must install an app before its people can sign in to it. Sign-in passes
+//! `force_install_if_needed=true`, so an admin whose account hasn't installed DumbSlab's app is
+//! shown the install screen and then goes straight on to approving it; anyone else still needs an
+//! admin to install it first. monday documents the parameter on its authorize endpoint, and says
+//! the new flow keeps that endpoint with the same parameters (adding PKCE); the new flow's own
+//! page doesn't name it.
+//!
 //! Docs: https://developer.monday.com/api-reference/docs/authentication,
 //! https://developer.monday.com/api-reference/docs/api-versioning, https://developer.monday.com/apps/docs/oauth,
 //! https://developer.monday.com/apps/docs/migrating-to-the-new-oauth-flow, https://developer.monday.com/api-reference/reference/me,
 //! https://developer.monday.com/api-reference/reference/account, https://developer.monday.com/api-reference/reference/items,
-//! https://developer.monday.com/api-reference/reference/column-values-v2
+//! https://developer.monday.com/api-reference/reference/column-values-v2,
+//! https://developer-community.monday.com/api-apps-framework-4/new-friction-free-oauth-flow-1850 (`force_install_if_needed`)
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -43,7 +51,8 @@ static INFO: ProviderInfo = ProviderInfo {
         scopes: &["me:read", "account:read", "boards:read", "users:read"],
         scope_param: "scope",
         scope_separator: " ",
-        extra: &[],
+        // An admin whose account hasn't installed the app installs it on the way.
+        extra: &[("force_install_if_needed", "true")],
         pkce: true,
         site: None,
     }),

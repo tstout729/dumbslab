@@ -2,6 +2,16 @@
 //! key and token, or by signing in with Atlassian (Trello's OAuth 2.0, once the host registered a
 //! confidential OAuth 2.0 client in Trello's app admin). Trello's older OAuth 1.0 isn't used.
 //!
+//! **No personal data is kept.** Trello asks every public app to register whether it stores
+//! personal data (a member's username, full name, email, avatar, bio, locale, or anything that
+//! identifies them); apps that do must poll Trello's compliance API at least every 14 days and
+//! erase data for deleted accounts, while apps that read such data from the API when it's needed
+//! don't. So connecting only checks that the key and token (or sign-in) work, asking for the
+//! member's id alone and keeping nothing of the answer: a connection's label is just "Trello" and
+//! its settings are empty. Previews read card members' names when they're shown, and nothing
+//! keeps them. Register DumbSlab's Trello app as not storing personal data.
+//! https://developer.atlassian.com/cloud/trello/guides/compliance/personal-data-storage-gdpr/
+//!
 //! Docs: https://developer.atlassian.com/cloud/trello/guides/rest-api/authorization/,
 //! https://developer.atlassian.com/cloud/trello/guides/rest-api/oauth-2-confidential-client-usage/,
 //! https://developer.atlassian.com/cloud/trello/scopes-for-oauth-2-3LO-and-forge-apps/,
@@ -91,7 +101,8 @@ impl Connector for Trello {
     }
 
     fn profile(&self, cred: &Credential) -> Vec<HttpCall> {
-        vec![api("/members/me?fields=username,fullName", cred)]
+        // Only checks the credentials: the id alone, and none of the answer is kept.
+        vec![api("/members/me?fields=id", cred)]
     }
 
     fn read_profile(&self, cred: &Credential, replies: &[HttpReply]) -> Result<Account, String> {
@@ -114,12 +125,11 @@ impl Connector for Trello {
                 _ => http_error("Trello", &r),
             });
         }
-        let m = r.json();
-        let username = s(&m["username"]);
-        if username.is_empty() {
+        if s(&r.json()["id"]).is_empty() {
             return Err("Trello didn't say whose account that is.".into());
         }
-        Ok(Account { label: format!("@{username}"), settings: json!({ "id": s(&m["id"]), "username": username }) })
+        // Nothing that identifies the member (see the module docs).
+        Ok(Account { label: "Trello".into(), settings: json!({}) })
     }
 
     /// Trello only previews links.
@@ -223,7 +233,7 @@ mod tests {
     #[test]
     fn connects_with_a_key_and_token_or_by_signing_in() {
         let calls = Trello.profile(&keyed());
-        assert_eq!(calls[0].url, "https://api.trello.com/1/members/me?fields=username,fullName");
+        assert_eq!(calls[0].url, "https://api.trello.com/1/members/me?fields=id");
         assert!(
             calls[0].headers.contains(&("authorization".into(), "OAuth oauth_consumer_key=\"abc123\", oauth_token=\"ATTAtok123\"".into())),
             "the key and token stay out of the URL"
@@ -231,10 +241,11 @@ mod tests {
         let signed_in = Credential { token: "eyJ.x.y".into(), refresh_token: Some("r".into()), ..Default::default() };
         assert!(Trello.profile(&signed_in)[0].headers.contains(&("authorization".into(), "Bearer eyJ.x.y".into())));
 
+        // Nothing personal is kept, even when Trello sends it.
         let account =
             Trello.read_profile(&keyed(), &[reply(200, json!({ "id": "5abb", "username": "ada", "fullName": "Ada L" }))]).unwrap();
-        assert_eq!(account.label, "@ada");
-        assert_eq!(account.settings["username"], "ada");
+        assert_eq!((account.label.as_str(), &account.settings), ("Trello", &json!({})));
+        assert!(Trello.read_profile(&keyed(), &[reply(200, json!({}))]).unwrap_err().contains("whose account"));
         assert!(Trello.read_profile(&keyed(), &[text(401, "invalid key")]).unwrap_err().contains("rejected that API key"));
         assert!(Trello.read_profile(&signed_in, &[text(401, "invalid token")]).unwrap_err().contains("Reconnect"));
         assert!(Trello.read_profile(&keyed(), &[reply(0, Value::Null)]).unwrap_err().contains("in time"));
