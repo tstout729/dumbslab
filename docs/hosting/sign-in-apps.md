@@ -51,7 +51,7 @@ Register the app in the [Microsoft Entra admin center](https://entra.microsoft.c
 
 ## Slack
 
-Slack uses the one DumbSlab Slack app, which also powers Add to Slack and connected-app search. That app's manifest is maintained with the Slack bot. For single sign-on it needs:
+Slack uses the one DumbSlab Slack app, which also powers Add to Slack and connected-app search. Create it from its manifest ([DumbSlab's Slack app](slack-app.md)), which already has the redirect URI and scopes below. For single sign-on it needs:
 
 1. Under **OAuth & Permissions › Redirect URLs**, the redirect URI (`https://dumbslab.com/sso/callback`).
 2. The user token scopes `openid`, `email` and `profile`. Slack asks for these in their own sign-in, separate from the bot's install.

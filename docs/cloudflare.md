@@ -116,6 +116,10 @@ To try it locally, create a Stripe sandbox, run `scripts/stripe-setup.sh local` 
 
 Set the `CONNECTOR_KEY` secret to let people connect GitHub, Google Drive, Jira and other apps; register OAuth apps to let them sign in instead of pasting tokens. The redirect URL is `https://<root domain>/connect/callback` for every workspace. See [connected-apps.md](connected-apps.md), and [hosting/connected-apps.md](hosting/connected-apps.md) for registering each app. The same key turns on [single sign-on](sso.md) with a workspace's own app, which its admins set up in Settings › Single sign-on; its redirect URI is the workspace's own `https://<workspace>.<root domain>/sso/callback`. To let admins set up Google, Microsoft or Slack sign-in in one click, register DumbSlab's own sign-in apps, whose redirect URI is `https://<root domain>/sso/callback`: see [sign-in apps](hosting/sign-in-apps.md).
 
+### Slack
+
+With DumbSlab's Slack app set up (`SLACK_CLIENT_ID` in `[vars]`, and the `SLACK_CLIENT_SECRET` and `SLACK_SIGNING_SECRET` secrets), admins connect Slack with one click: **Add to Slack** in Settings › Slack. Slack sends every workspace's commands and events to the root domain, and the Worker forwards each to the workspace that connected that Slack workspace. The `Directory` object keeps each connection's bot token. See [hosting/slack-app.md](hosting/slack-app.md).
+
 ### Operator API
 
 Manage workspaces with `Authorization: Bearer $OPERATOR_TOKEN` on the root domain:
