@@ -7598,10 +7598,16 @@ mod syncs {
         drive(&h, running[0].clone(), &github);
         assert_eq!(source_of(&h, &admin)["pending"], true);
 
+        // Changes to the installation only start a check of what GitHub says it is now.
+        let gh = GitHubNow::new();
+        let changed = |event: &str, body: &Value| check(&h, event, body, &gh);
+        let lifecycle = |action: &str| json!({ "action": action, "installation": { "id": 42, "account": { "login": "acme" } } });
+
         // A repository taken out of the App: the source waits, its posts stay.
+        gh.repos.borrow_mut().retain(|(id, _)| *id != 7);
         let removed =
             json!({ "action": "removed", "installation": { "id": 42 }, "repositories_removed": [{ "id": 7, "full_name": "acme/docs" }] });
-        assert_eq!(app_hook(&h, "installation_repositories", &removed, "gh-hook-secret").body["status"], "updated");
+        assert_eq!(changed("installation_repositories", &removed).0["removed"], 1);
         let s = source_of(&h, &admin);
         assert!(s["disconnected"].as_str().unwrap().contains("taken out"), "{s}");
         let r = h.call("POST", &format!("/api/v1/docs-sources/{source}/sync"), None, &admin);
@@ -7609,8 +7615,9 @@ mod syncs {
         assert!(background(&app_hook(&h, "push", &push(42, 7, "main", "acme/docs"), "gh-hook-secret")).is_empty());
         let listed = h.ok("GET", "/api/v1/docs-sources/github", None, &admin);
         assert_eq!(listed["installations"][0]["repositories"].as_array().unwrap().len(), 1, "no longer offered");
+        gh.repos.borrow_mut().extend([(7, "acme/docs"), (9, "acme/new")]);
         let added = json!({ "action": "added", "installation": { "id": 42 }, "repositories_added": [{ "id": 7, "full_name": "acme/docs" }, { "id": 9, "full_name": "acme/new" }] });
-        app_hook(&h, "installation_repositories", &added, "gh-hook-secret");
+        changed("installation_repositories", &added);
         assert_eq!(source_of(&h, &admin)["disconnected"], Value::Null, "back");
         let listed = h.ok("GET", "/api/v1/docs-sources/github", None, &admin);
         let names: Vec<&str> =
@@ -7618,17 +7625,20 @@ mod syncs {
         assert_eq!(names, vec!["acme/docs", "acme/site"], "a new repository waits until an admin here shows they can read it");
 
         // Suspended, then unsuspended.
-        let lifecycle = |action: &str| json!({ "action": action, "installation": { "id": 42, "account": { "login": "acme" } } });
-        app_hook(&h, "installation", &lifecycle("suspend"), "gh-hook-secret");
+        *gh.state.borrow_mut() = "suspended";
+        changed("installation", &lifecycle("suspend"));
         assert!(source_of(&h, &admin)["disconnected"].as_str().unwrap().contains("suspended"));
         assert_eq!(h.ok("GET", "/api/v1/docs-sources/github", None, &admin)["installations"][0]["suspended"], true);
-        app_hook(&h, "installation", &lifecycle("unsuspend"), "gh-hook-secret");
+        *gh.state.borrow_mut() = "active";
+        changed("installation", &lifecycle("unsuspend"));
         assert_eq!(source_of(&h, &admin)["disconnected"], Value::Null);
 
         // Uninstalled: the source waits, the installation is forgotten, nothing is deleted.
         let posts_before = count(&h, "SELECT COUNT(*) FROM posts WHERE deleted_at IS NULL");
-        let r = app_hook(&h, "installation", &lifecycle("deleted"), "gh-hook-secret");
-        assert_eq!(links(&r.effects), vec![(42, false)], "the directory stops forwarding its deliveries here");
+        *gh.state.borrow_mut() = "gone";
+        let (v, effects) = changed("installation", &lifecycle("deleted"));
+        assert_eq!(v["state"], "uninstalled");
+        assert_eq!(links(&effects), vec![(42, false)], "the directory stops forwarding its deliveries here");
         assert!(source_of(&h, &admin)["disconnected"].as_str().unwrap().contains("uninstalled"));
         assert_eq!(count(&h, "SELECT COUNT(*) FROM github_installations"), 0);
         assert_eq!(count(&h, "SELECT COUNT(*) FROM posts WHERE deleted_at IS NULL"), posts_before, "posts stay");
@@ -7644,6 +7654,64 @@ mod syncs {
         let feed = h.ok("GET", "/api/v1/activity?limit=200", None, &mo).to_string();
         assert!(!feed.contains("github.") && !feed.contains("docs_source"), "{feed}");
         assert!(h.ok("GET", "/api/v1/activity?limit=200", None, &admin).to_string().contains("github.uninstalled"));
+    }
+
+    /// GitHub's view of installation 42 now, for checks of it: `active`, `suspended` or `gone`, and
+    /// the repositories it can see.
+    struct GitHubNow {
+        state: RefCell<&'static str>,
+        repos: RefCell<Vec<(i64, &'static str)>>,
+    }
+
+    impl GitHubNow {
+        fn new() -> GitHubNow {
+            GitHubNow { state: RefCell::new("active"), repos: RefCell::new(vec![(7, "acme/docs"), (8, "acme/site")]) }
+        }
+
+        fn answer(&self, c: &HttpCall) -> HttpReply {
+            let state = *self.state.borrow();
+            if c.url == "https://api.github.com/app/installations/42" {
+                assert!(c.headers.iter().any(|(k, v)| k == "authorization" && v.starts_with("Bearer ey")), "the App's JWT");
+                return match state {
+                    "gone" => HttpReply { status: 404, body: "{}".into() },
+                    s => {
+                        ok(json!({ "id": 42, "suspended_at": if s == "suspended" { json!("2026-10-31T00:00:00Z") } else { Value::Null } }))
+                    }
+                };
+            }
+            if c.url == "https://api.github.com/app/installations/42/access_tokens" {
+                assert_eq!(
+                    serde_json::from_str::<Value>(c.body.as_deref().unwrap()).unwrap(),
+                    json!({ "permissions": { "metadata": "read" } })
+                );
+                return match state {
+                    "active" => HttpReply { status: 201, body: json!({ "token": "ghs_list" }).to_string() },
+                    "gone" => HttpReply { status: 404, body: "{}".into() },
+                    _ => HttpReply { status: 403, body: "{}".into() },
+                };
+            }
+            assert!(c.headers.contains(&("authorization".into(), "Bearer ghs_list".into())), "{c:?}");
+            let items: Vec<Value> =
+                self.repos.borrow().iter().map(|(id, name)| json!({ "id": id, "full_name": name, "default_branch": "main" })).collect();
+            let first = c.url == "https://api.github.com/installation/repositories?per_page=100&page=1";
+            ok(json!({ "total_count": items.len(), "repositories": if first { json!(items) } else { json!([]) } }))
+        }
+    }
+
+    /// The check a change to an installation starts, from the delivery.
+    fn check_of(h: &H, event: &str, body: &Value) -> Job {
+        let r = app_hook(h, event, body, "gh-hook-secret");
+        assert_eq!((r.status, r.body["status"].as_str()), (200, Some("checking")), "{}", r.body);
+        let jobs = background(&r);
+        assert_eq!(jobs.len(), 1);
+        jobs[0].clone()
+    }
+
+    /// Delivers a change to installation 42 and runs its check against `gh`: what it found, and its
+    /// effects.
+    fn check(h: &H, event: &str, body: &Value, gh: &GitHubNow) -> (Value, Vec<Effect>) {
+        let (finish, _, effects) = drive_all(h, check_of(h, event, body), &|c| gh.answer(c));
+        (filled(finish), effects)
     }
 
     #[test]
@@ -7786,21 +7854,7 @@ mod syncs {
         let topic = h.ok("POST", "/api/v1/topics", Some(json!({ "name": "Handbook" })), &admin)["id"].as_str().unwrap().to_string();
         let input = json!({ "provider": "github", "installation_id": 42, "repository": "acme/docs", "topic_id": topic });
         let source = h.ok("POST", "/api/v1/docs-sources", Some(input), &admin)["source"]["id"].as_str().unwrap().to_string();
-        let visible = RefCell::new(vec![(7, "acme/docs"), (8, "acme/site")]);
-        let github = |c: &HttpCall| -> HttpReply {
-            if c.url == "https://api.github.com/app/installations/42/access_tokens" {
-                assert_eq!(
-                    serde_json::from_str::<Value>(c.body.as_deref().unwrap()).unwrap(),
-                    json!({ "permissions": { "metadata": "read" } })
-                );
-                return HttpReply { status: 201, body: json!({ "token": "ghs_list" }).to_string() };
-            }
-            assert!(c.headers.contains(&("authorization".into(), "Bearer ghs_list".into())), "{c:?}");
-            let items: Vec<Value> =
-                visible.borrow().iter().map(|(id, name)| json!({ "id": id, "full_name": name, "default_branch": "main" })).collect();
-            let first = c.url == "https://api.github.com/installation/repositories?per_page=100&page=1";
-            ok(json!({ "total_count": items.len(), "repositories": if first { json!(items) } else { json!([]) } }))
-        };
+        let gh = GitHubNow::new();
         let picker = |h: &H| -> Vec<String> {
             h.ok("GET", "/api/v1/docs-sources/github", None, &admin)["installations"][0]["repositories"]
                 .as_array()
@@ -7812,27 +7866,20 @@ mod syncs {
 
         // From all repositories to selected ones: GitHub may name none of those left out, so the
         // list is checked, and acme/docs stops syncing (its posts stay).
-        visible.borrow_mut().retain(|(id, _)| *id == 8);
+        gh.repos.borrow_mut().retain(|(id, _)| *id == 8);
         let switched =
             json!({ "action": "removed", "repository_selection": "selected", "installation": { "id": 42 }, "repositories_removed": [] });
-        let r = app_hook(&h, "installation_repositories", &switched, "gh-hook-secret");
-        assert_eq!(r.status, 200, "{}", r.body);
-        let jobs = background(&r);
-        assert_eq!(jobs.len(), 1, "a check of the installation's repositories");
-        assert_eq!(filled(drive(&h, jobs[0].clone(), &github).0)["removed"], 1);
+        assert_eq!(check(&h, "installation_repositories", &switched, &gh).0["removed"], 1);
         assert!(source_of(&h, &admin)["disconnected"].as_str().unwrap().contains("taken out"));
         assert_eq!(picker(&h), vec!["acme/site"]);
         // GitHub redelivers it (same delivery id): handled again, the same way.
-        let r = app_hook(&h, "installation_repositories", &switched, "gh-hook-secret");
-        assert_eq!(r.status, 200);
-        assert_eq!(filled(drive(&h, background(&r)[0].clone(), &github).0)["removed"], 0);
+        assert_eq!(check(&h, "installation_repositories", &switched, &gh).0["removed"], 0);
 
         // Put back, also without being named: the next change brings it back.
-        visible.borrow_mut().push((7, "acme/docs"));
+        gh.repos.borrow_mut().push((7, "acme/docs"));
         let added =
             json!({ "action": "added", "repository_selection": "selected", "installation": { "id": 42 }, "repositories_added": [] });
-        let r = app_hook(&h, "installation_repositories", &added, "gh-hook-secret");
-        filled(drive(&h, background(&r)[0].clone(), &github).0);
+        check(&h, "installation_repositories", &added, &gh);
         assert_eq!(source_of(&h, &admin)["disconnected"], Value::Null);
         assert_eq!(picker(&h), vec!["acme/docs", "acme/site"]);
 
@@ -7843,10 +7890,78 @@ mod syncs {
         assert!(source_of(&h, &admin)["disconnected"].as_str().unwrap().contains("taken out"));
 
         // Uninstalled, and redelivered: the second finds nothing left to do.
+        *gh.state.borrow_mut() = "gone";
         let deleted = json!({ "action": "deleted", "installation": { "id": 42, "account": { "login": "acme" } } });
-        assert_eq!(app_hook(&h, "installation", &deleted, "gh-hook-secret").body["status"], "updated");
+        assert_eq!(check(&h, "installation", &deleted, &gh).0["state"], "uninstalled");
         let again = app_hook(&h, "installation", &deleted, "gh-hook-secret");
         assert_eq!((again.status, again.body["status"].as_str()), (200, Some("ignored")));
+    }
+
+    #[test]
+    fn only_the_newest_check_of_an_installation_applies() {
+        let mut h = H::new();
+        let (admin, _) = h.setup();
+        with_key(&mut h);
+        with_app(&mut h);
+        connect_github(&h, &admin, "&installation_id=42&setup_action=install", &installer);
+        let topic = h.ok("POST", "/api/v1/topics", Some(json!({ "name": "Handbook" })), &admin)["id"].as_str().unwrap().to_string();
+        let input = json!({ "provider": "github", "installation_id": 42, "repository": "acme/docs", "topic_id": topic });
+        h.ok("POST", "/api/v1/docs-sources", Some(input), &admin);
+
+        // acme/docs is taken out, and put back. The first change's check is slow: by the time it
+        // reads GitHub's list (without acme/docs, as it was then), the second change's check has
+        // already found it back. The older check gives way, so acme/docs stays.
+        let removed =
+            json!({ "action": "removed", "installation": { "id": 42 }, "repositories_removed": [{ "id": 7, "full_name": "acme/docs" }] });
+        let older = check_of(&h, "installation_repositories", &removed);
+        let added =
+            json!({ "action": "added", "installation": { "id": 42 }, "repositories_added": [{ "id": 7, "full_name": "acme/docs" }] });
+        let newer = check_of(&h, "installation_repositories", &added);
+        let now = GitHubNow::new();
+        assert_eq!(filled(drive(&h, newer, &|c| now.answer(c)).0)["state"], "active");
+        let then = GitHubNow::new();
+        then.repos.borrow_mut().retain(|(id, _)| *id != 7);
+        assert_eq!(filled(drive(&h, older, &|c| then.answer(c)).0)["state"], "superseded");
+        assert_eq!(source_of(&h, &admin)["disconnected"], Value::Null);
+        assert_eq!(
+            h.ok("GET", "/api/v1/docs-sources/github", None, &admin)["installations"][0]["repositories"].as_array().unwrap().len(),
+            2
+        );
+    }
+
+    #[test]
+    fn redelivered_installation_events_follow_githubs_current_state() {
+        let mut h = H::new();
+        let (admin, _) = h.setup();
+        with_key(&mut h);
+        with_app(&mut h);
+        connect_github(&h, &admin, "&installation_id=42&setup_action=install", &installer);
+        let topic = h.ok("POST", "/api/v1/topics", Some(json!({ "name": "Handbook" })), &admin)["id"].as_str().unwrap().to_string();
+        let input = json!({ "provider": "github", "installation_id": 42, "repository": "acme/docs", "topic_id": topic });
+        h.ok("POST", "/api/v1/docs-sources", Some(input), &admin);
+        let gh = GitHubNow::new();
+        let lifecycle = |action: &str| json!({ "action": action, "installation": { "id": 42, "account": { "login": "acme" } } });
+        let suspended = |h: &H| h.ok("GET", "/api/v1/docs-sources/github", None, &admin)["installations"][0]["suspended"].clone();
+
+        // A suspension didn't reach this workspace (the delivery failed here); the unsuspension did.
+        // An operator then redelivers the failed suspension: GitHub says the installation is active,
+        // so it stays active.
+        check(&h, "installation", &lifecycle("unsuspend"), &gh);
+        assert_eq!(check(&h, "installation", &lifecycle("suspend"), &gh).0["state"], "active");
+        assert_eq!((suspended(&h), source_of(&h, &admin)["disconnected"].clone()), (json!(false), Value::Null));
+
+        // The other way round: suspended now, and an old unsuspension redelivered keeps it so.
+        *gh.state.borrow_mut() = "suspended";
+        check(&h, "installation", &lifecycle("suspend"), &gh);
+        assert_eq!(check(&h, "installation", &lifecycle("unsuspend"), &gh).0["state"], "suspended");
+        assert_eq!(suspended(&h), json!(true));
+        assert!(source_of(&h, &admin)["disconnected"].as_str().unwrap().contains("suspended"));
+
+        // A redelivered uninstall while the installation still exists changes nothing.
+        *gh.state.borrow_mut() = "active";
+        assert_eq!(check(&h, "installation", &lifecycle("deleted"), &gh).0["state"], "active");
+        assert_eq!(count(&h, "SELECT COUNT(*) FROM github_installations"), 1);
+        assert_eq!(source_of(&h, &admin)["disconnected"], Value::Null);
     }
 
     #[test]

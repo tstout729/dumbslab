@@ -23,8 +23,9 @@
 //!   gets it directly. Each workspace checks the signature again ([`hook`]) and acts only on
 //!   installations it connected: a push syncs the sources on that repository and branch, and an
 //!   uninstall, suspension or removed repository marks the affected sources disconnected (posts stay).
-//!   Any change to an installation's repositories is checked against its current list
-//!   ([`ReposJob`]), since GitHub may not name the ones a switch from all to selected left out.
+//!   Those changes only trigger a read of what GitHub says the installation is now ([`CheckJob`]):
+//!   deliveries can arrive out of order or be redelivered, and GitHub may not name the
+//!   repositories a switch from all to selected left out.
 //! - **Registering with the directory** (hosted) is part of connecting: the job asks the host to
 //!   record the installation for this workspace ([`link_call`], which only hosts with a directory
 //!   are sent), and says so when the installation already serves as many workspaces as it may.
@@ -790,22 +791,11 @@ pub(crate) enum Delivery {
         full_name: String,
         branch: String,
     },
-    Uninstalled {
+    /// The installation changed: uninstalled, suspended or unsuspended, new permissions accepted,
+    /// or repositories added or taken out. Only a trigger: what it is now is read from GitHub
+    /// (see [`CheckJob`]), since deliveries can arrive late, out of order, or redelivered.
+    Changed {
         installation: i64,
-    },
-    Suspended {
-        installation: i64,
-    },
-    Unsuspended {
-        installation: i64,
-    },
-    RepositoriesRemoved {
-        installation: i64,
-        ids: Vec<i64>,
-    },
-    RepositoriesAdded {
-        installation: i64,
-        repos: Vec<(i64, String)>,
     },
     Ignored,
 }
@@ -813,12 +803,7 @@ pub(crate) enum Delivery {
 impl Delivery {
     fn installation(&self) -> Option<i64> {
         match self {
-            Delivery::Push { installation, .. }
-            | Delivery::Uninstalled { installation }
-            | Delivery::Suspended { installation }
-            | Delivery::Unsuspended { installation }
-            | Delivery::RepositoriesRemoved { installation, .. }
-            | Delivery::RepositoriesAdded { installation, .. } => Some(*installation),
+            Delivery::Push { installation, .. } | Delivery::Changed { installation } => Some(*installation),
             Delivery::Ping | Delivery::Ignored => None,
         }
     }
@@ -833,14 +818,6 @@ pub(crate) fn parse(event: &str, body: &[u8]) -> Delivery {
     }
     let v: Value = serde_json::from_slice(body).unwrap_or_default();
     let Some(installation) = v["installation"]["id"].as_i64().filter(|i| *i > 0) else { return Delivery::Ignored };
-    let repos = |key: &str| -> Vec<(i64, String)> {
-        v[key]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|r| Some((r["id"].as_i64()?, r["full_name"].as_str().unwrap_or_default().to_string())))
-            .collect()
-    };
     match (event, v["action"].as_str().unwrap_or_default()) {
         ("push", _) => {
             let branch = v["ref"].as_str().and_then(|r| r.strip_prefix("refs/heads/"));
@@ -851,13 +828,8 @@ pub(crate) fn parse(event: &str, body: &[u8]) -> Delivery {
                 _ => Delivery::Ignored,
             }
         }
-        ("installation", "deleted") => Delivery::Uninstalled { installation },
-        ("installation", "suspend") => Delivery::Suspended { installation },
-        ("installation", "unsuspend") => Delivery::Unsuspended { installation },
-        ("installation_repositories", "removed") => {
-            Delivery::RepositoriesRemoved { installation, ids: repos("repositories_removed").into_iter().map(|(id, _)| id).collect() }
-        }
-        ("installation_repositories", "added") => Delivery::RepositoriesAdded { installation, repos: repos("repositories_added") },
+        ("installation", "deleted" | "suspend" | "unsuspend" | "new_permissions_accepted")
+        | ("installation_repositories", "added" | "removed") => Delivery::Changed { installation },
         _ => Delivery::Ignored,
     }
 }
@@ -927,16 +899,10 @@ pub(crate) fn hook(db: &dyn Db, cfg: &HostConfig, req: &Request, base_url: &str,
         return Ok(hook_answer("pong"));
     }
     let Some(installation) = delivery.installation() else { return Ok(hook_answer("ignored")) };
-    let Some(row) = db.one("SELECT id, account, connected_by FROM github_installations WHERE id = ?", &params![installation])? else {
+    if db.one("SELECT 1 AS ok FROM github_installations WHERE id = ?", &params![installation])?.is_none() {
         return Ok(hook_answer("ignored"));
-    };
+    }
     let stamp = ts(now);
-    let owner = row.str("connected_by");
-    let account = row.str("account");
-    let mut ctx = super::ctx(db, cfg, &owner, base_url, now)?;
-    let note = |ctx: &mut crate::registry::Ctx, event: &str, summary: String| -> ApiResult<()> {
-        emit(ctx, Event::new(event, "github_installation", &installation.to_string(), summary).admin_only()).map(|_| ())
-    };
     match delivery {
         Delivery::Push { repo_id, full_name, branch, .. } => {
             let rows = db.query(
@@ -969,147 +935,197 @@ pub(crate) fn hook(db: &dyn Db, cfg: &HostConfig, req: &Request, base_url: &str,
                     None => super::mark_pending(db, super::docs::TABLE, SqlValue::from(id), now)?,
                 }
             }
-            return Ok(out);
+            Ok(out)
         }
-        Delivery::Uninstalled { .. } => {
+        // What changed is read from GitHub, by the newest check only.
+        Delivery::Changed { .. } => {
+            db.execute("UPDATE github_installations SET generation = generation + 1 WHERE id = ?", &params![installation])?;
+            let generation = db.scalar_i64("SELECT generation FROM github_installations WHERE id = ?", &params![installation])?;
+            let mut out = hook_answer("checking");
+            out.effects.push(Effect::Background(Job::GitHubCheck(Box::new(CheckJob::new(installation, generation, base_url)))));
+            Ok(out)
+        }
+        Delivery::Ping | Delivery::Ignored => Ok(hook_answer("ignored")),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Checking an installation against GitHub
+
+/// Brings an installation here in line with what GitHub says it is now, after GitHub reported a
+/// change. Deliveries only trigger it: they can arrive late, out of order, or redelivered (an
+/// operator redelivering an old suspension mustn't suspend an installation GitHub has since
+/// unsuspended), so the check reads the installation itself (`GET /app/installations/{id}`, gone
+/// when it answers 404) and, while it's active, its repositories. GitHub may not name every
+/// repository a change left out (switching from all repositories to selected ones can leave
+/// `repositories_removed` empty), so the list is read whole.
+///
+/// Each change bumps the installation's `generation`, and each check carries the one it started
+/// for. Only a check whose generation is still current applies what it read: an older check that
+/// finishes late gives way to the newer change's own check, which read GitHub after that change.
+///
+/// What it applies: an uninstalled installation is forgotten and its sources wait,
+/// disconnected; a suspended one's sources wait until it's unsuspended; repositories no longer on
+/// its list stop being offered and their sources wait, and ones back on it come back. New
+/// repositories aren't offered until an admin here connects again, which checks their own account
+/// can read them. Posts are never deleted.
+///
+/// Docs: https://docs.github.com/en/rest/apps/apps#get-an-installation-for-the-authenticated-app
+/// (a JWT; `suspended_at`; 200 or 404), https://docs.github.com/en/rest/apps/installations#list-repositories-accessible-to-the-app-installation
+#[derive(Clone, Debug)]
+pub struct CheckJob {
+    installation_id: i64,
+    generation: i64,
+    base_url: String,
+    phase: CheckPhase,
+    effects: Vec<Effect>,
+    staged: Vec<Effect>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum CheckPhase {
+    Start,
+    Reading,
+    Listing,
+}
+
+impl CheckJob {
+    pub(crate) fn new(installation_id: i64, generation: i64, base_url: &str) -> CheckJob {
+        CheckJob { installation_id, generation, base_url: base_url.into(), phase: CheckPhase::Start, effects: vec![], staged: vec![] }
+    }
+
+    pub(crate) fn take_effects(&mut self) -> Vec<Effect> {
+        std::mem::take(&mut self.effects)
+    }
+
+    pub(crate) fn settle(&mut self, committed: bool) {
+        let staged = std::mem::take(&mut self.staged);
+        if committed {
+            self.effects.extend(staged);
+        }
+    }
+}
+
+/// What GitHub says an installation is now.
+enum Now {
+    Gone,
+    Suspended,
+    /// Active, with the repositories it can see, and whether there are more than were read.
+    Active(Vec<Repository>, bool),
+}
+
+/// Runs the installation check's next step (see [`crate::connect::step`]).
+pub fn check_step(db: &dyn Db, cfg: &HostConfig, j: &mut CheckJob, replies: Vec<HttpReply>, now: DateTime<Utc>) -> ApiResult<Step> {
+    let failed = |message: String| Ok(Step::Done(Finish::Fail(ApiError::new(400, "github_failed", message))));
+    let Some(app) = app(cfg) else { return failed("DumbSlab's GitHub App isn't set up on this server any more.".into()) };
+    match j.phase {
+        CheckPhase::Start => {
+            let (Ok(jwt), Ok(mint)) = (jwt(app, now), listing_token_call(app, j.installation_id, now)) else {
+                return failed(BAD_KEY.into());
+            };
+            let read = api_call(HttpCall::get(format!("{API}/app/installations/{}", j.installation_id))).bearer(&jwt);
+            j.phase = CheckPhase::Reading;
+            Ok(Step::Fetch(vec![read, mint]))
+        }
+        CheckPhase::Reading => {
+            let read = replies.first().cloned().unwrap_or_default();
+            match read.status {
+                404 => apply(db, cfg, j, Now::Gone, now),
+                200 if !read.json()["suspended_at"].is_null() => apply(db, cfg, j, Now::Suspended, now),
+                200 => match read_token(&replies.get(1).cloned().unwrap_or_default(), 0) {
+                    Ok(minted) => {
+                        j.phase = CheckPhase::Listing;
+                        Ok(Step::Fetch(
+                            (1..=REPO_PAGES)
+                                .map(|page| {
+                                    api_call(HttpCall::get(format!("{API}/installation/repositories?per_page={PER_PAGE}&page={page}")))
+                                        .bearer(&minted.token)
+                                })
+                                .collect(),
+                        ))
+                    }
+                    Err(message) => failed(message),
+                },
+                _ => failed(http_error("GitHub", &read)),
+            }
+        }
+        CheckPhase::Listing => match read_repositories(&replies) {
+            Ok((repos, more)) => apply(db, cfg, j, Now::Active(repos, more), now),
+            Err(message) => failed(message),
+        },
+    }
+}
+
+/// Applies what GitHub said, if no newer change has come in since this check started.
+fn apply(db: &dyn Db, cfg: &HostConfig, j: &mut CheckJob, now_is: Now, now: DateTime<Utc>) -> ApiResult<Step> {
+    let installation = j.installation_id;
+    let Some(row) =
+        db.one("SELECT account, connected_by, generation, suspended_at FROM github_installations WHERE id = ?", &params![installation])?
+    else {
+        return Ok(Step::Done(Finish::Fill(json!({ "ok": true, "state": "forgotten" }))));
+    };
+    if row.i64("generation") != j.generation {
+        // A newer change's check reads GitHub after it, and applies instead.
+        return Ok(Step::Done(Finish::Fill(json!({ "ok": true, "state": "superseded" }))));
+    }
+    let account = row.str("account");
+    let was_suspended = row.opt_str("suspended_at").is_some();
+    let stamp = ts(now);
+    let mut ctx = super::ctx(db, cfg, &row.str("connected_by"), &j.base_url, now)?;
+    let note = |ctx: &mut crate::registry::Ctx, event: &str, summary: String| -> ApiResult<()> {
+        emit(ctx, Event::new(event, "github_installation", &installation.to_string(), summary).admin_only()).map(|_| ())
+    };
+    let state = match now_is {
+        Now::Gone => {
             disconnect(db, installation, "", UNINSTALLED, vec![])?;
             db.execute("DELETE FROM github_repositories WHERE installation_id = ?", &params![installation])?;
             db.execute("DELETE FROM github_installations WHERE id = ?", &params![installation])?;
             note(&mut ctx, "github.uninstalled", format!("DumbSlab's GitHub App was uninstalled from {account}"))?;
             ctx.effects.push(Effect::GitHubInstallation(InstallationLink { installation_id: installation, linked: false }));
+            json!({ "ok": true, "state": "uninstalled" })
         }
-        Delivery::Suspended { .. } => {
-            db.execute(
-                "UPDATE github_installations SET suspended_at = ?, updated_at = ? WHERE id = ?",
-                &params![stamp.clone(), stamp.clone(), installation],
-            )?;
+        Now::Suspended => {
+            if !was_suspended {
+                db.execute(
+                    "UPDATE github_installations SET suspended_at = ?, updated_at = ? WHERE id = ?",
+                    &params![stamp.clone(), stamp.clone(), installation],
+                )?;
+                note(&mut ctx, "github.suspended", format!("DumbSlab's GitHub App was suspended on {account}"))?;
+            }
             disconnect(db, installation, " AND disconnected IS NULL", SUSPENDED, vec![])?;
-            note(&mut ctx, "github.suspended", format!("DumbSlab's GitHub App was suspended on {account}"))?;
+            json!({ "ok": true, "state": "suspended" })
         }
-        Delivery::Unsuspended { .. } => {
-            db.execute(
-                "UPDATE github_installations SET suspended_at = NULL, updated_at = ? WHERE id = ?",
-                &params![stamp.clone(), installation],
-            )?;
+        Now::Active(repos, more) => {
+            if was_suspended {
+                db.execute(
+                    "UPDATE github_installations SET suspended_at = NULL, updated_at = ? WHERE id = ?",
+                    &params![stamp.clone(), installation],
+                )?;
+                note(&mut ctx, "github.unsuspended", format!("DumbSlab's GitHub App was unsuspended on {account}"))?;
+            }
             db.execute(
                 "UPDATE docs_source_links SET disconnected = NULL WHERE connection = 'github_app' AND installation_id = ? AND disconnected = ?",
                 &params![installation, SUSPENDED],
             )?;
-            note(&mut ctx, "github.unsuspended", format!("DumbSlab's GitHub App was unsuspended on {account}"))?;
-        }
-        Delivery::RepositoriesRemoved { ids, .. } => {
-            for id in &ids {
-                db.execute(
-                    "UPDATE github_repositories SET removed_at = ? WHERE installation_id = ? AND id = ?",
-                    &params![stamp.clone(), installation, *id],
-                )?;
-                disconnect(db, installation, " AND repo_id = ? AND disconnected IS NULL", REPOSITORY_REMOVED, params![*id])?;
-            }
-            note(&mut ctx, "github.repositories_removed", format!("repositories were taken out of DumbSlab's GitHub App on {account}"))?;
-            ctx.effects.push(Effect::Background(Job::GitHubRepos(Box::new(ReposJob::new(installation)))));
-        }
-        Delivery::RepositoriesAdded { repos, .. } => {
-            // Only repositories the admin here could already read come back; new ones need
-            // Connect GitHub again, which checks their account can read them.
-            for (id, name) in &repos {
-                let name = super::repo::github_repo(name).ok();
-                db.execute(
-                    "UPDATE github_repositories SET removed_at = NULL, full_name = COALESCE(?, full_name) WHERE installation_id = ? AND id = ?",
-                    &params![name, installation, *id],
-                )?;
-                db.execute(
-                    "UPDATE docs_source_links SET disconnected = NULL WHERE connection = 'github_app' AND installation_id = ? AND repo_id = ? AND disconnected = ?",
-                    &params![installation, *id, REPOSITORY_REMOVED],
-                )?;
-            }
-            note(&mut ctx, "github.repositories_added", format!("repositories were added to DumbSlab's GitHub App on {account}"))?;
-            ctx.effects.push(Effect::Background(Job::GitHubRepos(Box::new(ReposJob::new(installation)))));
-        }
-        Delivery::Ping | Delivery::Ignored => return Ok(hook_answer("ignored")),
-    }
-    let mut out = hook_answer("updated");
-    out.effects.append(&mut ctx.effects);
-    Ok(out)
-}
-
-// ---------------------------------------------------------------------------
-// Checking an installation's repositories
-
-/// Brings an installation's repositories here in line with GitHub's list for it, after GitHub
-/// reported a change. GitHub may not name every repository a change left out (switching from all
-/// repositories to selected ones can leave `repositories_removed` empty), so the list itself is
-/// read: repositories no longer on it stop being offered and their sources wait, disconnected;
-/// ones back on it come back. New repositories aren't offered until an admin here connects
-/// again, which checks their own account can read them.
-#[derive(Clone, Debug)]
-pub struct ReposJob {
-    installation_id: i64,
-    phase: ReposPhase,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum ReposPhase {
-    Start,
-    Minting,
-    Listing,
-}
-
-impl ReposJob {
-    pub(crate) fn new(installation_id: i64) -> ReposJob {
-        ReposJob { installation_id, phase: ReposPhase::Start }
-    }
-}
-
-/// Runs the repository check's next step (see [`crate::connect::step`]).
-pub fn repos_step(db: &dyn Db, cfg: &HostConfig, j: &mut ReposJob, replies: Vec<HttpReply>, now: DateTime<Utc>) -> ApiResult<Step> {
-    let failed = |message: String| Ok(Step::Done(Finish::Fail(ApiError::new(400, "github_failed", message))));
-    let Some(app) = app(cfg) else { return failed("DumbSlab's GitHub App isn't set up on this server any more.".into()) };
-    match j.phase {
-        ReposPhase::Start => match listing_token_call(app, j.installation_id, now) {
-            Ok(call) => {
-                j.phase = ReposPhase::Minting;
-                Ok(Step::Fetch(vec![call]))
-            }
-            Err(message) => failed(message),
-        },
-        ReposPhase::Minting => match read_token(&replies.first().cloned().unwrap_or_default(), 0) {
-            Ok(minted) => {
-                j.phase = ReposPhase::Listing;
-                Ok(Step::Fetch(
-                    (1..=REPO_PAGES)
-                        .map(|page| {
-                            api_call(HttpCall::get(format!("{API}/installation/repositories?per_page={PER_PAGE}&page={page}")))
-                                .bearer(&minted.token)
-                        })
-                        .collect(),
-                ))
-            }
-            Err(message) => failed(message),
-        },
-        ReposPhase::Listing => {
-            let (current, more) = match read_repositories(&replies) {
-                Ok(r) => r,
-                Err(message) => return failed(message),
-            };
-            let installation = j.installation_id;
-            let names: std::collections::BTreeMap<i64, String> = current.iter().map(|r| (r.id, r.full_name.clone())).collect();
-            let stamp = ts(now);
-            let mut gone = 0;
+            let names: std::collections::BTreeMap<i64, String> = repos.iter().map(|r| (r.id, r.full_name.clone())).collect();
+            let (mut gone, mut back) = (0, 0);
             for r in db.query("SELECT id, removed_at FROM github_repositories WHERE installation_id = ?", &params![installation])? {
                 let id = r.i64("id");
+                let removed = r.opt_str("removed_at").is_some();
                 match names.get(&id) {
                     Some(name) => {
                         db.execute(
                             "UPDATE github_repositories SET removed_at = NULL, full_name = ? WHERE installation_id = ? AND id = ?",
                             &params![name.clone(), installation, id],
                         )?;
-                        db.execute(
+                        back += db.execute(
                             "UPDATE docs_source_links SET disconnected = NULL WHERE connection = 'github_app' AND installation_id = ? AND repo_id = ? AND disconnected = ?",
                             &params![installation, id, REPOSITORY_REMOVED],
-                        )?;
+                        )? as usize
+                            + usize::from(removed);
                     }
                     // Only a whole list says what's missing from it.
-                    None if !more && r.opt_str("removed_at").is_none() => {
+                    None if !more && !removed => {
                         db.execute(
                             "UPDATE github_repositories SET removed_at = ? WHERE installation_id = ? AND id = ?",
                             &params![stamp.clone(), installation, id],
@@ -1120,9 +1136,21 @@ pub fn repos_step(db: &dyn Db, cfg: &HostConfig, j: &mut ReposJob, replies: Vec<
                     None => {}
                 }
             }
-            Ok(Step::Done(Finish::Fill(json!({ "ok": true, "repositories": current.len(), "removed": gone }))))
+            if gone > 0 {
+                note(
+                    &mut ctx,
+                    "github.repositories_removed",
+                    format!("repositories were taken out of DumbSlab's GitHub App on {account}"),
+                )?;
+            }
+            if back > 0 {
+                note(&mut ctx, "github.repositories_added", format!("repositories came back to DumbSlab's GitHub App on {account}"))?;
+            }
+            json!({ "ok": true, "state": "active", "repositories": repos.len(), "removed": gone })
         }
-    }
+    };
+    j.staged.append(&mut ctx.effects);
+    Ok(Step::Done(Finish::Fill(state)))
 }
 
 #[cfg(test)]
@@ -1273,14 +1301,14 @@ mod tests {
             assert_eq!(parse("push", b), Delivery::Ignored);
         }
         let lifecycle = |action: &str| body(json!({ "action": action, "installation": { "id": 42, "account": { "login": "acme" } } }));
-        assert_eq!(parse("installation", &lifecycle("deleted")), Delivery::Uninstalled { installation: 42 });
-        assert_eq!(parse("installation", &lifecycle("suspend")), Delivery::Suspended { installation: 42 });
-        assert_eq!(parse("installation", &lifecycle("unsuspend")), Delivery::Unsuspended { installation: 42 });
-        assert_eq!(parse("installation", &lifecycle("created")), Delivery::Ignored);
+        for action in ["deleted", "suspend", "unsuspend", "new_permissions_accepted"] {
+            assert_eq!(parse("installation", &lifecycle(action)), Delivery::Changed { installation: 42 }, "{action}");
+        }
+        assert_eq!(parse("installation", &lifecycle("created")), Delivery::Ignored, "nobody here connected it yet");
         let removed = body(
             json!({ "action": "removed", "installation": { "id": 42 }, "repositories_removed": [{ "id": 7, "full_name": "acme/docs" }] }),
         );
-        assert_eq!(parse("installation_repositories", &removed), Delivery::RepositoriesRemoved { installation: 42, ids: vec![7] });
+        assert_eq!(parse("installation_repositories", &removed), Delivery::Changed { installation: 42 });
         assert_eq!(parse("ping", b"{}"), Delivery::Ping);
         assert_eq!(parse("issues", &lifecycle("opened")), Delivery::Ignored);
 
