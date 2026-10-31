@@ -306,6 +306,12 @@ pub(crate) fn project_call(token: &str, path: &str) -> HttpCall {
     api_get(format!("{API}/projects/{}", enc(path)), token)
 }
 
+/// The request for one project by id, among those the admin can maintain (the same filter as
+/// [`project_calls`], which counts roles inherited from groups): empty when they can't.
+pub(crate) fn maintained_project_call(token: &str, id: i64) -> HttpCall {
+    api_get(format!("{API}/projects?membership=true&min_access_level=40&simple=true&id_after={}&id_before={}", id - 1, id + 1), token)
+}
+
 /// The request that adds a project's push webhook, to `url` with `secret` as its token.
 pub(crate) fn add_hook_call(token: &str, project_id: i64, url: &str, secret: &str) -> HttpCall {
     let body = json!({ "name": HOOK_NAME, "url": url, "push_events": true, "token": secret, "enable_ssl_verification": true });
@@ -499,6 +505,8 @@ pub fn callback(db: &dyn Db, cfg: &HostConfig, req: &Request) -> Outcome {
 #[derive(Clone, Debug)]
 pub struct Draft {
     pub source_id: String,
+    /// The project the admin picked, by id; the path (`repo`) is only for reading then.
+    pub project_id: Option<i64>,
     pub repo: String,
     pub branch: Option<String>,
     pub folder: String,
@@ -820,8 +828,21 @@ pub fn step(db: &dyn Db, cfg: &HostConfig, j: &mut GitLabJob, replies: Vec<HttpR
                 let message = project_error(&reply, &draft.repo);
                 return give_up(db, j, message);
             }
-            let Some(found) = read_project(&reply.json()) else {
-                return give_up(db, j, "GitLab's answer had no project in it. Try again.");
+            // The project the admin picked, by its id, whatever its path is now; or, given only a
+            // path, the project there now, whose id is kept from here on.
+            let found = match draft.project_id {
+                Some(id) => reply.json().as_array().and_then(|list| list.iter().filter_map(read_project).find(|p| p.id == id)),
+                None => read_project(&reply.json()),
+            };
+            let Some(found) = found else {
+                let message = match draft.project_id {
+                    Some(_) => format!(
+                        "GitLab no longer shows {} as a project you maintain (it was deleted, or your role changed). Choose it again.",
+                        draft.repo
+                    ),
+                    None => "GitLab's answer had no project in it. Try again.".into(),
+                };
+                return give_up(db, j, message);
             };
             let call = add_hook_call(&p.cred.token, found.id, &draft.webhook_url, secret);
             *project = Some(found);
@@ -940,7 +961,10 @@ fn finish_reconnect(db: &dyn Db, cfg: &HostConfig, j: &mut GitLabJob, now: DateT
 fn first_calls(kind: &Kind) -> Vec<HttpCall> {
     match kind {
         Kind::Projects { approval: Some(p), .. } => project_calls(&p.cred.token),
-        Kind::Create { approval: Some(p), draft, .. } => vec![project_call(&p.cred.token, &draft.repo)],
+        Kind::Create { approval: Some(p), draft, .. } => match draft.project_id {
+            Some(id) => vec![maintained_project_call(&p.cred.token, id)],
+            None => vec![project_call(&p.cred.token, &draft.repo)],
+        },
         Kind::Reconnect { approval: Some(p), rejoin, .. } => match rejoin.hook_id {
             Some(hook) => vec![edit_hook_call(&p.cred.token, rejoin.project_id, hook, &rejoin.webhook_url, &rejoin.secret)],
             None => vec![add_hook_call(&p.cred.token, rejoin.project_id, &rejoin.webhook_url, &rejoin.secret)],

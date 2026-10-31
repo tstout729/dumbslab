@@ -538,7 +538,8 @@ function gitlabSourceForm(gitlab, topics, reload) {
     }
     const picked = byId.get(project.value);
     busy(submit, async () => {
-      const body = { provider: 'gitlab', gitlab_connection: true, repository: picked.path, branch: branch.value.trim(), folder: folder.value.trim(), topic_id: topic.value };
+      // The project's id decides which one is added; its path is for reading.
+      const body = { provider: 'gitlab', gitlab_connection: true, project_id: picked.id, repository: picked.path, branch: branch.value.trim(), folder: folder.value.trim(), topic_id: topic.value };
       await firstSync(await api.post('/docs-sources', body), progress, reload);
     }).catch(toastError);
   });

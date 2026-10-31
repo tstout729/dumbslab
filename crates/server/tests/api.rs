@@ -10145,6 +10145,9 @@ mod syncs {
     /// gitlab.com, for an admin who maintains `acme/handbook` (id 3). Each approval is a grant: an
     /// access token `glo_<n>` and a refresh token `glr_<n>`, and a refresh replaces both, as GitLab
     /// does. Webhooks are kept as GitLab would.
+    /// A project's files, by path.
+    type Files = BTreeMap<String, Vec<u8>>;
+
     struct GitLabCom {
         files: RefCell<BTreeMap<String, Vec<u8>>>,
         /// Live grants: refresh token → access token.
@@ -10157,8 +10160,8 @@ mod syncs {
         removed: RefCell<Vec<String>>,
         /// Project 3's path now (renamed or moved, it changes).
         path: RefCell<String>,
-        /// Another project (4) that took project 3's first path, `acme/handbook`, with its own files.
-        squatter: RefCell<Option<BTreeMap<String, Vec<u8>>>>,
+        /// Other projects the admin maintains: id → (path, files).
+        others: RefCell<BTreeMap<i64, (String, Files)>>,
         /// GitLab can't answer just now (5xx).
         down: RefCell<bool>,
     }
@@ -10174,7 +10177,7 @@ mod syncs {
                 next_hook: RefCell::new(9),
                 removed: RefCell::new(vec![]),
                 path: RefCell::new("acme/handbook".into()),
-                squatter: RefCell::new(None),
+                others: RefCell::new(BTreeMap::new()),
                 down: RefCell::new(false),
             }
         }
@@ -10209,6 +10212,20 @@ mod syncs {
             HttpReply { status: 404, body: "{}".into() }
         }
 
+        /// Every project the admin maintains: (id, path).
+        fn projects(&self) -> Vec<(i64, String)> {
+            let mut all = vec![(3, self.path.borrow().clone())];
+            all.extend(self.others.borrow().iter().map(|(id, (path, _))| (*id, path.clone())));
+            all
+        }
+
+        fn files_of(&self, id: i64) -> Option<Files> {
+            if id == 3 {
+                return Some(self.files.borrow().clone());
+            }
+            self.others.borrow().get(&id).map(|(_, files)| files.clone())
+        }
+
         fn answer(&self, c: &HttpCall) -> HttpReply {
             if *self.down.borrow() {
                 return HttpReply { status: 503, body: "{}".into() };
@@ -10237,45 +10254,64 @@ mod syncs {
             if c.url == format!("{api}/user") {
                 return ok(json!({ "username": "ada" }));
             }
-            if c.url.starts_with(&format!("{api}/projects?membership=true&min_access_level=40")) {
+            let listed =
+                |id: i64, path: &str| json!({ "id": id, "path_with_namespace": path, "default_branch": "main", "visibility": "private" });
+            if let Some(query) = c.url.strip_prefix(&format!("{api}/projects?membership=true&min_access_level=40&simple=true")) {
+                // One project by id (`id_after` and `id_before` around it), or a page of them.
+                let bound = |key: &str| query.split('&').find_map(|kv| kv.strip_prefix(key)).and_then(|v| v.parse::<i64>().ok());
+                let (after, before) = (bound("id_after="), bound("id_before="));
+                let all = self.projects();
+                if after.is_some() || before.is_some() {
+                    let (after, before) = (after.unwrap_or(i64::MIN), before.unwrap_or(i64::MAX));
+                    let found: Vec<Value> =
+                        all.iter().filter(|(id, _)| *id > after && *id < before).map(|(id, p)| listed(*id, p)).collect();
+                    return ok(json!(found));
+                }
                 return ok(if c.url.ends_with("&page=1") {
-                    json!([{ "id": 3, "path_with_namespace": "acme/handbook", "default_branch": "main", "visibility": "private" }])
+                    json!(all.iter().map(|(id, p)| listed(*id, p)).collect::<Vec<_>>())
                 } else {
                     json!([])
                 });
             }
             let readable = !self.blocked.borrow().contains(&token);
-            let path = self.path.borrow().clone();
-            let squatted = self.squatter.borrow().is_some();
-            if squatted && c.url == format!("{api}/projects/acme%2Fhandbook") {
-                return ok(json!({ "id": 4, "path_with_namespace": "acme/handbook", "default_branch": "main" }));
+            let Some(rest) = c.url.strip_prefix(&format!("{api}/projects/")) else { panic!("unexpected {c:?}") };
+            let (key, rest) = rest.split_at(rest.find(['/', '?']).unwrap_or(rest.len()));
+            let by_id = key.parse::<i64>().ok();
+            assert!(by_id.is_some() || rest.is_empty(), "a GitLab app folder works on its project by id: {c:?}");
+            let project = self.projects().into_iter().find(|(id, path)| by_id == Some(*id) || urlencoding::encode(path) == key);
+            let Some((pid, path)) = project.filter(|_| readable || rest.starts_with("/hooks")) else {
+                return HttpReply { status: 404, body: "{}".into() };
+            };
+            if rest.is_empty() {
+                return ok(json!({ "id": pid, "path_with_namespace": path, "default_branch": "main" }));
             }
-            if c.url == format!("{api}/projects/3") || c.url == format!("{api}/projects/{}", urlencoding::encode(&path)) {
-                return if readable {
-                    ok(json!({ "id": 3, "path_with_namespace": path, "default_branch": "main" }))
-                } else {
-                    HttpReply { status: 404, body: "{}".into() }
-                };
-            }
-            if let Some(rest) = c.url.strip_prefix(&format!("{api}/projects/3/hooks")) {
+            if let Some(rest) = rest.strip_prefix("/hooks") {
                 if !readable {
                     return HttpReply { status: 403, body: "{}".into() };
                 }
                 if c.method == "GET" && rest.starts_with("?per_page=100&page=") {
                     let first = rest.ends_with("page=1");
-                    let all: Vec<Value> = self.hooks.borrow().iter().map(|(id, h)| json!({ "id": id, "url": h["url"] })).collect();
+                    let all: Vec<Value> = self
+                        .hooks
+                        .borrow()
+                        .iter()
+                        .filter(|(_, h)| h["project"] == pid)
+                        .map(|(id, h)| json!({ "id": id, "url": h["url"] }))
+                        .collect();
                     return ok(if first { json!(all) } else { json!([]) });
                 }
                 let id: Option<i64> = rest.strip_prefix('/').and_then(|i| i.parse().ok());
+                let mut body: Value = serde_json::from_str(&form).unwrap_or(json!({}));
+                body["project"] = json!(pid);
                 return match (c.method, id) {
                     ("POST", None) => {
                         let id = *self.next_hook.borrow();
                         *self.next_hook.borrow_mut() += 1;
-                        self.hooks.borrow_mut().insert(id, serde_json::from_str(&form).unwrap());
+                        self.hooks.borrow_mut().insert(id, body);
                         HttpReply { status: 201, body: json!({ "id": id }).to_string() }
                     }
-                    ("PUT", Some(id)) if self.hooks.borrow().contains_key(&id) => {
-                        self.hooks.borrow_mut().insert(id, serde_json::from_str(&form).unwrap());
+                    ("PUT", Some(id)) if self.hooks.borrow().get(&id).is_some_and(|h| h["project"] == pid) => {
+                        self.hooks.borrow_mut().insert(id, body);
                         ok(json!({ "id": id }))
                     }
                     ("DELETE", Some(id)) => {
@@ -10286,16 +10322,9 @@ mod syncs {
                     _ => HttpReply { status: 404, body: "{}".into() },
                 };
             }
-            // Project 3's files, by its id; by path, whichever project has that path now.
-            if let Some(rest) = c.url.strip_prefix(&format!("{api}/projects/3/repository")) {
-                return if readable { Self::repository(rest, &self.files.borrow()) } else { HttpReply { status: 404, body: "{}".into() } };
+            if let Some(rest) = rest.strip_prefix("/repository") {
+                return Self::repository(rest, &self.files_of(pid).unwrap());
             }
-            if let Some(rest) = c.url.strip_prefix(&format!("{api}/projects/acme%2Fhandbook/repository"))
-                && let Some(files) = self.squatter.borrow().as_ref()
-            {
-                return Self::repository(rest, files);
-            }
-            assert!(!c.url.contains("/repository/"), "a GitLab app folder reads its project by id: {c:?}");
             HttpReply { status: 404, body: "{}".into() }
         }
     }
@@ -10957,7 +10986,9 @@ mod syncs {
         // files. The folder's syncs still read its own project, by id (the fake refuses reads of
         // project 3 by path), and its links follow the new path.
         *lab.path.borrow_mut() = "acme/manual".into();
-        *lab.squatter.borrow_mut() = Some(BTreeMap::from([("docs/README.md".to_string(), b"# Not ours\n".to_vec())]));
+        lab.others
+            .borrow_mut()
+            .insert(4, ("acme/handbook".into(), BTreeMap::from([("docs/README.md".to_string(), b"# Not ours\n".to_vec())])));
         let r = sync();
         assert_eq!((r["updated"].as_i64(), r["unchanged"].as_i64(), r["archived"].as_i64()), (Some(1), Some(1), Some(0)), "{r}");
         assert_eq!(source_of(&h, &admin)["repository"], "acme/manual");
@@ -11154,6 +11185,98 @@ mod syncs {
         let (finish, sent) = drive(&h, pass(), &answer);
         assert_eq!((filled(finish)["removed"].as_i64(), renewals(&sent)), (Some(1), 0));
         assert!(!lab.hooks.borrow().contains_key(&hook_id));
+    }
+
+    #[test]
+    fn the_picked_gitlab_project_is_added_whatever_its_path_is_now() {
+        let (h, admin, lab, topic) = gitlab_setup();
+        let answer = |c: &HttpCall| lab.answer(c);
+        let project_of = |id: &str| count(&h, &format!("SELECT project_id FROM docs_source_links WHERE source_id = '{id}'"));
+        let add = |input: Value| {
+            let r = h.call("POST", "/api/v1/docs-sources", Some(input), &admin);
+            assert_eq!(r.status, 200, "{}", r.body);
+            drive(&h, job_of(&r), &answer).0
+        };
+        // A path alone (an agent's request) is looked up once, and the project's id kept.
+        connect_gitlab(&h, &admin, &lab);
+        let by_path = json!({ "provider": "gitlab", "gitlab_connection": true, "repository": "acme/handbook", "folder": "guides", "topic_id": topic });
+        let first = filled(add(by_path))["source"]["id"].as_str().unwrap().to_string();
+        assert_eq!(project_of(&first), 3);
+
+        // The picker lists project 3 as acme/handbook.
+        connect_gitlab(&h, &admin, &lab);
+        let listed = filled(drive(&h, job_of(&h.call("GET", "/api/v1/docs-sources/gitlab", None, &admin)), &answer).0);
+        let picked = listed["projects"].as_array().unwrap().iter().find(|p| p["path"] == "acme/handbook").unwrap().clone();
+        assert_eq!(picked["id"], 3);
+        // Then project 3 moves to acme/manual, and project 4, which the admin maintains too, takes
+        // acme/handbook. Adding what they picked adds project 3, under its path now, with its
+        // webhook on project 3.
+        *lab.path.borrow_mut() = "acme/manual".into();
+        lab.others.borrow_mut().insert(4, ("acme/handbook".into(), BTreeMap::new()));
+        let input = json!({ "provider": "gitlab", "gitlab_connection": true, "project_id": picked["id"], "repository": picked["path"], "folder": "docs", "topic_id": topic });
+        let created = filled(add(input.clone()));
+        assert_eq!(created["source"]["repository"], "acme/manual");
+        let second = created["source"]["id"].as_str().unwrap().to_string();
+        assert_eq!(project_of(&second), 3);
+        let newest = *lab.hooks.borrow().keys().last().unwrap();
+        assert_eq!(lab.hooks.borrow()[&newest]["project"], 3);
+        assert!(lab.hooks.borrow().values().all(|h| h["project"] == 3), "nothing on project 4");
+
+        // A project the admin doesn't maintain (any more) is refused.
+        connect_gitlab(&h, &admin, &lab);
+        let mut gone = input;
+        gone["project_id"] = json!(77);
+        gone["folder"] = json!("other");
+        assert!(matches!(add(gone), Finish::Fail(ref e) if e.message.contains("no longer shows")));
+        let mut wrong =
+            json!({ "provider": "gitlab", "project_id": 3, "repository": "acme/manual", "topic_id": topic, "token": "glpat-x" });
+        assert_eq!(
+            h.call("POST", "/api/v1/docs-sources", Some(wrong.clone()), &admin).status,
+            400,
+            "project_id goes with gitlab_connection"
+        );
+        wrong["provider"] = json!("github");
+        assert_eq!(h.call("POST", "/api/v1/docs-sources", Some(wrong), &admin).status, 400);
+    }
+
+    #[test]
+    fn a_project_that_takes_another_folders_old_path_still_syncs() {
+        let (h, admin, lab, topic) = gitlab_setup();
+        let answer = |c: &HttpCall| lab.answer(c);
+        // A is project 3 at acme/a, B is project 5 at acme/b: the same folder into the same topic.
+        *lab.path.borrow_mut() = "acme/a".into();
+        lab.others.borrow_mut().insert(5, ("acme/b".into(), lab.files.borrow().clone()));
+        let add = |project: i64, path: &str| {
+            connect_gitlab(&h, &admin, &lab);
+            let input = json!({ "provider": "gitlab", "gitlab_connection": true, "project_id": project, "repository": path, "folder": "docs", "topic_id": topic });
+            let r = h.call("POST", "/api/v1/docs-sources", Some(input), &admin);
+            filled(drive(&h, job_of(&r), &answer).0)["source"]["id"].as_str().unwrap().to_string()
+        };
+        let a = add(3, "acme/a");
+        let b = add(5, "acme/b");
+        let sync = |id: &str| drive(&h, job_of(&h.call("POST", &format!("/api/v1/docs-sources/{id}/sync"), None, &admin)), &answer).0;
+        let listed = |id: &str| {
+            let list = h.ok("GET", "/api/v1/docs-sources", None, &admin);
+            list["items"].as_array().unwrap().iter().find(|s| s["id"] == id).unwrap().clone()
+        };
+
+        // B moves to acme/c, then A moves to acme/b, and A syncs first: A now shows acme/b, and B
+        // still shows it too until it syncs. They're different projects, so neither waits.
+        lab.others.borrow_mut().get_mut(&5).unwrap().0 = "acme/c".into();
+        *lab.path.borrow_mut() = "acme/b".into();
+        assert_eq!(filled(sync(&a))["created"], 2);
+        assert_eq!((listed(&a)["repository"].as_str(), listed(&b)["repository"].as_str()), (Some("acme/b"), Some("acme/b")));
+        assert_eq!((listed(&a)["disconnected"].clone(), listed(&b)["disconnected"].clone()), (Value::Null, Value::Null));
+        // Reconnecting B isn't refused, nor is its push, and its sync follows its new path.
+        connect_gitlab(&h, &admin, &lab);
+        let r = h.call("PATCH", &format!("/api/v1/docs-sources/{b}"), Some(json!({ "gitlab_connection": true })), &admin);
+        assert_eq!(r.status, 200, "{}", r.body);
+        filled(drive(&h, job_of(&r), &answer).0);
+        let secret = lab.hooks.borrow().values().find(|h| h["project"] == 5).unwrap()["token"].as_str().unwrap().to_string();
+        let push = json!({ "object_kind": "push", "ref": "refs/heads/main" }).to_string();
+        let r = hook(&h, &format!("/hooks/docs/{b}"), &push, &[("x-gitlab-event", "Push Hook"), ("x-gitlab-token", &secret)]);
+        assert_eq!(filled(drive(&h, job_of(&r), &answer).0)["created"], 2);
+        assert_eq!(listed(&b)["repository"], "acme/c");
     }
 
     #[test]

@@ -557,6 +557,10 @@ pub struct CreateDocsSourceInput {
     /// With `installation_id`: the repository's `id` from list_github_repositories. Then that very
     /// repository is added, whatever its name is now, and `repository` is only for people to read.
     pub repository_id: Option<i64>,
+    /// With `gitlab_connection`: the project's `id` from list_gitlab_projects. Then that very
+    /// project is added (it must be one you maintain), whatever its path is now, and `repository`
+    /// is only for people to read. Without it, the path is looked up once and its id kept.
+    pub project_id: Option<i64>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -622,6 +626,9 @@ fn create_docs_source(ctx: &mut Ctx, input: CreateDocsSourceInput) -> ApiResult<
     if gitlab && (provider != sync::repo::Provider::GitLab || host != gitlab_app::HOST) {
         return Err(ApiError::bad_request("`gitlab_connection` is for projects on gitlab.com only; a self-managed GitLab takes a token"));
     }
+    if input.project_id.is_some() && !gitlab {
+        return Err(ApiError::bad_request("`project_id` goes with `gitlab_connection`, from list_gitlab_projects"));
+    }
     let repo = app.as_ref().map(|(_, (_, name, _))| name.clone()).unwrap_or(repo);
     let default_branch = app.as_ref().map(|(_, (_, _, b))| b.clone()).unwrap_or_else(|| "main".into());
     let typed_branch = clean(input.branch).map(|b| sync::checked_branch(&b)).transpose()?;
@@ -634,10 +641,11 @@ fn create_docs_source(ctx: &mut Ctx, input: CreateDocsSourceInput) -> ApiResult<
         folder: sync::checked_folder(input.folder.as_deref().unwrap_or_default())?,
         topic_id: input.topic_id.trim().to_string(),
     };
-    // (A GitLab project's id isn't known yet: the job checks it again by that too.)
-    let link = match &app {
-        Some((installation_id, (repo_id, _, _))) => Link::GitHubApp { installation_id: *installation_id, repo_id: *repo_id },
-        None => Link::Token,
+    // (A GitLab project picked by path has no id yet: the job checks again once it does.)
+    let link = match (&app, input.project_id) {
+        (Some((installation_id, (repo_id, _, _))), _) => Link::GitHubApp { installation_id: *installation_id, repo_id: *repo_id },
+        (None, Some(project_id)) => Link::GitLabOAuth { project_id, hook_id: None, token_expires_at: None },
+        (None, None) => Link::Token,
     };
     check_new_source(ctx, &fresh, &link)?;
     // Through DumbSlab's GitLab app: GitLab must first find the project for the admin and take
@@ -651,6 +659,7 @@ fn create_docs_source(ctx: &mut Ctx, input: CreateDocsSourceInput) -> ApiResult<
             .ok_or_else(|| ApiError::conflict("Connect GitLab first (Settings › Docs sync), then pick the project."))?;
         let draft = gitlab_app::Draft {
             webhook_url: ctx.url(&format!("/hooks/docs/{}", fresh.id)),
+            project_id: input.project_id,
             source_id: fresh.id,
             repo: fresh.repo,
             branch: typed_branch,
