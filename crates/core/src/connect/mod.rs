@@ -1111,6 +1111,8 @@ pub enum Job {
     GitHub(Box<crate::sync::github_app::InstallJob>),
     /// Checking an installation against GitHub after GitHub reported a change.
     GitHubCheck(Box<crate::sync::github_app::CheckJob>),
+    /// Docs sync with DumbSlab's GitLab app (see [`crate::sync::gitlab_app`]).
+    GitLab(Box<crate::sync::gitlab_app::GitLabJob>),
 }
 
 impl Job {
@@ -1131,6 +1133,7 @@ impl Job {
             Job::People(j) => j.take_effects(),
             Job::GitHub(j) => j.take_effects(),
             Job::GitHubCheck(j) => j.take_effects(),
+            Job::GitLab(j) => j.take_effects(),
             Job::Sso(j) => j.take_effects(),
             _ => vec![],
         }
@@ -1146,6 +1149,7 @@ impl Job {
             Job::People(j) => j.settle(committed),
             Job::GitHub(j) => j.settle(committed),
             Job::GitHubCheck(j) => j.settle(committed),
+            Job::GitLab(j) => j.settle(committed),
             Job::Slack(j) if !committed => drop(j.take_effects()),
             Job::Sso(j) if !committed => drop(j.take_effects()),
             _ => {}
@@ -1162,28 +1166,55 @@ impl Job {
     /// A job opts in by reading each renewal's answer in a step of its own that writes only that,
     /// and reporting it here. Connected apps' searches and previews do: their refresh step writes
     /// only through [`apply_refresh`] ([`save_token`], or letting go of the lease), then asks for
-    /// what it was refreshing for. Docs sync's GitLab tokens could adopt it the same way.
+    /// what it was refreshing for. So do docs sync's GitLab app folders, GitLab approvals and GitLab
+    /// webhook cleanups.
     pub fn wrote_only_credentials(&self) -> bool {
         match self {
             Job::People(j) => j.wrote_only_credentials(),
             Job::Search(j) => j.refreshed,
             Job::Preview(j) => j.refreshed,
+            Job::Docs(j) => j.wrote_only_credentials(),
+            Job::GitLab(j) => j.wrote_only_credentials(),
             _ => false,
         }
     }
 
     /// A request to send when a step failed with `error` and was rolled back (or the host couldn't
-    /// run it), for someone waiting elsewhere: a Slack command's answer. Hosts send it once, best
-    /// effort. `None` for jobs whose failure answers the request itself.
+    /// run it): a Slack command's answer, for someone waiting elsewhere, or taking off again a
+    /// GitLab webhook a docs sync job added for a folder that wasn't saved. Hosts send it once,
+    /// best effort. `None` for jobs whose failure answers the request itself.
     ///
-    /// Ask the job as it was *before* the failed step: the rollback undoes whatever that step
-    /// decided, such as having prepared its answer (see [`guarded_step`], which does this).
+    /// Slack's is asked of the job as it was *before* the failed step: the rollback undoes whatever
+    /// that step decided, such as having prepared its answer. GitLab's is asked of the job as the
+    /// step left it, which knows the webhook it added. [`guarded_step`] does both.
     pub fn failure_notice(&self, error: &ApiError) -> Option<HttpCall> {
         match self {
             Job::Slack(j) => j.failure_notice(error),
+            Job::GitLab(j) => j.failure_notice(),
+            Job::Docs(j) => j.failure_notice(),
             _ => None,
         }
     }
+
+    /// Records what the answers to the last requests did elsewhere that a failed step must undo: a
+    /// webhook GitLab just added. Pure (no database), so hosts can call it before the step's
+    /// transaction, and a step that never starts or never commits still undoes it (see
+    /// [`unran_notice`]). The step reads the same answers again.
+    pub fn note(&mut self, replies: &[HttpReply]) {
+        match self {
+            Job::GitLab(j) => j.note(replies),
+            Job::Docs(j) => j.note(replies),
+            _ => {}
+        }
+    }
+}
+
+/// What to send if the next step (with `replies`) can't run or can't commit: hosts call this before
+/// the step's transaction and send the answer only if the transaction fails. It notes the replies
+/// first ([`Job::note`]), so a webhook GitLab added just now comes off again.
+pub fn unran_notice(job: &mut Job, replies: &[HttpReply]) -> Option<HttpCall> {
+    job.note(replies);
+    job.failure_notice(&ApiError::internal("the step didn't run"))
 }
 
 #[derive(Clone, Debug)]
@@ -1515,6 +1546,7 @@ pub fn step(db: &dyn Db, cfg: &HostConfig, job: &mut Job, replies: Vec<HttpReply
         Job::Slack(j) => crate::slack::step(db, cfg, j, replies, now),
         Job::GitHub(j) => crate::sync::github_app::install_step(db, cfg, j, replies, now),
         Job::GitHubCheck(j) => crate::sync::github_app::check_step(db, cfg, j, replies, now),
+        Job::GitLab(j) => crate::sync::gitlab_app::step(db, cfg, j, replies, now),
     }
 }
 
@@ -1534,7 +1566,7 @@ pub fn guarded_step(
     now: DateTime<Utc>,
     guard: impl FnOnce(&dyn Db) -> Option<ApiError>,
 ) -> (ApiResult<Step>, Option<HttpCall>) {
-    // Only Slack's jobs have notices; the others needn't be copied.
+    // Only Slack's notices come from the job before the step; the others needn't be copied.
     let before = matches!(job, Job::Slack(_)).then(|| job.clone());
     let mut result = step(db, cfg, job, replies, now);
     // A step that only stored renewed credentials is kept: see [`Job::wrote_only_credentials`].
@@ -1544,9 +1576,10 @@ pub fn guarded_step(
     {
         result = Err(refused);
     }
-    let notice = match &result {
-        Err(e) => before.and_then(|b| b.failure_notice(e)),
-        Ok(_) => None,
+    let notice = match (&result, &before) {
+        (Err(e), Some(b)) => b.failure_notice(e),
+        (Err(e), None) => job.failure_notice(e),
+        (Ok(_), _) => None,
     };
     job.settle(result.is_ok());
     (result, notice)

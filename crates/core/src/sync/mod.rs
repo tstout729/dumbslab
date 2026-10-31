@@ -15,6 +15,7 @@
 
 pub mod docs;
 pub mod github_app;
+pub mod gitlab_app;
 pub mod people;
 pub(crate) mod repo;
 mod rewrite;
