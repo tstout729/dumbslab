@@ -495,9 +495,14 @@ function addSource(github, topics, reload) {
   tokenForm.hidden = true;
   const useToken = button('Use a token instead', { variant: 'ghost', size: 'sm' });
   useToken.addEventListener('click', () => { tokenForm.hidden = false; useToken.remove(); });
+  // Each admin picks from the repositories their own GitHub account can read: another admin's
+  // connecting doesn't share theirs.
+  const others = !usable && github.installations.length > 0;
   const intro = usable
     ? h('p', { class: 'small muted' }, 'Pick a repository from GitHub. Choose Connect GitHub to install DumbSlab’s app on another account, or to give it more repositories.')
-    : h('p', { class: 'small muted' }, 'Choose Connect GitHub, install DumbSlab’s app on the repositories you want, and come back here to pick one. No token or webhook needed: pushes sync by themselves. For GitLab, or a GitHub repository without the app, use a token.');
+    : others
+      ? h('p', { class: 'small muted' }, 'DumbSlab’s GitHub app is connected here, but you pick from the repositories your own GitHub account can read. Choose Connect GitHub and authorize DumbSlab; folders others added keep syncing either way.')
+      : h('p', { class: 'small muted' }, 'Choose Connect GitHub, install DumbSlab’s app on the repositories you want, and come back here to pick one. No token or webhook needed: pushes sync by themselves. For GitLab, or a GitHub repository without the app, use a token.');
   return h('div', { class: 'stack' },
     intro,
     usable ? githubSourceForm(github, topics, reload) : null,

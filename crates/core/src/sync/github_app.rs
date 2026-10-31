@@ -732,23 +732,30 @@ pub fn install_step(db: &dyn Db, cfg: &HostConfig, j: &mut InstallJob, replies: 
     }
 }
 
-/// Saves an installation and the repositories the admin's GitHub account can read in it, and
-/// puts back to work this workspace's disconnected sources on those repositories.
+/// Saves an installation and the repositories this admin's GitHub account can read in it (theirs
+/// alone: another admin's picker keeps its own), and puts back to work this workspace's
+/// disconnected sources on those repositories.
 fn save(ctx: &mut crate::registry::Ctx, i: &Installation, repos: &[Repository], more: bool) -> ApiResult<()> {
     let db = ctx.db;
     let now = ctx.now_s();
+    let admin = ctx.actor.user_id.clone();
     db.execute(
-        "INSERT INTO github_installations (id, account, account_type, connected_by, suspended_at, more_repositories, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        "INSERT INTO github_installations (id, account, account_type, connected_by, suspended_at, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(id) DO UPDATE SET account = excluded.account, account_type = excluded.account_type, connected_by = excluded.connected_by,
-           suspended_at = excluded.suspended_at, more_repositories = excluded.more_repositories, updated_at = excluded.updated_at",
-        &params![i.id, i.account.clone(), i.account_type.clone(), ctx.actor.user_id.clone(), i.suspended.then(|| now.clone()), more, now.clone(), now.clone()],
+           suspended_at = excluded.suspended_at, updated_at = excluded.updated_at",
+        &params![i.id, i.account.clone(), i.account_type.clone(), admin.clone(), i.suspended.then(|| now.clone()), now.clone(), now.clone()],
     )?;
-    db.execute("DELETE FROM github_repositories WHERE installation_id = ?", &params![i.id])?;
+    db.execute(
+        "INSERT INTO github_installation_admins (installation_id, user_id, more_repositories, connected_at) VALUES (?, ?, ?, ?)
+         ON CONFLICT(installation_id, user_id) DO UPDATE SET more_repositories = excluded.more_repositories, connected_at = excluded.connected_at",
+        &params![i.id, admin.clone(), more, now.clone()],
+    )?;
+    db.execute("DELETE FROM github_repositories WHERE installation_id = ? AND user_id = ?", &params![i.id, admin.clone()])?;
     for r in repos {
         db.execute(
-            "INSERT INTO github_repositories (installation_id, id, full_name, default_branch, private) VALUES (?, ?, ?, ?, ?)",
-            &params![i.id, r.id, r.full_name.clone(), r.default_branch.clone(), r.private],
+            "INSERT INTO github_repositories (installation_id, user_id, id, full_name, default_branch, private) VALUES (?, ?, ?, ?, ?, ?)",
+            &params![i.id, admin.clone(), r.id, r.full_name.clone(), r.default_branch.clone(), r.private],
         )?;
     }
     if !i.suspended {
@@ -1261,6 +1268,7 @@ fn apply(db: &dyn Db, cfg: &HostConfig, j: &mut CheckJob, now_is: Now, now: Date
         Now::Gone => {
             disconnect(db, installation, "", UNINSTALLED, vec![])?;
             db.execute("DELETE FROM github_repositories WHERE installation_id = ?", &params![installation])?;
+            db.execute("DELETE FROM github_installation_admins WHERE installation_id = ?", &params![installation])?;
             db.execute("DELETE FROM github_installations WHERE id = ?", &params![installation])?;
             note(&mut ctx, "github.uninstalled", format!("DumbSlab's GitHub App was uninstalled from {account}"))?;
             ctx.effects.push(Effect::GitHubInstallation(InstallationLink { installation_id: installation, linked: false }));

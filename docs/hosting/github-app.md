@@ -116,7 +116,7 @@ A delivery about the installation itself (uninstalled, suspended, unsuspended, n
 - A check that fails waits a while (a minute, doubling up to an hour). The change it owed is checked by the next change GitHub reports, or after the wait by a push, Sync now, or opening Settings › Docs sync. Only a reported change skips the wait. Sync now and a refused sync token ask for a check only when none is owed.
 - Only a check marks folders as disconnected. A late, out-of-order or redelivered delivery can't undo a newer change, and a sync that GitHub refuses a token for (422) asks for a check instead of deciding itself.
 
-A workspace only syncs repositories its own admin's GitHub account can read in the installation. That's checked when they connect, so one workspace never gets repositories that only another workspace's admin chose.
+A workspace only syncs repositories its own admin's GitHub account can read in the installation. That's checked when they connect, so one workspace never gets repositories that only another workspace's admin chose. The list is kept per admin (`github_repositories` by installation, admin and repository), so within a workspace too, an admin adds folders only from repositories their own GitHub account could read. Folders already added sync for everyone, and any admin can run, change or remove them.
 
 ## Registering from a manifest instead
 

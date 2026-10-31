@@ -64,8 +64,6 @@ CREATE TABLE IF NOT EXISTS github_installations (
   account_type TEXT NOT NULL DEFAULT '',
   connected_by TEXT REFERENCES users(id) ON DELETE SET NULL,
   suspended_at TEXT,
-  -- The admin's account can read more repositories there than were kept.
-  more_repositories INTEGER NOT NULL DEFAULT 0,
   -- Hosted DumbSlab: whether the directory forwards this installation's deliveries here: `ok`,
   -- `full` (it serves as many workspaces as it may), or NULL until it said (each sync asks again).
   forwarding TEXT,
@@ -82,11 +80,23 @@ CREATE TABLE IF NOT EXISTS github_installations (
   updated_at TEXT NOT NULL
 );
 
--- The repositories the connecting admin's own GitHub account could read in an installation: the
--- only ones a source here may sync, so one workspace never gets repositories only another
--- workspace's admin can see. Connecting again refreshes them.
+-- Each admin here who connected an installation, and whether their GitHub account could read more
+-- of its repositories than were kept.
+CREATE TABLE IF NOT EXISTS github_installation_admins (
+  installation_id INTEGER NOT NULL REFERENCES github_installations(id) ON DELETE CASCADE,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  more_repositories INTEGER NOT NULL DEFAULT 0,
+  connected_at TEXT NOT NULL,
+  PRIMARY KEY (installation_id, user_id)
+);
+
+-- The repositories each admin's own GitHub account could read in an installation, as of their
+-- connecting: the only ones that admin may pick for a new source. So one workspace never gets
+-- repositories only another workspace's admin can see, and one admin never adds a repository
+-- only another admin here can read. Connecting again refreshes theirs.
 CREATE TABLE IF NOT EXISTS github_repositories (
   installation_id INTEGER NOT NULL REFERENCES github_installations(id) ON DELETE CASCADE,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   id INTEGER NOT NULL,
   -- `owner/name`.
   full_name TEXT NOT NULL,
@@ -94,7 +104,7 @@ CREATE TABLE IF NOT EXISTS github_repositories (
   private INTEGER NOT NULL DEFAULT 1,
   -- Set when it was taken out of the installation on GitHub; cleared if it's put back.
   removed_at TEXT,
-  PRIMARY KEY (installation_id, id)
+  PRIMARY KEY (installation_id, user_id, id)
 );
 
 -- An admin's approval of DumbSlab's GitLab app, waiting for them to pick a project. Picking one

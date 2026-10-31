@@ -489,6 +489,10 @@ pub fn step(db: &dyn Db, cfg: &HostConfig, j: &mut DocsJob, replies: Vec<HttpRep
             }
         },
         Phase::Minting(link) => minted(db, j, &replies, link, now),
+        // Every step that writes checks again, in its own transaction, against the other sources
+        // as they are now: one that became another's twin while files were fetched (an older App
+        // source learned its repository's new name, say) writes nothing, and says why.
+        Phase::Listing | Phase::Reading(_) | Phase::Images(..) if has_older_twin(db, &j.source)? => fail(db, j, DUPLICATE, now),
         Phase::Listing => listing(db, cfg, j, &replies, now),
         Phase::Reading(plan) => reading(db, cfg, j, plan, &replies, now),
         Phase::Images(plan, texts) => images(db, cfg, j, plan, texts, &replies, now),

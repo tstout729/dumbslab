@@ -9688,7 +9688,11 @@ mod syncs {
         // A repository far down a large installation (not among the first 500 it lists), which the
         // admin's account could read when they connected.
         db_run(&h, |db| {
-            db.execute("INSERT INTO github_repositories (installation_id, id, full_name, default_branch, private) VALUES (42, 777, 'acme/zz-big', 'main', 1)", &[])
+            db.execute(
+                "INSERT INTO github_repositories (installation_id, user_id, id, full_name, default_branch, private)
+                 SELECT 42, user_id, 777, 'acme/zz-big', 'main', 1 FROM github_installation_admins WHERE installation_id = 42",
+                &[],
+            )
         });
         let topic = h.ok("POST", "/api/v1/topics", Some(json!({ "name": "Big" })), &admin)["id"].as_str().unwrap().to_string();
         let input = json!({ "provider": "github", "installation_id": 42, "repository": "acme/zz-big", "topic_id": topic });
@@ -10037,6 +10041,153 @@ mod syncs {
         assert!(moved.contains("[the API](https://github.com/acme/handbook/blob/main/handbook/api/README.md)"), "{moved}");
         assert_eq!(count(&h, "SELECT COUNT(*) FROM docs_rerender"), 0, "nothing owed");
         assert_eq!(sync()["unchanged"], 21);
+    }
+
+    #[test]
+    fn each_admin_picks_from_their_own_github_repositories() {
+        let mut h = H::new();
+        let (ada, _) = h.setup();
+        with_key(&mut h);
+        with_app(&mut h);
+        h.user(&ada, "bo@acme.test", "Bo", "admin");
+        let bo = sign_in(&h, "bo@acme.test", "password123");
+        let topic = h.ok("POST", "/api/v1/topics", Some(json!({ "name": "Handbook" })), &ada)["id"].as_str().unwrap().to_string();
+        let names = |who: &Auth| -> Vec<String> {
+            let list = h.ok("GET", "/api/v1/docs-sources/github", None, who);
+            list["installations"][0]["repositories"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| r["full_name"].as_str().unwrap().to_string())
+                .collect()
+        };
+        let add = |who: &Auth, extra: Value| {
+            let mut input = json!({ "provider": "github", "installation_id": 42, "topic_id": topic });
+            input.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            h.call("POST", "/api/v1/docs-sources", Some(input), who).status
+        };
+
+        // Ada connects the installation; her GitHub account reads the private acme/docs (7) and
+        // acme/site (8). She adds a folder of acme/docs.
+        connect_github(&h, &ada, "&installation_id=42&setup_action=install", &installer);
+        assert_eq!(names(&ada), ["acme/docs", "acme/site"]);
+        assert_eq!(add(&ada, json!({ "repository_id": 7, "repository": "acme/docs", "folder": "handbook" })), 200);
+        let source = h.ok("GET", "/api/v1/docs-sources", None, &ada)["items"][0]["id"].as_str().unwrap().to_string();
+
+        // Bo, another admin, never connected GitHub: nothing to pick, and neither her pick nor its
+        // name gets him acme/docs. Ada's folder still syncs when he asks.
+        assert!(names(&bo).is_empty());
+        assert_eq!(add(&bo, json!({ "repository_id": 7, "repository": "acme/docs" })), 404);
+        assert_eq!(add(&bo, json!({ "repository": "acme/docs" })), 404);
+        job_of(&h.call("POST", &format!("/api/v1/docs-sources/{source}/sync"), None, &bo));
+
+        // Bo connects; his GitHub account reads only acme/site. That's all he can pick.
+        let site_only = |c: &HttpCall| {
+            let mut r = installer(c);
+            if c.url.contains("/user/installations/42/repositories") {
+                let mut v: Value = serde_json::from_str(&r.body).unwrap();
+                v["repositories"].as_array_mut().unwrap().retain(|repo| repo["id"] == 8);
+                r.body = v.to_string();
+            }
+            r
+        };
+        connect_github(&h, &bo, "&installation_id=42&setup_action=install", &site_only);
+        assert_eq!(names(&bo), ["acme/site"]);
+        assert_eq!(add(&bo, json!({ "repository_id": 7, "repository": "acme/docs", "folder": "guides" })), 404);
+        assert_eq!(add(&bo, json!({ "repository_id": 8, "repository": "acme/site" })), 200);
+        assert_eq!(names(&ada), ["acme/docs", "acme/site"], "Ada's are hers");
+        // Once his account can read acme/docs too, he can add it.
+        connect_github(&h, &bo, "&installation_id=42&setup_action=install", &installer);
+        assert_eq!(add(&bo, json!({ "repository_id": 7, "repository": "acme/docs", "folder": "guides" })), 200);
+    }
+
+    #[test]
+    fn a_source_that_becomes_a_twin_mid_sync_writes_nothing() {
+        let mut h = H::new();
+        let (admin, _) = h.setup();
+        with_key(&mut h);
+        with_app(&mut h);
+        connect_github(&h, &admin, "&installation_id=42&setup_action=install", &installer);
+        let topic = h.ok("POST", "/api/v1/topics", Some(json!({ "name": "Handbook" })), &admin)["id"].as_str().unwrap().to_string();
+        let add = |input: Value| h.ok("POST", "/api/v1/docs-sources", Some(input), &admin)["source"]["id"].as_str().unwrap().to_string();
+        // An App folder of acme/docs (repository 7), then a token folder of acme/handbook: by name,
+        // another repository, so it's admitted.
+        let app =
+            add(json!({ "provider": "github", "installation_id": 42, "repository": "acme/docs", "folder": "handbook", "topic_id": topic }));
+        let token =
+            add(json!({ "provider": "github", "repository": "acme/handbook", "folder": "handbook", "topic_id": topic, "token": "ghp_x" }));
+        let repo = Repo::new(&[("README.md", b"# Handbook\n"), ("guide.md", b"# Guide\n")]);
+        // GitHub: repository 7 is called acme/handbook now.
+        let github = |c: &HttpCall| -> HttpReply {
+            if c.url == "https://api.github.com/app/installations/42/access_tokens" {
+                let body = json!({ "token": "ghs_x", "expires_at": "2099-01-01T00:00:00Z", "repositories": [{ "id": 7, "full_name": "acme/handbook" }] });
+                return HttpReply { status: 201, body: body.to_string() };
+            }
+            let url = c.url.replace("/repos/acme/handbook/", "/repos/acme/docs/");
+            repo.github(&HttpCall { url, ..c.clone() })
+        };
+        let posts_of = |id: &str| {
+            count(
+                &h,
+                &format!(
+                    "SELECT COUNT(*) FROM posts WHERE id IN (SELECT target_id FROM docs_items WHERE source_id = '{id}' AND kind = 'doc')"
+                ),
+            )
+        };
+        let listed = |id: &str| {
+            let list = h.ok("GET", "/api/v1/docs-sources", None, &admin);
+            list["items"].as_array().unwrap().iter().find(|s| s["id"] == id).unwrap().clone()
+        };
+
+        // The token folder's sync lists the folder and asks for its files.
+        let mut t = job_of(&h.call("POST", &format!("/api/v1/docs-sources/{token}/sync"), None, &admin));
+        let Ok(Step::Fetch(calls)) = step_with(&h, &mut t, vec![]).0 else { panic!("a listing") };
+        let Ok(Step::Fetch(calls)) = step_with(&h, &mut t, calls.iter().map(github).collect()).0 else { panic!("files to read") };
+        let files: Vec<HttpReply> = calls.iter().map(github).collect();
+        // Meanwhile the App folder syncs, learns its repository is acme/handbook now, and writes
+        // its posts: it's the older of the two.
+        assert_eq!(
+            filled(drive(&h, job_of(&h.call("POST", &format!("/api/v1/docs-sources/{app}/sync"), None, &admin)), &github).0)["created"],
+            2
+        );
+        // The token folder's next step checks again, and writes nothing.
+        let (result, _) = step_with(&h, &mut t, files);
+        assert!(matches!(result, Ok(Step::Done(Finish::Fail(ref e))) if e.message.contains("Another source already syncs")), "{result:?}");
+        assert_eq!((posts_of(&app), posts_of(&token)), (2, 0));
+        assert!(listed(&token)["disconnected"].as_str().unwrap().contains("Another source already syncs"));
+        assert_eq!(listed(&app)["disconnected"], Value::Null);
+    }
+
+    #[test]
+    fn sync_now_on_an_app_folder_with_a_stale_name_asks_github_first() {
+        let mut h = H::new();
+        let (admin, _) = h.setup();
+        with_key(&mut h);
+        with_app(&mut h);
+        connect_github(&h, &admin, "&installation_id=42&setup_action=install", &installer);
+        let topic = h.ok("POST", "/api/v1/topics", Some(json!({ "name": "Handbook" })), &admin)["id"].as_str().unwrap().to_string();
+        let add = |input: Value| h.ok("POST", "/api/v1/docs-sources", Some(input), &admin)["source"]["id"].as_str().unwrap().to_string();
+        add(json!({ "provider": "github", "repository": "acme/old", "folder": "handbook", "topic_id": topic, "token": "ghp_x" }));
+        let app =
+            add(json!({ "provider": "github", "installation_id": 42, "repository": "acme/docs", "folder": "handbook", "topic_id": topic }));
+        // The App folder still shows a name the token folder has (repository 7 was acme/old for a
+        // while), but GitHub calls it acme/docs now.
+        db_run(&h, |db| db.execute("UPDATE docs_sources SET repo = 'acme/old' WHERE id = ?", &dumbslab_core::params![app.clone()]));
+        let repo = Repo::new(&[("README.md", b"# Handbook\n")]);
+        let github = |c: &HttpCall| -> HttpReply {
+            if c.url == "https://api.github.com/app/installations/42/access_tokens" {
+                let body = json!({ "token": "ghs_x", "expires_at": "2099-01-01T00:00:00Z", "repositories": [{ "id": 7, "full_name": "acme/docs" }] });
+                return HttpReply { status: 201, body: body.to_string() };
+            }
+            repo.github(c)
+        };
+        // Sync now doesn't refuse it on the stale name: the sync asks GitHub, and goes on.
+        let r = h.call("POST", &format!("/api/v1/docs-sources/{app}/sync"), None, &admin);
+        assert_ne!(r.status, 409, "{}", r.body);
+        assert_eq!(filled(drive(&h, job_of(&r), &github).0)["created"], 1);
+        let list = h.ok("GET", "/api/v1/docs-sources", None, &admin);
+        let s = list["items"].as_array().unwrap().iter().find(|s| s["id"] == app.as_str()).unwrap().clone();
+        assert_eq!((s["repository"].as_str(), s["disconnected"].clone()), (Some("acme/docs"), Value::Null));
     }
 
     #[test]
