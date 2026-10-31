@@ -1164,12 +1164,15 @@ impl Job {
     /// step even when the host's guard would refuse it (a full workspace).
     ///
     /// A job opts in by reading each renewal's answer in a step of its own that writes only that,
-    /// and reporting it here: the people sync, docs sync's GitLab app folders, GitLab approvals and
-    /// GitLab webhook cleanups do. Connected apps' refreshes ([`save_token`]) could adopt it the
-    /// same way.
+    /// and reporting it here. Connected apps' searches and previews do: their refresh step writes
+    /// only through [`apply_refresh`] ([`save_token`], or letting go of the lease), then asks for
+    /// what it was refreshing for. So do docs sync's GitLab app folders, GitLab approvals and GitLab
+    /// webhook cleanups.
     pub fn wrote_only_credentials(&self) -> bool {
         match self {
             Job::People(j) => j.wrote_only_credentials(),
+            Job::Search(j) => j.refreshed,
+            Job::Preview(j) => j.refreshed,
             Job::Docs(j) => j.wrote_only_credentials(),
             Job::GitLab(j) => j.wrote_only_credentials(),
             _ => false,
@@ -1222,6 +1225,9 @@ pub struct SearchJob {
     /// Only these apps; every connected one when empty.
     pub only: Vec<String>,
     phase: SearchPhase,
+    /// The last step read refresh answers and wrote only the renewed tokens (see
+    /// [`Job::wrote_only_credentials`]).
+    refreshed: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -1239,7 +1245,7 @@ enum SearchPhase {
 
 impl SearchJob {
     pub fn new(user_id: &str, q: &str, limit: usize, only: Vec<String>) -> SearchJob {
-        SearchJob { user_id: user_id.into(), q: q.into(), limit, only, phase: SearchPhase::Start }
+        SearchJob { user_id: user_id.into(), q: q.into(), limit, only, phase: SearchPhase::Start, refreshed: false }
     }
 }
 
@@ -1251,6 +1257,9 @@ pub struct PreviewJob {
     url: String,
     target: String,
     phase: PreviewPhase,
+    /// The last step read the refresh answer and wrote only the renewed tokens (see
+    /// [`Job::wrote_only_credentials`]).
+    refreshed: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1267,7 +1276,7 @@ impl PreviewJob {
     /// that account's items (see [`Connector::preview_target`]).
     pub fn new(user_id: &str, conn: Connection, url: &str) -> Option<PreviewJob> {
         let target = providers::get(conn.provider)?.preview_target(&conn.account, url)?;
-        Some(PreviewJob { user_id: user_id.into(), conn, url: url.into(), target, phase: PreviewPhase::Start })
+        Some(PreviewJob { user_id: user_id.into(), conn, url: url.into(), target, phase: PreviewPhase::Start, refreshed: false })
     }
 
     /// Finds the link's target again on the connection as it is now. `false` when that's another
@@ -1589,6 +1598,7 @@ fn preview_step(db: &dyn Db, cfg: &HostConfig, j: &mut PreviewJob, replies: Vec<
         let value = LinkPreview { app: Some(p.info().id.into()), connected: true, preview, error };
         Ok(Step::Done(Finish::Fill(serde_json::to_value(value).map_err(|e| ApiError::internal(e.to_string()))?)))
     };
+    j.refreshed = false;
     match j.phase {
         PreviewPhase::Start => {
             // Another request may have refreshed the token since the preview was asked for, or the
@@ -1614,6 +1624,9 @@ fn preview_step(db: &dyn Db, cfg: &HostConfig, j: &mut PreviewJob, replies: Vec<
             Ok(Step::Fetch(p.preview(&j.conn.cred, &j.conn.account, &j.target)))
         }
         PreviewPhase::Refreshing => {
+            // This step writes only the renewed tokens (or lets go of the lease): a full workspace
+            // keeps it, since the app may have spent the old refresh token already.
+            j.refreshed = true;
             match apply_refresh(db, cfg, &j.user_id, &mut j.conn, &replies.first().cloned().unwrap_or_default(), now)? {
                 // A refused refresh may have loaded what's stored now instead.
                 Ok(()) if !j.retarget() => done(Err(reconnected_message(p.info().name))),
@@ -1653,6 +1666,7 @@ fn search_calls(j: &SearchJob, conns: Vec<Connection>) -> (Vec<HttpCall>, Vec<(C
 }
 
 fn search_step(db: &dyn Db, cfg: &HostConfig, j: &mut SearchJob, replies: Vec<HttpReply>, now: DateTime<Utc>) -> ApiResult<Step> {
+    j.refreshed = false;
     match std::mem::replace(&mut j.phase, SearchPhase::Start) {
         SearchPhase::Start => {
             let (mut fresh, mut stale, mut failed) = (vec![], vec![], vec![]);
@@ -1682,6 +1696,9 @@ fn search_step(db: &dyn Db, cfg: &HostConfig, j: &mut SearchJob, replies: Vec<Ht
             start_searching(j, fresh, failed)
         }
         SearchPhase::Refreshing(stale, mut fresh, mut failed) => {
+            // This step writes only the renewed tokens (or lets go of leases), then asks for the
+            // searches: a full workspace keeps it, since apps may have spent the old refresh tokens.
+            j.refreshed = true;
             for (mut c, reply) in stale.into_iter().zip(replies) {
                 match apply_refresh(db, cfg, &j.user_id, &mut c, &reply, now)? {
                     Ok(()) => fresh.push(c),
