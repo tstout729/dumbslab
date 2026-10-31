@@ -338,9 +338,9 @@ impl Connector for Zendesk {
         })
     }
 
-    /// `acme`, `acme.zendesk.com` or a link into it → `https://acme.zendesk.com`. Anything that
-    /// isn't one Zendesk subdomain (another domain, more labels, a port, a user name, characters
-    /// outside `[a-z0-9-]`) is refused rather than tidied up.
+    /// `acme`, `ACME`, `acme.zendesk.com` or a link into it → `https://acme.zendesk.com`.
+    /// Anything else (another domain, more labels, a port, a user name, characters outside
+    /// `[a-z0-9-]`) is refused, never cut down to a part that would pass.
     fn sign_in_site(&self, input: &str) -> Result<Site, String> {
         let name = subdomain(input)?;
         Ok(Site { origin: format!("https://{name}.zendesk.com"), name })
