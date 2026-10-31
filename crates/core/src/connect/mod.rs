@@ -32,8 +32,9 @@ use crate::{HostConfig, Request, params};
 
 /// How long a host waits for any one request to an app.
 pub const FETCH_TIMEOUT_SECS: u64 = 8;
-/// The most steps a job may take; a host stops a job that asks for more.
-pub const MAX_STEPS: usize = 4;
+/// The most steps a job may take; a host stops a job that asks for more. A docs sync through
+/// DumbSlab's GitHub App takes five: an installation token, the listing, files, images, writing.
+pub const MAX_STEPS: usize = 5;
 /// How long a sign-in with another app may take.
 const SIGN_IN_MINUTES: i64 = 15;
 /// Tokens this close to expiring are refreshed before use.
@@ -1106,6 +1107,10 @@ pub enum Job {
     Sso(crate::sso::SsoJob),
     /// Slack's slash command, link previews and settings (see [`crate::slack`]).
     Slack(crate::slack::SlackJob),
+    /// Finishing Connect GitHub for docs sync (see [`crate::sync::github_app`]).
+    GitHub(Box<crate::sync::github_app::InstallJob>),
+    /// Checking an installation against GitHub after GitHub reported a change.
+    GitHubCheck(Box<crate::sync::github_app::CheckJob>),
 }
 
 impl Job {
@@ -1124,6 +1129,8 @@ impl Job {
             Job::Slack(j) => j.take_effects(),
             Job::Docs(j) => j.take_effects(),
             Job::People(j) => j.take_effects(),
+            Job::GitHub(j) => j.take_effects(),
+            Job::GitHubCheck(j) => j.take_effects(),
             Job::Sso(j) => j.take_effects(),
             _ => vec![],
         }
@@ -1137,6 +1144,8 @@ impl Job {
         match self {
             Job::Docs(j) => j.settle(committed),
             Job::People(j) => j.settle(committed),
+            Job::GitHub(j) => j.settle(committed),
+            Job::GitHubCheck(j) => j.settle(committed),
             Job::Slack(j) if !committed => drop(j.take_effects()),
             Job::Sso(j) if !committed => drop(j.take_effects()),
             _ => {}
@@ -1495,6 +1504,8 @@ pub fn step(db: &dyn Db, cfg: &HostConfig, job: &mut Job, replies: Vec<HttpReply
         Job::Docs(j) => crate::sync::docs::step(db, cfg, j, replies, now),
         Job::Sso(j) => crate::sso::step(db, cfg, j, replies, now),
         Job::Slack(j) => crate::slack::step(db, cfg, j, replies, now),
+        Job::GitHub(j) => crate::sync::github_app::install_step(db, cfg, j, replies, now),
+        Job::GitHubCheck(j) => crate::sync::github_app::check_step(db, cfg, j, replies, now),
     }
 }
 

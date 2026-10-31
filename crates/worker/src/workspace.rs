@@ -27,6 +27,9 @@ use worker::*;
 
 use crate::sql::{DoDb, api_error_response, call_object, error_response, flag, json_response, read_body, transaction, var};
 
+/// Background jobs one request runs in a row, counting those they leave.
+const MAX_CHAINED_JOBS: usize = 6;
+
 /// How often, at most, a busy workspace reports its usage to the directory.
 const REPORT_EVERY_SECS: i64 = 300;
 
@@ -476,6 +479,7 @@ impl DurableObject for Workspace {
             workspace: workspace.clone(),
             hosting,
             connectors: crate::connect::connectors(&self.env, &origin, multi),
+            github_app: crate::connect::github_app(&self.env),
             slack: crate::connect::slack_app(&self.env, &origin, multi),
             sso_apps: crate::connect::sso_apps(&self.env, &origin, multi),
             // Session recordings and browser error reports; off unless these are set.
@@ -589,23 +593,43 @@ fn run_later(state: &State, env: &Env, job: Job, cfg: HostConfig) {
     let own = State::from(raw.clone().unchecked_into::<worker::worker_sys::DurableObjectState>());
     let env = env.clone();
     state.wait_until(async move {
-        match drive_job(&own, &env, job, &cfg).await {
-            Ok((finish, effects, _)) => {
-                if let Finish::Fail(e) = finish {
-                    console_warn!("a background job failed: {} ({})", e.message, e.code);
-                }
-                deliver(&own, &env, &cfg, effects);
+        // Jobs it leaves run after it, a few at most (a check of a GitHub App installation chains
+        // one more when changes arrived while it ran); past that, the rest wait for their next
+        // trigger.
+        let mut queue = vec![job];
+        let mut ran = 0;
+        while let Some(job) = queue.pop() {
+            if ran == MAX_CHAINED_JOBS {
+                console_warn!("a background job left more jobs than run in a row; the rest wait for their next trigger");
+                break;
             }
-            Err(e) => console_error!("a background job failed: {e}"),
+            ran += 1;
+            match drive_job(&own, &env, job, &cfg).await {
+                Ok((finish, effects, _)) => {
+                    if let Finish::Fail(e) = finish {
+                        console_warn!("a background job failed: {} ({})", e.message, e.code);
+                    }
+                    let (later, effects): (Vec<Effect>, Vec<Effect>) =
+                        effects.into_iter().partition(|e| matches!(e, Effect::Background(_)));
+                    queue.extend(later.into_iter().filter_map(|e| match e {
+                        Effect::Background(j) => Some(j),
+                        _ => None,
+                    }));
+                    send_effects(&own, &env, &cfg, effects);
+                }
+                Err(e) => console_error!("a background job failed: {e}"),
+            }
         }
     });
 }
 
-/// Delivers what a request or job left: webhooks, and jobs to run afterwards (Slack's: channel
-/// messages that wait for the directory's token, forgetting a token Slack called dead).
+/// Delivers what a request or job left: webhooks, GitHub App installations to record with the
+/// directory, and jobs to run afterwards (Slack's: channel messages that wait for the directory's
+/// token, forgetting a token Slack called dead; checks of GitHub App installations; GitLab webhook
+/// cleanups).
 fn deliver(state: &State, env: &Env, cfg: &HostConfig, effects: Vec<Effect>) {
     let (later, effects): (Vec<Effect>, Vec<Effect>) = effects.into_iter().partition(|e| matches!(e, Effect::Background(_)));
-    send_webhooks(state, effects);
+    send_effects(state, env, cfg, effects);
     for effect in later {
         if let Effect::Background(job) = effect {
             run_later(state, env, job, cfg.clone());
@@ -674,11 +698,35 @@ async fn drive_job(state: &State, env: &Env, mut job: Job, cfg: &HostConfig) -> 
             }
             Ok(Step::Done(done)) => return Ok((done, job.take_effects(), written)),
             Ok(Step::Fetch(calls)) => {
-                replies = futures_util::future::join_all(calls.iter().map(|c| crate::connect::send_for(env, home.as_deref(), c))).await
+                replies = futures_util::future::join_all(calls.iter().map(|c| send_call(env, home.as_deref(), c))).await;
             }
         }
     }
     Ok((Finish::Fail(ApiError::internal("connected apps took too many steps")), vec![], written))
+}
+
+/// Sends one request a job asked for. A request to record a GitHub App installation in the
+/// directory (`github_app::DIRECTORY_LINK_URL`) goes to the Directory object, for this workspace's
+/// home, and its answer is the reply; the rest go as [`crate::connect::send_for`] sends them.
+async fn send_call(env: &Env, home: Option<&str>, call: &HttpCall) -> connect::HttpReply {
+    if call.url != dumbslab_core::sync::github_app::DIRECTORY_LINK_URL {
+        return crate::connect::send_for(env, home, call).await;
+    }
+    let Some(home) = home else { return connect::HttpReply::default() };
+    let mut body: Value = serde_json::from_str(call.body.as_deref().unwrap_or("{}")).unwrap_or_default();
+    body["home"] = json!(home);
+    match call_object(env, "DIRECTORY", "directory", Method::Post, "/github/link", Some(&body)).await {
+        Ok((status, reply)) => {
+            if status != 200 {
+                console_warn!("the directory didn't record a GitHub App installation ({status})");
+            }
+            connect::HttpReply { status, body: reply.to_string() }
+        }
+        Err(e) => {
+            console_error!("recording a GitHub App installation failed: {e}");
+            connect::HttpReply::default()
+        }
+    }
 }
 
 /// Sends a failed job's notice (see `connect::Job::failure_notice`), best effort: a Slack command's
@@ -686,6 +734,27 @@ async fn drive_job(state: &State, env: &Env, mut job: Job, cfg: &HostConfig) -> 
 async fn notify_failure(env: &Env, home: Option<&str>, notice: Option<HttpCall>) {
     if let Some(call) = notice {
         crate::connect::send_for(env, home, &call).await;
+    }
+}
+
+/// Sends what a request or job left for after it: webhook deliveries, and (hosted workspaces) the
+/// GitHub App installations to record in the directory, so the root domain forwards their
+/// deliveries here. Best effort.
+fn send_effects(state: &State, env: &Env, cfg: &HostConfig, effects: Vec<Effect>) {
+    let (links, rest): (Vec<Effect>, Vec<Effect>) = effects.into_iter().partition(|e| matches!(e, Effect::GitHubInstallation(_)));
+    send_webhooks(state, rest);
+    let Some(home) = cfg.hosting.as_ref().map(|h| h.home.clone()) else { return };
+    for effect in links {
+        let Effect::GitHubInstallation(link) = effect else { continue };
+        let (env, home) = (env.clone(), home.clone());
+        state.wait_until(async move {
+            let body = json!({ "installation_id": link.installation_id, "home": home, "linked": link.linked });
+            match call_object(&env, "DIRECTORY", "directory", Method::Post, "/github/link", Some(&body)).await {
+                Ok((200, _)) => {}
+                Ok((status, reply)) => console_warn!("the directory didn't record a GitHub App installation ({status}): {reply}"),
+                Err(e) => console_error!("recording a GitHub App installation failed: {e}"),
+            }
+        });
     }
 }
 

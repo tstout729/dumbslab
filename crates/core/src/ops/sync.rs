@@ -12,7 +12,8 @@ use crate::error::{ApiError, ApiResult};
 use crate::events::{Event, emit};
 use crate::model::{TopicRef, UserRef, load_topic, topic_url, user_refs};
 use crate::registry::{Access, Ctx, Op, op};
-use crate::sync::docs::{self, DocsSyncResult, Source};
+use crate::sync::docs::{self, DocsSyncResult, Link, Source};
+use crate::sync::github_app;
 use crate::sync::people::{self, PeopleSyncRemoved, PeopleSyncResult};
 use crate::sync::{self, SyncState};
 use crate::util::new_secret;
@@ -20,6 +21,8 @@ use crate::{Effect, params};
 
 /// Docs sync sources a workspace may have.
 const MAX_SOURCES: i64 = 20;
+/// Two sources may not sync one folder into one topic.
+const ALREADY_SYNCED: &str = "that folder already syncs into that topic";
 const MAX_SECRET_CHARS: usize = 4096;
 
 pub fn ops() -> Vec<Op> {
@@ -50,21 +53,25 @@ pub fn ops() -> Vec<Op> {
             .title("Docs sync sources")
             .desc("Repository folders whose Markdown files are kept as posts (docs sync), with each one's topic, webhook address and how its last sync went.")
             .build(),
+        op("sync", "list_github_repositories", "GET", "/docs-sources/github", Access::Admin, list_github_repositories)
+            .title("GitHub repositories for docs sync")
+            .desc("The installations of DumbSlab's GitHub App that admins here connected (Settings › Docs sync › Connect GitHub, a browser step at `connect_url`), each with the repositories the connecting admin's GitHub account can read there and their default branches. Give one's `installation_id` and `full_name` to create_docs_source: no token or webhook needed.")
+            .build(),
         op("sync", "create_docs_source", "POST", "/docs-sources", Access::Admin, create_docs_source)
             .title("Add a docs sync source")
-            .desc("Keep a GitHub or GitLab folder's Markdown files as posts in a topic, one way: each file is a post, sub-folders become sub-topics, relative links and images keep working, and synced posts are edited in the repository, not here. Give a read-only token for private repositories. Answers with the webhook secret, once: add a push webhook with it in GitHub or GitLab so pushes sync. Then run sync_docs_source.")
+            .desc("Keep a GitHub or GitLab folder's Markdown files as posts in a topic, one way: each file is a post, sub-folders become sub-topics, relative links and images keep working, and synced posts are edited in the repository, not here. For a repository from list_github_repositories, give its `installation_id`: DumbSlab's GitHub App reads it and reports pushes, with no token or webhook. Otherwise give a read-only token for private repositories; the answer then has the webhook secret, once: add a push webhook with it in GitHub or GitLab so pushes sync. Then run sync_docs_source.")
             .build(),
         op("sync", "update_docs_source", "PATCH", "/docs-sources/{id}", Access::Admin, update_docs_source)
             .title("Change a docs sync source")
-            .desc("Replace its token (an empty string removes it), switch its branch, or make a new webhook secret (shown once). To sync another repository or folder, add a new source.")
+            .desc("Replace its token (an empty string removes it), switch its branch, or make a new webhook secret (shown once). Sources read through DumbSlab's GitHub App have no token or webhook secret; only their branch changes. To sync another repository or folder, add a new source.")
             .build(),
         op("sync", "sync_docs_source", "POST", "/docs-sources/{id}/sync", Access::Admin, sync_docs_source)
             .title("Sync docs now")
-            .desc("Sync a source's folder now. One run syncs at most 20 changed files and 10 images; when `remaining` is above 0, run it again to continue.")
+            .desc("Sync a source's folder now. One run syncs at most 20 changed files and 10 images; when `remaining` is above 0, run it again to continue. For a disconnected GitHub App source, it asks GitHub again instead (`checking` says so) and syncs nothing; sync again once Settings shows it's connected.")
             .build(),
         op("sync", "delete_docs_source", "DELETE", "/docs-sources/{id}", Access::Admin, delete_docs_source)
             .title("Remove a docs sync source")
-            .desc("Stop syncing a folder and forget its credentials. Its posts and topics stay, as ordinary posts anyone with access can edit.")
+            .desc("Stop syncing a folder and forget its credentials. Its posts and topics stay, as ordinary posts anyone with access can edit. Refused while a sync of it runs; try again once it's done.")
             .destructive()
             .build(),
     ]
@@ -260,10 +267,20 @@ pub struct DocsSource {
     pub folder_url: String,
     /// Where synced posts go. Sub-folders become its sub-topics.
     pub topic: Option<TopicRef>,
+    /// How it reads the repository: `token` (a saved token, or none for a public repository, and a
+    /// webhook you add) or `github_app` (DumbSlab's GitHub App: no token, and pushes arrive by themselves).
+    pub connection: String,
+    /// `github_app`: the App's installation that reads the repository.
+    pub installation_id: Option<i64>,
+    /// Why it can't sync now, e.g. the GitHub App was uninstalled, or an older source syncs the same
+    /// folder into the same topic (a repository renamed into another's). Its posts stay. Null when
+    /// it can.
+    pub disconnected: Option<String>,
     /// A token is saved (it's never shown).
     pub has_token: bool,
-    /// Where GitHub or GitLab sends push events: add a webhook for pushes there with this source's secret.
-    pub webhook_url: String,
+    /// `token` sources: where GitHub or GitLab sends push events. Add a webhook for pushes there with
+    /// this source's secret. Null for `github_app` sources, whose pushes arrive through the App.
+    pub webhook_url: Option<String>,
     /// Markdown files synced as posts.
     pub synced_files: i64,
     /// Synced posts' writer: the admin who added the source.
@@ -278,6 +295,9 @@ pub struct DocsSource {
 pub struct DocsSourceList {
     /// Syncs are available on this server (it has a connector key).
     pub enabled: bool,
+    /// DumbSlab's GitHub App is set up on this server, so GitHub repositories need no token: see
+    /// list_github_repositories.
+    pub github_app: bool,
     pub items: Vec<DocsSource>,
 }
 
@@ -304,8 +324,17 @@ fn source_view(ctx: &Ctx, r: &Row) -> ApiResult<DocsSource> {
         folder: source.repo.folder.clone(),
         folder_url: source.repo.folder_url(),
         topic,
+        connection: source.link.id().into(),
+        installation_id: match source.link {
+            Link::GitHubApp { installation_id, .. } => Some(installation_id),
+            Link::Token => None,
+        },
+        disconnected: match source.disconnected.as_deref() {
+            Some(code) => Some(github_app::disconnected_message(code)),
+            None => docs::has_older_twin(ctx.db, &source)?.then(|| docs::DUPLICATE.to_string()),
+        },
         has_token: !source.cred.token.is_empty(),
-        webhook_url: ctx.url(&format!("/hooks/docs/{}", source.id)),
+        webhook_url: (source.link == Link::Token).then(|| ctx.url(&format!("/hooks/docs/{}", source.id))),
         synced_files,
         owner,
         state: unreadable(sync::state_of(r, ctx.now), readable),
@@ -326,7 +355,7 @@ fn unreadable(mut state: SyncState, readable: bool) -> SyncState {
 
 fn load_source_row(ctx: &Ctx, id: &str) -> ApiResult<Row> {
     ctx.db
-        .one("SELECT * FROM docs_sources WHERE id = ?", &params![id.trim()])?
+        .one(&format!("{} WHERE s.id = ?", docs::SOURCES_SQL), &params![id.trim()])?
         .ok_or_else(|| ApiError::not_found(format!("docs sync source `{id}`")))
 }
 
@@ -334,11 +363,108 @@ fn list_docs_sources(ctx: &mut Ctx, _: NoInput) -> ApiResult<DocsSourceList> {
     let enabled = connect::enabled(ctx.cfg);
     let mut items = vec![];
     if enabled {
-        for r in ctx.db.query("SELECT * FROM docs_sources ORDER BY created_at", &[])? {
+        for r in ctx.db.query(&format!("{} ORDER BY s.created_at", docs::SOURCES_SQL), &[])? {
             items.push(source_view(ctx, &r)?);
         }
     }
-    Ok(DocsSourceList { enabled, items })
+    Ok(DocsSourceList { enabled, github_app: enabled && github_app::app(ctx.cfg).is_some(), items })
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct GitHubRepositories {
+    /// DumbSlab's GitHub App is set up on this server.
+    pub available: bool,
+    /// Open this in a browser, signed in as an admin, to install the App on GitHub (or change which
+    /// repositories it can read) and come back to Settings › Docs sync. Null when it isn't available.
+    pub connect_url: Option<String>,
+    pub installations: Vec<GitHubInstallation>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct GitHubInstallation {
+    pub installation_id: i64,
+    /// The GitHub user or organization it's installed on.
+    pub account: String,
+    /// `User`, `Organization` or `Enterprise`.
+    pub account_type: String,
+    /// Suspended on GitHub: its sources don't sync until it's unsuspended.
+    pub suspended: bool,
+    /// The admin who connected it here.
+    pub connected_by: Option<UserRef>,
+    pub connected_at: String,
+    /// The repositories your own GitHub account can read in it, as of your connecting: the ones you
+    /// may add folders from. Empty until you choose Connect GitHub yourself (another admin's
+    /// connecting doesn't share theirs). Connect GitHub again to refresh them.
+    pub repositories: Vec<GitHubRepository>,
+    /// Your account could read more repositories there than are listed (the first 500 are).
+    pub more_repositories: bool,
+    /// Whether GitHub's deliveries for it reach this workspace: `direct` (this server gets them
+    /// itself), `ok`, `pending` (each sync asks the hosted directory again until it's recorded) or
+    /// `full` (it already serves as many workspaces as it may, so pushes don't sync by themselves
+    /// here; Sync now still works).
+    pub forwarding: String,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct GitHubRepository {
+    pub id: i64,
+    /// `owner/name`: give it to create_docs_source as `repository`.
+    pub full_name: String,
+    pub default_branch: String,
+    pub private: bool,
+}
+
+fn list_github_repositories(ctx: &mut Ctx, _: NoInput) -> ApiResult<GitHubRepositories> {
+    let available = connect::enabled(ctx.cfg) && github_app::app(ctx.cfg).is_some();
+    let mut installations = vec![];
+    let rows = ctx.db.query("SELECT * FROM github_installations ORDER BY account, id", &[])?;
+    // Checks of installations that are still owed (one failed earlier) are tried again.
+    for r in &rows {
+        if let Some(check) = github_app::resume_check(ctx.db, r.i64("id"), &ctx.base_url, ctx.now)? {
+            ctx.effects.push(Effect::Background(check));
+        }
+    }
+    let people = user_refs(ctx.db, &rows.iter().map(|r| r.str("connected_by")).collect::<Vec<_>>())?;
+    for r in &rows {
+        // Yours alone: repositories only another admin here can read aren't offered to you.
+        let mine = params![r.i64("id"), ctx.actor.user_id.clone()];
+        let more = ctx
+            .db
+            .one("SELECT more_repositories FROM github_installation_admins WHERE installation_id = ? AND user_id = ?", &mine)?
+            .is_some_and(|m| m.bool("more_repositories"));
+        let repositories = ctx
+            .db
+            .query(
+                "SELECT id, full_name, default_branch, private FROM github_repositories
+                 WHERE installation_id = ? AND user_id = ? AND removed_at IS NULL ORDER BY full_name",
+                &mine,
+            )?
+            .iter()
+            .map(|p| GitHubRepository {
+                id: p.i64("id"),
+                full_name: p.str("full_name"),
+                default_branch: p.str("default_branch"),
+                private: p.bool("private"),
+            })
+            .collect();
+        installations.push(GitHubInstallation {
+            installation_id: r.i64("id"),
+            account: r.str("account"),
+            account_type: r.str("account_type"),
+            suspended: r.opt_str("suspended_at").is_some(),
+            connected_by: people.get(&r.str("connected_by")).cloned(),
+            connected_at: r.str("created_at"),
+            repositories,
+            more_repositories: more,
+            forwarding: match (ctx.cfg.hosting.is_some(), r.opt_str("forwarding")) {
+                (false, _) => "direct".into(),
+                (true, Some(f)) => f,
+                (true, None) => "pending".into(),
+            },
+        });
+    }
+    let connect_url = available.then(|| ctx.url(github_app::INSTALL_PATH));
+    Ok(GitHubRepositories { available, connect_url, installations })
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -358,20 +484,78 @@ pub struct CreateDocsSourceInput {
     pub token: Option<String>,
     /// A self-managed GitLab's address, e.g. `https://gitlab.example.com`. Default gitlab.com.
     pub host: Option<String>,
+    /// GitHub only: read the repository through this installation of DumbSlab's GitHub App, from
+    /// list_github_repositories. Then `repository` must be one listed there, and no token or
+    /// webhook is needed. The branch defaults to the repository's default branch.
+    pub installation_id: Option<i64>,
+    /// With `installation_id`: the repository's `id` from list_github_repositories. Then that very
+    /// repository is added, whatever its name is now, and `repository` is only for people to read.
+    pub repository_id: Option<i64>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct DocsSourceCreated {
     pub source: DocsSource,
     /// The webhook secret, shown only now: GitHub's webhook "Secret", or GitLab's "Secret token".
+    /// Null for sources read through DumbSlab's GitHub App, which need no webhook.
     pub webhook_secret: Option<String>,
+}
+
+/// A repository from an installation connected here, which this admin's own GitHub account could
+/// read when they connected it (another admin's access doesn't count): (repository id,
+/// `owner/name`, default branch). By its id when the picker gave it (the one the admin chose,
+/// whatever its name is now), else by name.
+fn app_repository(ctx: &Ctx, installation_id: i64, repo: &str, repo_id: Option<i64>) -> ApiResult<(i64, String, String)> {
+    if github_app::app(ctx.cfg).is_none() {
+        return Err(ApiError::new(503, "github_app_off", "DumbSlab's GitHub App isn't set up on this server; give a token instead."));
+    }
+    let installation =
+        ctx.db.one("SELECT suspended_at FROM github_installations WHERE id = ?", &params![installation_id])?.ok_or_else(|| {
+            ApiError::not_found(format!("GitHub installation {installation_id} (Connect GitHub in Settings › Docs sync first)"))
+        })?;
+    if installation.opt_str("suspended_at").is_some() {
+        return Err(ApiError::conflict("that installation of DumbSlab's GitHub App is suspended on GitHub"));
+    }
+    let found = match repo_id {
+        Some(id) => ctx.db.one(
+            "SELECT id, full_name, default_branch FROM github_repositories WHERE installation_id = ? AND user_id = ? AND id = ? AND removed_at IS NULL",
+            &params![installation_id, ctx.actor.user_id.clone(), id],
+        )?,
+        None => ctx.db.one(
+            "SELECT id, full_name, default_branch FROM github_repositories
+             WHERE installation_id = ? AND user_id = ? AND lower(full_name) = lower(?) AND removed_at IS NULL",
+            &params![installation_id, ctx.actor.user_id.clone(), repo],
+        )?,
+    };
+    let r = found.ok_or_else(|| {
+        ApiError::not_found(format!(
+            "{repo} in that installation, among the repositories your own GitHub account could read there when you connected it. Choose Connect GitHub yourself (another admin's connecting doesn't count), and give the App access to it"
+        ))
+    })?;
+    Ok((r.i64("id"), r.str("full_name"), r.str("default_branch")))
 }
 
 fn create_docs_source(ctx: &mut Ctx, input: CreateDocsSourceInput) -> ApiResult<DocsSourceCreated> {
     key_needed(ctx)?;
     let provider = sync::repo_provider(&input.provider)?;
     let (host, repo) = sync::repo_name(provider, &input.repository, input.host.as_deref().unwrap_or_default())?;
-    let branch = clean(input.branch).unwrap_or_else(|| "main".into());
+    // Through DumbSlab's GitHub App: a repository the admin's own GitHub account showed it can read.
+    let app = match input.installation_id {
+        Some(_) if provider != sync::repo::Provider::GitHub => {
+            return Err(ApiError::bad_request("`installation_id` is for GitHub repositories only"));
+        }
+        Some(_) if clean(input.token.clone()).is_some() => {
+            return Err(ApiError::bad_request("a source read through DumbSlab's GitHub App takes no token; leave out `token`"));
+        }
+        Some(installation) => Some((installation, app_repository(ctx, installation, &repo, input.repository_id)?)),
+        None if input.repository_id.is_some() => {
+            return Err(ApiError::bad_request("`repository_id` goes with `installation_id`, from list_github_repositories"));
+        }
+        None => None,
+    };
+    let repo = app.as_ref().map(|(_, (_, name, _))| name.clone()).unwrap_or(repo);
+    let default_branch = app.as_ref().map(|(_, (_, _, b))| b.clone()).unwrap_or_else(|| "main".into());
+    let branch = clean(input.branch).unwrap_or(default_branch);
     let branch = sync::checked_branch(&branch)?;
     let folder = sync::checked_folder(input.folder.as_deref().unwrap_or_default())?;
     let topic = load_topic(ctx, input.topic_id.trim())?;
@@ -379,17 +563,22 @@ fn create_docs_source(ctx: &mut Ctx, input: CreateDocsSourceInput) -> ApiResult<
     if count >= MAX_SOURCES {
         return Err(ApiError::conflict(format!("a workspace can have at most {MAX_SOURCES} docs sync sources")));
     }
-    let duplicate = ctx.db.one(
-        "SELECT id FROM docs_sources WHERE provider = ? AND host = ? AND repo = ? AND branch = ? AND folder = ? AND topic_id = ?",
-        &params![provider.id(), host.clone(), repo.clone(), branch.clone(), folder.clone(), topic.str("id")],
-    )?;
-    if duplicate.is_some() {
-        return Err(ApiError::conflict("that folder already syncs into that topic"));
+    // The same folder twice, by the repository's name or (renamed since) its id.
+    let wanted = sync::repo::Repo { provider, host: host.clone(), repo: repo.clone(), branch: branch.clone(), folder: folder.clone() };
+    let link = match &app {
+        Some((installation_id, (repo_id, _, _))) => Link::GitHubApp { installation_id: *installation_id, repo_id: *repo_id },
+        None => Link::Token,
+    };
+    if !docs::twins(ctx.db, &wanted, &link, &topic.str("id"), "")?.is_empty() {
+        return Err(ApiError::conflict(ALREADY_SYNCED));
     }
     let id = crate::util::new_id();
-    let webhook_secret = new_secret("whsec_");
+    // A GitHub App source keeps no token and needs no webhook secret.
+    let webhook_secret = app.is_none().then(|| new_secret("whsec_"));
     let mut cred = Credential { token: secret_input(input.token, "token")?.unwrap_or_default(), ..Default::default() };
-    cred.fields.insert("webhook_secret".into(), webhook_secret.clone());
+    if let Some(s) = &webhook_secret {
+        cred.fields.insert("webhook_secret".into(), s.clone());
+    }
     let secret = sync::seal(ctx.cfg, &docs::owner(&id), provider.id(), &cred)?;
     let now = ctx.now_s();
     ctx.db.execute(
@@ -409,12 +598,18 @@ fn create_docs_source(ctx: &mut Ctx, input: CreateDocsSourceInput) -> ApiResult<
             now
         ],
     )?;
+    if let Some((installation_id, (repo_id, _, _))) = app {
+        ctx.db.execute(
+            "INSERT INTO docs_source_links (source_id, connection, installation_id, repo_id) VALUES (?, 'github_app', ?, ?)",
+            &params![id.clone(), installation_id, repo_id],
+        )?;
+    }
     emit(
         ctx,
         Event::new("docs_source.created", "docs_source", &id, format!("added docs sync from {repo}")).topic(&topic.str("id")).admin_only(),
     )?;
     let row = load_source_row(ctx, &id)?;
-    Ok(DocsSourceCreated { source: source_view(ctx, &row)?, webhook_secret: Some(webhook_secret) })
+    Ok(DocsSourceCreated { source: source_view(ctx, &row)?, webhook_secret })
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -434,12 +629,24 @@ fn update_docs_source(ctx: &mut Ctx, input: UpdateDocsSourceInput) -> ApiResult<
     let row = load_source_row(ctx, &input.id)?;
     // Credentials that can't be read any more are replaced: a token, and a new webhook secret.
     let (mut source, readable) = Source::from_row_or_blank(ctx.cfg, &row)?;
+    if source.link != Link::Token && (input.token.is_some() || input.new_webhook_secret == Some(true)) {
+        return Err(ApiError::bad_request(
+            "this source is read through DumbSlab's GitHub App: it has no token or webhook secret. Only its branch can change.",
+        ));
+    }
     if let Some(t) = secret_input(input.token, "token")? {
         source.cred.token = t;
     }
     if let Some(b) = clean(input.branch) {
-        source.repo.branch = sync::checked_branch(&b)?;
+        let branch = sync::checked_branch(&b)?;
+        if branch != source.repo.branch {
+            source.repo.branch = branch;
+            if !docs::twins(ctx.db, &source.repo, &source.link, &source.topic_id, &source.id)?.is_empty() {
+                return Err(ApiError::conflict(ALREADY_SYNCED));
+            }
+        }
     }
+    // (A GitHub App source keeps no credentials, so it's always readable.)
     let webhook_secret = (input.new_webhook_secret.unwrap_or(false) || !readable).then(|| new_secret("whsec_"));
     if let Some(s) = &webhook_secret {
         source.cred.fields.insert("webhook_secret".into(), s.clone());
@@ -467,6 +674,31 @@ fn sync_docs_source(ctx: &mut Ctx, input: SourceIdInput) -> ApiResult<Deferred<D
     key_needed(ctx)?;
     let row = load_source_row(ctx, &input.id)?;
     let source = Source::from_row(ctx.cfg, &row)?;
+    // (A GitHub App source's name may be stale: its sync checks once its token says the name now.)
+    if source.link == Link::Token && docs::has_older_twin(ctx.db, &source)? {
+        return Err(ApiError::new(409, "duplicate", docs::DUPLICATE));
+    }
+    if let Link::GitHubApp { installation_id, .. } = source.link {
+        // Disconnected: Sync now asks GitHub again (a check already owed or running covers it).
+        // The check is asked for in this answer (so it's kept), and decides whether the folder can
+        // sync.
+        let known = ctx.db.one("SELECT 1 AS ok FROM github_installations WHERE id = ?", &params![installation_id])?.is_some();
+        if source.disconnected.is_some() && known {
+            if let Some(check) = github_app::recheck(ctx.db, installation_id, &ctx.base_url, ctx.now)? {
+                ctx.effects.push(Effect::Background(check));
+            }
+            let checking =
+                "DumbSlab is checking GitHub's access for this folder before it syncs. Settings shows what it finds; sync again then.";
+            return Ok(Deferred::Ready(DocsSyncResult { checking: Some(checking.into()), ..Default::default() }));
+        }
+        // A check of its installation that's still owed (it failed earlier) is tried again too.
+        if let Some(check) = github_app::resume_check(ctx.db, installation_id, &ctx.base_url, ctx.now)? {
+            ctx.effects.push(Effect::Background(check));
+        }
+    }
+    if let Some(code) = &source.disconnected {
+        return Err(ApiError::new(409, "disconnected", github_app::disconnected_message(code)));
+    }
     match docs::start(ctx.db, source, &ctx.base_url, Utc::now())? {
         Some(job) => {
             ctx.effects.push(Effect::Connect(job));
@@ -478,9 +710,27 @@ fn sync_docs_source(ctx: &mut Ctx, input: SourceIdInput) -> ApiResult<Deferred<D
 
 fn delete_docs_source(ctx: &mut Ctx, input: SourceIdInput) -> ApiResult<Done> {
     let row = load_source_row(ctx, &input.id)?;
-    let id = row.str("id");
-    ctx.db.execute("DELETE FROM docs_items WHERE source_id = ?", &params![id.clone()])?;
-    ctx.db.execute("DELETE FROM docs_sources WHERE id = ?", &params![id.clone()])?;
-    emit(ctx, Event::new("docs_source.deleted", "docs_source", &id, format!("removed docs sync from {}", row.str("repo"))).admin_only())?;
+    remove_sources(ctx, &[row])?;
     Ok(DONE)
+}
+
+/// Removes sources (rows of [`docs::SOURCES_SQL`]): removing one, or deleting the topic they sync
+/// into. Each must have no sync running: this takes the sync's lease, so none starts either, and
+/// whatever the source keeps elsewhere is cleaned up from what's stored now. Their posts stay.
+pub(crate) fn remove_sources(ctx: &mut Ctx, rows: &[Row]) -> ApiResult<()> {
+    let now = Utc::now();
+    for row in rows {
+        let id = row.str("id");
+        if sync::claim(ctx.db, docs::TABLE, id.as_str().into(), now)?.is_none() {
+            return Err(ApiError::conflict(format!("A sync of {} is running. Try again in a moment, once it's done.", row.str("repo"))));
+        }
+        ctx.db.execute("DELETE FROM docs_items WHERE source_id = ?", &params![id.clone()])?;
+        ctx.db.execute("DELETE FROM docs_rerender WHERE source_id = ?", &params![id.clone()])?;
+        ctx.db.execute("DELETE FROM docs_sources WHERE id = ?", &params![id.clone()])?;
+        emit(
+            ctx,
+            Event::new("docs_source.deleted", "docs_source", &id, format!("removed docs sync from {}", row.str("repo"))).admin_only(),
+        )?;
+    }
+    Ok(())
 }

@@ -90,6 +90,30 @@ pub(crate) fn owner(source_id: &str) -> String {
     format!("docs-source:{source_id}")
 }
 
+/// Sources, with how each reads its repository (`docs_source_links`; none for a token). Add a
+/// `WHERE` on `s.` columns.
+pub(crate) const SOURCES_SQL: &str = "SELECT s.*, l.connection, l.installation_id, l.repo_id, l.disconnected
+    FROM docs_sources s LEFT JOIN docs_source_links l ON l.source_id = s.id";
+
+/// How a source reads its repository (`docs_source_links.connection`).
+#[derive(Clone, Debug, PartialEq)]
+pub enum Link {
+    /// A pasted token (none for a public repository), and a push webhook the admin added.
+    Token,
+    /// DumbSlab's GitHub App: each sync mints a token for this one repository (see
+    /// [`super::github_app`]), and the App's own webhook reports pushes.
+    GitHubApp { installation_id: i64, repo_id: i64 },
+}
+
+impl Link {
+    pub fn id(&self) -> &'static str {
+        match self {
+            Link::Token => "token",
+            Link::GitHubApp { .. } => "github_app",
+        }
+    }
+}
+
 /// A source, with its credentials.
 #[derive(Clone, Debug)]
 pub struct Source {
@@ -98,12 +122,18 @@ pub struct Source {
     pub topic_id: String,
     pub owner_id: String,
     pub cred: Credential,
+    pub link: Link,
+    /// Why it can't sync now (see [`super::github_app::disconnected_message`]).
+    pub disconnected: Option<String>,
 }
 
 impl Source {
     pub(crate) fn from_row(cfg: &HostConfig, r: &Row) -> ApiResult<Source> {
         let mut source = Source::without_credentials(r)?;
-        source.cred = super::open(cfg, &owner(&source.id), source.repo.provider.id(), &r.str("secret"))?;
+        // A GitHub App source keeps no credentials: its tokens are minted for each sync.
+        if source.link == Link::Token {
+            source.cred = super::open(cfg, &owner(&source.id), source.repo.provider.id(), &r.str("secret"))?;
+        }
         Ok(source)
     }
 
@@ -119,17 +149,24 @@ impl Source {
 
     fn without_credentials(r: &Row) -> ApiResult<Source> {
         let provider = Provider::parse(&r.str("provider")).ok_or_else(|| ApiError::internal("unknown docs sync provider"))?;
+        let link = match (r.opt_str("connection").as_deref(), r.opt_i64("installation_id"), r.opt_i64("repo_id")) {
+            (None, _, _) => Link::Token,
+            (Some("github_app"), Some(installation_id), Some(repo_id)) => Link::GitHubApp { installation_id, repo_id },
+            _ => return Err(ApiError::internal("a docs sync source's connection is incomplete")),
+        };
         Ok(Source {
             id: r.str("id"),
             repo: Repo { provider, host: r.str("host"), repo: r.str("repo"), branch: r.str("branch"), folder: r.str("folder") },
             topic_id: r.str("topic_id"),
             owner_id: r.str("owner_id"),
             cred: Credential::default(),
+            link,
+            disconnected: r.opt_str("disconnected"),
         })
     }
 
     pub(crate) fn load(db: &dyn Db, cfg: &HostConfig, id: &str) -> ApiResult<Option<Source>> {
-        match db.one("SELECT * FROM docs_sources WHERE id = ?", &params![id])? {
+        match db.one(&format!("{SOURCES_SQL} WHERE s.id = ?"), &params![id])? {
             Some(r) => Ok(Some(Source::from_row(cfg, &r)?)),
             None => Ok(None),
         }
@@ -138,6 +175,72 @@ impl Source {
     fn token(&self) -> &str {
         &self.cred.token
     }
+}
+
+/// What a source that waits for an older one doing the same work shows, and its syncs answer.
+pub const DUPLICATE: &str = "Another source already syncs this folder into this topic (its repository was renamed into this one's, say), so this one doesn't. The older one keeps syncing; remove one of them. Posts stay either way.";
+
+/// The other sources that sync the same folder of the same branch into the same topic as `repo`
+/// would, from the same repository. Two sources read through DumbSlab's GitHub App are the same
+/// repository only by its id, which a rename keeps: another repository that took a name one of
+/// them still shows isn't theirs. Otherwise (either reads with a token) by name. Oldest first;
+/// `except` is left out.
+pub(crate) fn twins(db: &dyn Db, repo: &Repo, link: &Link, topic_id: &str, except: &str) -> ApiResult<Vec<Row>> {
+    let (repo_id, _) = ids_of(link);
+    db.query(
+        "SELECT s.id, s.created_at, s.rowid AS seq FROM docs_sources s LEFT JOIN docs_source_links l ON l.source_id = s.id
+         WHERE s.id != ? AND s.branch = ? AND s.folder = ? AND s.topic_id = ?
+           AND CASE WHEN ? IS NOT NULL AND l.connection = 'github_app' THEN l.repo_id = ?
+                    ELSE s.provider = ? AND s.host = ? AND lower(s.repo) = lower(?) END
+         ORDER BY s.created_at, s.rowid",
+        &params![
+            except,
+            repo.branch.clone(),
+            repo.folder.clone(),
+            topic_id,
+            repo_id,
+            repo_id,
+            repo.provider.id(),
+            repo.host.clone(),
+            repo.repo.clone()
+        ],
+    )
+}
+
+/// Another source, older than this one, already does its work (renames made them the same): this
+/// one waits, its posts kept, until one of them is removed. Never both syncing one folder.
+pub(crate) fn has_older_twin(db: &dyn Db, source: &Source) -> ApiResult<bool> {
+    // Older: added earlier, or in the same millisecond but inserted first.
+    let Some(me) = db.one("SELECT created_at, rowid AS seq FROM docs_sources WHERE id = ?", &params![source.id.clone()])? else {
+        return Ok(false);
+    };
+    let mine = (me.str("created_at"), me.i64("seq"));
+    Ok(twins(db, &source.repo, &source.link, &source.topic_id, &source.id)?.iter().any(|t| (t.str("created_at"), t.i64("seq")) < mine))
+}
+
+/// A repository renamed on GitHub keeps its id: its source follows the new name, and every file it
+/// synced is rendered again (see [`mark_renamed`]), since links out of the folder name the
+/// repository.
+pub(crate) fn rename(db: &dyn Db, source_id: &str, name: &str, now: DateTime<Utc>) -> ApiResult<()> {
+    if db
+        .execute("UPDATE docs_sources SET repo = ?, updated_at = ? WHERE id = ? AND repo != ?", &params![name, ts(now), source_id, name])?
+        > 0
+    {
+        mark_renamed(db, source_id)?;
+    }
+    Ok(())
+}
+
+/// Every file the source synced is owed a render under its new name (`docs_rerender`, by post),
+/// however many runs that takes. Their last synced blobs stay as they were, so a file that moves
+/// meanwhile is still found by its contents and keeps its post.
+fn mark_renamed(db: &dyn Db, source_id: &str) -> ApiResult<()> {
+    db.execute(
+        "INSERT INTO docs_rerender (source_id, target_id) SELECT source_id, target_id FROM docs_items WHERE source_id = ? AND kind = 'doc'
+         ON CONFLICT DO NOTHING",
+        &params![source_id],
+    )?;
+    Ok(())
 }
 
 /// A file a sync skipped, and why.
@@ -172,6 +275,10 @@ pub struct DocsSyncResult {
     pub done: bool,
     /// Files left out, and why (the first 100).
     pub skipped: Vec<Skipped>,
+    /// Nothing was synced: DumbSlab is checking GitHub's access for this folder first (it was
+    /// disconnected). Settings shows what it finds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checking: Option<String>,
 }
 
 impl DocsSyncResult {
@@ -279,6 +386,9 @@ impl DocsJob {
 #[derive(Clone, Debug)]
 enum Phase {
     Start,
+    /// GitHub App sources: waiting for this sync's installation token (and, when `true`, the
+    /// directory's answer to registering the installation again).
+    Minting(bool),
     Listing,
     /// Waiting for this run's Markdown files.
     Reading(Plan),
@@ -349,13 +459,96 @@ pub(crate) fn start(db: &dyn Db, source: Source, base_url: &str, now: DateTime<U
 /// Runs a docs sync's next step (see [`crate::connect::step`]).
 pub fn step(db: &dyn Db, cfg: &HostConfig, j: &mut DocsJob, replies: Vec<HttpReply>, now: DateTime<Utc>) -> ApiResult<Step> {
     match std::mem::replace(&mut j.phase, Phase::Start) {
-        Phase::Start => {
-            j.phase = Phase::Listing;
-            Ok(Step::Fetch(j.source.repo.tree_calls(j.source.token())))
+        // (A GitHub App source checks once its token says the repository's name now.)
+        Phase::Start if j.source.link == Link::Token && has_older_twin(db, &j.source)? => fail(db, j, DUPLICATE, now),
+        Phase::Start => match j.source.link {
+            Link::GitHubApp { installation_id, repo_id } => {
+                let Some(app) = super::github_app::app(cfg) else {
+                    return fail(db, j, "DumbSlab's GitHub App isn't set up on this server any more, so this folder can't sync.", now);
+                };
+                match super::github_app::token_call(app, installation_id, repo_id, now) {
+                    Ok(call) => {
+                        // Hosted, until the directory has the installation, each sync asks again.
+                        let link = super::github_app::needs_link(db, cfg, installation_id)?;
+                        let mut calls = vec![call];
+                        if link {
+                            calls.push(super::github_app::link_call(installation_id));
+                        }
+                        j.phase = Phase::Minting(link);
+                        Ok(Step::Fetch(calls))
+                    }
+                    Err(message) => fail(db, j, &message, now),
+                }
+            }
+            Link::Token => {
+                j.phase = Phase::Listing;
+                Ok(Step::Fetch(j.source.repo.tree_calls(j.source.token())))
+            }
+        },
+        Phase::Minting(link) => minted(db, j, &replies, link, now),
+        // Every step that writes checks again first, in its own transaction (see [`unchanged`]).
+        phase @ (Phase::Listing | Phase::Reading(_) | Phase::Images(..)) => {
+            if let Some(stop) = unchanged(db, j, true, now)? {
+                return Ok(stop);
+            }
+            match phase {
+                Phase::Listing => listing(db, cfg, j, &replies, now),
+                Phase::Reading(plan) => reading(db, cfg, j, plan, &replies, now),
+                Phase::Images(plan, texts) => images(db, cfg, j, plan, texts, &replies, now),
+                _ => unreachable!("a writing phase"),
+            }
         }
-        Phase::Listing => listing(db, cfg, j, &replies, now),
-        Phase::Reading(plan) => reading(db, cfg, j, plan, &replies, now),
-        Phase::Images(plan, texts) => images(db, cfg, j, plan, texts, &replies, now),
+    }
+}
+
+/// What a sync that stopped because its source changed says (see [`unchanged`]).
+pub const CHANGED: &str = "The folder's repository, branch or topic changed while it synced (it was renamed, say), so this sync stopped without writing. Sync again to pick it up.";
+
+/// Before a step writes, in the same transaction: the source as stored now must still be the one
+/// this run started with (its repository's name and id, branch, folder and topic). If it changed
+/// meanwhile (a push or a check renamed it, say), the run writes nothing and ends, its source left
+/// pending, so the next sync starts from the source as it is. And (with `twin`) no older source
+/// may do the same work, by that identity: one that became another's twin while files were
+/// fetched (an older App source learned its repository's new name, say) writes nothing, and says
+/// why. `Some` is how the run ends.
+fn unchanged(db: &dyn Db, j: &mut DocsJob, twin: bool, now: DateTime<Utc>) -> ApiResult<Option<Step>> {
+    let Some(r) = db.one(
+        "SELECT s.repo, s.branch, s.folder, s.topic_id, l.repo_id, l.project_id FROM docs_sources s
+         LEFT JOIN docs_source_links l ON l.source_id = s.id WHERE s.id = ?",
+        &params![j.source.id.clone()],
+    )?
+    else {
+        return Ok(Some(lost()));
+    };
+    let (repo_id, project_id) = ids_of(&j.source.link);
+    let same = r.str("repo") == j.source.repo.repo
+        && r.str("branch") == j.source.repo.branch
+        && r.str("folder") == j.source.repo.folder
+        && r.str("topic_id") == j.source.topic_id
+        && r.opt_i64("repo_id") == repo_id
+        && r.opt_i64("project_id") == project_id;
+    if !same {
+        if !super::holds(db, TABLE, j.source.id.as_str().into(), &j.lease)? {
+            return Ok(Some(lost()));
+        }
+        super::mark_pending(db, TABLE, j.source.id.as_str().into(), now)?;
+        j.result.done = false;
+        let value = serde_json::to_value(&j.result).map_err(|e| ApiError::internal(e.to_string()))?;
+        let ended = Ended { status: "partial", error: Some(CHANGED), result: Some(value.clone()) };
+        super::finish(db, TABLE, j.source.id.as_str().into(), &j.lease, ended, now)?;
+        return Ok(Some(Step::Done(Finish::Fill(value))));
+    }
+    if twin && has_older_twin(db, &j.source)? {
+        return Ok(Some(fail(db, j, DUPLICATE, now)?));
+    }
+    Ok(None)
+}
+
+/// The repository's id (GitHub App) and the project's id (GitLab app) a source reads by, if any.
+fn ids_of(link: &Link) -> (Option<i64>, Option<i64>) {
+    match link {
+        Link::GitHubApp { repo_id, .. } => (Some(*repo_id), None),
+        Link::Token => (None, None),
     }
 }
 
@@ -572,6 +765,43 @@ fn set_status(ctx: &mut Ctx, post_id: &str, status: &str) -> ApiResult<bool> {
     Ok(true)
 }
 
+/// A GitHub App source's token arrived: list the folder with it. A repository renamed on GitHub
+/// keeps its id; the source follows its new name, so links point at the right place.
+fn minted(db: &dyn Db, j: &mut DocsJob, replies: &[HttpReply], link: bool, now: DateTime<Utc>) -> ApiResult<Step> {
+    let Link::GitHubApp { installation_id, repo_id } = j.source.link else {
+        return Err(ApiError::internal("only GitHub App sources mint tokens"));
+    };
+    if link && let Some(reply) = replies.get(1) {
+        super::github_app::record_link(db, installation_id, super::github_app::read_link(reply))?;
+    }
+    let reply = replies.first().cloned().unwrap_or_default();
+    let minted = match super::github_app::read_token(&reply, repo_id) {
+        Ok(m) => m,
+        // GitHub says the installation can't reach the repository now. Only a check of the
+        // installation decides that (this answer may be older than a change GitHub reported since),
+        // so one is asked for; it marks the source if it's so.
+        Err(_) if reply.status == 422 => {
+            if let Some(check) = super::github_app::recheck(db, installation_id, &j.base_url, now)? {
+                j.staged.push(crate::Effect::Background(check));
+            }
+            let message = "GitHub didn't let DumbSlab's App read this repository just now, so DumbSlab is checking the App's access to it. Settings shows what it finds; sync again in a moment.";
+            return fail(db, j, message, now);
+        }
+        Err(message) => return fail(db, j, &message, now),
+    };
+    if let Some(name) = minted.full_name.filter(|n| *n != j.source.repo.repo) {
+        rename(db, &j.source.id, &name, now)?;
+        j.source.repo.repo = name;
+    }
+    // With its name as it is now: another source may already sync this folder.
+    if has_older_twin(db, &j.source)? {
+        return fail(db, j, DUPLICATE, now);
+    }
+    j.source.cred.token = minted.token;
+    j.phase = Phase::Listing;
+    Ok(Step::Fetch(j.source.repo.tree_calls(j.source.token())))
+}
+
 /// Reads the folder's listing, works out what changed, and asks for this run's files.
 fn listing(db: &dyn Db, cfg: &HostConfig, j: &mut DocsJob, replies: &[HttpReply], now: DateTime<Utc>) -> ApiResult<Step> {
     let source_id = j.source.id.clone();
@@ -725,6 +955,20 @@ fn listing(db: &dyn Db, cfg: &HostConfig, j: &mut DocsJob, replies: &[HttpReply]
         d.sha = None;
     }
 
+    // Files owed a render since the repository was renamed (see [`mark_renamed`]). Those of files
+    // no longer in the folder are dropped: a file that comes back is synced anyway.
+    let mut rerender: BTreeSet<String> = db
+        .query("SELECT target_id FROM docs_rerender WHERE source_id = ?", &params![source_id.clone()])?
+        .iter()
+        .map(|r| r.str("target_id"))
+        .collect();
+    let here: BTreeSet<&String> = docs.values().map(|d| &d.target_id).collect();
+    for gone in rerender.iter().filter(|t| !here.contains(t)) {
+        db.execute("DELETE FROM docs_rerender WHERE source_id = ? AND target_id = ?", &params![source_id.clone(), gone.clone()])?;
+    }
+    // (The run's name is the source's as stored now: see [`unchanged`].)
+    rerender.retain(|t| here.contains(t));
+
     // Files that link to a changed path are synced again, now or in a later run.
     let dependents: Vec<String> =
         docs.iter().filter(|(_, d)| d.sha.is_some() && d.refs.iter().any(|x| changed.contains(x))).map(|(p, _)| p.clone()).collect();
@@ -756,7 +1000,10 @@ fn listing(db: &dyn Db, cfg: &HostConfig, j: &mut DocsJob, replies: &[HttpReply]
     let mut todo: Vec<Work> = vec![];
     for (path, entry) in &tree_docs {
         let item = &docs[path];
-        if item.sha.as_deref() == Some(entry.sha.as_str()) {
+        // Unchanged, unless it's owed a render under the repository's new name (a post in the
+        // trash waits until it's restored and the file changes, as before).
+        let owed = rerender.contains(&item.target_id) && !trashed.contains(&item.target_id);
+        if item.sha.as_deref() == Some(entry.sha.as_str()) && !owed {
             j.result.unchanged += 1;
         } else if let Some(why) = blocked(path) {
             j.result.skip(path, why);
@@ -1127,6 +1374,12 @@ fn write(ctx: &mut Ctx, j: &mut DocsJob, mut plan: Plan, texts: Vec<Text>, ready
             "UPDATE docs_items SET sha = ?, refs = ?, synced_at = ?, removed_at = NULL, skipped_sha = NULL, skip_reason = NULL
              WHERE source_id = ? AND kind = 'doc' AND path = ?",
             &params![t.work.sha.clone(), refs.join("\n"), ts(now), source_id.clone(), t.work.path.clone()],
+        )?;
+        // Rendered under the repository's name: no longer owed a render, unless it was renamed
+        // again meanwhile.
+        db.execute(
+            "DELETE FROM docs_rerender WHERE source_id = ? AND target_id = ? AND EXISTS (SELECT 1 FROM docs_sources WHERE id = ? AND repo = ?)",
+            &params![source_id.clone(), t.work.post_id.clone(), source_id.clone(), j.source.repo.repo.clone()],
         )?;
     }
     j.result.images_reused = reused.len();

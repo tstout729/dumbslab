@@ -90,6 +90,12 @@ STRIPE_PRICE_ID = ""
 # Optional: the customer portal settings scripts/stripe-setup.sh made (bpc_…).
 STRIPE_PORTAL_CONFIG = ""
 PRO_PRICE_LABEL = "$8 a month"
+# DumbSlab's GitHub App, so docs sync needs no token (docs/hosting/github-app.md). Empty turns it
+# off. Its client secret, private key and webhook secret are secrets: GITHUB_APP_CLIENT_SECRET,
+# GITHUB_APP_PRIVATE_KEY and GITHUB_APP_WEBHOOK_SECRET.
+GITHUB_APP_ID = ""
+GITHUB_APP_SLUG = ""
+GITHUB_APP_CLIENT_ID = ""
 # Single-workspace mode only: public URL and Durable Object name.
 BASE_URL = ""
 WORKSPACE_NAME = "main"

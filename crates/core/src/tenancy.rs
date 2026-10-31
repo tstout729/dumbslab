@@ -239,6 +239,16 @@ CREATE TABLE IF NOT EXISTS billing (
   updated_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS billing_home ON billing(home);
+-- Installations of DumbSlab's GitHub App and the workspaces (by first address) that connected
+-- them. GitHub sends every installation's webhook deliveries to the root domain, which forwards
+-- each one to these workspaces only. One installation can serve several workspaces.
+CREATE TABLE IF NOT EXISTS installation_workspaces (
+  installation_id INTEGER NOT NULL,
+  home TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (installation_id, home)
+);
+CREATE INDEX IF NOT EXISTS installation_workspaces_home ON installation_workspaces(home);
 -- Slack workspaces added with DumbSlab's own Slack app (Add to Slack): the installation itself,
 -- bot token included, and the one workspace (by its first address) that holds it. This table is
 -- the only record of who holds a Slack workspace and the only copy of its token: Slack sends
@@ -400,6 +410,7 @@ pub fn remove(db: &dyn Db, home: &str) -> ApiResult<()> {
     db.execute("DELETE FROM workspaces WHERE slug = ?", &params![home])?;
     db.execute("DELETE FROM addresses WHERE home = ?", &params![home])?;
     db.execute("DELETE FROM usage WHERE home = ?", &params![home])?;
+    db.execute("DELETE FROM installation_workspaces WHERE home = ?", &params![home])?;
     db.execute("UPDATE billing SET detached = 1 WHERE home = ?", &params![home])?;
     db.execute("DELETE FROM slack_installs WHERE home = ?", &params![home])?;
     // Whatever the deleted workspace still had under way (an Add to Slack) names an older value,
@@ -457,6 +468,67 @@ pub fn resolve(db: &dyn Db, slug: &str) -> ApiResult<Option<(String, Vec<String>
     };
     let moved = db.query("SELECT slug FROM addresses WHERE home = ? ORDER BY created_at", &params![home.clone()])?;
     Ok(Some((home, moved.iter().map(|r| r.str("slug")).collect())))
+}
+
+// ---------------------------------------------------------------------------
+// GitHub App installations
+
+/// The most workspaces one installation's deliveries are forwarded to. Each delivery wakes them
+/// all, in parallel, within GitHub's 10 seconds; a workspace only connects an installation its
+/// admin's GitHub account can access, so this is far more than one organization's teams need.
+pub const MAX_WORKSPACES_PER_INSTALLATION: i64 = 100;
+/// The most installations one workspace may connect.
+pub const MAX_INSTALLATIONS_PER_WORKSPACE: i64 = 100;
+
+/// Records that the workspace whose first address is `home` connected (`linked`) or stopped using
+/// an installation of DumbSlab's GitHub App. Linking again changes nothing.
+pub fn link_installation(db: &dyn Db, installation_id: i64, home: &str, linked: bool, now: DateTime<Utc>) -> ApiResult<()> {
+    validate_slug(home).map_err(ApiError::bad_request)?;
+    if installation_id <= 0 {
+        return Err(ApiError::bad_request("send a GitHub installation id"));
+    }
+    if !linked {
+        db.execute("DELETE FROM installation_workspaces WHERE installation_id = ? AND home = ?", &params![installation_id, home])?;
+        return Ok(());
+    }
+    if db
+        .one("SELECT 1 AS ok FROM installation_workspaces WHERE installation_id = ? AND home = ?", &params![installation_id, home])?
+        .is_some()
+    {
+        return Ok(());
+    }
+    if db.one("SELECT 1 AS ok FROM workspaces WHERE slug = ? AND status = 'active'", &params![home])?.is_none() {
+        return Err(ApiError::not_found(format!("workspace `{home}`")));
+    }
+    let sharing = db.scalar_i64("SELECT COUNT(*) FROM installation_workspaces WHERE installation_id = ?", &params![installation_id])?;
+    let mine = db.scalar_i64("SELECT COUNT(*) FROM installation_workspaces WHERE home = ?", &params![home])?;
+    if sharing >= MAX_WORKSPACES_PER_INSTALLATION {
+        return Err(ApiError::new(
+            409,
+            "installation_full",
+            "that GitHub App installation is connected to as many workspaces as it can be",
+        ));
+    }
+    if mine >= MAX_INSTALLATIONS_PER_WORKSPACE {
+        return Err(ApiError::new(409, "installation_full", "this workspace has connected as many GitHub App installations as it can"));
+    }
+    db.execute(
+        "INSERT INTO installation_workspaces (installation_id, home, created_at) VALUES (?, ?, ?)",
+        &params![installation_id, home, ts(now)],
+    )?;
+    Ok(())
+}
+
+/// Where an installation's deliveries go: each active workspace that connected it, as (its first
+/// address, which names its storage; its current address).
+pub fn installation_targets(db: &dyn Db, installation_id: i64) -> ApiResult<Vec<(String, String)>> {
+    let rows = db.query(
+        "SELECT g.home, (SELECT a.slug FROM addresses a WHERE a.home = g.home AND a.current = 1) AS current
+         FROM installation_workspaces g JOIN workspaces w ON w.slug = g.home
+         WHERE g.installation_id = ? AND w.status = 'active' ORDER BY g.created_at LIMIT ?",
+        &params![installation_id, MAX_WORKSPACES_PER_INSTALLATION],
+    )?;
+    Ok(rows.iter().map(|r| (r.str("home"), r.opt_str("current").unwrap_or_else(|| r.str("home")))).collect())
 }
 
 // ---------------------------------------------------------------------------

@@ -86,12 +86,16 @@ pub fn handle(db: &dyn Db, cfg: &HostConfig, req: &Request) -> Option<Outcome> {
     } else if path.starts_with("/slack/") {
         // Slack's own requests: no session or token, only Slack's signature.
         crate::slack::handle(db, cfg, req)
-    } else if path.starts_with("/hooks/") {
-        no_store(crate::sync::hook(db, cfg, req))
+    } else if path == crate::sync::github_app::INSTALL_PATH && req.method == "GET" {
+        crate::sync::github_app::install_start(db, cfg, req)
+    } else if path == crate::sync::github_app::CALLBACK_PATH && req.method == "GET" {
+        crate::sync::github_app::install_callback(db, cfg, req)
     } else if path == crate::sync::people::CALLBACK_PATH && req.method == "GET" {
         crate::sync::people::callback(db, cfg, req)
     } else if path.starts_with("/sync/") {
         failed(&ApiError::not_found("route"))
+    } else if path.starts_with("/hooks/") {
+        no_store(crate::sync::hook(db, cfg, req))
     } else {
         let rest = path.strip_prefix(API_PREFIX)?;
         let r = api(db, cfg, req, rest);

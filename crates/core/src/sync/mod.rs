@@ -14,6 +14,7 @@
 //! secret checks out; they only say that something changed, and the sync reads the source itself.
 
 pub mod docs;
+pub mod github_app;
 pub mod people;
 pub(crate) mod repo;
 mod rewrite;
@@ -175,8 +176,9 @@ fn hook_started(job: connect::Job) -> Outcome {
     out
 }
 
-/// `POST /hooks/people` (BambooHR) and `POST /hooks/docs/<source id>` (GitHub, GitLab): something
-/// changed there, so sync. Each checks its own secret.
+/// `POST /hooks/people` (BambooHR), `POST /hooks/docs/<source id>` (GitHub, GitLab) and
+/// `POST /hooks/github` (DumbSlab's GitHub App): something changed there, so sync. Each checks its
+/// own secret.
 pub fn hook(db: &dyn Db, cfg: &HostConfig, req: &Request) -> Outcome {
     let run = || -> ApiResult<Outcome> {
         if req.method != "POST" {
@@ -188,6 +190,7 @@ pub fn hook(db: &dyn Db, cfg: &HostConfig, req: &Request) -> Outcome {
         match segments.as_slice() {
             ["people"] => people::hook(db, cfg, req, &base_url, now),
             ["docs", id] if !id.is_empty() => docs::hook(db, cfg, req, id, &base_url, now),
+            ["github"] => github_app::hook(db, cfg, req, &base_url, now),
             _ => Err(ApiError::not_found("webhook")),
         }
     };

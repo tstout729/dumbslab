@@ -55,6 +55,13 @@ struct UsageInput {
 }
 
 #[derive(Deserialize)]
+struct InstallationInput {
+    installation_id: i64,
+    home: Option<String>,
+    linked: Option<bool>,
+}
+
+#[derive(Deserialize)]
 struct SlackTeamInput {
     team_id: Option<String>,
     #[serde(default)]
@@ -221,6 +228,25 @@ impl DurableObject for Directory {
                     tenancy::report_usage(db, &input.home, &input.plan, input.writes_24h, input.storage_bytes, now)?;
                     let capacity = tenancy::free_capacity(db, now, limits.free)?;
                     serde_json::to_value(capacity).map_err(|e| ApiError::internal(e.to_string()))
+                })?
+            }
+            // A workspace connected (or stopped using) an installation of DumbSlab's GitHub App.
+            (Method::Post, "/github/link") => {
+                let input: ApiResult<InstallationInput> = parse(&body);
+                self.run(move |db| {
+                    let input = input?;
+                    let home = input.home.ok_or_else(|| ApiError::bad_request("send the workspace's home"))?;
+                    tenancy::link_installation(db, input.installation_id, &home, input.linked.unwrap_or(true), Utc::now())
+                        .map(|_| json!({ "ok": true }))
+                })?
+            }
+            // Where the root domain forwards an installation's webhook deliveries.
+            (Method::Post, "/github/targets") => {
+                let input: ApiResult<InstallationInput> = parse(&body);
+                self.run(move |db| {
+                    let targets = tenancy::installation_targets(db, input?.installation_id)?;
+                    let list: Vec<Value> = targets.into_iter().map(|(home, address)| json!({ "home": home, "address": address })).collect();
+                    Ok(json!({ "workspaces": list }))
                 })?
             }
             (Method::Post, "/billing/link") => {

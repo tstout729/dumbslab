@@ -6,6 +6,7 @@ use std::time::Duration;
 use dumbslab_core::connect::{self, Connectors, FETCH_TIMEOUT_SECS, HttpCall, HttpReply, MAX_REPLY_BYTES};
 use dumbslab_core::slack::{self, SharedApp};
 use dumbslab_core::sso::SharedApps;
+use dumbslab_core::sync::github_app::GitHubApp;
 use futures_util::StreamExt;
 use futures_util::future::{Either, select};
 use wasm_bindgen::JsValue;
@@ -22,6 +23,13 @@ pub fn connectors(env: &Env, origin: &str, hosted: bool) -> Connectors {
     let apps = connect::oauth_apps(|name| var(env, name));
     let callback_url = if hosted { root_callback(env, origin, "/connect/callback") } else { None };
     Connectors { key: var(env, "CONNECTOR_KEY"), apps, callback_url }
+}
+
+/// DumbSlab's GitHub App for docs sync: `GITHUB_APP_ID`, `GITHUB_APP_SLUG` and
+/// `GITHUB_APP_CLIENT_ID` in `[vars]`, and the secrets `GITHUB_APP_CLIENT_SECRET`,
+/// `GITHUB_APP_PRIVATE_KEY` and `GITHUB_APP_WEBHOOK_SECRET` (see docs/hosting/github-app.md).
+pub fn github_app(env: &Env) -> Option<GitHubApp> {
+    GitHubApp::from_env(|name| var(env, name))
 }
 
 /// Add to Slack with DumbSlab's own Slack app: the secret `SLACK_SIGNING_SECRET`, with
@@ -138,9 +146,9 @@ pub async fn send(call: &HttpCall) -> HttpReply {
 }
 
 /// `GET {path}` on the root domain (`/connect/callback`, `/sso/callback`,
-/// `/sync/bamboohr/callback`, `/slack/install/callback`): an app sent someone back after they signed
-/// in. The `state` starts with their workspace's address; send them on to the same path at the
-/// workspace, which checks it.
+/// `/sync/bamboohr/callback`, `/slack/install/callback`, `/sync/github/callback`): an app sent
+/// someone back after they signed in. The `state` starts with their workspace's address; send them
+/// on to the same path at the workspace, which checks it.
 pub fn root_callback_redirect(url: &Url, root: &str, path: &str) -> Result<Response> {
     let query = url.query().unwrap_or_default();
     let state = url.query_pairs().find(|(k, _)| k == "state").map(|(_, v)| v.into_owned()).unwrap_or_default();
