@@ -3414,6 +3414,131 @@ mod connected {
         assert!(error(step(&h, &mut job, vec![])).contains("isn't connected any more"));
     }
 
+    /// One step under a guard that refuses every step, as the Worker does on a full workspace.
+    fn step_on_a_full_workspace(h: &H, job: &mut Job, replies: Vec<HttpReply>) -> dumbslab_core::ApiResult<Step> {
+        let full = || Some(dumbslab_core::ApiError::new(507, "workspace_full", "The workspace is full."));
+        h.store
+            .with_tx(|db| {
+                let (step, _) = connect::guarded_step(db, &h.cfg, job, replies, chrono::Utc::now(), |_| full());
+                let ok = step.is_ok();
+                (step, ok)
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn refreshed_tokens_are_kept_on_a_full_workspace() {
+        let mut h = H::new();
+        let (admin, _) = h.setup();
+        with_key(&mut h);
+        h.cfg.connectors.apps.insert("zendesk".into(), OAuthApp { client_id: "zdg-dumbslab".into(), client_secret: "zsecret".into() });
+        h.cfg.connectors.apps.insert("google-drive".into(), OAuthApp { client_id: "gid".into(), client_secret: "gsecret".into() });
+        let user_id = h.ok("GET", "/api/v1/me", None, &admin)["user"]["id"].as_str().unwrap().to_string();
+        // Two connections about to expire: Zendesk, which hands out a new refresh token each time
+        // (and revokes the access token it replaces), and Google Drive, which keeps its refresh token.
+        let soon = || dumbslab_core::util::ts(chrono::Utc::now() + chrono::Duration::minutes(1));
+        let zendesk_cred = connect::Credential {
+            token: "zd-at-1".into(),
+            refresh_token: Some("zd-rt-1".into()),
+            fields: [("subdomain".to_string(), "acme".to_string())].into(),
+        };
+        let drive_cred = connect::Credential { token: "drive-at-1".into(), refresh_token: Some("drive-rt".into()), ..Default::default() };
+        let rows = [
+            ("zendesk", "ada@acme.com (acme.zendesk.com)", json!({ "host": "acme.zendesk.com", "user_id": 7 }), &zendesk_cred),
+            ("google-drive", "ada@acme.test", json!({}), &drive_cred),
+        ];
+        h.store
+            .with_tx(|db| {
+                for (app, account, settings, cred) in &rows {
+                    let sealed = connect::seal("connector-key", &user_id, app, cred).unwrap();
+                    db.execute(
+                        "INSERT INTO connections (user_id, provider, account, settings, secret, expires_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                        &dumbslab_core::params![user_id.clone(), *app, *account, settings.to_string(), sealed, soon(), soon(), soon()],
+                    )
+                    .unwrap();
+                }
+                ((), true)
+            })
+            .unwrap();
+        let answer = |c: &HttpCall| -> HttpReply {
+            if c.url.contains("zendesk.com") {
+                zendesk(c)
+            } else if c.url.contains("oauth2.googleapis.com/token") {
+                ok(json!({ "access_token": "drive-at-2", "expires_in": 3600 }))
+            } else {
+                ok(
+                    json!({ "files": [{ "name": "Printer manual", "mimeType": "application/pdf", "webViewLink": "https://drive.google.com/x" }] }),
+                )
+            }
+        };
+        let stored = |app: &str| {
+            let secret = h
+                .store
+                .with_tx(|db| {
+                    (
+                        db.one("SELECT secret FROM connections WHERE provider = ?", &dumbslab_core::params![app])
+                            .unwrap()
+                            .unwrap()
+                            .str("secret"),
+                        true,
+                    )
+                })
+                .unwrap();
+            let cred = connect::open("connector-key", &user_id, app, &secret).unwrap();
+            (cred.token, cred.refresh_token.unwrap_or_default())
+        };
+        let bearers = |calls: &[HttpCall], host: &str| -> Vec<String> {
+            calls
+                .iter()
+                .filter(|c| c.url.contains(host))
+                .filter_map(|c| c.headers.iter().find(|(k, _)| k == "authorization").map(|(_, v)| v.clone()))
+                .collect()
+        };
+
+        // A search refreshes both first. On a full workspace, the step that reads the refresh
+        // answers is kept: it stores only the renewed tokens, and the apps have spent the old
+        // refresh tokens by then.
+        let r = h.call("GET", "/api/v1/search/connected?q=printer", None, &admin);
+        let mut job = job_of(&r);
+        let refreshes = fetches(step(&h, &mut job, vec![]));
+        assert_eq!(refreshes.len(), 2, "{refreshes:?}");
+        let searches = match step_on_a_full_workspace(&h, &mut job, refreshes.iter().map(answer).collect()) {
+            Ok(Step::Fetch(calls)) => calls,
+            other => panic!("kept: {other:?}"),
+        };
+        assert!(bearers(&searches, "zendesk.com").iter().all(|b| b == "Bearer zd-at-2"), "{searches:?}");
+        assert_eq!(bearers(&searches, "googleapis.com"), ["Bearer drive-at-2"]);
+        assert_eq!(stored("zendesk"), ("zd-at-2".to_string(), "zd-rt-2".to_string()));
+        assert_eq!(stored("google-drive"), ("drive-at-2".to_string(), "drive-rt".to_string()));
+        // The step after it is refused as usual.
+        assert!(step_on_a_full_workspace(&h, &mut job, searches.iter().map(answer).collect()).is_err());
+
+        // The next search uses the renewed tokens, without refreshing again.
+        let r = h.call("GET", "/api/v1/search/connected?q=printer", None, &admin);
+        let (finish, sent) = drive(&h, job_of(&r), &answer);
+        assert!(!sent.iter().any(|c| c.url.contains("/token") || c.url.contains("/oauth/tokens")), "{sent:?}");
+        assert!(bearers(&sent, "zendesk.com").iter().all(|b| b == "Bearer zd-at-2"));
+        assert_eq!(bearers(&sent, "googleapis.com"), ["Bearer drive-at-2"]);
+        let v = filled(&r, finish);
+        assert!(v["apps"].as_array().unwrap().iter().all(|a| a["ok"] == true), "{v}");
+
+        // A preview's refresh step is kept the same way.
+        h.store
+            .with_tx(|db| {
+                (db.execute("UPDATE connections SET expires_at = ? WHERE provider = 'zendesk'", &dumbslab_core::params![soon()]), true)
+            })
+            .unwrap()
+            .unwrap();
+        let link = urlencoding::encode("https://acme.zendesk.com/agent/tickets/12");
+        let r = h.call("GET", &format!("/api/v1/connections/preview?url={link}"), None, &admin);
+        let mut job = job_of(&r);
+        let refresh = fetches(step(&h, &mut job, vec![]));
+        assert_eq!(refresh[0].url, "https://acme.zendesk.com/oauth/tokens");
+        let renewed = ok(json!({ "access_token": "zd-at-3", "refresh_token": "zd-rt-3", "token_type": "bearer", "expires_in": 28800 }));
+        assert!(matches!(step_on_a_full_workspace(&h, &mut job, vec![renewed]), Ok(Step::Fetch(_))));
+        assert_eq!(stored("zendesk"), ("zd-at-3".to_string(), "zd-rt-3".to_string()));
+    }
+
     #[test]
     fn expired_tokens_are_refreshed_first() {
         let mut h = H::new();
