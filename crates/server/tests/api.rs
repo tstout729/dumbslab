@@ -3144,14 +3144,9 @@ mod connected {
             })
             .unwrap();
 
-        // Run 0015 (the last migration) again, as an upgrade from before it would.
-        let at = dumbslab_core::db::MIGRATIONS.iter().position(|m| m.contains("keep no personal data from Atlassian")).unwrap();
-        assert_eq!(at, dumbslab_core::db::MIGRATIONS.len() - 1, "0015 is listed last");
-        h.store
-            .with_tx(|db| (db.execute("UPDATE meta SET value = ? WHERE key = 'schema_version'", &[at.to_string().into()]), true))
-            .unwrap()
-            .unwrap();
-        let _reopened = Store::open(&h._dir.path().join("t.db")).unwrap();
+        // Run the migration again, as an upgrade from before it would.
+        let sql = dumbslab_core::db::MIGRATIONS.iter().find(|m| m.contains("keep no personal data from Atlassian")).unwrap();
+        h.store.with_tx(|db| (db.execute_batch(sql), true)).unwrap().unwrap();
 
         let after: Vec<(String, String, String)> = h
             .store
