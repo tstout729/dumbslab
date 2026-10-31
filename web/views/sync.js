@@ -553,9 +553,14 @@ function connectLink(url, label, variant) {
 
 function githubBlock(github, topics, reload) {
   const usable = github.installations.some((i) => !i.suspended && i.repositories.length);
+  // Each admin picks from the repositories their own GitHub account can read: another admin's
+  // connecting doesn't share theirs.
+  const others = !usable && github.installations.length > 0;
   const intro = usable
     ? 'Pick a repository. Choose Connect GitHub to install DumbSlab’s app on another account, or to give it more repositories.'
-    : 'Choose Connect GitHub, install DumbSlab’s app on the repositories you want, and come back here to pick one. No token or webhook needed: pushes sync by themselves.';
+    : others
+      ? 'DumbSlab’s GitHub app is connected here, but you pick from the repositories your own GitHub account can read. Choose Connect GitHub and authorize DumbSlab; folders others added keep syncing either way.'
+      : 'Choose Connect GitHub, install DumbSlab’s app on the repositories you want, and come back here to pick one. No token or webhook needed: pushes sync by themselves.';
   return h('div', { class: 'stack' },
     h('p', { class: 'app-name' }, 'GitHub'),
     h('p', { class: 'small muted' }, intro),

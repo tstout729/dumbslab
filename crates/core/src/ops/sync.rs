@@ -466,10 +466,11 @@ pub struct GitHubInstallation {
     /// The admin who connected it here.
     pub connected_by: Option<UserRef>,
     pub connected_at: String,
-    /// The repositories the connecting admin's GitHub account can read in it, as of connecting.
-    /// Connect GitHub again to refresh them.
+    /// The repositories your own GitHub account can read in it, as of your connecting: the ones you
+    /// may add folders from. Empty until you choose Connect GitHub yourself (another admin's
+    /// connecting doesn't share theirs). Connect GitHub again to refresh them.
     pub repositories: Vec<GitHubRepository>,
-    /// Their account could read more repositories there than are listed (the first 500 are).
+    /// Your account could read more repositories there than are listed (the first 500 are).
     pub more_repositories: bool,
     /// Whether GitHub's deliveries for it reach this workspace: `direct` (this server gets them
     /// itself), `ok`, `pending` (each sync asks the hosted directory again until it's recorded) or
@@ -499,14 +500,26 @@ fn list_github_repositories(ctx: &mut Ctx, _: NoInput) -> ApiResult<GitHubReposi
     }
     let people = user_refs(ctx.db, &rows.iter().map(|r| r.str("connected_by")).collect::<Vec<_>>())?;
     for r in &rows {
+        // Yours alone: repositories only another admin here can read aren't offered to you.
+        let mine = params![r.i64("id"), ctx.actor.user_id.clone()];
+        let more = ctx
+            .db
+            .one("SELECT more_repositories FROM github_installation_admins WHERE installation_id = ? AND user_id = ?", &mine)?
+            .is_some_and(|m| m.bool("more_repositories"));
         let repositories = ctx
             .db
             .query(
-                "SELECT id, full_name, default_branch, private FROM github_repositories WHERE installation_id = ? AND removed_at IS NULL ORDER BY full_name",
-                &params![r.i64("id")],
+                "SELECT id, full_name, default_branch, private FROM github_repositories
+                 WHERE installation_id = ? AND user_id = ? AND removed_at IS NULL ORDER BY full_name",
+                &mine,
             )?
             .iter()
-            .map(|p| GitHubRepository { id: p.i64("id"), full_name: p.str("full_name"), default_branch: p.str("default_branch"), private: p.bool("private") })
+            .map(|p| GitHubRepository {
+                id: p.i64("id"),
+                full_name: p.str("full_name"),
+                default_branch: p.str("default_branch"),
+                private: p.bool("private"),
+            })
             .collect();
         installations.push(GitHubInstallation {
             installation_id: r.i64("id"),
@@ -516,7 +529,7 @@ fn list_github_repositories(ctx: &mut Ctx, _: NoInput) -> ApiResult<GitHubReposi
             connected_by: people.get(&r.str("connected_by")).cloned(),
             connected_at: r.str("created_at"),
             repositories,
-            more_repositories: r.bool("more_repositories"),
+            more_repositories: more,
             forwarding: match (ctx.cfg.hosting.is_some(), r.opt_str("forwarding")) {
                 (false, _) => "direct".into(),
                 (true, Some(f)) => f,
@@ -571,9 +584,10 @@ pub struct DocsSourceCreated {
     pub webhook_secret: Option<String>,
 }
 
-/// A repository from an installation an admin here connected, which their GitHub account can read:
-/// (repository id, `owner/name`, default branch). By its id when the picker gave it (the one the
-/// admin chose, whatever its name is now), else by name.
+/// A repository from an installation connected here, which this admin's own GitHub account could
+/// read when they connected it (another admin's access doesn't count): (repository id,
+/// `owner/name`, default branch). By its id when the picker gave it (the one the admin chose,
+/// whatever its name is now), else by name.
 fn app_repository(ctx: &Ctx, installation_id: i64, repo: &str, repo_id: Option<i64>) -> ApiResult<(i64, String, String)> {
     if github_app::app(ctx.cfg).is_none() {
         return Err(ApiError::new(503, "github_app_off", "DumbSlab's GitHub App isn't set up on this server; give a token instead."));
@@ -587,17 +601,18 @@ fn app_repository(ctx: &Ctx, installation_id: i64, repo: &str, repo_id: Option<i
     }
     let found = match repo_id {
         Some(id) => ctx.db.one(
-            "SELECT id, full_name, default_branch FROM github_repositories WHERE installation_id = ? AND id = ? AND removed_at IS NULL",
-            &params![installation_id, id],
+            "SELECT id, full_name, default_branch FROM github_repositories WHERE installation_id = ? AND user_id = ? AND id = ? AND removed_at IS NULL",
+            &params![installation_id, ctx.actor.user_id.clone(), id],
         )?,
         None => ctx.db.one(
-            "SELECT id, full_name, default_branch FROM github_repositories WHERE installation_id = ? AND lower(full_name) = lower(?) AND removed_at IS NULL",
-            &params![installation_id, repo],
+            "SELECT id, full_name, default_branch FROM github_repositories
+             WHERE installation_id = ? AND user_id = ? AND lower(full_name) = lower(?) AND removed_at IS NULL",
+            &params![installation_id, ctx.actor.user_id.clone(), repo],
         )?,
     };
     let r = found.ok_or_else(|| {
         ApiError::not_found(format!(
-            "{repo} in that installation, among the repositories your GitHub account can read there. To add one, Connect GitHub again and give the App access to it"
+            "{repo} in that installation, among the repositories your own GitHub account could read there when you connected it. Choose Connect GitHub yourself (another admin's connecting doesn't count), and give the App access to it"
         ))
     })?;
     Ok((r.i64("id"), r.str("full_name"), r.str("default_branch")))
@@ -884,7 +899,8 @@ fn sync_docs_source(ctx: &mut Ctx, input: SourceIdInput) -> ApiResult<Deferred<D
     }
     let row = load_source_row(ctx, &input.id)?;
     let source = Source::from_row(ctx.cfg, &row)?;
-    if docs::has_older_twin(ctx.db, &source)? {
+    // (A GitHub App source's name may be stale: its sync checks once its token says the name now.)
+    if source.link == Link::Token && docs::has_older_twin(ctx.db, &source)? {
         return Err(ApiError::new(409, "duplicate", docs::DUPLICATE));
     }
     if let Link::GitHubApp { installation_id, .. } = source.link {
