@@ -447,7 +447,8 @@ enum Saved {
     /// Saved. Holds the previous Add to Slack install's Slack workspace and id, when it was another
     /// one: that claim waits in `slack_releases` to be let go of.
     Done(Option<(String, String)>),
-    /// Updating in place, the saved install isn't the one this job started from any more.
+    /// The saved connection isn't the one this job started from any more (a disconnect, another
+    /// save, or the same install changed in place): nothing was written.
     Changed,
 }
 
@@ -489,27 +490,43 @@ fn save_install(db: &dyn Db, cfg: &HostConfig, job: &mut SlackJob, inst: &Instal
         return Ok(Saved::Done(None));
     }
     let moved_on = old.as_ref().and_then(|a| a.team_id.as_deref()).is_some_and(|t| t != inst.team_id);
-    db.execute("INSERT INTO slack_app (id, updated_at) VALUES (1, ?) ON CONFLICT(id) DO NOTHING", &params![ts(now)])?;
+    let mut values = params![
+        seal(cfg, BOT_TOKEN, &inst.token)?,
+        inst.team_id.clone(),
+        inst.team_name.clone(),
+        Some(inst.bot_user_id.clone()).filter(|b| !b.is_empty()),
+        inst.scopes.join(","),
+        job.install_id.clone(),
+        revision.clone(),
+        confirmed,
+        admin,
+        ts(now)
+    ];
+    // Only over the connection saved when the job started: a disconnect or another save meanwhile
+    // stays as it is.
+    let written = match job.prior.as_deref() {
+        None => db.execute(
+            "INSERT INTO slack_app (id, bot_token, team_id, team_name, bot_user_id, scopes, shared, install_id, revision, confirmed,
+               updated_by, updated_at) VALUES (1, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?) ON CONFLICT(id) DO NOTHING",
+            &values,
+        )?,
+        Some(prior) => {
+            values.extend(params![prior.install_id.clone(), prior.revision.clone()]);
+            db.execute(
+                "UPDATE slack_app SET bot_token = ?, signing_secret = NULL, team_id = ?, team_name = ?, bot_user_id = ?, scopes = ?,
+                   shared = 1, install_id = ?, revision = ?, confirmed = ?, updated_by = ?, updated_at = ?
+                 WHERE id = 1 AND install_id IS ? AND revision IS ?",
+                &values,
+            )?
+        }
+    };
+    if written != 1 {
+        return Ok(Saved::Changed);
+    }
     if moved_on {
         // Channel IDs belong to one Slack workspace.
         db.execute("DELETE FROM slack_channels", &[])?;
     }
-    db.execute(
-        "UPDATE slack_app SET bot_token = ?, signing_secret = NULL, team_id = ?, team_name = ?, bot_user_id = ?, scopes = ?, shared = 1,
-           install_id = ?, revision = ?, confirmed = ?, updated_by = ?, updated_at = ? WHERE id = 1",
-        &params![
-            seal(cfg, BOT_TOKEN, &inst.token)?,
-            inst.team_id.clone(),
-            inst.team_name.clone(),
-            Some(inst.bot_user_id.clone()).filter(|b| !b.is_empty()),
-            inst.scopes.join(","),
-            job.install_id.clone(),
-            revision.clone(),
-            confirmed,
-            admin,
-            ts(now)
-        ],
-    )?;
     job.revision = Some(revision);
     // The previous install, for another Slack workspace: nothing acts on it from now on, and its
     // claim is let go of, by its id.
@@ -775,7 +792,9 @@ pub(super) fn step(
             let held = app.install_id.clone().filter(|_| app.shared && app.team_id.as_deref() == Some(inst.team_id.as_str()));
             job.in_place = held.is_some();
             // In place: the revision it updates, which must still be the saved one when it does.
+            // Otherwise: the connection it replaces, which must still be the saved one when it does.
             job.revision = app.revision.clone().filter(|_| job.in_place);
+            job.prior = load(db, cfg)?.map(|a| Box::new(At::of(&a)));
             let install_id = held.unwrap_or_else(crate::util::new_id);
             job.install_id = Some(install_id.clone());
             let Some(home) = home else {
@@ -838,6 +857,8 @@ pub(super) fn step(
                 Saved::Done(previous) => previous,
                 // Updating in place, the saved install changed meanwhile. If it's gone (a
                 // disconnect), the claim this job just made is no install's: let go of it.
+                // A new install: the claim is this job's alone. Let go of it; leave the settings be.
+                Saved::Changed if !job.in_place => return undo(db, job, InstallError::Busy),
                 Saved::Changed => {
                     let now_saved = load(db, cfg)?.unwrap_or_default();
                     if !gone(&now_saved, &install_id) {
@@ -925,14 +946,31 @@ pub(super) fn step(
         (Phase::Releasing, _) => ok(),
 
         // Confirm a saved install whose confirmation never ran, if the saved connection is still
-        // the one it started from. Confirming a confirmed claim again changes nothing.
+        // the one it started from. Its token is checked first: Slack may have removed the app
+        // meanwhile, and a dead token must never be confirmed. Confirming a confirmed claim again
+        // changes nothing.
         (Phase::Start, Work::Confirm { at }) => {
-            let (Some(team), Some(id), Some(home)) = (at.team_id.clone(), at.install_id.clone(), home(cfg)) else { return ok() };
-            if !at.matches(app) || !app.confirming() {
+            if !at.matches(app) || !app.confirming() || home(cfg).is_none() {
                 return ok();
             }
-            job.phase = Phase::Confirming;
-            Ok(Step::Fetch(vec![directory_call("/slack/confirm", &team, home, Some(&id))]))
+            let Some(token) = app.saved_token.clone() else { return ok() };
+            job.phase = Phase::Testing;
+            Ok(Step::Fetch(vec![test_call(&token)]))
+        }
+        (Phase::Testing, Work::Confirm { at }) => {
+            let (Some(team), Some(id), Some(home)) = (at.team_id.clone(), at.install_id.clone(), home(cfg)) else { return ok() };
+            match answer_of(&answer) {
+                Answer::Dead => uninstalled(db, cfg, job, app, &at, now),
+                // Unclear: tried again later.
+                Answer::Unknown => ok(),
+                Answer::Ok | Answer::Refused => {
+                    if !at.matches(app) {
+                        return ok();
+                    }
+                    job.phase = Phase::Confirming;
+                    Ok(Step::Fetch(vec![directory_call("/slack/confirm", &team, home, Some(&id))]))
+                }
+            }
         }
         (Phase::Confirming, Work::Confirm { at }) => {
             let (Some(team), Some(id)) = (at.team_id.clone(), at.install_id.clone()) else { return ok() };
@@ -941,15 +979,7 @@ pub(super) fn step(
                     return ok();
                 }
                 // Confirmed, but the install is gone here: the claim is no install's. Let go of it.
-                queue_release(db, &team, &id, now)?;
-                return match home(cfg) {
-                    Some(home) => {
-                        job.work = Work::Release { team_id: team.clone(), install_id: id.clone() };
-                        job.phase = Phase::Releasing;
-                        Ok(Step::Fetch(vec![directory_call("/slack/release", &team, home, Some(&id))]))
-                    }
-                    None => ok(),
-                };
+                return release_now(db, cfg, job, &team, &id, now);
             }
             if refused_claim(&answer) {
                 // Only the install it set out to confirm, as it was then.
@@ -986,52 +1016,61 @@ pub(super) fn step(
         (Phase::Posting, Work::Post { .. }) => ok(),
 
         // Slack says the shared app was removed, or its token revoked: believe the token, not the
-        // event's time, and change only the connection (install and revision) the event arrived for.
+        // event's time, and change only the connection (install and revision) the event arrived
+        // for. Also while it waits for its confirmation: the saved token is checked either way.
         (Phase::Start, Work::Check { at }) => {
             if !at.matches(app) || !app.shared {
                 return ok();
             }
-            let Some(token) = app.bot_token.clone() else { return ok() };
+            let Some(token) = app.saved_token.clone() else { return ok() };
             job.attempt = 1;
             job.phase = Phase::Testing;
             Ok(Step::Fetch(vec![test_call(&token)]))
         }
         (Phase::Testing, Work::Check { at }) => match answer_of(&answer) {
             Answer::Unknown if job.attempt < 2 => {
-                let Some(token) = app.bot_token.clone().filter(|_| at.matches(app)) else { return ok() };
+                let Some(token) = app.saved_token.clone().filter(|_| at.matches(app)) else { return ok() };
                 job.attempt += 1;
                 Ok(Step::Fetch(vec![test_call(&token)]))
             }
-            Answer::Dead => {
-                // Not if the connection changed since (added again, even with the same install id).
-                if !forget_install(db, &at)? {
-                    return ok();
-                }
-                let mut ctx = job_ctx(db, cfg, &job.base_url.clone(), slack_actor(), now);
-                emit(
-                    &mut ctx,
-                    Event::new("slack.uninstalled", "settings", "slack", "Slack removed DumbSlab's app, so Slack is disconnected")
-                        .data(json!({ "slack_workspace": app.team_name, "slack_workspace_id": app.team_id }))
-                        .admin_only(),
-                )?;
-                job.effects.extend(std::mem::take(&mut ctx.effects));
-                // The install is gone here: let go of its claim, by its id.
-                match (home(cfg), at.team_id.clone(), at.install_id.clone()) {
-                    (Some(home), Some(team), Some(id)) => {
-                        queue_release(db, &team, &id, now)?;
-                        job.work = Work::Release { team_id: team.clone(), install_id: id.clone() };
-                        job.phase = Phase::Releasing;
-                        Ok(Step::Fetch(vec![directory_call("/slack/release", &team, home, Some(&id))]))
-                    }
-                    _ => ok(),
-                }
-            }
+            Answer::Dead => uninstalled(db, cfg, job, app, &at, now),
             // It works (the event was about an earlier install), or Slack's answer is unclear:
-            // keep it. An admin can still disconnect.
+            // keep it. An admin can still disconnect, and a confirmation checks the token first.
             _ => ok(),
         },
         (phase, _) => Err(ApiError::internal(format!("Add to Slack can't continue from {phase:?}"))),
     }
+}
+
+/// Slack says the token of the connection at `at` is dead: Slack removed the app, or revoked it.
+/// Forgets that install, only if the saved connection is still exactly that, records it, and
+/// lets go of its claim (hosted), by its id: the install is gone here now.
+fn uninstalled(db: &dyn Db, cfg: &HostConfig, job: &mut SlackJob, app: &App, at: &At, now: DateTime<Utc>) -> ApiResult<Step> {
+    if !forget_install(db, at)? {
+        return fill(json!({ "ok": true }));
+    }
+    let mut ctx = job_ctx(db, cfg, &job.base_url.clone(), slack_actor(), now);
+    emit(
+        &mut ctx,
+        Event::new("slack.uninstalled", "settings", "slack", "Slack removed DumbSlab's app, so Slack is disconnected")
+            .data(json!({ "slack_workspace": app.team_name, "slack_workspace_id": app.team_id }))
+            .admin_only(),
+    )?;
+    job.effects.extend(std::mem::take(&mut ctx.effects));
+    match (at.team_id.clone(), at.install_id.clone()) {
+        (Some(team), Some(id)) => release_now(db, cfg, job, &team, &id, now),
+        _ => fill(json!({ "ok": true })),
+    }
+}
+
+/// Lets go of a claim whose install is gone here, by its exact id: recorded in `slack_releases`,
+/// then asked of the directory as this job's next step.
+fn release_now(db: &dyn Db, cfg: &HostConfig, job: &mut SlackJob, team: &str, install_id: &str, now: DateTime<Utc>) -> ApiResult<Step> {
+    let Some(home) = home(cfg) else { return fill(json!({ "ok": true })) };
+    queue_release(db, team, install_id, now)?;
+    job.work = Work::Release { team_id: team.to_string(), install_id: install_id.to_string() };
+    job.phase = Phase::Releasing;
+    Ok(Step::Fetch(vec![directory_call("/slack/release", team, home, Some(install_id))]))
 }
 
 /// Who did it, in the activity log, when Slack removed the app.

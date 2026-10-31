@@ -151,7 +151,7 @@ pub(crate) fn settings_view(ctx: &Ctx) -> ApiResult<SlackSettings> {
         mode,
         install_url: slack::shared(ctx.cfg).map(|_| ctx.url(slack::INSTALL_PATH)),
         connected: a.bot_token.is_some() && a.signing_secret.is_some(),
-        bot_token_saved: a.token_saved,
+        bot_token_saved: a.saved_token.is_some(),
         confirming: a.confirming(),
         signing_secret_saved: a.signing_secret.is_some(),
         slack_workspace: Some(a.team_name.clone()).filter(|n| !n.is_empty()),
@@ -249,6 +249,8 @@ fn disconnect_slack(ctx: &mut Ctx, _: NoInput) -> ApiResult<Deferred<Done>> {
     if !slack::remove(ctx.db)? {
         return Err(ApiError::not_found("Slack connection"));
     }
+    // An Add to Slack under way mustn't reconnect it afterwards.
+    slack::clear_install_lock(ctx.db)?;
     emit(ctx, Event::new("slack.disconnected", "settings", "slack", "disconnected Slack").admin_only())?;
     // DumbSlab's own Slack app, hosted: let go of the Slack workspace before answering, so another
     // DumbSlab workspace can add it at once. Its token isn't revoked: it's every install's.

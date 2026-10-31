@@ -76,7 +76,10 @@
 //!   connection it started from (`At`: Slack workspace, install id and a `revision` that changes on
 //!   every save, re-add and confirmation) and acts only while the saved connection is still exactly
 //!   that: its changes are conditional on the install id and revision. It lets go of a claim only
-//!   when its install is truly gone here.
+//!   when its install is truly gone here. Add to Slack replaces only the connection saved when it
+//!   started, and a disconnect or another save ends the install lock, so a stalled one gives up.
+//!   Uninstall checks run while an install awaits confirmation too, and a confirmation tried again
+//!   checks the token first.
 //! - A command's or event's job acts only for the connection it came for, while that's still the
 //!   confirmed one here. Channel and test messages from the shared app on hosted DumbSlab are sent
 //!   only after the directory confirms the install right then (`Work::Post`), so a workspace
@@ -176,8 +179,9 @@ pub struct App {
     /// the host's connector key, and for an Add to Slack install the directory hasn't confirmed:
     /// until it has, nothing here may act on Slack.
     pub bot_token: Option<String>,
-    /// A bot token is saved (whether or not it may be used yet).
-    pub token_saved: bool,
+    /// The saved bot token, whether or not it may be used to act on Slack yet: only for checking
+    /// whether it still works (`auth.test`).
+    pub saved_token: Option<String>,
     /// The workspace's own app's, or with the shared app the host's (while it has one).
     pub signing_secret: Option<String>,
     /// The Slack workspace the bot token belongs to, from `auth.test` or `oauth.v2.access`.
@@ -249,9 +253,10 @@ pub fn load(db: &dyn Db, cfg: &HostConfig) -> ApiResult<Option<App>> {
         true => cfg.slack.signing_secret.clone().filter(|s| !s.is_empty()),
         false => open(SIGNING_SECRET, "signing_secret"),
     };
+    let token = open(BOT_TOKEN, "bot_token");
     Ok(Some(App {
-        bot_token: open(BOT_TOKEN, "bot_token").filter(|_| !shared || confirmed),
-        token_saved: r.opt_str("bot_token").is_some(),
+        bot_token: token.clone().filter(|_| !shared || confirmed),
+        saved_token: token,
         signing_secret,
         team_id: r.opt_str("team_id"),
         team_name: r.str("team_name"),
@@ -299,12 +304,27 @@ fn save(db: &dyn Db, cfg: &HostConfig, change: &Change, team: Option<&Team>, act
         )?;
     }
     if let Some(secret) = &change.signing_secret {
-        db.execute("UPDATE slack_app SET signing_secret = ? WHERE id = 1", &params![seal(cfg, SIGNING_SECRET, secret)?])?;
+        db.execute(
+            "UPDATE slack_app SET signing_secret = ?, revision = ? WHERE id = 1",
+            &params![seal(cfg, SIGNING_SECRET, secret)?, crate::util::new_id()],
+        )?;
+    }
+    if change.bot_token.is_some() || change.signing_secret.is_some() {
+        // An Add to Slack under way was started against the connection before this one: it
+        // mustn't finish (see `shared_app`).
+        clear_install_lock(db)?;
     }
     if let Some(on) = change.unfurls {
         db.execute("UPDATE slack_app SET unfurls = ? WHERE id = 1", &params![on])?;
     }
     db.execute("UPDATE slack_app SET updated_by = ?, updated_at = ? WHERE id = 1", &params![actor_id, ts(now)])?;
+    Ok(())
+}
+
+/// Ends any Add to Slack under way, from claiming to confirming: the connection changed, so it
+/// gives up at its next step and lets go of its own claim.
+pub(crate) fn clear_install_lock(db: &dyn Db) -> ApiResult<()> {
+    db.execute("DELETE FROM slack_install_lock", &[])?;
     Ok(())
 }
 
@@ -462,7 +482,8 @@ fn run(db: &dyn Db, cfg: &HostConfig, req: &Request) -> ApiResult<Outcome> {
     let Some(app) = app.filter(|a| !a.shared || ours(a, path, &req.body, routed.as_deref())) else {
         return stray(cfg, &base, path, &req.body, routed.as_deref());
     };
-    if app.confirming() {
+    // Not confirmed yet: commands wait. Events still go through, so an uninstall is checked.
+    if app.confirming() && path == COMMANDS_PATH {
         return unconfirmed(cfg, &app, &base, path, &req.body);
     }
     if path == COMMANDS_PATH { command(db, &app, &base, &req.body) } else { event(db, cfg, &app, &base, &req.body, now) }
@@ -568,10 +589,16 @@ fn event(db: &dyn Db, cfg: &HostConfig, app: &App, base: &str, body: &[u8], now:
             if app.shared && (e["type"] == "app_uninstalled" || bot_revoked) {
                 // Slack doesn't keep events in order, and its times are whole seconds: this may be
                 // about an earlier install. Ask Slack whether the saved token still works.
+                // Also while the install waits for its confirmation: a dead token must not be
+                // confirmed later.
                 if app.install_id.is_none() {
                     return Ok(ack());
                 }
                 return Ok(later(Response::json(200, &json!({ "ok": true })), SlackJob::new(base, Work::Check { at: At::of(app) })));
+            }
+            // Anything else waits for the confirmation, which this tries again.
+            if app.confirming() {
+                return unconfirmed(cfg, app, base, EVENTS_PATH, body);
             }
             let user = e["user"].as_str().unwrap_or_default();
             if e["type"] != "link_shared" || !app.unfurls || app.bot_token.is_none() || !valid_id(user) {
@@ -980,6 +1007,9 @@ pub struct SlackJob {
     bound: Option<Box<At>>,
     /// Add to Slack: the revision it expects (updating in place), then the one it saved.
     revision: Option<String>,
+    /// Add to Slack, replacing the connection: what was saved when it started (`None`: nothing).
+    /// It saves only if that's still so.
+    prior: Option<Box<At>>,
     /// Add to Slack, switching Slack workspaces: the previous one's claim (Slack workspace,
     /// install), let go of alongside the confirmation.
     releasing: Option<(String, String)>,
@@ -1111,6 +1141,7 @@ impl SlackJob {
             in_place: false,
             bound: None,
             revision: None,
+            prior: None,
             releasing: None,
         }
     }
