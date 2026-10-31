@@ -239,6 +239,10 @@ pub struct DocsSyncResult {
     /// `checked`, `pointed at this workspace's address`, `added again`, or why it couldn't.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub webhook: Option<String>,
+    /// Nothing was synced: DumbSlab is checking GitHub's access for this folder first (it was
+    /// disconnected). Settings shows what it finds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checking: Option<String>,
 }
 
 impl DocsSyncResult {
