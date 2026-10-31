@@ -203,6 +203,10 @@ async fn root_site(req: Request, env: &Env, root: &str, path: &str) -> Result<Re
         (Method::Get, "/connect/callback") => connect::root_callback_redirect(&req.url()?, root, "/connect/callback"),
         // Single sign-on with DumbSlab's own apps: every workspace's sign-ins come back here.
         (Method::Get, "/sso/callback") => connect::root_callback_redirect(&req.url()?, root, dumbslab_core::sso::CALLBACK_PATH),
+        // The people sync's Sign in with BambooHR: every workspace's sign-ins come back here too.
+        (Method::Get, "/sync/bamboohr/callback") => {
+            connect::root_callback_redirect(&req.url()?, root, dumbslab_core::sync::people::CALLBACK_PATH)
+        }
         (Method::Post, "/api/stripe/webhook") => billing::webhook(req, env).await,
         (_, p) if p.starts_with("/api/operator/") => operator(req, env, p).await,
         // Static files the sign-up page uses.

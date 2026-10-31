@@ -1322,13 +1322,9 @@ fn deleted_comments_leave_no_body_behind() {
         .unwrap()
         .unwrap();
     h.ok("DELETE", &format!("/api/v1/posts/{pid}?permanent=true"), None, &admin);
-    // Run the scrub (0004) again, and the migrations after it.
-    let before_scrub = dumbslab_core::db::MIGRATIONS.iter().position(|m| m.contains("UPDATE activity SET data = '{}'")).unwrap();
-    h.store
-        .with_tx(|db| (db.execute("UPDATE meta SET value = ? WHERE key = 'schema_version'", &[before_scrub.to_string().into()]), true))
-        .unwrap()
-        .unwrap();
-    let _reopened = Store::open(&h._dir.path().join("t.db")).unwrap();
+    // Run the scrub (0004) again. Only it: a later migration that adds a column can't run twice.
+    let scrub = dumbslab_core::db::MIGRATIONS.iter().find(|m| m.contains("UPDATE activity SET data = '{}'")).unwrap();
+    h.store.with_tx(|db| (db.execute_batch(scrub), true)).unwrap().unwrap();
     assert!(!h.ok("GET", "/api/v1/activity?limit=200", None, &admin).to_string().contains("9999"));
 }
 
@@ -6147,6 +6143,135 @@ mod syncs {
         }
     }
 
+    /// Saves the people sync like an admin in Settings: the host checks the key with BambooHR and
+    /// adds its webhook, answered by `answer`. Returns the answer and the requests sent.
+    fn save_people(h: &H, auth: &Auth, body: Value, answer: &dyn Fn(&HttpCall) -> HttpReply) -> (Value, Vec<HttpCall>) {
+        let r = h.call("PUT", "/api/v1/people-sync", Some(body), auth);
+        assert_eq!(r.status, 200, "{}", r.body);
+        let (finish, sent) = drive(h, job_of(&r), answer);
+        (filled(finish), sent)
+    }
+
+    fn basic(key: &str) -> (String, String) {
+        ("authorization".into(), format!("Basic {}", base64::engine::general_purpose::STANDARD.encode(format!("{key}:x"))))
+    }
+
+    /// A fake BambooHR: no employees, the fields webhooks may watch, webhooks added with ids
+    /// counting up from `next` and private keys `pk-<id>`, and OAuth tokens `at-<n>` / `rt-<n>`.
+    /// `refuse` answers instead, by kind of request: `token`, `check`, `fields`, `list`, `get`,
+    /// `add` or `delete` (status 0 is a timeout).
+    struct FakeBamboo {
+        next: std::cell::Cell<u32>,
+        tokens: std::cell::Cell<u32>,
+        /// The webhooks it has, by id: its company, where it posts, and its name.
+        hooks: RefCell<BTreeMap<String, (String, String, String)>>,
+        refuse: RefCell<BTreeMap<&'static str, HttpReply>>,
+    }
+
+    impl FakeBamboo {
+        fn new(next: u32) -> FakeBamboo {
+            FakeBamboo {
+                next: std::cell::Cell::new(next),
+                tokens: std::cell::Cell::new(0),
+                hooks: RefCell::new(BTreeMap::new()),
+                refuse: RefCell::new(BTreeMap::new()),
+            }
+        }
+
+        fn refuse(&self, kind: &'static str, status: u16, body: Value) {
+            self.refuse.borrow_mut().insert(kind, HttpReply { status, body: body.to_string() });
+        }
+
+        fn ids(&self) -> Vec<String> {
+            self.hooks.borrow().keys().cloned().collect()
+        }
+
+        fn answer(&self, call: &HttpCall) -> HttpReply {
+            let url = call.url.split('?').next().unwrap_or_default();
+            let kind = match (call.method, url) {
+                ("POST", u) if u.ends_with("/token.php") => "token",
+                ("GET", u) if u.ends_with("/api/v1/employees") => "check",
+                ("GET", u) if u.ends_with("/api/v1/webhooks/monitor_fields") => "fields",
+                ("GET", u) if u.ends_with("/api/v1/webhooks") => "list",
+                ("GET", u) if u.contains("/api/v1/webhooks/") => "get",
+                ("POST", u) if u.ends_with("/api/v1/webhooks") => "add",
+                ("DELETE", _) => "delete",
+                other => panic!("unexpected request {other:?}"),
+            };
+            let id = url.rsplit('/').next().unwrap_or_default().to_string();
+            // Each company sees only its own webhooks.
+            let company = url.trim_start_matches("https://").split('.').next().unwrap_or_default().to_string();
+            let theirs = |c: &str| c == company;
+            if let Some(r) = self.refuse.borrow().get(kind) {
+                return r.clone();
+            }
+            match kind {
+                "check" => ok(json!({ "data": [], "meta": { "total": 0, "page": { "limit": 1, "nextCursor": null } } })),
+                "fields" => ok(json!({ "fields": [
+                    { "id": "4175", "name": "Accrual Level Start Date", "alias": null },
+                    { "id": "15", "name": "Work Email", "alias": "workEmail" },
+                    { "id": "17", "name": "Job Title", "alias": "jobTitle" },
+                    { "id": "4", "name": "Department", "alias": "department" },
+                    { "id": "18", "name": "Location", "alias": "location" },
+                    { "id": "16", "name": "Work Phone", "alias": "workPhone" },
+                    { "id": "91", "name": "Reporting To", "alias": "reportsTo" },
+                    { "id": "4400", "name": "Pronouns", "alias": null },
+                    { "id": "1", "name": "First Name", "alias": "firstName" }
+                ] })),
+                "token" => {
+                    let n = self.tokens.get() + 1;
+                    self.tokens.set(n);
+                    let company = url.trim_start_matches("https://").split('.').next().unwrap_or_default();
+                    ok(json!({ "access_token": format!("at-{n}"), "refresh_token": format!("rt-{n}"), "expires_in": 3600,
+                               "token_type": "Bearer", "scope": "openid offline_access employee webhooks webhooks.write",
+                               "id_token": "x.y.z", "companyDomain": company }))
+                }
+                "list" => {
+                    ok(json!({ "webhooks": self.hooks.borrow().iter().filter(|(_, (c, _, _))| theirs(c)).map(|(id, (_, url, name))| json!({
+                    "id": id, "name": name, "created": "2026-10-31 18:00:00", "lastSent": null, "url": url })).collect::<Vec<_>>() }))
+                }
+                "get" => match self.hooks.borrow().get(&id).filter(|(c, _, _)| theirs(c)) {
+                    Some((_, posts_to, name)) => {
+                        ok(json!({ "id": id, "name": name, "url": posts_to, "format": "json", "events": ["employee.updated"] }))
+                    }
+                    None => HttpReply {
+                        status: 404,
+                        body: json!({ "errors": [{ "error": format!("No webhook was found with ID: {id}.") }] }).to_string(),
+                    },
+                },
+                "add" => {
+                    let id = self.next.get();
+                    self.next.set(id + 1);
+                    let body: Value = serde_json::from_str(call.body.as_deref().unwrap_or_default()).unwrap();
+                    let (url, name) = (body["url"].as_str().unwrap_or_default(), body["name"].as_str().unwrap_or_default());
+                    self.hooks.borrow_mut().insert(id.to_string(), (company.clone(), url.to_string(), name.to_string()));
+                    HttpReply {
+                        status: 201,
+                        body: json!({ "id": id.to_string(), "name": body["name"], "created": "2026-10-31 18:00:00", "lastSent": null,
+                                      "monitorFields": body["monitorFields"], "postFields": {}, "url": body["url"], "format": "json",
+                                      "privateKey": format!("pk-{id}") })
+                        .to_string(),
+                    }
+                }
+                _ if self.hooks.borrow().get(&id).is_some_and(|(c, _, _)| theirs(c)) => {
+                    self.hooks.borrow_mut().remove(&id);
+                    HttpReply { status: 200, body: "Web hook has been deleted.".into() }
+                }
+                _ => HttpReply { status: 404, body: "{}".into() },
+            }
+        }
+    }
+
+    /// A BambooHR webhook delivery signed with `key`.
+    fn people_hook(h: &H, key: &str) -> Res {
+        let at = chrono::Utc::now().timestamp().to_string();
+        let body = json!({ "type": "employee.updated", "timestamp": "2026-10-31T18:00:00+0000",
+                           "data": { "companyId": "1", "employeeId": dumbslab_core::util::new_id(), "changedFields": ["jobTitle"] } })
+        .to_string();
+        let sig = hmac_sha256_hex(key, &format!("{body}{at}"));
+        hook(h, "/hooks/people", &body, &[("x-bamboohr-timestamp", &at), ("x-bamboohr-signature", &sig)])
+    }
+
     #[test]
     fn people_sync_fills_profiles_by_work_email() {
         let mut h = H::new();
@@ -6157,6 +6282,7 @@ mod syncs {
         h.ok("PATCH", "/api/v1/users/gone@acme.test", Some(json!({ "deactivated": true })), &admin);
         h.ok("POST", "/api/v1/users", Some(json!({ "email": "bot@acme.test", "name": "Bot", "is_bot": true })), &admin);
         let setup = json!({ "subdomain": "acme.bamboohr.com", "api_key": "bamboo-secret-key", "webhook_key": "bamboo-hook-key" });
+        let accept = bamboo(vec![json!([])]);
 
         // Without a connector key there's nothing to encrypt credentials with.
         assert_eq!(h.ok("GET", "/api/v1/people-sync", None, &admin)["enabled"], false);
@@ -6171,8 +6297,12 @@ mod syncs {
         assert_eq!(h.call("PUT", "/api/v1/people-sync", Some(json!({ "subdomain": "evil.test/x", "api_key": "k" })), &admin).status, 400);
         assert_eq!(h.call("POST", "/api/v1/people-sync/run", None, &admin).status, 404, "not set up yet");
 
-        let v = h.ok("PUT", "/api/v1/people-sync", Some(setup), &admin);
+        // A pasted webhook private key: DumbSlab adds no webhook of its own, and only checks the key.
+        let (v, sent) = save_people(&h, &admin, setup, &accept);
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert!(sent[0].url.starts_with("https://acme.bamboohr.com/api/v1/employees?fields=workEmail&"), "{}", sent[0].url);
         assert_eq!((v["subdomain"].as_str(), v["webhook"].as_bool()), (Some("acme"), Some(true)));
+        assert_eq!((v["automatic_webhook"].as_bool(), &v["webhook_error"]), (Some(false), &Value::Null));
         assert_eq!(v["webhook_url"], "https://kb.test/hooks/people");
         // Credentials are encrypted and never come back.
         let stored =
@@ -6181,8 +6311,9 @@ mod syncs {
         for r in [h.ok("GET", "/api/v1/people-sync", None, &admin), h.ok("GET", "/api/v1/activity", None, &admin)] {
             assert!(!r.to_string().contains("bamboo-secret-key") && !r.to_string().contains("bamboo-hook-key"), "{r}");
         }
-        // Leaving the key out keeps it.
-        h.ok("PUT", "/api/v1/people-sync", Some(json!({ "subdomain": "acme" })), &admin);
+        // Leaving the keys out keeps them.
+        let (v, _) = save_people(&h, &admin, json!({ "subdomain": "acme" }), &accept);
+        assert_eq!((v["webhook"].as_bool(), v["automatic_webhook"].as_bool()), (Some(true), Some(false)));
 
         let ada_id = h.ok("GET", "/api/v1/me", None, &admin)["user"]["id"].as_str().unwrap().to_string();
         let mut zed = employee("3", "Zed Z", "zed@acme.test", "Designer", "", Some("1"));
@@ -6291,12 +6422,1520 @@ mod syncs {
         assert_eq!(state["last_status"], "failed");
         assert_eq!(state["last_result"]["updated"], 0, "the last good result stays");
 
-        // Without a webhook key, its address is gone; removing the sync keeps the profiles.
-        h.ok("PUT", "/api/v1/people-sync", Some(json!({ "subdomain": "acme", "webhook_key": "" })), &admin);
+        // Without a webhook key (here BambooHR won't let DumbSlab add one), its address is gone;
+        // removing the sync keeps the profiles.
+        let no_webhooks = |c: &HttpCall| if c.url.contains("/webhooks") { HttpReply { status: 403, body: "{}".into() } } else { accept(c) };
+        let (v, _) = save_people(&h, &admin, json!({ "subdomain": "acme", "webhook_key": "" }), &no_webhooks);
+        assert_eq!((v["webhook"].as_bool(), v["webhook_error"].is_string()), (Some(false), true), "{v}");
         assert_eq!(deliver("4", now).status, 404);
         h.ok("DELETE", "/api/v1/people-sync", None, &admin);
         assert_eq!(details(&h, &admin, "mo@acme.test")["title"], "Engineer");
         assert_eq!(count(&h, "SELECT COUNT(*) FROM people_sync"), 0);
+    }
+
+    #[test]
+    fn people_sync_adds_its_own_bamboohr_webhook() {
+        let mut h = H::new();
+        let (admin, _) = h.setup();
+        let (_, mo) = h.user(&admin, "mo@acme.test", "Mo", "member");
+        with_key(&mut h);
+        let fake = FakeBamboo::new(41);
+        let answer = |c: &HttpCall| fake.answer(c);
+        let urls = |sent: &[HttpCall]| -> Vec<(String, String)> {
+            sent.iter().map(|c| (c.method.to_string(), c.url.split('?').next().unwrap().to_string())).collect()
+        };
+        let webhooks = "https://acme.bamboohr.com/api/v1/webhooks";
+        let call = |m: &str, u: &str| (m.to_string(), u.to_string());
+
+        // One step: the company domain as it was pasted, and the API key. DumbSlab checks the key,
+        // then adds the webhook in BambooHR.
+        let body = json!({ "subdomain": "https://Acme.bamboohr.com/home?tab=1", "api_key": "key-1" });
+        let (v, sent) = save_people(&h, &admin, body, &answer);
+        assert_eq!(
+            urls(&sent),
+            [
+                call("GET", "https://acme.bamboohr.com/api/v1/employees"),
+                call("GET", "https://acme.bamboohr.com/api/v1/webhooks/monitor_fields"),
+                call("POST", webhooks)
+            ]
+        );
+        assert!(sent[0].url.contains("page%5Blimit%5D=1"), "a cheap check: {}", sent[0].url);
+        assert!(sent.iter().all(|c| c.headers.contains(&basic("key-1"))));
+        let added: Value = serde_json::from_str(sent[2].body.as_deref().unwrap()).unwrap();
+        assert_eq!(added["url"], "https://kb.test/hooks/people");
+        assert_eq!((added["format"].as_str(), &added["events"]), (Some("json"), &json!(["employee.updated"])));
+        assert_eq!(added["monitorFields"], json!(["workEmail", "jobTitle", "department", "location", "workPhone", "reportsTo", "4400"]));
+        assert_eq!(
+            (v["subdomain"].as_str(), v["webhook"].as_bool(), v["automatic_webhook"].as_bool()),
+            (Some("acme"), Some(true), Some(true))
+        );
+        assert_eq!((&v["webhook_error"], v.get("notice")), (&Value::Null, None), "{v}");
+
+        // The keys are encrypted and never shown, nor is the webhook's id.
+        assert_eq!(count(&h, "SELECT COUNT(*) FROM people_sync WHERE secret LIKE '%key-1%' OR secret LIKE '%pk-41%'"), 0);
+        for r in [h.ok("GET", "/api/v1/people-sync", None, &admin), h.ok("GET", "/api/v1/activity", None, &admin)] {
+            let text = r.to_string();
+            assert!(!text.contains("key-1") && !text.contains("pk-41") && !text.contains("webhook_id"), "{r}");
+        }
+        let event = &h.ok("GET", "/api/v1/activity", None, &admin)["items"][0];
+        assert_eq!((event["event"].as_str(), &event["data"]["automatic_webhook"]), (Some("people_sync.updated"), &json!(true)), "{event}");
+
+        // BambooHR's calls, signed with the webhook's private key, start a sync.
+        let r = people_hook(&h, "pk-41");
+        assert_eq!(r.status, 200, "{}", r.body);
+        filled(drive(&h, job_of(&r), &answer).0);
+
+        // Admins only.
+        assert_eq!(h.call("GET", "/api/v1/people-sync", None, &mo).status, 403);
+        assert_eq!(h.call("PUT", "/api/v1/people-sync", Some(json!({ "subdomain": "acme", "api_key": "k" })), &mo).status, 403);
+        assert_eq!(h.call("DELETE", "/api/v1/people-sync", None, &mo).status, 403);
+
+        // A wrong key or company domain is refused before anything changes, here or in BambooHR.
+        fake.refuse("check", 401, json!(null));
+        let r = h.call("PUT", "/api/v1/people-sync", Some(json!({ "subdomain": "acme", "api_key": "wrong" })), &admin);
+        let (finish, sent) = drive(&h, job_of(&r), &answer);
+        assert!(
+            matches!(&finish, Finish::Fail(e) if e.status == 400 && e.message.contains("rejected the API key for acme.bamboohr.com")),
+            "{finish:?}"
+        );
+        assert!(sent.iter().all(|c| c.method == "GET"), "no webhook was added or deleted: {sent:?}");
+        fake.refuse("check", 404, json!(null));
+        let r = h.call("PUT", "/api/v1/people-sync", Some(json!({ "subdomain": "nope.bamboohr.com" })), &admin);
+        let (finish, _) = drive(&h, job_of(&r), &answer);
+        assert!(matches!(&finish, Finish::Fail(e) if e.message.contains("no company at nope.bamboohr.com")), "{finish:?}");
+        fake.refuse.borrow_mut().clear();
+        let v = h.ok("GET", "/api/v1/people-sync", None, &admin);
+        assert_eq!((v["subdomain"].as_str(), v["automatic_webhook"].as_bool()), (Some("acme"), Some(true)));
+        let r = people_hook(&h, "pk-41");
+        assert_eq!(r.status, 200, "the webhook still works: {}", r.body);
+        filled(drive(&h, job_of(&r), &answer).0);
+
+        // A new key replaces the webhook: the old one is deleted, with the key that added it and,
+        // in case that one was revoked, the new one (the same BambooHR user's, perhaps).
+        let (v, sent) = save_people(&h, &admin, json!({ "subdomain": "acme", "api_key": "key-2" }), &answer);
+        let deletes: Vec<_> = sent.iter().filter(|c| c.method == "DELETE").collect();
+        assert_eq!(deletes.len(), 2, "{sent:?}");
+        assert!(deletes.iter().all(|c| c.url == format!("{webhooks}/41")));
+        assert!(deletes[0].headers.contains(&basic("key-1")) && deletes[1].headers.contains(&basic("key-2")));
+        assert!(sent.iter().filter(|c| c.method != "DELETE").all(|c| c.headers.contains(&basic("key-2"))));
+        assert_eq!(v["automatic_webhook"], true);
+        assert_eq!(people_hook(&h, "pk-41").status, 401, "the old webhook's calls are turned away");
+        let r = people_hook(&h, "pk-42");
+        assert_eq!(r.status, 200, "{}", r.body);
+        filled(drive(&h, job_of(&r), &answer).0);
+
+        // Saving again with nothing changed keeps the webhook, once BambooHR says it still has it.
+        let (v, sent) = save_people(&h, &admin, json!({ "subdomain": "acme" }), &answer);
+        assert_eq!(
+            urls(&sent),
+            [
+                call("GET", "https://acme.bamboohr.com/api/v1/employees"),
+                call("GET", "https://acme.bamboohr.com/api/v1/webhooks/monitor_fields"),
+                call("GET", &format!("{webhooks}/42"))
+            ]
+        );
+        assert_eq!(v["automatic_webhook"], true);
+        let r = people_hook(&h, "pk-42");
+        assert_eq!(r.status, 200, "the same webhook, the same key: {}", r.body);
+        filled(drive(&h, job_of(&r), &answer).0);
+        // Gone from BambooHR (someone deleted it there): saving again adds a new one.
+        fake.hooks.borrow_mut().clear();
+        let (v, sent) = save_people(&h, &admin, json!({ "subdomain": "acme" }), &answer);
+        assert!(sent.iter().any(|c| c.method == "POST"), "{sent:?}");
+        assert_eq!(v["automatic_webhook"], true);
+        assert_eq!(people_hook(&h, "pk-42").status, 401);
+        let r = people_hook(&h, "pk-43");
+        assert_eq!(r.status, 200, "{}", r.body);
+        filled(drive(&h, job_of(&r), &answer).0);
+
+        // The workspace moved: Settings says to save again, and saving moves the webhook.
+        h.cfg.base_url = Some("https://new.test".into());
+        let v = h.ok("GET", "/api/v1/people-sync", None, &admin);
+        assert_eq!(v["webhook_url"], "https://new.test/hooks/people");
+        assert!(v["webhook_error"].as_str().is_some_and(|e| e.contains("address changed")), "{v}");
+        let (v, sent) = save_people(&h, &admin, json!({ "subdomain": "acme" }), &answer);
+        assert_eq!(urls(&sent).iter().filter(|(m, _)| m == "DELETE").count(), 1, "the same key: one try");
+        let added: Value = serde_json::from_str(sent.iter().find(|c| c.method == "POST").unwrap().body.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            (added["url"].as_str(), added["postFields"].clone()),
+            (Some("https://new.test/hooks/people"), json!({})),
+            "a delivery carries no field values"
+        );
+        assert!(added["name"].as_str().unwrap().starts_with("DumbSlab people sync (new.test) ds-"), "{added}");
+        assert_eq!(v["webhook_error"], Value::Null);
+        h.cfg.base_url = Some("https://kb.test".into());
+
+        // BambooHR won't let the key's user add webhooks: the sync is saved anyway, and Settings
+        // says why. Syncing on demand still works.
+        fake.refuse("fields", 403, json!({ "errors": [{ "error": "You do not have access to webhooks" }] }));
+        let (v, sent) = save_people(&h, &admin, json!({ "subdomain": "acme" }), &answer);
+        assert!(!sent.iter().any(|c| c.method == "POST"), "{sent:?}");
+        assert!(sent.iter().any(|c| c.method == "DELETE" && c.url == format!("{webhooks}/44")), "the old one is deleted: {sent:?}");
+        assert_eq!((v["webhook"].as_bool(), v["automatic_webhook"].as_bool()), (Some(false), Some(false)));
+        assert!(v["webhook_error"].as_str().is_some_and(|e| e.contains("didn't let DumbSlab add webhooks")), "{v}");
+        assert_eq!(people_hook(&h, "pk-44").status, 404, "no webhook, no address");
+        let r = h.call("POST", "/api/v1/people-sync/run", None, &admin);
+        filled(drive(&h, job_of(&r), &answer).0);
+        // Or it may not watch some of the fields: BambooHR names them.
+        fake.refuse.borrow_mut().clear();
+        fake.refuse("add", 403, json!({ "errors": { "monitorFields": [{ "id": 15, "name": "Work Email" }], "unknownFields": [] } }));
+        let (v, _) = save_people(&h, &admin, json!({ "subdomain": "acme" }), &answer);
+        assert!(v["webhook_error"].as_str().is_some_and(|e| e.contains("watch these fields") && e.contains("Work Email")), "{v}");
+        fake.refuse.borrow_mut().clear();
+
+        // The manual way still works: with a pasted private key, DumbSlab adds no webhook.
+        let (v, sent) = save_people(&h, &admin, json!({ "subdomain": "acme", "webhook_key": "hand-made" }), &answer);
+        assert_eq!(urls(&sent), [call("GET", "https://acme.bamboohr.com/api/v1/employees")]);
+        assert_eq!(
+            (v["webhook"].as_bool(), v["automatic_webhook"].as_bool(), &v["webhook_error"]),
+            (Some(true), Some(false), &Value::Null)
+        );
+        let r = people_hook(&h, "hand-made");
+        assert_eq!(r.status, 200, "{}", r.body);
+        filled(drive(&h, job_of(&r), &answer).0);
+        // Saving again keeps it; removing it lets DumbSlab add its own again.
+        let (v, sent) = save_people(&h, &admin, json!({ "subdomain": "acme" }), &answer);
+        assert_eq!((sent.len(), v["automatic_webhook"].as_bool()), (1, Some(false)));
+        let (v, sent) = save_people(&h, &admin, json!({ "subdomain": "acme", "webhook_key": "" }), &answer);
+        assert!(sent.iter().any(|c| c.method == "POST"));
+        assert_eq!(v["automatic_webhook"], true);
+        let id = fake.next.get() - 1;
+
+        // Removing the sync deletes its webhook in BambooHR: a cleanup pass lists the webhooks its
+        // key can see, and deletes this workspace's.
+        let r = h.call("DELETE", "/api/v1/people-sync", None, &admin);
+        assert_eq!(r.status, 200, "{}", r.body);
+        let (finish, sent) = drive(&h, job_of(&r), &answer);
+        assert_eq!(filled(finish), json!({ "ok": true }));
+        assert!(urls(&sent).contains(&call("GET", webhooks)), "{sent:?}");
+        let delete = sent.iter().find(|c| c.method == "DELETE" && c.headers.contains(&basic("key-2"))).unwrap();
+        assert_eq!(delete.url, format!("{webhooks}/{id}"));
+        assert!(fake.ids().is_empty());
+        assert_eq!(count(&h, "SELECT COUNT(*) FROM people_sync"), 0);
+        assert_eq!(people_hook(&h, &format!("pk-{id}")).status, 404);
+
+        // When BambooHR won't delete it, the sync is still removed, and the answer says so.
+        save_people(&h, &admin, json!({ "subdomain": "acme", "api_key": "key-3" }), &answer);
+        fake.refuse("delete", 500, json!(null));
+        let r = h.call("DELETE", "/api/v1/people-sync", None, &admin);
+        let v = filled(drive(&h, job_of(&r), &answer).0);
+        assert!(v["ok"] == true && v["notice"].as_str().is_some_and(|n| n.contains("couldn't delete the webhook")), "{v}");
+        assert_eq!(count(&h, "SELECT COUNT(*) FROM people_sync"), 0);
+        assert_eq!(h.call("DELETE", "/api/v1/people-sync", None, &admin).status, 404);
+    }
+
+    #[test]
+    fn people_sync_webhook_needs_https_and_one_save_at_a_time() {
+        let mut h = H::new();
+        let (admin, _) = h.setup();
+        with_key(&mut h);
+        let fake = FakeBamboo::new(50);
+        let answer = |c: &HttpCall| fake.answer(c);
+
+        // BambooHR calls https addresses only, so on an http one DumbSlab doesn't try.
+        h.cfg.base_url = Some("http://localhost:8080".into());
+        let (v, sent) = save_people(&h, &admin, json!({ "subdomain": "acme", "api_key": "key-1" }), &answer);
+        assert_eq!(sent.len(), 1, "only the key check: {sent:?}");
+        assert_eq!((v["configured"].as_bool(), v["webhook"].as_bool()), (Some(true), Some(false)));
+        assert!(v["webhook_error"].as_str().is_some_and(|e| e.contains("https") && e.contains("http://localhost:8080")), "{v}");
+        h.ok("DELETE", "/api/v1/people-sync", None, &admin);
+        h.cfg.base_url = Some("https://kb.test".into());
+
+        // One save at a time: while one is under way, another save, or removing the sync, is
+        // refused before anything happens.
+        let r = h.call("PUT", "/api/v1/people-sync", Some(json!({ "subdomain": "acme", "api_key": "key-1" })), &admin);
+        let first = job_of(&r);
+        let r = h.call("PUT", "/api/v1/people-sync", Some(json!({ "subdomain": "acme", "api_key": "key-2" })), &admin);
+        assert_eq!(r.status, 409, "{}", r.body);
+        assert!(r.effects.is_empty());
+        let (finish, _) = drive(&h, first, &answer);
+        assert_eq!(filled(finish)["automatic_webhook"], true);
+        let r = h.call("PUT", "/api/v1/people-sync", Some(json!({ "subdomain": "acme", "api_key": "key-2" })), &admin);
+        let second = job_of(&r);
+        assert_eq!(h.call("DELETE", "/api/v1/people-sync", None, &admin).status, 409);
+        let (finish, sent) = drive(&h, second, &answer);
+        assert_eq!(filled(finish)["automatic_webhook"], true);
+        assert!(sent.iter().any(|c| c.method == "DELETE" && c.url.ends_with("/webhooks/50")), "{sent:?}");
+        // A save that fails lets go too.
+        fake.refuse("check", 401, json!(null));
+        let r = h.call("PUT", "/api/v1/people-sync", Some(json!({ "subdomain": "acme", "api_key": "wrong" })), &admin);
+        assert!(matches!(drive(&h, job_of(&r), &answer).0, Finish::Fail(_)));
+        fake.refuse.borrow_mut().clear();
+        let r = people_hook(&h, "pk-51");
+        assert_eq!(r.status, 200, "{}", r.body);
+        filled(drive(&h, job_of(&r), &answer).0);
+
+        // BambooHR won't delete the old webhook (its key was revoked, say): the new one is added,
+        // and the answer says so.
+        fake.refuse("delete", 401, json!(null));
+        let (v, sent) = save_people(&h, &admin, json!({ "subdomain": "acme", "api_key": "key-3" }), &answer);
+        assert_eq!(sent.iter().filter(|c| c.method == "DELETE").count(), 2, "{sent:?}");
+        assert_eq!(v["automatic_webhook"], true);
+        assert!(v["notice"].as_str().is_some_and(|n| n.contains("couldn't delete the webhook")), "{v}");
+        assert!(h.ok("GET", "/api/v1/people-sync", None, &admin).get("notice").is_none(), "only in the answer");
+    }
+
+    // -----------------------------------------------------------------------
+    // Sign in with BambooHR
+
+    fn with_bamboohr_app(h: &mut H) {
+        h.cfg
+            .connectors
+            .apps
+            .insert("bamboohr".into(), connect::OAuthApp { client_id: "bhr-client".into(), client_secret: "bhr-secret".into() });
+    }
+
+    /// Starts Sign in with BambooHR; returns BambooHR's link and the state in it.
+    fn sign_in_link(h: &H, auth: &Auth, subdomain: &str) -> (String, String) {
+        let v = h.ok("POST", "/api/v1/people-sync/sign-in", Some(json!({ "subdomain": subdomain })), auth);
+        let url = v["authorize_url"].as_str().unwrap().to_string();
+        let state = url.split(['?', '&']).find_map(|p| p.strip_prefix("state=")).unwrap();
+        (url.clone(), urlencoding::decode(state).unwrap().into_owned())
+    }
+
+    /// BambooHR sends the browser back to the workspace.
+    fn come_back(h: &H, auth: &Auth, query: &str) -> Res {
+        let r = h.call("GET", &format!("/sync/bamboohr/callback?{query}"), None, auth);
+        assert_eq!(r.status, 302, "{}", r.body);
+        r
+    }
+
+    fn back_with(state: &str) -> String {
+        format!("code=c0de&state={}", urlencoding::encode(state))
+    }
+
+    fn redirected(finish: Finish) -> String {
+        match finish {
+            Finish::Redirect(url) => url,
+            other => panic!("expected a redirect, got {other:?}"),
+        }
+    }
+
+    fn bearer(token: &str) -> (String, String) {
+        ("authorization".into(), format!("Bearer {token}"))
+    }
+
+    #[test]
+    fn people_sync_signs_in_with_bamboohr() {
+        let mut h = H::new();
+        let (admin, admin_token) = h.setup();
+        let (_, mo) = h.user(&admin, "mo@acme.test", "Mo", "member");
+        let (bo_id, _) = h.user(&admin, "bo@acme.test", "Bo", "admin");
+        let login = |h: &H, email: &str, password: &str| {
+            session_from(&h.call("POST", "/api/v1/auth/login", Some(json!({ "email": email, "password": password })), &Auth::None))
+        };
+        let bo = login(&h, "bo@acme.test", "password123");
+        with_key(&mut h);
+        let fake = FakeBamboo::new(60);
+        let answer = |c: &HttpCall| fake.answer(c);
+        let settings = "https://kb.test/settings/people-sync";
+
+        // Without the host's BambooHR app, signing in isn't offered; self-hosted, API keys are.
+        let v = h.ok("GET", "/api/v1/people-sync", None, &admin);
+        assert_eq!((v["sign_in_available"].as_bool(), v["api_key_allowed"].as_bool()), (Some(false), Some(true)));
+        assert_eq!(h.call("POST", "/api/v1/people-sync/sign-in", Some(json!({ "subdomain": "acme" })), &admin).status, 503);
+        with_bamboohr_app(&mut h);
+        assert_eq!(h.ok("GET", "/api/v1/people-sync", None, &admin)["sign_in_available"], true);
+        assert_eq!(h.call("POST", "/api/v1/people-sync/sign-in", Some(json!({ "subdomain": "acme" })), &mo).status, 403, "admins only");
+
+        // BambooHR's sign-in page on the company's own domain, with the scopes a sync needs.
+        let (url, state) = sign_in_link(&h, &admin, "https://Acme.bamboohr.com/home");
+        assert!(
+            url.starts_with("https://acme.bamboohr.com/authorize.php?request=authorize&response_type=code&client_id=bhr-client&"),
+            "{url}"
+        );
+        assert!(url.contains("&redirect_uri=https%3A%2F%2Fkb.test%2Fsync%2Fbamboohr%2Fcallback&"), "{url}");
+        assert!(
+            url.ends_with(
+                "&scope=openid+offline_access+employee+employee%3Acontact+employee%3Ajob+employee%3Aname+webhooks+webhooks.write"
+            ),
+            "{url}"
+        );
+        // Kept hashed.
+        assert_eq!(count(&h, &format!("SELECT COUNT(*) FROM people_sync_sign_ins WHERE state_hash = '{state}'")), 0);
+        let hash = dumbslab_core::util::sha256_hex(&state);
+        assert_eq!(count(&h, &format!("SELECT COUNT(*) FROM people_sync_sign_ins WHERE state_hash = '{hash}'")), 1);
+
+        // A made-up state goes nowhere; errors come back as codes only.
+        let r = come_back(&h, &admin, "code=c0de&state=forged");
+        assert_eq!(r.header("location"), Some(&*format!("{settings}?people_sync_error=expired_link")));
+        assert!(r.effects.is_empty());
+        // Another browser session of the same admin can't finish it, and the link is spent.
+        let other = login(&h, "ada@acme.test", "correct horse");
+        let r = come_back(&h, &other, &back_with(&state));
+        assert_eq!(r.header("location"), Some(&*format!("{settings}?people_sync_error=wrong_person")));
+        assert!(r.effects.is_empty());
+        let r = come_back(&h, &admin, &back_with(&state));
+        assert_eq!(r.header("location"), Some(&*format!("{settings}?people_sync_error=expired_link")), "once only");
+        // Nor another person.
+        let (_, state) = sign_in_link(&h, &admin, "acme");
+        let r = come_back(&h, &mo, &back_with(&state));
+        assert_eq!(r.header("location"), Some(&*format!("{settings}?people_sync_error=wrong_person")));
+        // An admin who lost the role meanwhile can't finish.
+        let (_, state) = sign_in_link(&h, &bo, "acme");
+        h.ok("PATCH", &format!("/api/v1/users/{bo_id}"), Some(json!({ "role": "member" })), &admin);
+        let r = come_back(&h, &bo, &back_with(&state));
+        assert_eq!(r.header("location"), Some(&*format!("{settings}?people_sync_error=not_admin")));
+        // Too slow, or declined in BambooHR.
+        let (_, state) = sign_in_link(&h, &admin, "acme");
+        db_run(&h, |db| db.execute("UPDATE people_sync_sign_ins SET created_at = '2026-01-01T00:00:00.000Z'", &[]));
+        let r = come_back(&h, &admin, &back_with(&state));
+        assert_eq!(r.header("location"), Some(&*format!("{settings}?people_sync_error=too_slow")));
+        let (_, state) = sign_in_link(&h, &admin, "acme");
+        let r = come_back(&h, &admin, &format!("error=access_denied&state={}", urlencoding::encode(&state)));
+        assert_eq!(r.header("location"), Some(&*format!("{settings}?people_sync_error=declined")));
+        // BambooHR refusing the code saves nothing.
+        fake.refuse("token", 400, json!({ "error": "invalid_grant" }));
+        let (_, state) = sign_in_link(&h, &admin, "acme");
+        let (finish, sent) = drive(&h, job_of(&come_back(&h, &admin, &back_with(&state))), &answer);
+        assert_eq!(redirected(finish), format!("{settings}?people_sync_error=refused"));
+        assert_eq!(sent.len(), 1);
+        assert_eq!(h.ok("GET", "/api/v1/people-sync", None, &admin)["configured"], false);
+        fake.refuse.borrow_mut().clear();
+
+        // Signing in: DumbSlab exchanges the code, checks access, adds the webhook and saves, then
+        // sends the admin back to Settings.
+        let (_, state) = sign_in_link(&h, &admin, "acme");
+        let r = come_back(&h, &admin, &back_with(&state));
+        let (finish, sent) = drive(&h, job_of(&r), &answer);
+        assert_eq!(redirected(finish), format!("{settings}?people_sync=connected"));
+        assert_eq!((sent[0].method, sent[0].url.as_str()), ("POST", "https://acme.bamboohr.com/token.php?request=token"));
+        let form = sent[0].body.clone().unwrap();
+        for part in [
+            "grant_type=authorization_code",
+            "code=c0de",
+            "redirect_uri=https%3A%2F%2Fkb.test%2Fsync%2Fbamboohr%2Fcallback",
+            "client_id=bhr-client",
+            "client_secret=bhr-secret",
+        ] {
+            assert!(form.contains(part), "{form}");
+        }
+        assert!(sent[1..].iter().all(|c| c.headers.contains(&bearer("at-1"))), "{sent:?}");
+        assert!(sent.iter().any(|c| c.method == "POST" && c.url == "https://acme.bamboohr.com/api/v1/webhooks"));
+        let v = h.ok("GET", "/api/v1/people-sync", None, &admin);
+        assert_eq!(
+            (v["auth"].as_str(), v["automatic_webhook"].as_bool(), v["subdomain"].as_str()),
+            (Some("oauth"), Some(true), Some("acme"))
+        );
+        assert_eq!(h.ok("GET", "/api/v1/activity", None, &admin)["items"][0]["data"]["auth"], "oauth");
+        // Tokens are sealed and never shown.
+        assert_eq!(count(&h, "SELECT COUNT(*) FROM people_sync WHERE secret LIKE '%at-1%' OR secret LIKE '%rt-1%'"), 0);
+        for r in [h.ok("GET", "/api/v1/people-sync", None, &admin), h.ok("GET", "/api/v1/activity", None, &admin)] {
+            let text = r.to_string();
+            assert!(!text.contains("at-1") && !text.contains("rt-1") && !text.contains("bhr-secret") && !text.contains("pk-60"), "{r}");
+        }
+        let r = come_back(&h, &admin, &back_with(&state));
+        assert_eq!(r.header("location"), Some(&*format!("{settings}?people_sync_error=expired_link")), "once only");
+
+        // Syncs use the sign-in, and so do BambooHR's webhook calls.
+        let r = h.call("POST", "/api/v1/people-sync/run", None, &admin_token);
+        let (finish, sent) = drive(&h, job_of(&r), &answer);
+        filled(finish);
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].headers.contains(&bearer("at-1")));
+        let r = people_hook(&h, "pk-60");
+        assert_eq!(r.status, 200, "{}", r.body);
+        filled(drive(&h, job_of(&r), &answer).0);
+
+        // Shortly before the access token expires, a sync renews it first, and keeps the rest.
+        let soon = |h: &H| {
+            let at = dumbslab_core::util::ts(chrono::Utc::now() + chrono::Duration::seconds(60));
+            db_run(h, |db| db.execute("UPDATE people_sync SET expires_at = ?", &[at.into()]));
+        };
+        soon(&h);
+        let r = h.call("POST", "/api/v1/people-sync/run", None, &admin);
+        let (finish, sent) = drive(&h, job_of(&r), &answer);
+        filled(finish);
+        assert_eq!((sent[0].method, sent[0].url.as_str()), ("POST", "https://acme.bamboohr.com/token.php?request=token"));
+        let form = sent[0].body.clone().unwrap();
+        assert!(
+            form.contains("grant_type=refresh_token") && form.contains("refresh_token=rt-1") && form.contains("client_secret=bhr-secret")
+        );
+        assert!(sent[1].headers.contains(&bearer("at-2")));
+        let later = dumbslab_core::util::ts(chrono::Utc::now() + chrono::Duration::minutes(50));
+        assert_eq!(count(&h, &format!("SELECT COUNT(*) FROM people_sync WHERE expires_at > '{later}' AND refreshing_until IS NULL")), 1);
+        let r = h.call("POST", "/api/v1/people-sync/run", None, &admin);
+        let (_, sent) = drive(&h, job_of(&r), &answer);
+        assert!(sent.len() == 1 && sent[0].headers.contains(&bearer("at-2")), "renewed once: {sent:?}");
+        let r = people_hook(&h, "pk-60");
+        assert_eq!(r.status, 200, "the webhook's key survives renewal: {}", r.body);
+        filled(drive(&h, job_of(&r), &answer).0);
+        // One renewal at a time: while another request renews an expired token, the sync waits.
+        db_run(&h, |db| {
+            db.execute(
+                "UPDATE people_sync SET expires_at = '2026-01-01T00:00:00.000Z', refreshing_until = ?",
+                &[format!("{} other", dumbslab_core::util::ts(chrono::Utc::now() + chrono::Duration::seconds(30))).into()],
+            )
+        });
+        let r = h.call("POST", "/api/v1/people-sync/run", None, &admin);
+        let (finish, sent) = drive(&h, job_of(&r), &answer);
+        assert!(sent.is_empty() && matches!(&finish, Finish::Fail(e) if e.message.contains("renewing")), "{finish:?}");
+        db_run(&h, |db| db.execute("UPDATE people_sync SET refreshing_until = NULL", &[]));
+        // BambooHR refusing the renewal: sign in again.
+        fake.refuse("token", 400, json!({ "error": "invalid_grant" }));
+        let r = h.call("POST", "/api/v1/people-sync/run", None, &admin);
+        let (finish, _) = drive(&h, job_of(&r), &answer);
+        assert!(matches!(&finish, Finish::Fail(e) if e.message.contains("Sign in with BambooHR again")), "{finish:?}");
+        assert_eq!(count(&h, "SELECT COUNT(*) FROM people_sync WHERE refreshing_until IS NOT NULL"), 0, "the lease is let go");
+        fake.refuse.borrow_mut().clear();
+        soon(&h);
+
+        // Saving again with the saved sign-in renews it, and keeps the webhook BambooHR still has.
+        let (v, sent) = save_people(&h, &admin, json!({ "subdomain": "acme" }), &answer);
+        assert_eq!(sent[0].url, "https://acme.bamboohr.com/token.php?request=token");
+        assert!(!sent.iter().any(|c| c.method == "POST" && c.url.ends_with("/webhooks")), "kept: {sent:?}");
+        assert!(sent.iter().any(|c| c.method == "GET" && c.url.ends_with("/webhooks/60") && c.headers.contains(&bearer("at-3"))));
+        assert_eq!((v["auth"].as_str(), v["automatic_webhook"].as_bool()), (Some("oauth"), Some(true)));
+        // A renewal under way when the sign-in is saved again may still store what it gets.
+        let renewing = format!("{} other", dumbslab_core::util::ts(chrono::Utc::now() + chrono::Duration::seconds(30)));
+        db_run(&h, |db| db.execute("UPDATE people_sync SET refreshing_until = ?", &[renewing.clone().into()]));
+        save_people(&h, &admin, json!({ "subdomain": "acme" }), &answer);
+        assert_eq!(count(&h, &format!("SELECT COUNT(*) FROM people_sync WHERE refreshing_until = '{renewing}'")), 1);
+        db_run(&h, |db| db.execute("UPDATE people_sync SET refreshing_until = NULL", &[]));
+        // Another company needs its own sign-in.
+        assert_eq!(h.call("PUT", "/api/v1/people-sync", Some(json!({ "subdomain": "other" })), &admin).status, 400);
+
+        // Removing the sync deletes the webhook with the sign-in, renewed first when it's about to expire.
+        soon(&h);
+        let r = h.call("DELETE", "/api/v1/people-sync", None, &admin);
+        let (finish, sent) = drive(&h, job_of(&r), &answer);
+        assert_eq!(filled(finish), json!({ "ok": true }));
+        assert!(sent[0].body.as_deref().unwrap().contains("refresh_token=rt-3"), "{sent:?}");
+        assert_eq!((sent[1].method, sent[1].url.as_str()), ("GET", "https://acme.bamboohr.com/api/v1/webhooks"));
+        assert_eq!((sent[2].method, sent[2].url.as_str()), ("DELETE", "https://acme.bamboohr.com/api/v1/webhooks/60"));
+        assert!(sent[1].headers.contains(&bearer("at-4")) && sent[2].headers.contains(&bearer("at-4")));
+        assert!(fake.hooks.borrow().is_empty());
+    }
+
+    /// One step of a job, in its own transaction, like a host.
+    fn people_step(h: &H, job: &mut Job, replies: Vec<HttpReply>) -> Step {
+        h.store
+            .with_tx(|db| {
+                let (step, _) = connect::guarded_step(db, &h.cfg, job, replies, chrono::Utc::now(), |_| None);
+                let ok = step.is_ok();
+                (step, ok)
+            })
+            .unwrap()
+            .unwrap()
+    }
+
+    fn fetched(step: Step) -> Vec<HttpCall> {
+        match step {
+            Step::Fetch(calls) => calls,
+            Step::Done(f) => panic!("expected requests, got {f:?}"),
+        }
+    }
+
+    fn failed_with(step: Step) -> dumbslab_core::ApiError {
+        match step {
+            Step::Done(Finish::Fail(e)) => e,
+            other => panic!("expected a failure, got {other:?}"),
+        }
+    }
+
+    /// A renewal's answer after its connection retired: that step only hands the tokens over (and
+    /// is kept), and the next one stops.
+    fn hands_over_then_stops(h: &H, job: &mut Job, replies: Vec<HttpReply>) -> dumbslab_core::ApiError {
+        let step = people_step(h, job, replies);
+        assert!(matches!(&step, Step::Fetch(calls) if calls.is_empty()), "{step:?}");
+        failed_with(people_step(h, job, vec![]))
+    }
+
+    /// The job a request left to run after its response (the webhooks DumbSlab still has to delete).
+    fn background_of(r: &Res) -> Job {
+        r.effects
+            .iter()
+            .find_map(|e| match e {
+                Effect::Background(j) => Some(j.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("a background job; got {} {}", r.status, r.body))
+    }
+
+    /// The access token stored for the people sync expires in a minute.
+    fn expiring(h: &H) {
+        let at = dumbslab_core::util::ts(chrono::Utc::now() + chrono::Duration::seconds(60));
+        db_run(h, |db| db.execute("UPDATE people_sync SET expires_at = ?", &[at.into()]));
+    }
+
+    /// Signs in with BambooHR for `company`: where the admin lands, the requests sent, and the
+    /// callback's answer (with its cleanup job).
+    fn bamboo_sign_in(h: &H, admin: &Auth, company: &str, answer: &dyn Fn(&HttpCall) -> HttpReply) -> (String, Vec<HttpCall>, Res) {
+        let (_, state) = sign_in_link(h, admin, company);
+        let r = come_back(h, admin, &back_with(&state));
+        let (finish, sent) = drive(h, job_of(&r), answer);
+        (redirected(finish), sent, r)
+    }
+
+    /// One step that the host rolls back (the Worker refuses a step that grows a full workspace).
+    fn people_step_rolled_back(h: &H, job: &mut Job, replies: Vec<HttpReply>) {
+        let full = || Some(dumbslab_core::ApiError::new(507, "workspace_full", "The workspace is full."));
+        let step = h
+            .store
+            .with_tx(|db| {
+                let (step, _) = connect::guarded_step(db, &h.cfg, job, replies, chrono::Utc::now(), |_| full());
+                let ok = step.is_ok();
+                (step, ok)
+            })
+            .unwrap();
+        assert!(step.is_err(), "rolled back");
+    }
+
+    /// The cleanup's waits are over: every record may run now.
+    fn waits_over(h: &H) {
+        db_run(h, |db| db.execute("UPDATE people_sync_cleanup SET next_attempt_at = '2026-01-01T00:00:00.000Z'", &[]));
+    }
+
+    fn records(h: &H) -> i64 {
+        count(h, "SELECT COUNT(*) FROM people_sync_cleanup")
+    }
+
+    fn has_background(r: &Res) -> bool {
+        r.effects.iter().any(|e| matches!(e, Effect::Background(_)))
+    }
+
+    /// The activity log's newest "gave up on old webhooks" event.
+    fn abandoned(h: &H, admin: &Auth) -> Option<Value> {
+        let items = h.ok("GET", "/api/v1/activity?limit=200", None, admin)["items"].clone();
+        items.as_array().unwrap().iter().find(|e| e["event"] == "people_sync.webhook_abandoned").cloned()
+    }
+
+    #[test]
+    fn people_sync_reconnecting_stops_work_under_way() {
+        let mut h = H::new();
+        let (admin, _) = h.setup();
+        h.user(&admin, "mo@acme.test", "Mo", "member");
+        with_key(&mut h);
+        with_bamboohr_app(&mut h);
+        let fake = FakeBamboo::new(80);
+        let answer = |c: &HttpCall| fake.answer(c);
+        let (landed, _, _) = bamboo_sign_in(&h, &admin, "acme", &answer);
+        assert!(landed.ends_with("?people_sync=connected"), "{landed}");
+
+        // A sync of acme is renewing its sign-in when an admin connects beta instead.
+        expiring(&h);
+        let r = h.call("POST", "/api/v1/people-sync/run", None, &admin);
+        let mut stale = job_of(&r);
+        let calls = fetched(people_step(&h, &mut stale, vec![]));
+        assert!(
+            calls[0].url.starts_with("https://acme.bamboohr.com/token.php")
+                && calls[0].body.as_deref().unwrap().contains("refresh_token=rt-1")
+        );
+        // Connecting beta waits while acme's sign-in is being renewed, by a new sign-in or a new key.
+        let (_, state) = sign_in_link(&h, &admin, "beta");
+        let r = come_back(&h, &admin, &back_with(&state));
+        assert_eq!(r.header("location"), Some("https://kb.test/settings/people-sync?people_sync_error=busy"));
+        assert!(r.effects.is_empty());
+        let r = h.call("PUT", "/api/v1/people-sync", Some(json!({ "subdomain": "beta", "api_key": "k" })), &admin);
+        assert_eq!(r.status, 409, "{}", r.body);
+        assert!(r.body["error"]["message"].as_str().unwrap().contains("renewing"));
+        // The renewal outlives its lease (a stalled host, say); then beta connects.
+        db_run(&h, |db| db.execute("UPDATE people_sync SET refreshing_until = '2026-01-01T00:00:00.000Z x'", &[]));
+        let (landed, sent, r) = bamboo_sign_in(&h, &admin, "beta", &answer);
+        // acme's sign-in is about to expire, so its webhook is left to the cleanup, and Settings says so.
+        assert!(landed.ends_with("?people_sync=connected&people_sync_notice=old_webhook"), "{landed}");
+        assert!(!sent.iter().any(|c| c.method == "DELETE"), "{sent:?}");
+        let cleanup = background_of(&r);
+        // acme's renewal comes back: it lost its lease, so the sync stops and stores nothing.
+        let renewed = answer(&calls[0]);
+        let e = hands_over_then_stops(&h, &mut stale, vec![renewed.clone()]);
+        assert!(e.message.contains("sign-in changed"), "{e:?}");
+        let v = h.ok("GET", "/api/v1/people-sync", None, &admin);
+        assert_eq!((v["subdomain"].as_str(), v["webhook_cleanup"].as_i64()), (Some("beta"), Some(2)), "beta's and acme's credentials");
+        let r = h.call("POST", "/api/v1/people-sync/run", None, &admin);
+        let (_, sent) = drive(&h, job_of(&r), &answer);
+        assert!(sent[0].url.starts_with("https://beta.bamboohr.com/api/v1/employees"), "{sent:?}");
+        // The pass deletes acme's webhook with the tokens the stopped renewal handed over (BambooHR
+        // may have spent the refresh token it had), and keeps beta's live one.
+        let at = serde_json::from_str::<Value>(&renewed.body).unwrap()["access_token"].as_str().unwrap().to_string();
+        let (_, sent) = drive(&h, cleanup, &answer);
+        let delete = sent.iter().find(|c| c.method == "DELETE").unwrap();
+        assert_eq!(delete.url, "https://acme.bamboohr.com/api/v1/webhooks/80");
+        assert!(delete.headers.contains(&bearer(&at)), "{sent:?}");
+        assert!(!sent.iter().any(|c| c.url.starts_with("https://acme.") && c.url.ends_with("/token.php?request=token")), "{sent:?}");
+        assert_eq!(fake.ids(), ["81"]);
+        assert_eq!(records(&h), 0);
+
+        // A sync of beta is reading when an admin connects acme again: what it read is dropped.
+        let r = h.call("POST", "/api/v1/people-sync/run", None, &admin);
+        let mut stale = job_of(&r);
+        fetched(people_step(&h, &mut stale, vec![]));
+        bamboo_sign_in(&h, &admin, "acme", &answer);
+        let page =
+            ok(json!({ "data": [employee("1", "Mo", "mo@acme.test", "Spy", "Beta", None)], "meta": { "page": { "nextCursor": null } } }));
+        let e = failed_with(people_step(&h, &mut stale, vec![page]));
+        assert!(e.message.contains("people sync changed"), "{e:?}");
+        assert_eq!(count(&h, "SELECT COUNT(*) FROM user_profiles"), 0);
+
+        // Removing the sync waits while a renewal is under way: it would spend the refresh token
+        // that deleting the webhook needs.
+        let lease = format!("{} other", dumbslab_core::util::ts(chrono::Utc::now() + chrono::Duration::seconds(30)));
+        db_run(&h, |db| db.execute("UPDATE people_sync SET refreshing_until = ?", &[lease.into()]));
+        let r = h.call("DELETE", "/api/v1/people-sync", None, &admin);
+        assert_eq!(r.status, 409, "{}", r.body);
+        assert!(r.body["error"]["message"].as_str().unwrap().contains("renewing"));
+        assert_eq!(count(&h, "SELECT COUNT(*) FROM people_sync"), 1);
+        db_run(&h, |db| db.execute("UPDATE people_sync SET refreshing_until = NULL", &[]));
+        let r = h.call("DELETE", "/api/v1/people-sync", None, &admin);
+        let (finish, _) = drive(&h, job_of(&r), &answer);
+        assert_eq!(filled(finish), json!({ "ok": true }));
+        assert!(fake.ids().is_empty(), "every webhook is gone: {:?}", fake.ids());
+    }
+
+    #[test]
+    fn people_sync_queued_sync_never_renews_into_a_new_connection() {
+        let mut h = H::new();
+        let (admin, _) = h.setup();
+        with_key(&mut h);
+        with_bamboohr_app(&mut h);
+        let fake = FakeBamboo::new(150);
+        let answer = |c: &HttpCall| fake.answer(c);
+        bamboo_sign_in(&h, &admin, "acme", &answer);
+
+        // A sync of acme, whose sign-in is about to expire, is queued; beta is connected before its
+        // first step runs.
+        expiring(&h);
+        let r = h.call("POST", "/api/v1/people-sync/run", None, &admin);
+        let mut queued = job_of(&r);
+        bamboo_sign_in(&h, &admin, "beta", &answer);
+        // Its first step finds another connection: it renews nothing, and stores nothing.
+        let e = failed_with(people_step(&h, &mut queued, vec![]));
+        assert!(e.message.contains("sign-in changed"), "{e:?}");
+        assert_eq!(fake.tokens.get(), 2, "acme's sign-in and beta's: no renewal");
+        assert_eq!(count(&h, "SELECT COUNT(*) FROM people_sync WHERE subdomain = 'beta' AND refreshing_until IS NULL"), 1);
+        // beta's sign-in is untouched: a sync uses it.
+        let r = h.call("POST", "/api/v1/people-sync/run", None, &admin);
+        let (_, sent) = drive(&h, job_of(&r), &answer);
+        assert!(sent[0].url.starts_with("https://beta.bamboohr.com/") && sent[0].headers.contains(&bearer("at-2")), "{sent:?}");
+    }
+
+    #[test]
+    fn people_sync_cleanup_renews_an_old_sign_in_after_switching_companies() {
+        let mut h = H::new();
+        let (admin, _) = h.setup();
+        with_key(&mut h);
+        with_bamboohr_app(&mut h);
+        let fake = FakeBamboo::new(90);
+        let answer = |c: &HttpCall| fake.answer(c);
+        bamboo_sign_in(&h, &admin, "acme", &answer);
+        db_run(&h, |db| db.execute("UPDATE people_sync SET expires_at = '2026-01-01T00:00:00.000Z'", &[]));
+
+        // acme's access token has expired. Connecting beta can't delete acme's webhook now: acme's
+        // credentials, refresh token included, are kept for the cleanup (sealed), and Settings says so.
+        let (landed, sent, r) = bamboo_sign_in(&h, &admin, "beta", &answer);
+        assert!(landed.ends_with("&people_sync_notice=old_webhook"), "{landed}");
+        assert!(!sent.iter().any(|c| c.url.starts_with("https://acme.")), "{sent:?}");
+        assert_eq!(h.ok("GET", "/api/v1/people-sync", None, &admin)["webhook_cleanup"], 2);
+        assert_eq!(count(&h, "SELECT COUNT(*) FROM people_sync_cleanup WHERE secret LIKE '%rt-1%'"), 0, "sealed");
+        // The pass renews acme's sign-in, lists acme's webhooks, and deletes this workspace's.
+        let (_, sent) = drive(&h, background_of(&r), &answer);
+        let at = |m: &str, u: &str| sent.iter().position(|c| c.method == m && c.url == u).unwrap_or_else(|| panic!("{m} {u}: {sent:?}"));
+        let (renew, list, delete) = (
+            at("POST", "https://acme.bamboohr.com/token.php?request=token"),
+            at("GET", "https://acme.bamboohr.com/api/v1/webhooks"),
+            at("DELETE", "https://acme.bamboohr.com/api/v1/webhooks/90"),
+        );
+        assert!(renew < list && list < delete);
+        assert!(sent[renew].body.as_deref().unwrap().contains("refresh_token=rt-1"));
+        assert!(!sent[delete].headers.contains(&bearer("at-1")));
+        assert_eq!(fake.ids(), ["91"], "beta's live webhook stays");
+        assert_eq!(records(&h), 0);
+        // With nothing left, syncs and Settings schedule no pass.
+        assert!(!has_background(&h.call("GET", "/api/v1/people-sync", None, &admin)));
+        let r = h.call("POST", "/api/v1/people-sync/run", None, &admin);
+        assert!(!has_background(&r));
+        drive(&h, job_of(&r), &answer);
+    }
+
+    #[test]
+    fn people_sync_cleanup_finds_webhooks_whose_ids_were_lost() {
+        let mut h = H::new();
+        let (admin, _) = h.setup();
+        with_key(&mut h);
+        let fake = FakeBamboo::new(100);
+        let answer = |c: &HttpCall| fake.answer(c);
+        save_people(&h, &admin, json!({ "subdomain": "acme", "api_key": "key-1" }), &answer);
+
+        // A new key replaces the webhook, and the host rolls back the step that read BambooHR's
+        // answers: the new webhook's id is lost with it.
+        let r = h.call("PUT", "/api/v1/people-sync", Some(json!({ "subdomain": "acme", "api_key": "key-2" })), &admin);
+        let mut job = job_of(&r);
+        let calls = fetched(people_step(&h, &mut job, vec![]));
+        let calls = fetched(people_step(&h, &mut job, calls.iter().map(answer).collect()));
+        people_step_rolled_back(&h, &mut job, calls.iter().map(answer).collect());
+        assert_eq!(fake.ids(), ["101"], "BambooHR deleted the old one and added the new one");
+        assert_eq!(h.ok("GET", "/api/v1/people-sync", None, &admin)["automatic_webhook"], true, "as before the save");
+        assert_eq!(records(&h), 2, "both keys were recorded before BambooHR changed");
+        // The save's lease runs out (the rolled-back step held it).
+        db_run(&h, |db| db.execute("UPDATE settings SET value = '2026-01-01T00:00:00.000Z x' WHERE key = 'people_sync_saving'", &[]));
+
+        // A pass with each key lists acme's webhooks and deletes the untracked one, and says the
+        // saved one is gone.
+        let (_, sent) = drive(&h, background_of(&r), &answer);
+        let delete = sent.iter().find(|c| c.method == "DELETE").unwrap();
+        assert_eq!(delete.url, "https://acme.bamboohr.com/api/v1/webhooks/101");
+        assert!(fake.ids().is_empty());
+        assert_eq!(records(&h), 0);
+        let v = h.ok("GET", "/api/v1/people-sync", None, &admin);
+        assert_eq!(v["webhook"], false);
+        assert!(v["webhook_error"].as_str().unwrap().contains("stopped partway"), "{v}");
+        // Saving again adds a webhook again.
+        let (v, _) = save_people(&h, &admin, json!({ "subdomain": "acme" }), &answer);
+        assert_eq!((v["automatic_webhook"].as_bool(), &v["webhook_error"]), (Some(true), &Value::Null));
+    }
+
+    #[test]
+    fn people_sync_removal_retries_with_backoff_until_bamboohr_answers() {
+        let mut h = H::new();
+        let (admin, _) = h.setup();
+        with_key(&mut h);
+        let fake = FakeBamboo::new(120);
+        let answer = |c: &HttpCall| fake.answer(c);
+        save_people(&h, &admin, json!({ "subdomain": "acme", "api_key": "key-1" }), &answer);
+        let waits = |h: &H, secs: i64| {
+            let at = dumbslab_core::util::ts(chrono::Utc::now() + chrono::Duration::seconds(secs));
+            count(h, &format!("SELECT COUNT(*) FROM people_sync_cleanup WHERE next_attempt_at > '{at}'"))
+        };
+
+        // BambooHR has an error while the sync is removed: the sync is gone, its webhook is kept for
+        // the cleanup, and the answer says so.
+        fake.refuse("list", 500, json!(null));
+        let r = h.call("DELETE", "/api/v1/people-sync", None, &admin);
+        let v = filled(drive(&h, job_of(&r), &answer).0);
+        assert!(v["notice"].as_str().unwrap().contains("tries again"), "{v}");
+        assert_eq!((records(&h), waits(&h, 50), waits(&h, 70)), (1, 1, 0), "a minute's wait");
+        // Until then, opening Settings or an unknown delivery runs nothing.
+        assert!(!has_background(&h.call("GET", "/api/v1/people-sync", None, &admin)));
+        let r = people_hook(&h, "pk-120");
+        assert_eq!(r.status, 404);
+        assert!(!has_background(&r));
+        // Then opening Settings runs a pass. BambooHR times out: the wait doubles.
+        waits_over(&h);
+        fake.refuse("list", 0, json!(null));
+        let r = h.call("GET", "/api/v1/people-sync", None, &admin);
+        drive(&h, background_of(&r), &answer);
+        assert_eq!((records(&h), waits(&h, 110), waits(&h, 130)), (1, 1, 0), "two minutes");
+        // BambooHR is back. The orphaned webhook's next delivery prompts the pass that deletes it.
+        fake.refuse.borrow_mut().clear();
+        waits_over(&h);
+        let r = people_hook(&h, "pk-120");
+        assert_eq!(r.status, 404, "turned away");
+        let (_, sent) = drive(&h, background_of(&r), &answer);
+        assert_eq!(sent.last().map(|c| (c.method, c.url.as_str())), Some(("DELETE", "https://acme.bamboohr.com/api/v1/webhooks/120")));
+        assert!(fake.ids().is_empty());
+        assert_eq!(records(&h), 0);
+        assert!(abandoned(&h, &admin).is_none());
+    }
+
+    #[test]
+    fn people_sync_cleanup_gives_up_only_on_dead_credentials_or_after_thirty_days() {
+        let mut h = H::new();
+        let (admin, _) = h.setup();
+        with_key(&mut h);
+        with_bamboohr_app(&mut h);
+        let fake = FakeBamboo::new(130);
+        let answer = |c: &HttpCall| fake.answer(c);
+        let pass = |h: &H| {
+            waits_over(h);
+            let r = h.call("GET", "/api/v1/people-sync", None, &admin);
+            drive(h, background_of(&r), &answer);
+        };
+        save_people(&h, &admin, json!({ "subdomain": "acme", "api_key": "key-1" }), &answer);
+        fake.refuse("list", 503, json!(null));
+        let r = h.call("DELETE", "/api/v1/people-sync", None, &admin);
+        drive(&h, job_of(&r), &answer);
+
+        // Timeouts, rate limits and BambooHR's own errors never end it, however many.
+        db_run(&h, |db| db.execute("UPDATE people_sync_cleanup SET failures = 40", &[]));
+        for status in [503, 429, 0, 502] {
+            fake.refuse("list", status, json!(null));
+            pass(&h);
+            assert_eq!(records(&h), 1, "after HTTP {status}");
+        }
+        assert_eq!(count(&h, "SELECT COUNT(*) FROM people_sync_cleanup WHERE failures = 44"), 1);
+        assert!(abandoned(&h, &admin).is_none());
+        // After 30 days DumbSlab gives up, names the webhook and the company for an admin, and
+        // forgets the credentials.
+        db_run(&h, |db| db.execute("UPDATE people_sync_cleanup SET created_at = '2026-09-01T00:00:00.000Z'", &[]));
+        pass(&h);
+        assert_eq!(records(&h), 0);
+        let event = abandoned(&h, &admin).expect("an activity event");
+        let summary = event["summary"].as_str().unwrap();
+        assert!(summary.contains("30 days") && summary.contains("webhook 130") && summary.contains("acme.bamboohr.com"), "{summary}");
+        assert_eq!(event["data"]["webhook_ids"], json!(["130"]));
+        db_run(&h, |db| db.execute("DELETE FROM activity WHERE event = 'people_sync.webhook_abandoned'", &[]));
+        fake.refuse.borrow_mut().clear();
+
+        // An API key BambooHR refuses is dead: DumbSlab gives up at once.
+        save_people(&h, &admin, json!({ "subdomain": "beta", "api_key": "key-2" }), &answer);
+        fake.refuse("list", 401, json!(null));
+        let r = h.call("DELETE", "/api/v1/people-sync", None, &admin);
+        drive(&h, job_of(&r), &answer);
+        assert_eq!(records(&h), 0);
+        let summary = abandoned(&h, &admin).unwrap()["summary"].as_str().unwrap().to_string();
+        assert!(summary.contains("HTTP 401") && summary.contains("webhook 131") && summary.contains("beta.bamboohr.com"), "{summary}");
+        db_run(&h, |db| db.execute("DELETE FROM activity WHERE event = 'people_sync.webhook_abandoned'", &[]));
+        fake.refuse.borrow_mut().clear();
+
+        // So is a sign-in BambooHR won't renew, the second time: a renewal still under way when the
+        // sync was removed could have handed over new tokens.
+        bamboo_sign_in(&h, &admin, "gamma", &answer);
+        db_run(&h, |db| db.execute("UPDATE people_sync SET expires_at = '2026-01-01T00:00:00.000Z'", &[]));
+        fake.refuse("token", 400, json!({ "error": "invalid_grant" }));
+        let r = h.call("DELETE", "/api/v1/people-sync", None, &admin);
+        drive(&h, job_of(&r), &answer);
+        assert_eq!(records(&h), 1, "once: wait");
+        assert!(abandoned(&h, &admin).is_none());
+        pass(&h);
+        assert_eq!(records(&h), 0);
+        let summary = abandoned(&h, &admin).unwrap()["summary"].as_str().unwrap().to_string();
+        assert!(
+            summary.contains("refused to renew") && summary.contains("webhook 132") && summary.contains("gamma.bamboohr.com"),
+            "{summary}"
+        );
+    }
+
+    #[test]
+    fn people_sync_a_finishing_pass_keeps_work_queued_meanwhile() {
+        let mut h = H::new();
+        let (admin, _) = h.setup();
+        with_key(&mut h);
+        let fake = FakeBamboo::new(41);
+        let answer = |c: &HttpCall| fake.answer(c);
+        save_people(&h, &admin, json!({ "subdomain": "acme", "api_key": "key-1" }), &answer);
+        // An orphan of this workspace's next to the live webhook 41.
+        let tag = db_run(&h, |db| dumbslab_core::ops::admin::setting(db, "people_sync_tag")).unwrap();
+        let orphan = (String::from("acme"), String::from("https://kb.test/hooks/people"), format!("DumbSlab people sync (kb.test) {tag}"));
+        fake.hooks.borrow_mut().insert("40".into(), orphan);
+
+        // A pass is deleting orphan 40, and keeps live webhook 41.
+        let r = h.call("GET", "/api/v1/people-sync", None, &admin);
+        let mut pass = background_of(&r);
+        let calls = fetched(people_step(&h, &mut pass, vec![]));
+        let calls = fetched(people_step(&h, &mut pass, calls.iter().map(answer).collect()));
+        assert_eq!(calls.iter().map(|c| c.url.as_str()).collect::<Vec<_>>(), ["https://acme.bamboohr.com/api/v1/webhooks/40"]);
+        // Meanwhile the sync is removed: its connection is recorded again, now for 41 too. The pass
+        // holds the record, so removal's own pass leaves it.
+        let r = h.call("DELETE", "/api/v1/people-sync", None, &admin);
+        let v = filled(drive(&h, job_of(&r), &answer).0);
+        assert!(v["notice"].as_str().unwrap().contains("tries again"), "{v}");
+        // The first pass ends: the record was recorded again meanwhile, so it stays for the next one.
+        let step = people_step(&h, &mut pass, calls.iter().map(answer).collect());
+        assert!(matches!(step, Step::Done(Finish::Fill(_))), "{step:?}");
+        assert_eq!(fake.ids(), ["41"]);
+        assert_eq!((records(&h), count(&h, "SELECT COUNT(*) FROM people_sync_cleanup WHERE working_until IS NULL")), (1, 1));
+        // The next pass deletes 41.
+        let r = h.call("GET", "/api/v1/people-sync", None, &admin);
+        let (_, sent) = drive(&h, background_of(&r), &answer);
+        assert!(sent.iter().any(|c| c.method == "DELETE" && c.url.ends_with("/webhooks/41")), "{sent:?}");
+        assert!(fake.ids().is_empty());
+        assert_eq!(records(&h), 0);
+    }
+
+    #[test]
+    fn people_sync_cleanup_keeps_the_tokens_a_fenced_renewal_got() {
+        let mut h = H::new();
+        let (admin, _) = h.setup();
+        with_key(&mut h);
+        with_bamboohr_app(&mut h);
+        let fake = FakeBamboo::new(160);
+        let answer = |c: &HttpCall| fake.answer(c);
+        bamboo_sign_in(&h, &admin, "acme", &answer);
+
+        // A pass renews acme, the live sign-in.
+        expiring(&h);
+        let r = h.call("GET", "/api/v1/people-sync", None, &admin);
+        let mut pass = background_of(&r);
+        let calls = fetched(people_step(&h, &mut pass, vec![]));
+        assert!(calls[0].url.starts_with("https://acme.bamboohr.com/token.php"));
+        assert!(calls[0].body.as_deref().unwrap().contains("refresh_token=rt-1"));
+        // Its renewal outlives its lease, and beta is connected before BambooHR answers.
+        db_run(&h, |db| db.execute("UPDATE people_sync SET refreshing_until = '2026-01-01T00:00:00.000Z x'", &[]));
+        let (_, _, connected) = bamboo_sign_in(&h, &admin, "beta", &answer);
+        // BambooHR renews acme. Fenced off from the saved sign-in (beta's now), the tokens go to
+        // acme's record, and the pass leaves it for the next one: no giving up.
+        let renewed = answer(&calls[0]);
+        let at = serde_json::from_str::<Value>(&renewed.body).unwrap()["access_token"].as_str().unwrap().to_string();
+        let step = people_step(&h, &mut pass, vec![renewed]);
+        assert!(matches!(&step, Step::Fetch(calls) if calls.is_empty()), "{step:?}");
+        let step = people_step(&h, &mut pass, vec![]);
+        assert!(matches!(step, Step::Done(Finish::Fill(_))), "{step:?}");
+        assert!(abandoned(&h, &admin).is_none());
+        assert_eq!(count(&h, "SELECT COUNT(*) FROM people_sync_cleanup WHERE subdomain = 'acme' AND working_until IS NULL"), 1);
+        // The connect's own pass deletes acme's webhook with the handed-over tokens: no renewal.
+        let (_, sent) = drive(&h, background_of(&connected), &answer);
+        assert!(!sent.iter().any(|c| c.url.ends_with("/token.php?request=token")), "{sent:?}");
+        let delete = sent.iter().find(|c| c.method == "DELETE").unwrap();
+        assert_eq!(delete.url, "https://acme.bamboohr.com/api/v1/webhooks/160");
+        assert!(delete.headers.contains(&bearer(&at)));
+        assert_eq!(fake.ids(), ["161"], "beta's live webhook stays");
+        assert_eq!(records(&h), 0);
+        assert!(abandoned(&h, &admin).is_none());
+    }
+
+    #[test]
+    fn people_sync_a_renewal_that_outlived_its_lease_still_stores_its_tokens() {
+        let mut h = H::new();
+        let (admin, _) = h.setup();
+        with_key(&mut h);
+        with_bamboohr_app(&mut h);
+        let fake = FakeBamboo::new(180);
+        let answer = |c: &HttpCall| fake.answer(c);
+        bamboo_sign_in(&h, &admin, "acme", &answer);
+
+        // A cleanup pass renews the saved sign-in: BambooHR spends rt-1 and answers with rt-2, but
+        // the pass stalls past its lease.
+        expiring(&h);
+        let r = h.call("GET", "/api/v1/people-sync", None, &admin);
+        let mut pass = background_of(&r);
+        let calls = fetched(people_step(&h, &mut pass, vec![]));
+        assert!(calls[0].body.as_deref().unwrap().contains("refresh_token=rt-1"));
+        let renewed = answer(&calls[0]);
+        db_run(&h, |db| db.execute("UPDATE people_sync SET refreshing_until = '2026-01-01T00:00:00.000Z x'", &[]));
+        // A sync takes over the renewal with rt-1, and BambooHR refuses: it was spent.
+        let r = h.call("POST", "/api/v1/people-sync/run", None, &admin);
+        let mut sync = job_of(&r);
+        let sent = fetched(people_step(&h, &mut sync, vec![]));
+        assert!(sent[0].body.as_deref().unwrap().contains("refresh_token=rt-1"));
+        let refused = HttpReply { status: 400, body: json!({ "error": "invalid_grant" }).to_string() };
+        failed_with(people_step(&h, &mut sync, vec![refused]));
+        // The pass resumes. The saved sign-in still holds the refresh token it spent, so the new
+        // tokens land there.
+        let calls = fetched(people_step(&h, &mut pass, vec![renewed]));
+        assert!(calls[0].headers.contains(&bearer("at-2")), "{calls:?}");
+        people_step(&h, &mut pass, calls.iter().map(answer).collect());
+        // The sync works with them, and renews with rt-2 next time.
+        let r = h.call("POST", "/api/v1/people-sync/run", None, &admin);
+        let (finish, sent) = drive(&h, job_of(&r), &answer);
+        filled(finish);
+        assert!(sent.len() == 1 && sent[0].headers.contains(&bearer("at-2")), "{sent:?}");
+        expiring(&h);
+        let r = h.call("POST", "/api/v1/people-sync/run", None, &admin);
+        let (finish, sent) = drive(&h, job_of(&r), &answer);
+        filled(finish);
+        assert!(sent[0].body.as_deref().unwrap().contains("refresh_token=rt-2"), "{sent:?}");
+        // A renewal that ends after another advanced the tokens keeps those.
+        expiring(&h);
+        let r = h.call("POST", "/api/v1/people-sync/run", None, &admin);
+        let mut slow = job_of(&r);
+        let calls = fetched(people_step(&h, &mut slow, vec![]));
+        let late = answer(&calls[0]);
+        // It stalls past its leases, and another sync renews meanwhile.
+        db_run(&h, |db| db.execute("UPDATE people_sync SET refreshing_until = NULL, running_until = NULL", &[]));
+        let r = h.call("POST", "/api/v1/people-sync/run", None, &admin);
+        let (_, sent) = drive(&h, job_of(&r), &answer);
+        let newest = sent[1].headers.iter().find(|(k, _)| k == "authorization").unwrap().1.clone();
+        let calls = fetched(people_step(&h, &mut slow, vec![late]));
+        assert_eq!(calls[0].headers.iter().find(|(k, _)| k == "authorization").unwrap().1, newest, "the newer tokens");
+    }
+
+    #[test]
+    fn people_sync_cleanup_keeps_each_connections_tokens_its_own() {
+        let mut h = H::new();
+        let (admin, _) = h.setup();
+        with_key(&mut h);
+        with_bamboohr_app(&mut h);
+        let fake = FakeBamboo::new(200);
+        let answer = |c: &HttpCall| fake.answer(c);
+        // acme and then beta are signed in with the same refresh token value (rt-1), and both
+        // retired: gamma is the saved sign-in now.
+        bamboo_sign_in(&h, &admin, "acme", &answer);
+        fake.tokens.set(0);
+        bamboo_sign_in(&h, &admin, "beta", &answer);
+        bamboo_sign_in(&h, &admin, "gamma", &answer);
+        let acme = "subdomain = 'acme'";
+        let beta = "subdomain = 'beta'";
+        assert_eq!(count(&h, &format!("SELECT COUNT(*) FROM people_sync_cleanup WHERE {acme} OR {beta}")), 2);
+        // A pass renews acme's copy, and only acme's: beta's waits.
+        db_run(&h, |db| {
+            db.execute(&format!("UPDATE people_sync_cleanup SET expires_at = '2026-01-01T00:00:00.000Z' WHERE {acme}"), &[])?;
+            db.execute("UPDATE people_sync_cleanup SET next_attempt_at = '2099-01-01T00:00:00.000Z' WHERE subdomain <> 'acme'", &[])
+        });
+        let r = h.call("GET", "/api/v1/people-sync", None, &admin);
+        let (_, sent) = drive(&h, background_of(&r), &answer);
+        assert!(sent[0].url.starts_with("https://acme.") && sent[0].body.as_deref().unwrap().contains("refresh_token=rt-1"), "{sent:?}");
+        // beta's record still holds beta's own tokens: its pass uses them.
+        db_run(&h, |db| db.execute(&format!("UPDATE people_sync_cleanup SET next_attempt_at = NULL WHERE {beta}"), &[]));
+        let r = h.call("GET", "/api/v1/people-sync", None, &admin);
+        let (_, sent) = drive(&h, background_of(&r), &answer);
+        let list = sent.iter().find(|c| c.url == "https://beta.bamboohr.com/api/v1/webhooks").unwrap();
+        assert!(list.headers.contains(&bearer("at-1")), "{sent:?}");
+        assert!(!fake.ids().iter().any(|id| id == "201"), "beta's old webhook is gone: {:?}", fake.ids());
+    }
+
+    #[test]
+    fn people_sync_a_stalled_pass_never_disables_a_new_webhook() {
+        let mut h = H::new();
+        let (admin, _) = h.setup();
+        with_key(&mut h);
+        let fake = FakeBamboo::new(210);
+        let answer = |c: &HttpCall| fake.answer(c);
+        save_people(&h, &admin, json!({ "subdomain": "acme", "api_key": "key-1" }), &answer);
+
+        // A pass lists acme's webhooks (210, live), then stalls.
+        let r = h.call("GET", "/api/v1/people-sync", None, &admin);
+        let mut pass = background_of(&r);
+        let calls = fetched(people_step(&h, &mut pass, vec![]));
+        let listed: Vec<HttpReply> = calls.iter().map(answer).collect();
+        // Meanwhile a new key for the same company replaces the webhook with 211.
+        let (v, _) = save_people(&h, &admin, json!({ "subdomain": "acme", "api_key": "key-2" }), &answer);
+        assert_eq!(v["automatic_webhook"], true);
+        assert_eq!(fake.ids(), ["211"]);
+        // The pass resumes with its old list, which lacks 211: it leaves everything to the next pass.
+        let step = people_step(&h, &mut pass, listed);
+        assert!(matches!(step, Step::Done(Finish::Fill(_))), "{step:?}");
+        let v = h.ok("GET", "/api/v1/people-sync", None, &admin);
+        assert_eq!((v["automatic_webhook"].as_bool(), &v["webhook_error"]), (Some(true), &Value::Null), "{v}");
+        let r = people_hook(&h, "pk-211");
+        assert_eq!(r.status, 200, "the new webhook still works: {}", r.body);
+        drive(&h, job_of(&r), &answer);
+        assert_eq!(fake.ids(), ["211"]);
+    }
+
+    /// One step under a guard that refuses it (a full workspace): its answer, and whether it was
+    /// kept.
+    fn people_step_on_a_full_workspace(h: &H, job: &mut Job, replies: Vec<HttpReply>) -> dumbslab_core::ApiResult<Step> {
+        let full = || Some(dumbslab_core::ApiError::new(507, "workspace_full", "The workspace is full."));
+        h.store
+            .with_tx(|db| {
+                let (step, _) = connect::guarded_step(db, &h.cfg, job, replies, chrono::Utc::now(), |_| full());
+                let ok = step.is_ok();
+                (step, ok)
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn people_sync_keeps_renewed_tokens_on_a_full_workspace() {
+        let mut h = H::new();
+        let (admin, _) = h.setup();
+        h.user(&admin, "mo@acme.test", "Mo", "member");
+        with_key(&mut h);
+        with_bamboohr_app(&mut h);
+        let fake = FakeBamboo::new(220);
+        let answer = |c: &HttpCall| fake.answer(c);
+        bamboo_sign_in(&h, &admin, "acme", &answer);
+
+        // A sync renews the sign-in on a full workspace. The step that stores the renewed tokens is
+        // kept, though the host refuses steps that grow storage: BambooHR has spent rt-1 already.
+        expiring(&h);
+        let r = h.call("POST", "/api/v1/people-sync/run", None, &admin);
+        let mut sync = job_of(&r);
+        let calls = fetched(people_step(&h, &mut sync, vec![]));
+        let step = people_step_on_a_full_workspace(&h, &mut sync, calls.iter().map(answer).collect());
+        let pages = match step {
+            Ok(Step::Fetch(pages)) => pages,
+            other => panic!("kept: {other:?}"),
+        };
+        assert!(pages[0].headers.contains(&bearer("at-2")));
+        // The next step, which writes profiles, is refused and rolled back as usual.
+        let page =
+            ok(json!({ "data": [employee("1", "Mo", "mo@acme.test", "Spy", "Ops", None)], "meta": { "page": { "nextCursor": null } } }));
+        assert!(people_step_on_a_full_workspace(&h, &mut sync, vec![page]).is_err());
+        assert_eq!(count(&h, "SELECT COUNT(*) FROM user_profiles"), 0);
+        db_run(&h, |db| db.execute("UPDATE people_sync SET running_until = NULL", &[]));
+        // The renewed tokens are stored: the next sync uses them, and renews with rt-2.
+        let r = h.call("POST", "/api/v1/people-sync/run", None, &admin);
+        let (_, sent) = drive(&h, job_of(&r), &answer);
+        assert!(sent.len() == 1 && sent[0].headers.contains(&bearer("at-2")), "{sent:?}");
+        expiring(&h);
+        let r = h.call("POST", "/api/v1/people-sync/run", None, &admin);
+        let (_, sent) = drive(&h, job_of(&r), &answer);
+        assert!(sent[0].body.as_deref().unwrap().contains("refresh_token=rt-2"), "{sent:?}");
+
+        // So does a cleanup pass renewing a retired sign-in's copy.
+        db_run(&h, |db| db.execute("UPDATE people_sync SET expires_at = '2026-01-01T00:00:00.000Z'", &[]));
+        let (_, _, connected) = bamboo_sign_in(&h, &admin, "beta", &answer);
+        let mut pass = background_of(&connected);
+        let calls = fetched(people_step(&h, &mut pass, vec![]));
+        assert!(calls[0].url.starts_with("https://acme.") && calls[0].url.ends_with("/token.php?request=token"));
+        let renewed = calls.iter().map(answer).collect();
+        assert!(matches!(people_step_on_a_full_workspace(&h, &mut pass, renewed), Ok(Step::Fetch(_))));
+        let acme = count(&h, "SELECT COUNT(*) FROM people_sync_cleanup WHERE subdomain = 'acme' AND expires_at > '2026-06-01'");
+        assert_eq!(acme, 1, "acme's renewed copy is stored");
+    }
+
+    #[test]
+    fn people_sync_cleanup_waits_for_the_hosts_bamboohr_app() {
+        let mut h = H::new();
+        let (admin, _) = h.setup();
+        with_key(&mut h);
+        with_bamboohr_app(&mut h);
+        let fake = FakeBamboo::new(230);
+        let answer = |c: &HttpCall| fake.answer(c);
+        bamboo_sign_in(&h, &admin, "acme", &answer);
+        db_run(&h, |db| db.execute("UPDATE people_sync SET expires_at = '2026-01-01T00:00:00.000Z'", &[]));
+
+        // The host's BambooHR app goes missing (a deploy without it, say), and the sync is removed:
+        // the sign-in can't be renewed now, so the cleanup waits and keeps the credentials.
+        let app = h.cfg.connectors.apps.remove("bamboohr").unwrap();
+        let r = h.call("DELETE", "/api/v1/people-sync", None, &admin);
+        let v = filled(drive(&h, job_of(&r), &answer).0);
+        assert!(v["notice"].as_str().unwrap().contains("tries again"), "{v}");
+        assert_eq!(records(&h), 1);
+        assert!(abandoned(&h, &admin).is_none());
+        // It's back: the next pass renews, and deletes the webhook.
+        h.cfg.connectors.apps.insert("bamboohr".into(), app);
+        waits_over(&h);
+        let r = h.call("GET", "/api/v1/people-sync", None, &admin);
+        let (_, sent) = drive(&h, background_of(&r), &answer);
+        assert!(sent[0].url.ends_with("/token.php?request=token"), "{sent:?}");
+        assert!(fake.ids().is_empty());
+        assert_eq!(records(&h), 0);
+        assert!(abandoned(&h, &admin).is_none());
+    }
+
+    #[test]
+    fn people_sync_a_save_stalled_past_its_lease_cant_bring_back_a_removed_sync() {
+        let mut h = H::new();
+        let (admin, _) = h.setup();
+        with_key(&mut h);
+        let fake = FakeBamboo::new(240);
+        let answer = |c: &HttpCall| fake.answer(c);
+        save_people(&h, &admin, json!({ "subdomain": "acme", "api_key": "key-1" }), &answer);
+
+        // A save with a new key starts, and stalls past its lease.
+        let r = h.call("PUT", "/api/v1/people-sync", Some(json!({ "subdomain": "acme", "api_key": "key-2" })), &admin);
+        let mut stalled = job_of(&r);
+        let calls = fetched(people_step(&h, &mut stalled, vec![]));
+        db_run(&h, |db| db.execute("UPDATE settings SET value = '2026-01-01T00:00:00.000Z x' WHERE key = 'people_sync_saving'", &[]));
+        // Meanwhile the sync is removed.
+        let r = h.call("DELETE", "/api/v1/people-sync", None, &admin);
+        assert_eq!(r.status, 200, "{}", r.body);
+        drive(&h, job_of(&r), &answer);
+        assert!(fake.ids().is_empty());
+        // The stalled save resumes: it no longer holds its lease, so it changes nothing.
+        let e = failed_with(people_step(&h, &mut stalled, calls.iter().map(answer).collect()));
+        assert_eq!(e.status, 409);
+        assert_eq!(count(&h, "SELECT COUNT(*) FROM people_sync"), 0, "the sync stays removed");
+        assert!(fake.ids().is_empty(), "no webhook added");
+    }
+
+    #[test]
+    fn people_sync_keeps_handed_over_tokens_on_a_full_workspace() {
+        let mut h = H::new();
+        let (admin, _) = h.setup();
+        with_key(&mut h);
+        with_bamboohr_app(&mut h);
+        let fake = FakeBamboo::new(260);
+        let answer = |c: &HttpCall| fake.answer(c);
+        let acme_renewed = |h: &H, at: &str| {
+            let sql = format!("SELECT COUNT(*) FROM people_sync_cleanup WHERE subdomain = 'acme' AND expires_at > '{at}'");
+            count(h, &sql)
+        };
+        let later = dumbslab_core::util::ts(chrono::Utc::now() + chrono::Duration::minutes(50));
+
+        // A sync's renewal outlives its lease, and beta is connected meanwhile. On a full workspace,
+        // the step that hands the renewed tokens to acme's record is kept.
+        bamboo_sign_in(&h, &admin, "acme", &answer);
+        expiring(&h);
+        let r = h.call("POST", "/api/v1/people-sync/run", None, &admin);
+        let mut sync = job_of(&r);
+        let calls = fetched(people_step(&h, &mut sync, vec![]));
+        db_run(&h, |db| db.execute("UPDATE people_sync SET refreshing_until = '2026-01-01T00:00:00.000Z x'", &[]));
+        bamboo_sign_in(&h, &admin, "beta", &answer);
+        assert_eq!(acme_renewed(&h, &later), 0);
+        let step = people_step_on_a_full_workspace(&h, &mut sync, calls.iter().map(answer).collect());
+        assert!(matches!(&step, Ok(Step::Fetch(calls)) if calls.is_empty()), "kept: {step:?}");
+        assert_eq!(acme_renewed(&h, &later), 1, "acme's record holds the renewed tokens");
+        assert!(people_step_on_a_full_workspace(&h, &mut sync, vec![]).is_err(), "the next step is refused as usual");
+        assert_eq!(acme_renewed(&h, &later), 1);
+        db_run(&h, |db| db.execute("DELETE FROM people_sync_cleanup", &[]));
+
+        // So does a save's: a save of beta again renews beta's sign-in, stalls past its leases, and
+        // gamma is connected meanwhile.
+        expiring(&h);
+        let r = h.call("PUT", "/api/v1/people-sync", Some(json!({ "subdomain": "beta" })), &admin);
+        let mut save = job_of(&r);
+        let calls = fetched(people_step(&h, &mut save, vec![]));
+        assert!(calls[0].url.starts_with("https://beta.") && calls[0].url.ends_with("/token.php?request=token"), "{calls:?}");
+        db_run(&h, |db| {
+            db.execute("UPDATE people_sync SET refreshing_until = '2026-01-01T00:00:00.000Z x'", &[])?;
+            db.execute("UPDATE settings SET value = '2026-01-01T00:00:00.000Z x' WHERE key = 'people_sync_saving'", &[])
+        });
+        bamboo_sign_in(&h, &admin, "gamma", &answer);
+        let beta_renewed = format!("SELECT COUNT(*) FROM people_sync_cleanup WHERE subdomain = 'beta' AND expires_at > '{later}'");
+        assert_eq!(count(&h, &beta_renewed), 0);
+        let step = people_step_on_a_full_workspace(&h, &mut save, calls.iter().map(answer).collect());
+        assert!(matches!(&step, Ok(Step::Fetch(calls)) if calls.is_empty()), "kept: {step:?}");
+        assert_eq!(count(&h, &beta_renewed), 1, "beta's record holds the renewed tokens");
+        let e = failed_with(people_step(&h, &mut save, vec![]));
+        assert_eq!(e.status, 409);
+        assert_eq!(h.ok("GET", "/api/v1/people-sync", None, &admin)["subdomain"], "gamma");
+    }
+
+    #[test]
+    fn people_sync_a_stalled_save_leaves_newer_cleanup_work() {
+        let mut h = H::new();
+        let (admin, _) = h.setup();
+        with_key(&mut h);
+        let fake = FakeBamboo::new(250);
+        let answer = |c: &HttpCall| fake.answer(c);
+        save_people(&h, &admin, json!({ "subdomain": "acme", "api_key": "key-1" }), &answer);
+        let r = h.call("GET", "/api/v1/people-sync", None, &admin);
+        drive(&h, background_of(&r), &answer);
+        assert_eq!(records(&h), 0);
+
+        // Save A moves to beta (retiring acme's connection), sends its changes, and stalls past its lease.
+        let r = h.call("PUT", "/api/v1/people-sync", Some(json!({ "subdomain": "beta", "api_key": "key-2" })), &admin);
+        let mut stalled = job_of(&r);
+        let calls = fetched(people_step(&h, &mut stalled, vec![]));
+        let changes = fetched(people_step(&h, &mut stalled, calls.iter().map(answer).collect()));
+        db_run(&h, |db| db.execute("UPDATE settings SET value = '2026-01-01T00:00:00.000Z x' WHERE key = 'people_sync_saving'", &[]));
+        // Save B recreates acme's webhook with key-1, then the sync is removed while BambooHR is
+        // down: acme's credentials are recorded again, and wait.
+        save_people(&h, &admin, json!({ "subdomain": "acme", "api_key": "key-1" }), &answer);
+        fake.refuse("list", 500, json!(null));
+        let r = h.call("DELETE", "/api/v1/people-sync", None, &admin);
+        drive(&h, job_of(&r), &answer);
+        fake.refuse.borrow_mut().clear();
+        let acme = "SELECT COUNT(*) FROM people_sync_cleanup WHERE subdomain = 'acme'";
+        let before = count(&h, acme);
+        assert!(before >= 2, "B's and the removal's: {before}");
+        // A resumes: BambooHR answers its changes, but it no longer holds its lease. It changes
+        // nothing here, and drops none of the newer records.
+        let e = failed_with(people_step(&h, &mut stalled, changes.iter().map(answer).collect()));
+        assert_eq!(e.status, 409);
+        assert_eq!(count(&h, acme), before);
+        assert_eq!(count(&h, "SELECT COUNT(*) FROM people_sync"), 0, "still removed");
+        // The cleanup deletes every webhook left: acme's and the one A added for beta.
+        waits_over(&h);
+        let r = h.call("GET", "/api/v1/people-sync", None, &admin);
+        drive(&h, background_of(&r), &answer);
+        assert!(fake.ids().is_empty(), "{:?}", fake.ids());
+    }
+
+    #[test]
+    fn people_sync_a_late_pass_leaves_a_record_made_anew() {
+        let mut h = H::new();
+        let (admin, _) = h.setup();
+        with_key(&mut h);
+        let fake = FakeBamboo::new(190);
+        let answer = |c: &HttpCall| fake.answer(c);
+        save_people(&h, &admin, json!({ "subdomain": "acme", "api_key": "key-1" }), &answer);
+
+        // A pass takes the record and stalls past its lease; another pass ends it.
+        let r = h.call("GET", "/api/v1/people-sync", None, &admin);
+        let mut late = background_of(&r);
+        fetched(people_step(&h, &mut late, vec![]));
+        db_run(&h, |db| db.execute("UPDATE people_sync_cleanup SET working_until = '2026-01-01T00:00:00.000Z x'", &[]));
+        let r = h.call("GET", "/api/v1/people-sync", None, &admin);
+        drive(&h, background_of(&r), &answer);
+        assert_eq!(records(&h), 0);
+        // The sync is removed: the same connection is recorded anew, at the first version again.
+        let r = h.call("DELETE", "/api/v1/people-sync", None, &admin);
+        assert_eq!(r.status, 200);
+        assert_eq!(count(&h, "SELECT COUNT(*) FROM people_sync_cleanup WHERE version = 0"), 1);
+        // The late pass ends: the new record isn't its to drop.
+        let step = people_step(&h, &mut late, vec![ok(json!({ "webhooks": [] }))]);
+        assert!(matches!(step, Step::Done(Finish::Fill(_))), "{step:?}");
+        assert_eq!(records(&h), 1);
+        // Removal's pass deletes the webhook.
+        drive(&h, job_of(&r), &answer);
+        assert!(fake.ids().is_empty());
+        assert_eq!(records(&h), 0);
+    }
+
+    #[test]
+    fn people_sync_cleanup_waits_for_a_renewal_still_under_way() {
+        let mut h = H::new();
+        let (admin, _) = h.setup();
+        with_key(&mut h);
+        with_bamboohr_app(&mut h);
+        let fake = FakeBamboo::new(170);
+        let answer = |c: &HttpCall| fake.answer(c);
+        bamboo_sign_in(&h, &admin, "acme", &answer);
+
+        // A sync has sent acme's refresh token when the admin connects beta (the renewal outlived
+        // its lease). The save keeps a copy of acme's credentials for the cleanup.
+        expiring(&h);
+        let r = h.call("POST", "/api/v1/people-sync/run", None, &admin);
+        let mut sync = job_of(&r);
+        fetched(people_step(&h, &mut sync, vec![]));
+        db_run(&h, |db| db.execute("UPDATE people_sync SET refreshing_until = '2026-01-01T00:00:00.000Z x'", &[]));
+        let (_, _, connected) = bamboo_sign_in(&h, &admin, "beta", &answer);
+        // The cleanup renews the copy first. BambooHR refuses (the sync's renewal spent that refresh
+        // token): DumbSlab waits instead of giving up.
+        fake.refuse("token", 400, json!({ "error": "invalid_grant" }));
+        drive(&h, background_of(&connected), &answer);
+        assert_eq!(count(&h, "SELECT COUNT(*) FROM people_sync_cleanup WHERE subdomain = 'acme' AND refused = 1"), 1);
+        assert!(abandoned(&h, &admin).is_none());
+        // Another pass renews the copy again (rt-1 still); meanwhile the sync's renewal comes back: it
+        // stops, and hands its new tokens to acme's record.
+        waits_over(&h);
+        let r = h.call("GET", "/api/v1/people-sync", None, &admin);
+        let mut again = background_of(&r);
+        let calls = fetched(people_step(&h, &mut again, vec![]));
+        assert!(calls.iter().any(|c| c.body.as_deref().is_some_and(|b| b.contains("refresh_token=rt-1"))), "{calls:?}");
+        let renewed = ok(json!({ "access_token": "at-late", "refresh_token": "rt-late", "expires_in": 3600 }));
+        let e = hands_over_then_stops(&h, &mut sync, vec![renewed]);
+        assert!(e.message.contains("sign-in changed"), "{e:?}");
+        assert_eq!(count(&h, "SELECT COUNT(*) FROM people_sync_cleanup WHERE subdomain = 'acme' AND refused = 0"), 1);
+        // BambooHR refuses that pass's renewal (rt-1, already spent). The record holds other tokens
+        // now: no giving up, though it was refused before.
+        let answers: Vec<HttpReply> = calls.iter().map(answer).collect();
+        // The step reading renewals stores only credentials; the refusal is dealt with in the next.
+        let step = people_step(&h, &mut again, answers);
+        assert!(matches!(&step, Step::Fetch(calls) if calls.is_empty()), "{step:?}");
+        people_step(&h, &mut again, vec![]);
+        assert!(abandoned(&h, &admin).is_none());
+        assert_eq!(count(&h, "SELECT COUNT(*) FROM people_sync_cleanup WHERE subdomain = 'acme'"), 1);
+        // The next pass needs no renewal: it deletes acme's webhook with those tokens.
+        fake.refuse.borrow_mut().clear();
+        waits_over(&h);
+        let r = h.call("GET", "/api/v1/people-sync", None, &admin);
+        let (_, sent) = drive(&h, background_of(&r), &answer);
+        let delete = sent.iter().find(|c| c.method == "DELETE").unwrap();
+        assert_eq!(delete.url, "https://acme.bamboohr.com/api/v1/webhooks/170");
+        assert!(delete.headers.contains(&bearer("at-late")));
+        assert!(!sent.iter().any(|c| c.url.starts_with("https://acme.") && c.url.ends_with("/token.php?request=token")));
+        assert_eq!(fake.ids(), ["171"]);
+        assert_eq!(records(&h), 0);
+        assert!(abandoned(&h, &admin).is_none());
+    }
+
+    #[test]
+    fn people_sync_cleanup_renews_the_saved_sign_in_through_its_lease() {
+        let mut h = H::new();
+        let (admin, _) = h.setup();
+        with_key(&mut h);
+        with_bamboohr_app(&mut h);
+        let fake = FakeBamboo::new(110);
+        let answer = |c: &HttpCall| fake.answer(c);
+        bamboo_sign_in(&h, &admin, "acme", &answer);
+
+        // Saved again with the same sign-in, BambooHR wouldn't look up or delete the old webhook: a
+        // new one is added, and the cleanup has the old one to delete.
+        fake.refuse("get", 500, json!(null));
+        fake.refuse("delete", 500, json!(null));
+        let r = h.call("PUT", "/api/v1/people-sync", Some(json!({ "subdomain": "acme" })), &admin);
+        let v = filled(drive(&h, job_of(&r), &answer).0);
+        assert!(v["notice"].as_str().unwrap().contains("tries again"), "{v}");
+        assert_eq!(fake.ids(), ["110", "111"]);
+        // The sign-in is about to expire. The pass renews the saved sign-in itself, through its
+        // renewal lease, and stores the new tokens; it never renews a copy.
+        expiring(&h);
+        let (_, sent) = drive(&h, background_of(&r), &answer);
+        assert!(sent[0].body.as_deref().unwrap().contains("refresh_token=rt-1"), "{sent:?}");
+        assert!(sent[1..].iter().all(|c| c.headers.contains(&bearer("at-2"))), "{sent:?}");
+        assert_eq!(count(&h, "SELECT COUNT(*) FROM people_sync WHERE refreshing_until IS NULL"), 1);
+        let r = h.call("POST", "/api/v1/people-sync/run", None, &admin);
+        let (_, sent) = drive(&h, job_of(&r), &answer);
+        assert!(sent.len() == 1 && sent[0].headers.contains(&bearer("at-2")), "the sync uses the renewed tokens: {sent:?}");
+        // BambooHR is back: the next pass deletes the old webhook, and keeps the live one.
+        fake.refuse.borrow_mut().clear();
+        waits_over(&h);
+        let r = h.call("GET", "/api/v1/people-sync", None, &admin);
+        drive(&h, background_of(&r), &answer);
+        assert_eq!(fake.ids(), ["111"]);
+        assert_eq!(records(&h), 0);
+        // The sync's own renewals still work: nothing else spent its refresh token.
+        expiring(&h);
+        let r = h.call("POST", "/api/v1/people-sync/run", None, &admin);
+        let (finish, sent) = drive(&h, job_of(&r), &answer);
+        filled(finish);
+        assert!(sent[0].body.as_deref().unwrap().contains("refresh_token=rt-2"), "{sent:?}");
+    }
+
+    #[test]
+    fn people_sync_loses_no_webhook_when_the_admin_is_demoted_mid_save() {
+        let mut h = H::new();
+        let (admin, _) = h.setup();
+        let (bo_id, _) = h.user(&admin, "bo@acme.test", "Bo", "admin");
+        let bo = session_from(&h.call(
+            "POST",
+            "/api/v1/auth/login",
+            Some(json!({ "email": "bo@acme.test", "password": "password123" })),
+            &Auth::None,
+        ));
+        with_key(&mut h);
+        let fake = FakeBamboo::new(100);
+        let answer = |c: &HttpCall| fake.answer(c);
+        let role = |r: &str| h.ok("PATCH", &format!("/api/v1/users/{bo_id}"), Some(json!({ "role": r })), &admin);
+        save_people(&h, &admin, json!({ "subdomain": "acme", "api_key": "key-1" }), &answer);
+
+        // Demoted before DumbSlab changes anything in BambooHR: the save stops there.
+        let before = records(&h);
+        let r = h.call("PUT", "/api/v1/people-sync", Some(json!({ "subdomain": "acme", "api_key": "key-2" })), &bo);
+        let mut job = job_of(&r);
+        let calls = fetched(people_step(&h, &mut job, vec![]));
+        role("member");
+        let e = failed_with(people_step(&h, &mut job, calls.iter().map(answer).collect()));
+        assert_eq!(e.status, 403);
+        assert_eq!(fake.ids(), ["100"], "nothing changed in BambooHR");
+        assert_eq!(records(&h), before, "nor recorded");
+        assert_eq!(h.ok("GET", "/api/v1/people-sync", None, &admin)["automatic_webhook"], true);
+        role("admin");
+
+        // Demoted while BambooHR deletes the old webhook and adds the new one: Settings says the old
+        // one is gone, and the pass deletes the new one, which nothing keeps.
+        let r = h.call("PUT", "/api/v1/people-sync", Some(json!({ "subdomain": "acme", "api_key": "key-2" })), &bo);
+        let mut job = job_of(&r);
+        let cleanup = background_of(&r);
+        let calls = fetched(people_step(&h, &mut job, vec![]));
+        let calls = fetched(people_step(&h, &mut job, calls.iter().map(answer).collect()));
+        assert!(calls.iter().any(|c| c.method == "POST"), "{calls:?}");
+        role("member");
+        let e = failed_with(people_step(&h, &mut job, calls.iter().map(answer).collect()));
+        assert_eq!(e.status, 403);
+        assert_eq!(fake.ids(), ["101"]);
+        let v = h.ok("GET", "/api/v1/people-sync", None, &admin);
+        assert_eq!((v["webhook"].as_bool(), v["webhook_cleanup"].as_i64()), (Some(false), Some(2)));
+        assert!(v["webhook_error"].as_str().unwrap().contains("stopped partway"), "{v}");
+        assert_eq!(people_hook(&h, "pk-100").status, 404);
+        assert_eq!(people_hook(&h, "pk-101").status, 404);
+        let (_, sent) = drive(&h, cleanup, &answer);
+        assert!(sent.iter().any(|c| c.method == "DELETE" && c.url == "https://acme.bamboohr.com/api/v1/webhooks/101"), "{sent:?}");
+        assert!(fake.ids().is_empty());
+        assert_eq!(records(&h), 0);
+
+        // Saving again, as an admin, adds a webhook again.
+        let (v, _) = save_people(&h, &admin, json!({ "subdomain": "acme" }), &answer);
+        assert_eq!((v["automatic_webhook"].as_bool(), &v["webhook_error"]), (Some(true), &Value::Null));
+    }
+
+    #[test]
+    fn hosted_people_sync_signs_in_with_bamboohr_only() {
+        let (mut h, admin) = hosted(None);
+        with_key(&mut h);
+        let fake = FakeBamboo::new(70);
+        let answer = |c: &HttpCall| fake.answer(c);
+
+        // BambooHR's terms rule out API keys here, and without the host's BambooHR app there's no
+        // other way yet.
+        let v = h.ok("GET", "/api/v1/people-sync", None, &admin);
+        assert_eq!((v["sign_in_available"].as_bool(), v["api_key_allowed"].as_bool()), (Some(false), Some(false)));
+        let r = h.call("PUT", "/api/v1/people-sync", Some(json!({ "subdomain": "acme", "api_key": "k" })), &admin);
+        assert_eq!((r.status, r.body["error"]["code"].as_str()), (400, Some("api_key_not_allowed")), "{}", r.body);
+        assert!(r.body["error"]["message"].as_str().unwrap().contains("Sign in with BambooHR"));
+        assert_eq!(h.call("POST", "/api/v1/people-sync/sign-in", Some(json!({ "subdomain": "acme" })), &admin).status, 503);
+        assert_eq!(h.call("PUT", "/api/v1/people-sync", Some(json!({ "subdomain": "acme" })), &admin).status, 400);
+
+        // With the host's app, BambooHR sends the admin back through the root domain, and the
+        // state names the workspace so the root can forward them.
+        with_bamboohr_app(&mut h);
+        h.cfg.connectors.callback_url = Some("https://kb.test/connect/callback".into());
+        let (url, state) = sign_in_link(&h, &admin, "acme");
+        assert!(url.contains("&redirect_uri=https%3A%2F%2Fkb.test%2Fsync%2Fbamboohr%2Fcallback&"), "{url}");
+        assert!(state.starts_with("acme."), "{state}");
+        let (finish, sent) = drive(&h, job_of(&come_back(&h, &admin, &back_with(&state))), &answer);
+        assert_eq!(redirected(finish), "https://acme.kb.test/settings/people-sync?people_sync=connected");
+        assert!(sent[0].body.as_deref().unwrap().contains("redirect_uri=https%3A%2F%2Fkb.test%2Fsync%2Fbamboohr%2Fcallback"));
+        let added: Value =
+            serde_json::from_str(sent.iter().find(|c| c.url.ends_with("/webhooks")).unwrap().body.as_deref().unwrap()).unwrap();
+        assert_eq!(added["url"], "https://acme.kb.test/hooks/people");
+        let v = h.ok("GET", "/api/v1/people-sync", None, &admin);
+        assert_eq!((v["auth"].as_str(), v["automatic_webhook"].as_bool()), (Some("oauth"), Some(true)));
+
+        // Still no API keys once signed in; saving again with the sign-in works, and so do syncs.
+        let r = h.call("PUT", "/api/v1/people-sync", Some(json!({ "subdomain": "acme", "api_key": "k" })), &admin);
+        assert_eq!(r.status, 400);
+        let (v, _) = save_people(&h, &admin, json!({ "subdomain": "acme" }), &answer);
+        assert_eq!(v["automatic_webhook"], true);
+        let r = h.call("POST", "/api/v1/people-sync/run", None, &admin);
+        let (finish, sent) = drive(&h, job_of(&r), &answer);
+        filled(finish);
+        assert!(sent[0].headers.contains(&bearer("at-1")));
     }
 
     // -----------------------------------------------------------------------

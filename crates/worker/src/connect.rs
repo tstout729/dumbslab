@@ -86,9 +86,9 @@ pub async fn send(call: &HttpCall) -> HttpReply {
     }
 }
 
-/// `GET {path}` on the root domain (`/connect/callback`, `/sso/callback`): an app sent someone
-/// back after they signed in. The `state` starts with their workspace's address; send them on to
-/// the same path at the workspace, which checks it.
+/// `GET {path}` on the root domain (`/connect/callback`, `/sso/callback`,
+/// `/sync/bamboohr/callback`): an app sent someone back after they signed in. The `state` starts
+/// with their workspace's address; send them on to the same path at the workspace, which checks it.
 pub fn root_callback_redirect(url: &Url, root: &str, path: &str) -> Result<Response> {
     let query = url.query().unwrap_or_default();
     let state = url.query_pairs().find(|(k, _)| k == "state").map(|(_, v)| v.into_owned()).unwrap_or_default();
