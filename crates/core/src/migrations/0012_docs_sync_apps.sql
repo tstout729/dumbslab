@@ -55,6 +55,9 @@ CREATE TABLE IF NOT EXISTS github_installations (
   -- Hosted DumbSlab: whether the directory forwards this installation's deliveries here: `ok`,
   -- `full` (it serves as many workspaces as it may), or NULL until it said (each sync asks again).
   forwarding TEXT,
+  -- Bumped by each change GitHub reports; only a check of the installation started for the
+  -- newest change applies what it reads (see `sync::github_app::CheckJob`).
+  generation INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );

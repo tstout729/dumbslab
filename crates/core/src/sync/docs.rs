@@ -647,7 +647,7 @@ fn minted(db: &dyn Db, j: &mut DocsJob, replies: &[HttpReply], link: bool, now: 
         Ok(m) => m,
         Err(message) => {
             // GitHub says the installation can't reach the repository: it waits, disconnected,
-            // until it's put back (see `github_app::ReposJob`).
+            // until it's put back (see `github_app::CheckJob`).
             if reply.status == 422 {
                 db.execute(
                     "UPDATE docs_source_links SET disconnected = ? WHERE source_id = ? AND disconnected IS NULL",
