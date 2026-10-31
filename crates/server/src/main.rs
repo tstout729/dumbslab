@@ -1,6 +1,6 @@
 //! `dumbslab`: the self-hosted server and CLI. One binary, one SQLite file.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -13,10 +13,11 @@ use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderName, HeaderValue, StatusCode};
 use clap::{Parser, Subcommand};
 use dumbslab_core::auth::{Actor, Role, Scopes, Via};
-use dumbslab_core::connect::{self, Connectors, HttpCall, HttpReply, OAuthApp};
+use dumbslab_core::connect::{self, Connectors, HttpCall, HttpReply};
 use dumbslab_core::db::DbExt;
 use dumbslab_core::mcp::Toolset;
 use dumbslab_core::registry::registry;
+use dumbslab_core::sso::SharedApps;
 use dumbslab_core::telemetry::Telemetry;
 use dumbslab_core::{Effect, HostConfig, Outcome, Request, WebhookDelivery, params};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -28,19 +29,12 @@ use dumbslab::web;
 
 /// Connected apps' settings from the environment: `DUMBSLAB_CONNECTOR_KEY` encrypts people's
 /// credentials, and `DUMBSLAB_<APP>_CLIENT_ID` / `_CLIENT_SECRET` (e.g. `DUMBSLAB_GITHUB_CLIENT_ID`,
-/// `DUMBSLAB_GOOGLE_DRIVE_CLIENT_SECRET`) let people sign in to that app.
+/// `DUMBSLAB_GOOGLE_DRIVE_CLIENT_SECRET`) let people sign in to that app, and
+/// `DUMBSLAB_ATLASSIAN_CLIENT_ID` / `_CLIENT_SECRET` to Jira and Confluence (see
+/// [`connect::oauth_apps`]).
 fn connectors_from_env() -> Connectors {
     let var = |k: &str| std::env::var(k).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
-    let mut apps = BTreeMap::new();
-    for c in connect::providers::ALL {
-        let id = c.info().id;
-        let env = id.to_ascii_uppercase().replace('-', "_");
-        if let (Some(client_id), Some(client_secret)) =
-            (var(&format!("DUMBSLAB_{env}_CLIENT_ID")), var(&format!("DUMBSLAB_{env}_CLIENT_SECRET")))
-        {
-            apps.insert(id.to_string(), OAuthApp { client_id, client_secret });
-        }
-    }
+    let apps = connect::oauth_apps(|name| var(&format!("DUMBSLAB_{name}")));
     Connectors { key: var("DUMBSLAB_CONNECTOR_KEY"), apps, callback_url: None }
 }
 
@@ -48,6 +42,13 @@ fn connectors_from_env() -> Connectors {
 /// `_CLIENT_SECRET`, `_PRIVATE_KEY` and `_WEBHOOK_SECRET` (see docs/hosting/github-app.md).
 fn github_app_from_env() -> Option<dumbslab_core::sync::github_app::GitHubApp> {
     dumbslab_core::sync::github_app::GitHubApp::from_env(|name| std::env::var(format!("DUMBSLAB_{name}")).ok())
+}
+
+/// This server's own sign-in apps for single sign-on: `DUMBSLAB_SSO_GOOGLE_CLIENT_ID` /
+/// `_SECRET`, `DUMBSLAB_SSO_MICROSOFT_CLIENT_ID` / `_SECRET` and `DUMBSLAB_SLACK_CLIENT_ID` /
+/// `_SECRET` (see `dumbslab_core::sso::SharedApps`). Their redirect URI is `<public URL>/sso/callback`.
+fn sso_apps_from_env() -> SharedApps {
+    SharedApps::from_vars(|k| std::env::var(format!("DUMBSLAB_{k}")).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty()))
 }
 
 #[derive(Parser)]
@@ -223,6 +224,7 @@ fn local_config(base_url: Option<String>) -> HostConfig {
         base_url: base_url.map(|u| u.trim_end_matches('/').to_string()),
         connectors: connectors_from_env(),
         github_app: github_app_from_env(),
+        sso_apps: sso_apps_from_env(),
         ..Default::default()
     }
 }
@@ -359,6 +361,7 @@ async fn serve(
         telemetry,
         connectors: connectors_from_env(),
         github_app: github_app_from_env(),
+        sso_apps: sso_apps_from_env(),
         ..Default::default()
     };
     let app = App::new(store, cfg, allow_private_webhooks);

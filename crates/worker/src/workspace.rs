@@ -505,6 +505,7 @@ impl DurableObject for Workspace {
             hosting,
             connectors: crate::connect::connectors(&self.env, &origin, multi),
             github_app: crate::connect::github_app(&self.env),
+            sso_apps: crate::connect::sso_apps(&self.env, &origin, multi),
             // Session recordings and browser error reports; off unless these are set.
             telemetry: Telemetry::new(
                 var(&self.env, "QUILL_HOST").as_deref(),

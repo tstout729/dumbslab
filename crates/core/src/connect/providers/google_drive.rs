@@ -24,6 +24,8 @@ static INFO: ProviderInfo = ProviderInfo {
         // A refresh token, every time: Google sends one only when the person is asked to consent.
         extra: &[("access_type", "offline"), ("prompt", "consent"), ("include_granted_scopes", "true")],
         pkce: true,
+        site: None,
+        refresh_revokes: false,
     }),
     token_fields: &[],
     token_help: "",

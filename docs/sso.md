@@ -2,9 +2,41 @@
 
 People can sign in with your organization's identity provider instead of a password: Google Workspace, Microsoft Entra ID, Okta, OneLogin, Slack, or any other OpenID Connect provider. Each workspace sets it up for itself, in Settings › Single sign-on. It's on every plan.
 
-## Before you start
+## Set it up with Google, Microsoft or Slack
 
-The server needs a **connector key**, the same one [connected apps](connected-apps.md) use. It encrypts the client secret. Without it, Settings › Single sign-on says it isn't available.
+There's nothing to register. DumbSlab has its own Google, Microsoft and Slack sign-in apps, and you sign in once with your organization's account.
+
+1. As a workspace admin, open Settings › Single sign-on.
+2. Choose **Set up with Google**, **Set up with Microsoft** or **Set up with Slack**.
+3. Sign in with your organization's account: a Google Workspace account, a Microsoft work or school account, or your Slack workspace's account. Approve DumbSlab if asked.
+4. You come back to Settings › Single sign-on. The "Sign in with …" button is on, and your own account is linked.
+5. Check the allowed email domains, then try signing in from a private window. Turn on auto-provisioning or "Require single sign-on" afterwards, if you want them. Setting up leaves both as they were (off, at first).
+
+DumbSlab reads your organization from the account you sign in with:
+
+| Provider | Only these accounts can sign in | Allowed email domain |
+| --- | --- | --- |
+| Google | your Google Workspace domain (the account's `hd`) | that domain |
+| Microsoft | your Microsoft Entra directory (the account's `tid`) | your email's domain, when Microsoft confirms its owner (`xms_edov`) |
+| Slack | your Slack workspace (`https://slack.com/team_id`) | none at first: Slack confirms your address, not that its domain is your organization's. Settings suggests it, and one click allows it |
+
+Personal Google accounts and personal Microsoft accounts can't be used: they have no organization. DumbSlab never allows or suggests a free-mail domain from Microsoft or Slack, such as gmail.com, outlook.com or tutamail.com (Google's domain is always your Workspace's own). When it can't take a domain from your sign-in, Settings says so, and you add your email domains there (or allow the one it suggests).
+
+**Microsoft approval.** Some organizations let only their administrators approve new apps. If yours does, Microsoft asks for an administrator, and DumbSlab says so. A Microsoft Entra administrator can approve DumbSlab (under Enterprise applications › Admin consent requests, when your organization uses them), or do the setup themselves if they're an admin here too.
+
+**Replacing other settings.** If single sign-on is already set up with your own app, or with another provider, Settings asks before replacing it. Accounts linked at the old provider stop signing in.
+
+**Switching apps.** You can switch between DumbSlab's app and your own at any time; linked accounts carry over. Microsoft gives each app a different `sub` for the same person, so DumbSlab links Microsoft accounts by their `oid`, which is the same for every app in your directory. Microsoft accounts linked before that (self-hosted servers that used single sign-on earlier) are linked by `sub`; each moves to its `oid` the next time that person signs in. If you switch Microsoft apps before everyone has, the links that couldn't move are forgotten, and if "Require single sign-on" is on and anyone besides admins lost a link, it's turned off and Settings says why. Those people sign in with Microsoft (matched by verified email) or with their password, and link Microsoft in Settings › Profile. Then turn "Require single sign-on" back on; Settings asks you to confirm they have (agents pass `relinked: true` with `require_sso: true`), so an old form or script can't turn it on by accident.
+
+**If the server loses its app.** Single sign-on turns itself off, so "Require single sign-on" never locks anyone out, and Settings says why. Everyone can sign in with a password until the app is back, or until you set up your own app.
+
+Self-hosted servers have these buttons only when whoever runs the server adds their own sign-in apps (see [Sign-in apps](hosting/sign-in-apps.md)).
+
+## Set it up with your own app
+
+Use this for Okta, OneLogin and other OpenID Connect providers, or to use an app you registered with Google, Microsoft or Slack yourself. It's under **Use your own app** in Settings › Single sign-on.
+
+The server needs a **connector key**, the same one [connected apps](connected-apps.md) use. It encrypts the client secret. Without it, Settings › Single sign-on says your own app isn't available.
 
 | Host | Setting |
 | --- | --- |
@@ -20,16 +52,14 @@ You register an app with your provider. Its **redirect URI** is your workspace's
 
 Settings › Single sign-on shows it with a copy button. If the workspace's address changes, change it in the provider's app too.
 
-## Set it up
-
 1. Register an app with your provider (see [the providers](#the-providers)) and copy its client ID and client secret.
-2. In Settings › Single sign-on, choose the provider and fill in its details, the client ID and secret, and your organization's email domains.
+2. In Settings › Single sign-on › Use your own app, choose the provider and fill in its details, the client ID and secret, and your organization's email domains.
 3. Tick "Show “Sign in with …” on the sign-in page" and save. DumbSlab reads the provider's discovery document and says whether it checks out.
 4. Try signing in from a private window. Then turn on auto-provisioning or require single sign-on, if you want them.
 
 ## Who can sign in
 
-- **Linked accounts.** DumbSlab links each account at the provider to one person here, by the provider's issuer and its permanent ID for the account (`sub`). A linked account signs in as that person, whatever email it has later.
+- **Linked accounts.** DumbSlab links each account at the provider to one person here, by the provider's issuer and its permanent ID for the account: `sub`, or for Microsoft `oid` (its `sub` is different for every app). A linked account signs in as that person, whatever email it has later.
 - **First sign-in.** An account that isn't linked yet joins the person here with the same email only when the provider says the address is verified and its domain is one of the allowed domains. The rules for each provider are in the table below.
 - **Linking your own account.** When the provider doesn't vouch for someone's email, or their email there differs from the one here, they sign in with their password and choose Settings › Profile › "Link your … account". Linking must finish in the same browser session that started it, while it's still signed in: a link started in a session that is then signed out (or revoked) can't be finished anywhere.
 - **Auto-provisioning** is off by default. When it's on, someone whose verified email is at an allowed domain, and who has no account here, joins as a member.
@@ -52,6 +82,8 @@ With "Require single sign-on" on, only admins can sign in with a password, so an
 It applies only while single sign-on is on and fully set up. Turning single sign-on off lets everyone use their password again.
 
 ## The providers
+
+These steps are for your own app. With Google, Microsoft or Slack you can skip them and [set up by signing in](#set-it-up-with-google-microsoft-or-slack).
 
 ### Google Workspace
 
@@ -102,17 +134,30 @@ Auth0, Keycloak, JumpCloud, Ping, Authentik and others work the same way.
 ## How it works
 
 - Signing in uses OpenID Connect's authorization code flow with PKCE (S256), a `state` and a `nonce`. The `state` is stored hashed and works once, for 15 minutes, in the browser that started it (a short-lived cookie names that browser).
+- With DumbSlab's own apps on hosted DumbSlab, every workspace's sign-ins come back to `https://dumbslab.com/sso/callback`. The `state` starts with the workspace's address, and that page only sends the browser on to the workspace's own `/sso/callback`, which checks everything as usual.
+- Setting up by signing in is the same flow, tied to the admin's browser session instead of a cookie, the way linking is. It must finish in that session, still signed in, by someone who is still an admin, and the settings must be as they were when it started. Microsoft setups start at Microsoft's `organizations` endpoints, whose issuer is `https://login.microsoftonline.com/{tenantid}/v2.0`. The admin's ID token must name a directory (`tid`, a GUID, not personal accounts' `9188040d-6c67-4c5b-b112-36a304b66dad`), and its issuer must be exactly that template with its own `tid`. Later sign-ins use that directory's own issuer.
 - Each sign-in reads `<issuer>/.well-known/openid-configuration`. Its `issuer` must equal the configured issuer exactly, and its endpoints must be https.
 - The code is exchanged at the token endpoint with the client secret: with HTTP Basic, or in the form for providers that only take that (Slack).
 - The ID token arrives straight from the token endpoint over TLS, so, as OpenID Connect Core 1.0 section 3.1.3.7 allows, its signature isn't checked. Its issuer, audience, authorized party, expiry, issue time and nonce are. When it lacks the email or `email_verified`, and the account isn't linked yet, DumbSlab asks the userinfo endpoint (except Microsoft's). Its answer must be about the same `sub`, and its `email_verified` counts only for the ID token's own address.
 - The core builds every request and reads every answer; the host only sends them, over https, without following redirects, within 8 seconds and reading at most 4 MB. The self-hosted server refuses private network addresses unless it runs with `--allow-private-webhooks`.
 - A sign-in starts an ordinary browser session, with the same cookie rules and 30-day length as a password sign-in.
-- Problems send people back to the sign-in page (or Settings › Profile, when linking) with only an error code, such as `?sso_error=unverified_email`. The page shows its own message for each code, so a link can't make the sign-in page say anything else, and nothing the provider sends (error text, tokens) ever reaches it. The admin's settings check gives the details of a provider that doesn't check out.
-- Changes to the settings, every newly linked account (linked by the person, matched by a verified email on a first sign-in, or created by auto-provisioning) and people who join appear in the admins' activity log (`sso.updated`, `sso.linked`, `sso.unlinked`, `user.created`). Events that happen during a sign-in aren't sent to webhooks.
+- Problems send people back to the sign-in page (or Settings › Profile when linking, or Settings › Single sign-on when setting up) with only an error code, such as `?sso_error=unverified_email`. The page shows its own message for each code, so a link can't make the sign-in page say anything else, and nothing the provider sends (error text, tokens) ever reaches it. The admin's settings check gives the details of a provider that doesn't check out.
+- Changes to the settings, every newly linked account (linked by the person, matched by a verified email on a first sign-in, created by auto-provisioning, or linked while setting up) and people who join appear in the admins' activity log (`sso.updated`, `sso.linked`, `sso.unlinked`, `user.created`). Events that happen during a sign-in aren't sent to webhooks; setting up's are, like any settings change.
 
 ## For agents and scripts
 
-The operations are `get_sso`, `update_sso`, `list_sso_identities`, `link_sso` and `unlink_sso`. For example, as an admin:
+The operations are `get_sso`, `update_sso`, `setup_sso`, `allow_suggested_sso_domain`, `list_sso_identities`, `link_sso` and `unlink_sso`. `allow_suggested_sso_domain` allows Slack's suggested domain: it takes the `suggested_domain` and `suggestion_id` from `get_sso`, adds the domain to the allowed domains as they are now, and refuses if the suggestion or the provider changed since.
+
+`setup_sso` needs a person signing in from a browser, so it works only from the web app. An agent can set up shared mode with `update_sso` and `shared: true`, giving the domain, tenant or team itself. `get_sso` lists the providers the server has its own app for in `shared_providers`:
+
+```sh
+curl -X PATCH https://acme.dumbslab.com/api/v1/sso \
+  -H "Authorization: Bearer $DUMBSLAB_TOKEN" -H "content-type: application/json" \
+  -d '{"provider": "microsoft", "shared": true, "tenant": "72f988bf-86f1-41af-91ab-2d7cd011db47",
+       "allowed_domains": ["acme.com"], "enabled": true}'
+```
+
+With your own app, as an admin:
 
 ```sh
 curl -X PATCH https://acme.dumbslab.com/api/v1/sso \

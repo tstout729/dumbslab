@@ -28,7 +28,7 @@ An open-source team knowledge base, written in Rust and built so AI agents can d
 | Admin | Workspace settings, API tokens with scopes, signed webhooks, JSON export |
 | Slack | `/dumbslab search` and `/dumbslab new` from Slack as yourself, previews of links to posts everyone can see, and messages in chosen channels when posts are published or updated. See [docs/slack.md](docs/slack.md) |
 | Connected apps | Everyone connects their own GitHub, Google Drive, Slack, Jira, Confluence, Zendesk, Asana, Box, Dropbox, Guru and more, to search them from DumbSlab and preview links to them in posts. See [docs/connected-apps.md](docs/connected-apps.md) |
-| Single sign-on | Sign in with Google Workspace, Microsoft Entra ID, Okta, OneLogin, Slack or any OpenID Connect provider, set up per workspace on every plan. Optional auto-provisioning, and an option to require it for everyone but admins. See [docs/sso.md](docs/sso.md) |
+| Single sign-on | Sign in with Google Workspace, Microsoft Entra ID, Okta, OneLogin, Slack or any OpenID Connect provider, set up per workspace on every plan. Google, Microsoft and Slack set up in one click: an admin signs in once with DumbSlab's own app. Optional auto-provisioning, and an option to require it for everyone but admins. See [docs/sso.md](docs/sso.md) |
 
 ## Quick start
 
@@ -46,7 +46,8 @@ Options (flags or environment variables):
 | `--bind` | `DUMBSLAB_BIND` | `127.0.0.1:8080` |
 | `--base-url` | `DUMBSLAB_BASE_URL` | the request's origin |
 | `--setup-token` | `DUMBSLAB_SETUP_TOKEN` | generated and logged |
-| | `DUMBSLAB_CONNECTOR_KEY` | unset: [connected apps](docs/connected-apps.md), [single sign-on](docs/sso.md), [Slack](docs/slack.md), people sync and docs sync are off |
+| | `DUMBSLAB_CONNECTOR_KEY` | unset: [connected apps](docs/connected-apps.md), [single sign-on](docs/sso.md) with your own app, [Slack](docs/slack.md), people sync and docs sync are off |
+| | `DUMBSLAB_SSO_GOOGLE_CLIENT_ID`, `DUMBSLAB_SSO_MICROSOFT_CLIENT_ID`, `DUMBSLAB_SLACK_CLIENT_ID` and their `_CLIENT_SECRET`s | unset: no one-click single sign-on with that provider ([sign-in apps](docs/hosting/sign-in-apps.md)) |
 | `--open-setup` | | off (local development only: setup without a token) |
 | `--quill-host` | `DUMBSLAB_QUILL_HOST` | off: record sessions in this [Quill](https://github.com/164investments/quill) or other PostHog-compatible server |
 | `--quill-token` | `DUMBSLAB_QUILL_TOKEN` | off: that project's public `phc_` token |

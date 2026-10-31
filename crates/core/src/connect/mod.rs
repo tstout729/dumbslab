@@ -167,7 +167,9 @@ pub struct Field {
 /// How a provider's OAuth sign-in works.
 #[derive(Clone, Copy, Debug)]
 pub struct OAuthSpec {
+    /// The sign-in page. For apps with a [`OAuthSpec::site`], its path on the customer's site.
     pub authorize_url: &'static str,
+    /// The token endpoint. For apps with a [`OAuthSpec::site`], its path on the customer's site.
     pub token_url: &'static str,
     pub scopes: &'static [&'static str],
     /// `scope`, or Slack's `user_scope` for user tokens.
@@ -176,6 +178,24 @@ pub struct OAuthSpec {
     /// Extra query parameters for the authorize URL.
     pub extra: &'static [(&'static str, &'static str)],
     pub pkce: bool,
+    /// For apps whose sign-in is on each customer's own site (Zendesk's `<subdomain>.zendesk.com`):
+    /// what the person fills in first. [`Connector::sign_in_site`] checks it; the credential keeps
+    /// it under this field's key, so its tokens only ever go back to that site.
+    pub site: Option<Field>,
+    /// Refreshing revokes the access token it replaces, not just the refresh token (Zendesk). While
+    /// one request refreshes, no other may use the old token (see [`renewal`]), and a token the app
+    /// refuses may just have been replaced by another request (see [`recover`]).
+    pub refresh_revokes: bool,
+}
+
+/// A customer's own site, for apps that sign in there (see [`OAuthSpec::site`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Site {
+    /// What the credential keeps, e.g. `acme`.
+    pub name: String,
+    /// Where signing in happens: `https://` and a host, nothing after it, e.g.
+    /// `https://acme.zendesk.com`.
+    pub origin: String,
 }
 
 /// What the workspace shows about a provider.
@@ -311,15 +331,22 @@ pub trait Connector: Sync {
     /// Reads the answers to [`Connector::search`], best first, at most `limit`.
     fn read_search(&self, account: &Account, replies: &[HttpReply], limit: usize) -> Result<Vec<Hit>, String>;
 
-    /// The request that exchanges a sign-in code (or a refresh token) for tokens. `form` holds
-    /// the standard OAuth fields; most apps take them, with the client's, as a form.
-    fn token_request(&self, app: &OAuthApp, form: Vec<(String, String)>) -> HttpCall {
-        let spec = self.info().oauth.expect("only OAuth providers exchange tokens");
+    /// For apps with an [`OAuthSpec::site`]: what the person filled in (or the credential kept),
+    /// checked strictly, as a [`Site`]; or what to fix. Its origin is the only host that sign-in,
+    /// token exchanges and refreshes go to.
+    fn sign_in_site(&self, _input: &str) -> Result<Site, String> {
+        Err(format!("{} signs in at one address for everyone.", self.info().name))
+    }
+
+    /// The request to `token_url` (see [`oauth_urls`]) that exchanges a sign-in code (or a
+    /// refresh token) for tokens. `form` holds the standard OAuth fields; most apps take them,
+    /// with the client's, as a form.
+    fn token_request(&self, app: &OAuthApp, token_url: &str, form: Vec<(String, String)>) -> HttpCall {
         let mut all = form;
         all.push(("client_id".into(), app.client_id.clone()));
         all.push(("client_secret".into(), app.client_secret.clone()));
         let pairs: Vec<(&str, &str)> = all.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-        HttpCall::post_form(spec.token_url, &pairs).header("accept", "application/json")
+        HttpCall::post_form(token_url, &pairs).header("accept", "application/json")
     }
 
     /// Reads the token endpoint's answer. Most apps answer with standard OAuth JSON.
@@ -672,19 +699,119 @@ pub fn oauth_app<'a>(cfg: &'a HostConfig, provider: &str) -> Option<&'a OAuthApp
     cfg.connectors.apps.get(provider).filter(|a| !a.client_id.is_empty() && !a.client_secret.is_empty())
 }
 
+/// Apps that can share one OAuth app, and the name of the shared one: a single Atlassian app
+/// signs people in to Jira and Confluence (sign-ins then ask for both; see [`sign_in_scopes`]).
+/// Trello's OAuth clients are made in Trello's own app admin, not Atlassian's developer console,
+/// so Trello can't share it.
+const SHARED_APPS: &[(&str, &str)] = &[("jira", "ATLASSIAN"), ("confluence", "ATLASSIAN")];
+
+/// The name an app's settings use: its id in capitals with `-` as `_`, e.g. `GOOGLE_DRIVE`.
+pub fn env_name(id: &str) -> String {
+    id.to_ascii_uppercase().replace('-', "_")
+}
+
+/// The OAuth apps a host's settings register, read with `var` by name: `<APP>_CLIENT_ID` and
+/// `<APP>_CLIENT_SECRET` (hosts add their own prefix, like `DUMBSLAB_`). An app without both of
+/// its own uses a shared app's (see [`SHARED_APPS`]), so `ATLASSIAN_CLIENT_ID` and
+/// `ATLASSIAN_CLIENT_SECRET` cover Jira and Confluence at once.
+pub fn oauth_apps(var: impl Fn(&str) -> Option<String>) -> BTreeMap<String, OAuthApp> {
+    let pair = |name: &str| match (var(&format!("{name}_CLIENT_ID")), var(&format!("{name}_CLIENT_SECRET"))) {
+        (Some(client_id), Some(client_secret)) if !client_id.is_empty() && !client_secret.is_empty() => {
+            Some(OAuthApp { client_id, client_secret })
+        }
+        _ => None,
+    };
+    let mut apps = BTreeMap::new();
+    for c in providers::ALL {
+        let id = c.info().id;
+        let shared = SHARED_APPS.iter().find(|(app, _)| *app == id).and_then(|(_, name)| pair(name));
+        if let Some(app) = pair(&env_name(id)).or(shared) {
+            apps.insert(id.to_string(), app);
+        }
+    }
+    apps
+}
+
+/// The sign-in page and the token endpoint for a connection to `connector` whose credential (so
+/// far) is `cred`: the app's own, or for apps on each customer's site ([`OAuthSpec::site`]), the
+/// spec's paths on the site the credential keeps. Nothing else decides the host.
+pub fn oauth_urls(connector: &dyn Connector, cred: &Credential) -> Result<(String, String), String> {
+    let info = connector.info();
+    let spec = info.oauth.ok_or_else(|| format!("{} has no sign-in.", info.name))?;
+    let Some(field) = spec.site else { return Ok((spec.authorize_url.to_string(), spec.token_url.to_string())) };
+    let site = connector.sign_in_site(cred.field(field.key))?;
+    // An origin is `https://` and a host, nothing more; the paths are the spec's own.
+    let bare = site.origin.strip_prefix("https://").is_some_and(|host| {
+        !host.is_empty() && host.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'.')
+    });
+    if !bare || !spec.authorize_url.starts_with('/') || !spec.token_url.starts_with('/') {
+        return Err(format!("{} named a sign-in address that isn't one.", info.name));
+    }
+    Ok((format!("{}{}", site.origin, spec.authorize_url), format!("{}{}", site.origin, spec.token_url)))
+}
+
+/// The scopes signing in to `id` asks for: its own, and those of the other apps this server signs
+/// in with the same OAuth client at the same place (one Atlassian app for Jira and Confluence).
+/// Atlassian keeps one grant per person and client, and each new consent replaces its scopes, so
+/// connecting Confluence mustn't take away what a Jira connection needs.
+fn sign_in_scopes(cfg: &HostConfig, id: &str, spec: &OAuthSpec, app: &OAuthApp) -> Vec<&'static str> {
+    let mut scopes = spec.scopes.to_vec();
+    for other in providers::ALL.iter().map(|p| p.info()).filter(|o| o.id != id) {
+        let shared = other.oauth.filter(|o| o.authorize_url == spec.authorize_url && o.site.is_none() && spec.site.is_none());
+        let Some(o) = shared.filter(|_| oauth_app(cfg, other.id).is_some_and(|a| a.client_id == app.client_id)) else { continue };
+        for scope in o.scopes {
+            if !scopes.contains(scope) {
+                scopes.push(scope);
+            }
+        }
+    }
+    scopes
+}
+
 fn pkce_challenge(verifier: &str) -> String {
     URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()))
 }
 
+/// What a sign-in under way keeps for its token exchange, in `connect_requests.verifier`: the
+/// PKCE verifier as it is, or, for apps on each customer's site, both it and the site as JSON.
+/// The site stays on the server, never in the `state` that travels through the browser. A bare
+/// verifier (letters and digits) never starts with `{`.
+#[derive(Debug, Default, PartialEq, Serialize, Deserialize)]
+struct Pending {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    verifier: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    site: Option<String>,
+}
+
+impl Pending {
+    fn to_column(&self) -> ApiResult<Option<String>> {
+        match &self.site {
+            None => Ok(self.verifier.clone()),
+            Some(_) => serde_json::to_string(self).map(Some).map_err(|e| ApiError::internal(e.to_string())),
+        }
+    }
+
+    /// `None` when the column holds something else.
+    fn from_column(column: Option<String>) -> Option<Pending> {
+        match column {
+            Some(json) if json.starts_with('{') => serde_json::from_str(&json).ok(),
+            verifier => Some(Pending { verifier, site: None }),
+        }
+    }
+}
+
 /// Starts signing in with an app: records who asked, and returns the app's sign-in URL. On
 /// hosted DumbSlab the `state` starts with the workspace address, so the root domain can send the
-/// person back to their workspace.
+/// person back to their workspace. Apps on each customer's own site ([`OAuthSpec::site`]) need
+/// `site`, what the person filled in for it; others refuse one.
 pub fn start_sign_in(
     db: &dyn Db,
     cfg: &HostConfig,
     base_url: &str,
     user_id: &str,
     connector: &dyn Connector,
+    site: Option<&str>,
     now: DateTime<Utc>,
 ) -> ApiResult<String> {
     key_of(cfg)?;
@@ -695,6 +822,19 @@ pub fn start_sign_in(
             info.name
         )));
     };
+    // The credential so far: for apps on each customer's site, which site.
+    let mut cred = Credential::default();
+    let site = site.map(str::trim).filter(|s| !s.is_empty());
+    match (spec.site, site) {
+        (None, None) => {}
+        (None, Some(_)) => return Err(ApiError::bad_request(format!("{} signs in without `site`; leave it out", info.name))),
+        (Some(field), None) => return Err(ApiError::bad_request(format!("{} needs `site` ({}) to sign in", info.name, field.label))),
+        (Some(field), Some(input)) => {
+            let site = connector.sign_in_site(input).map_err(ApiError::bad_request)?;
+            cred.fields.insert(field.key.into(), site.name);
+        }
+    }
+    let (authorize_url, _) = oauth_urls(connector, &cred).map_err(ApiError::bad_request)?;
     db.execute("DELETE FROM connect_requests WHERE created_at < ?", &params![ts(now - Duration::minutes(SIGN_IN_MINUTES))])?;
     let random = crate::util::new_secret("");
     let state = match &cfg.workspace {
@@ -702,9 +842,10 @@ pub fn start_sign_in(
         None => random,
     };
     let verifier = spec.pkce.then(|| crate::util::new_secret("") + &crate::util::new_secret(""));
+    let pending = Pending { verifier: verifier.clone(), site: spec.site.map(|f| cred.field(f.key).to_string()) };
     db.execute(
         "INSERT INTO connect_requests (state_hash, user_id, provider, verifier, created_at) VALUES (?, ?, ?, ?, ?)",
-        &params![sha256_hex(&state), user_id, info.id, verifier.clone(), ts(now)],
+        &params![sha256_hex(&state), user_id, info.id, pending.to_column()?, ts(now)],
     )?;
     let mut query: Vec<(String, String)> = vec![
         ("client_id".into(), app.client_id.clone()),
@@ -712,8 +853,9 @@ pub fn start_sign_in(
         ("response_type".into(), "code".into()),
         ("state".into(), state),
     ];
-    if !spec.scopes.is_empty() {
-        query.push((spec.scope_param.into(), spec.scopes.join(spec.scope_separator)));
+    let scopes = sign_in_scopes(cfg, info.id, &spec, app);
+    if !scopes.is_empty() {
+        query.push((spec.scope_param.into(), scopes.join(spec.scope_separator)));
     }
     for (k, v) in spec.extra {
         query.push(((*k).into(), (*v).into()));
@@ -723,7 +865,7 @@ pub fn start_sign_in(
         query.push(("code_challenge_method".into(), "S256".into()));
     }
     let qs = query.iter().map(|(k, v)| format!("{}={}", urlencoding::encode(k), urlencoding::encode(v))).collect::<Vec<_>>().join("&");
-    Ok(format!("{}?{qs}", spec.authorize_url))
+    Ok(format!("{authorize_url}?{qs}"))
 }
 
 /// Why connecting by signing in didn't work. Only these codes go in the link back to Settings,
@@ -810,11 +952,26 @@ pub fn callback(db: &dyn Db, cfg: &HostConfig, req: &Request) -> crate::Outcome 
             (_, Some(_)) => return Ok(redirect(settings_url(&base, &provider, Err(SignInError::Declined)))),
             _ => return Ok(redirect(settings_url(&base, &provider, Err(SignInError::NoCode)))),
         };
+        let failed = || Ok(redirect(settings_url(&base, &provider, Err(SignInError::Failed))));
+        let Some(pending) = Pending::from_column(row.opt_str("verifier")) else { return failed() };
+        // An app on each customer's site gets the site this sign-in started with, checked again;
+        // other apps never get one.
+        let mut cred = Credential::default();
+        match (connector.info().oauth.and_then(|s| s.site), pending.site) {
+            (None, None) => {}
+            (Some(field), Some(site)) => match connector.sign_in_site(&site) {
+                Ok(site) => {
+                    cred.fields.insert(field.key.into(), site.name);
+                }
+                Err(_) => return failed(),
+            },
+            _ => return failed(),
+        }
         let job = Job::Connect(ConnectJob {
             user_id: row.str("user_id"),
             provider: connector.info().id,
-            sign_in: Some(SignIn { code, verifier: row.opt_str("verifier"), redirect_uri: callback_url(cfg, &base) }),
-            cred: Credential::default(),
+            sign_in: Some(SignIn { code, verifier: pending.verifier, redirect_uri: callback_url(cfg, &base) }),
+            cred,
             expires_at: None,
             phase: ConnectPhase::Start,
             back_to: Some(base.clone()),
@@ -959,9 +1116,10 @@ impl Job {
     }
 
     /// What the job's operations left for the host to deliver once it finishes: a draft started
-    /// from Slack, and posts a docs sync wrote, have webhooks to send. Events a sign-in records send
-    /// no webhooks, and connected apps' jobs record none. Hosts deliver them when the job ends,
-    /// also when a step failed: a sync's committed steps keep theirs (see [`Job::settle`]).
+    /// from Slack, posts a docs sync wrote, and single sign-on an admin set up by signing in have
+    /// webhooks to send. Events a sign-in records send no webhooks, and connected apps' jobs record
+    /// none. Hosts deliver them when the job ends, also when a step failed: a sync's committed
+    /// steps keep theirs (see [`Job::settle`]).
     pub fn take_effects(&mut self) -> Vec<crate::Effect> {
         match self {
             Job::Slack(j) => j.take_effects(),
@@ -969,13 +1127,15 @@ impl Job {
             Job::People(j) => j.take_effects(),
             Job::GitHub(j) => j.take_effects(),
             Job::GitLab(j) => j.take_effects(),
+            Job::Sso(j) => j.take_effects(),
             _ => vec![],
         }
     }
 
     /// After each step, whether it was kept. A sync's committed steps keep their effects for the
     /// host to deliver when the job ends, however it ends; a rolled-back step's go with it. A
-    /// Slack job keeps its effects only if it finishes, as it always has. [`guarded_step`] calls this.
+    /// Slack job, and single sign-on's setting up, keep their effects only if the step that made
+    /// them is kept. [`guarded_step`] calls this.
     pub fn settle(&mut self, committed: bool) {
         match self {
             Job::Docs(j) => j.settle(committed),
@@ -983,6 +1143,7 @@ impl Job {
             Job::GitHub(j) => j.settle(committed),
             Job::GitLab(j) => j.settle(committed),
             Job::Slack(j) if !committed => drop(j.take_effects()),
+            Job::Sso(j) if !committed => drop(j.take_effects()),
             _ => {}
         }
     }
@@ -1019,8 +1180,12 @@ enum SearchPhase {
     Start,
     /// Refreshing these connections' tokens first; then the rest, and the apps that failed.
     Refreshing(Vec<Connection>, Vec<Connection>, Vec<AppResult>),
-    /// Waiting for search answers: each connection and how many requests it sent.
-    Searching(Vec<(Connection, usize)>, Vec<AppResult>),
+    /// Waiting for search answers: each connection and how many requests it sent, and the results
+    /// so far.
+    Searching(Vec<(Connection, usize)>, ConnectedResults),
+    /// Waiting for searches sent again with tokens other requests saved meanwhile (see
+    /// [`recover`]); they're read as they come.
+    Retrying(Vec<(Connection, usize)>, ConnectedResults),
 }
 
 impl SearchJob {
@@ -1044,6 +1209,8 @@ enum PreviewPhase {
     Start,
     Refreshing,
     Fetching,
+    /// Fetching again with the token another request saved meanwhile (see [`recover`]).
+    Retrying,
 }
 
 impl PreviewJob {
@@ -1144,18 +1311,21 @@ pub struct ConnectedAccount {
     pub connected_at: String,
 }
 
-/// The token expires soon and can be refreshed.
+/// The token expires soon and can be refreshed: at the connection's own site, for apps that
+/// have one (see [`oauth_urls`]).
 fn needs_refresh(cfg: &HostConfig, conn: &Connection, now: DateTime<Utc>) -> bool {
     conn.cred.refresh_token.is_some()
         && conn.expires_at.is_some_and(|e| e - Duration::seconds(REFRESH_MARGIN_SECS) <= now)
         && oauth_app(cfg, conn.provider).is_some()
+        && providers::get(conn.provider).is_some_and(|p| oauth_urls(p, &conn.cred).is_ok())
 }
 
 fn refresh_call(cfg: &HostConfig, conn: &Connection) -> HttpCall {
     let p = providers::get(conn.provider).expect("known provider");
     let app = oauth_app(cfg, conn.provider).expect("checked by needs_refresh");
+    let (_, token_url) = oauth_urls(p, &conn.cred).expect("checked by needs_refresh");
     let refresh = conn.cred.refresh_token.clone().unwrap_or_default();
-    p.token_request(app, vec![("grant_type".into(), "refresh_token".into()), ("refresh_token".into(), refresh)])
+    p.token_request(app, &token_url, vec![("grant_type".into(), "refresh_token".into()), ("refresh_token".into(), refresh)])
 }
 
 /// What a request does about a token that expires soon.
@@ -1165,8 +1335,14 @@ enum Renewal {
     Refresh,
     /// Another request is refreshing it, and the current token still works until it expires.
     UseCurrent,
-    /// Another request is refreshing it, and the current token has expired.
+    /// Another request is refreshing it, and the current token has expired, or is about to be
+    /// revoked by that refresh ([`OAuthSpec::refresh_revokes`]).
     Wait,
+}
+
+/// Refreshing `provider`'s tokens revokes the access token being replaced.
+fn refresh_revokes(provider: &str) -> bool {
+    providers::get(provider).and_then(|p| p.info().oauth).is_some_and(|o| o.refresh_revokes)
 }
 
 /// How long one request may take refreshing a token before another may try.
@@ -1175,7 +1351,9 @@ const REFRESH_LEASE_SECS: i64 = 30;
 /// Lets one request at a time refresh a connection's token. Apps that hand out a new refresh token
 /// each time (Box, Atlassian, monday) refuse the old one once it's used, so two requests refreshing
 /// together would leave one asking the person to reconnect. Refreshing starts
-/// [`REFRESH_MARGIN_SECS`] before the token expires, so the others can keep using it meanwhile.
+/// [`REFRESH_MARGIN_SECS`] before the token expires, so the others can keep using it meanwhile,
+/// except where the refresh revokes it ([`OAuthSpec::refresh_revokes`]): there they never send the
+/// old token, which could be refused at any moment, and wait for the new one instead.
 fn renewal(db: &dyn Db, user_id: &str, conn: &mut Connection, now: DateTime<Utc>) -> ApiResult<Renewal> {
     // When it runs out, then a random id: each lease is this request's alone.
     let lease = format!("{} {}", ts(now + Duration::seconds(REFRESH_LEASE_SECS)), crate::util::new_id());
@@ -1188,7 +1366,7 @@ fn renewal(db: &dyn Db, user_id: &str, conn: &mut Connection, now: DateTime<Utc>
             conn.lease = Some(lease);
             Renewal::Refresh
         }
-        false if conn.expires_at.is_some_and(|e| e > now) => Renewal::UseCurrent,
+        false if conn.expires_at.is_some_and(|e| e > now) && !refresh_revokes(conn.provider) => Renewal::UseCurrent,
         false => Renewal::Wait,
     })
 }
@@ -1233,12 +1411,47 @@ fn apply_refresh(
     if let Some(r) = tokens.refresh_token.clone() {
         conn.cred.refresh_token = Some(r);
     }
-    conn.cred.fields.extend(tokens.fields.clone());
+    keep_fields(p, &mut conn.cred, tokens.fields.clone());
     conn.expires_at = expiry(now, &tokens);
     if !save_token(db, cfg, user_id, conn, now)? {
         return Ok(Err(reconnected_message(p.info().name)));
     }
     Ok(Ok(()))
+}
+
+/// What to do when an app refused a connection's token (HTTP 401).
+#[derive(Debug)]
+enum Recovery {
+    /// Another request refreshed it meanwhile: try once more with what it saved.
+    Retry(Box<Connection>),
+    /// Another request is refreshing it right now: the person should try again in a moment.
+    Busy,
+}
+
+/// For apps whose refresh revokes the token it replaces ([`OAuthSpec::refresh_revokes`]): when
+/// `replies` include a refusal, whether that's only because another request is renewing the
+/// token, or has just renewed it. `None` otherwise (other apps, or no refusal), so the answer is
+/// read as usual and may ask the person to reconnect.
+fn recover(
+    db: &dyn Db,
+    cfg: &HostConfig,
+    user_id: &str,
+    conn: &Connection,
+    replies: &[HttpReply],
+    now: DateTime<Utc>,
+) -> ApiResult<Option<Recovery>> {
+    if !refresh_revokes(conn.provider) || !replies.iter().any(|r| r.status == 401) {
+        return Ok(None);
+    }
+    let saved = connections(db, cfg, user_id)?.into_iter().find(|c| c.provider == conn.provider);
+    if let Some(saved) = saved.filter(|s| s.cred.token != conn.cred.token && !needs_refresh(cfg, s, now)) {
+        return Ok(Some(Recovery::Retry(Box::new(saved))));
+    }
+    let renewing = db.one(
+        "SELECT provider FROM connections WHERE user_id = ? AND provider = ? AND refreshing_until > ?",
+        &params![user_id, conn.provider, ts(now)],
+    )?;
+    Ok(renewing.map(|_| Recovery::Busy))
 }
 
 fn failed_app(provider: &'static str, error: String) -> AppResult {
@@ -1248,6 +1461,13 @@ fn failed_app(provider: &'static str, error: String) -> AppResult {
 
 fn reconnect_message(name: &str) -> String {
     format!("{name} needs you to connect it again (Settings › Connected apps).")
+}
+
+/// Keeps what a token answer adds (Wrike's API host) with the credential. Never the site an app on
+/// each customer's site signed in at: the answer can't send the tokens anywhere else.
+fn keep_fields(connector: &dyn Connector, cred: &mut Credential, fields: BTreeMap<String, String>) {
+    let site = connector.info().oauth.and_then(|s| s.site).map(|f| f.key);
+    cred.fields.extend(fields.into_iter().filter(|(k, _)| Some(k.as_str()) != site));
 }
 
 fn expiry(now: DateTime<Utc>, tokens: &TokenSet) -> Option<DateTime<Utc>> {
@@ -1353,7 +1573,19 @@ fn preview_step(db: &dyn Db, cfg: &HostConfig, j: &mut PreviewJob, replies: Vec<
                 Err(message) => done(Err(message)),
             }
         }
-        PreviewPhase::Fetching => done(p.read_preview(&j.conn.account, &j.target, &replies)),
+        PreviewPhase::Fetching => match recover(db, cfg, &j.user_id, &j.conn, &replies, now)? {
+            Some(Recovery::Retry(saved)) => {
+                j.conn = *saved;
+                if !j.retarget() {
+                    return done(Err(reconnected_message(p.info().name)));
+                }
+                j.phase = PreviewPhase::Retrying;
+                Ok(Step::Fetch(p.preview(&j.conn.cred, &j.conn.account, &j.target)))
+            }
+            Some(Recovery::Busy) => done(Err(busy_message(p.info().name))),
+            None => done(p.read_preview(&j.conn.account, &j.target, &replies)),
+        },
+        PreviewPhase::Retrying => done(p.read_preview(&j.conn.account, &j.target, &replies)),
     }
 }
 
@@ -1407,44 +1639,72 @@ fn search_step(db: &dyn Db, cfg: &HostConfig, j: &mut SearchJob, replies: Vec<Ht
             }
             start_searching(j, fresh, failed)
         }
-        SearchPhase::Searching(plan, mut apps) => {
-            let mut items = vec![];
+        SearchPhase::Searching(plan, mut results) => {
+            let mut retry = vec![];
             let mut replies = replies.into_iter();
             for (c, n) in plan {
-                let p = providers::get(c.provider).expect("known provider");
                 let these: Vec<HttpReply> = replies.by_ref().take(n).collect();
-                match p.read_search(&c.account, &these, j.limit) {
-                    Ok(mut hits) => {
-                        hits.truncate(j.limit);
-                        for hit in &mut hits {
-                            hit.url = web_link(&hit.url);
-                        }
-                        apps.push(AppResult {
-                            provider: c.provider.into(),
-                            name: p.info().name.into(),
-                            ok: true,
-                            error: None,
-                            count: hits.len(),
-                        });
-                        items.extend(hits);
+                match recover(db, cfg, &j.user_id, &c, &these, now)? {
+                    Some(Recovery::Retry(saved)) => retry.push(*saved),
+                    Some(Recovery::Busy) => {
+                        let name = providers::get(c.provider).expect("known provider").info().name;
+                        results.apps.push(failed_app(c.provider, busy_message(name)));
                     }
-                    Err(e) => apps.push(failed_app(c.provider, e)),
+                    None => read_results(j, &c, &these, &mut results),
                 }
             }
-            let value = serde_json::to_value(ConnectedResults { items, apps }).map_err(|e| ApiError::internal(e.to_string()))?;
-            Ok(Step::Done(Finish::Fill(value)))
+            let (calls, plan) = search_calls(j, retry);
+            if calls.is_empty() {
+                return finish_search(results);
+            }
+            j.phase = SearchPhase::Retrying(plan, results);
+            Ok(Step::Fetch(calls))
+        }
+        SearchPhase::Retrying(plan, mut results) => {
+            let mut replies = replies.into_iter();
+            for (c, n) in plan {
+                let these: Vec<HttpReply> = replies.by_ref().take(n).collect();
+                read_results(j, &c, &these, &mut results);
+            }
+            finish_search(results)
         }
     }
 }
 
+/// Reads one connection's search answers into `results`.
+fn read_results(j: &SearchJob, c: &Connection, replies: &[HttpReply], results: &mut ConnectedResults) {
+    let p = providers::get(c.provider).expect("known provider");
+    match p.read_search(&c.account, replies, j.limit) {
+        Ok(mut hits) => {
+            hits.truncate(j.limit);
+            for hit in &mut hits {
+                hit.url = web_link(&hit.url);
+            }
+            results.apps.push(AppResult {
+                provider: c.provider.into(),
+                name: p.info().name.into(),
+                ok: true,
+                error: None,
+                count: hits.len(),
+            });
+            results.items.extend(hits);
+        }
+        Err(e) => results.apps.push(failed_app(c.provider, e)),
+    }
+}
+
+fn finish_search(results: ConnectedResults) -> ApiResult<Step> {
+    let value = serde_json::to_value(results).map_err(|e| ApiError::internal(e.to_string()))?;
+    Ok(Step::Done(Finish::Fill(value)))
+}
+
 fn start_searching(j: &mut SearchJob, conns: Vec<Connection>, failed: Vec<AppResult>) -> ApiResult<Step> {
     let (calls, plan) = search_calls(j, conns);
+    let results = ConnectedResults { items: vec![], apps: failed };
     if calls.is_empty() {
-        let value =
-            serde_json::to_value(ConnectedResults { items: vec![], apps: failed }).map_err(|e| ApiError::internal(e.to_string()))?;
-        return Ok(Step::Done(Finish::Fill(value)));
+        return finish_search(results);
     }
-    j.phase = SearchPhase::Searching(plan, failed);
+    j.phase = SearchPhase::Searching(plan, results);
     Ok(Step::Fetch(calls))
 }
 
@@ -1464,6 +1724,12 @@ fn connect_step(db: &dyn Db, cfg: &HostConfig, j: &mut ConnectJob, replies: Vec<
                 let Some(app) = oauth_app(cfg, j.provider) else {
                     return Ok(fail(j, SignInError::Unavailable, format!("Signing in with {name} isn't set up on this server any more.")));
                 };
+                // On the site the sign-in started with, for apps that have one (the callback put
+                // it in the credential).
+                let token_url = match oauth_urls(connector, &j.cred) {
+                    Ok((_, token_url)) => token_url,
+                    Err(e) => return Ok(fail(j, SignInError::Failed, e)),
+                };
                 let mut form = vec![
                     ("grant_type".into(), "authorization_code".into()),
                     ("code".into(), sign_in.code.clone()),
@@ -1473,7 +1739,7 @@ fn connect_step(db: &dyn Db, cfg: &HostConfig, j: &mut ConnectJob, replies: Vec<
                     form.push(("code_verifier".into(), v.clone()));
                 }
                 j.phase = ConnectPhase::Exchanging;
-                Ok(Step::Fetch(vec![connector.token_request(app, form)]))
+                Ok(Step::Fetch(vec![connector.token_request(app, &token_url, form)]))
             }
             None => {
                 j.phase = ConnectPhase::Profiling;
@@ -1486,7 +1752,7 @@ fn connect_step(db: &dyn Db, cfg: &HostConfig, j: &mut ConnectJob, replies: Vec<
                 Ok(tokens) => {
                     j.cred.token = tokens.access_token.clone();
                     j.cred.refresh_token = tokens.refresh_token.clone();
-                    j.cred.fields.extend(tokens.fields.clone());
+                    keep_fields(connector, &mut j.cred, tokens.fields.clone());
                     j.expires_at = expiry(now, &tokens);
                     j.phase = ConnectPhase::Profiling;
                     Ok(Step::Fetch(connector.profile(&j.cred)))
@@ -1592,6 +1858,53 @@ mod tests {
         decode_entities(&"&amp".repeat(500_000));
         assert!(started.elapsed() < std::time::Duration::from_secs(2), "took {:?}", started.elapsed());
         assert_eq!(html_text(&"a".repeat(100_000)).len(), 64 * 1024, "capped");
+    }
+
+    #[test]
+    fn one_atlassian_app_covers_jira_and_confluence() {
+        let env = |pairs: &[(&str, &str)]| {
+            let map: BTreeMap<String, String> = pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+            oauth_apps(move |name| map.get(name).cloned())
+        };
+        let apps = env(&[("ATLASSIAN_CLIENT_ID", "atl"), ("ATLASSIAN_CLIENT_SECRET", "atl-s"), ("GITHUB_CLIENT_ID", "gh")]);
+        assert_eq!(apps.keys().collect::<Vec<_>>(), ["confluence", "jira"], "GitHub without its secret isn't registered");
+        assert!(apps.values().all(|a| a.client_id == "atl" && a.client_secret == "atl-s"));
+        // An app's own pair wins; half of one falls back to the shared one.
+        let apps = env(&[
+            ("ATLASSIAN_CLIENT_ID", "atl"),
+            ("ATLASSIAN_CLIENT_SECRET", "atl-s"),
+            ("JIRA_CLIENT_ID", "jira"),
+            ("JIRA_CLIENT_SECRET", "jira-s"),
+            ("CONFLUENCE_CLIENT_ID", "conf"),
+            ("GOOGLE_DRIVE_CLIENT_ID", "g"),
+            ("GOOGLE_DRIVE_CLIENT_SECRET", "g-s"),
+        ]);
+        assert_eq!(apps["jira"].client_id, "jira");
+        assert_eq!(apps["confluence"].client_id, "atl");
+        assert_eq!(apps["google-drive"].client_secret, "g-s");
+        assert!(!apps.contains_key("trello") && !apps.contains_key("zendesk"));
+        assert!(env(&[("ATLASSIAN_CLIENT_ID", "atl"), ("ATLASSIAN_CLIENT_SECRET", "")]).is_empty());
+    }
+
+    #[test]
+    fn pending_sign_ins_keep_the_site_on_the_server() {
+        // Apps without a site keep the bare verifier (or nothing), as before.
+        let bare = Pending { verifier: Some("abc123".into()), site: None };
+        assert_eq!(bare.to_column().unwrap().as_deref(), Some("abc123"));
+        assert_eq!(Pending::from_column(Some("abc123".into())), Some(bare));
+        assert_eq!(Pending::default().to_column().unwrap(), None);
+        assert_eq!(Pending::from_column(None), Some(Pending::default()));
+        let both = Pending { verifier: Some("abc123".into()), site: Some("acme".into()) };
+        let column = both.to_column().unwrap();
+        assert_eq!(Pending::from_column(column), Some(both));
+        assert_eq!(Pending::from_column(Some("{not json".into())), None);
+
+        // A token answer can add fields, but never move the credential to another site.
+        let mut cred = Credential { fields: [("subdomain".to_string(), "acme".to_string())].into(), ..Default::default() };
+        let answer: BTreeMap<String, String> =
+            [("subdomain", "evil"), ("host", "x")].iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        keep_fields(&providers::zendesk::Zendesk, &mut cred, answer);
+        assert_eq!((cred.field("subdomain"), cred.field("host")), ("acme", "x"));
     }
 
     #[test]
