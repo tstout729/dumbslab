@@ -254,7 +254,7 @@ pub(crate) fn apply_refresh(
     let saved =
         db.one("SELECT secret, expires_at FROM people_sync WHERE id = 1 AND auth = 'oauth' AND connection = ?", &params![connection])?;
     let Some(row) = saved else {
-        super::cleanup::hand_over(db, cfg, &spent, creds)?;
+        super::cleanup::hand_over(db, cfg, connection, &spent, creds)?;
         return Ok(Err(CHANGED.into()));
     };
     let mut stored = crate::sync::open(cfg, OWNER, PROVIDER, &row.str("secret"))?;

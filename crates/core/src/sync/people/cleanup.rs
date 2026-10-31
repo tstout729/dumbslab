@@ -172,13 +172,19 @@ pub(crate) fn due(db: &dyn Db, now: DateTime<Utc>) -> ApiResult<bool> {
     Ok(ready.is_some() && !setup::saving(db, now)?)
 }
 
-/// A sign-in was renewed: BambooHR may have spent the refresh token that records hold too, so hand
-/// them the new tokens. Otherwise their credentials would be dead.
-pub(crate) fn hand_over(db: &dyn Db, cfg: &HostConfig, old_refresh: &str, creds: &Creds) -> ApiResult<()> {
+/// A renewal of `connection` ended after it retired: BambooHR spent the refresh token its record
+/// holds, so hand the record the new tokens. Otherwise its credentials would be dead. Only that
+/// connection's record, and only while it holds the spent refresh token: another connection's may
+/// hold the same value.
+pub(crate) fn hand_over(db: &dyn Db, cfg: &HostConfig, connection: &str, old_refresh: &str, creds: &Creds) -> ApiResult<()> {
     if old_refresh.is_empty() {
         return Ok(());
     }
-    for r in db.query("SELECT connection, secret FROM people_sync_cleanup WHERE refresh_hash = ?", &params![sha256_hex(old_refresh)])? {
+    let holders = db.query(
+        "SELECT connection, secret FROM people_sync_cleanup WHERE connection = ? AND refresh_hash = ?",
+        &params![connection, sha256_hex(old_refresh)],
+    )?;
+    for r in holders {
         let connection = r.str("connection");
         let Ok(mut stored) = crate::sync::open(cfg, &owner(&connection), PROVIDER, &r.str("secret")) else { continue };
         stored.token = creds.cred.token.clone();
@@ -229,6 +235,8 @@ struct Item {
     version: i64,
     /// BambooHR refused to renew these credentials once before.
     refused: bool,
+    /// The saved sync's connection and webhook when the list was asked for.
+    seen: Option<(Option<String>, Option<String>)>,
     state: State,
 }
 
@@ -266,6 +274,21 @@ fn creds_of(cfg: &HostConfig, r: &Row) -> ApiResult<Creds> {
 
 fn list_call(item: &Item) -> HttpCall {
     item.creds.call(HttpCall::get(super::api_url(&item.subdomain, "webhooks")))
+}
+
+/// The saved sync's connection and webhook now.
+fn live_now(db: &dyn Db) -> ApiResult<Option<(Option<String>, Option<String>)>> {
+    Ok(db
+        .one("SELECT connection, webhook_id FROM people_sync WHERE id = 1", &[])?
+        .map(|r| (r.opt_str("connection"), r.opt_str("webhook_id"))))
+}
+
+/// Asks for the webhooks the item's credentials can see, noting the saved sync as it is now: what
+/// the answer leads to is fenced on it.
+fn listing(db: &dyn Db, item: &mut Item) -> ApiResult<HttpCall> {
+    item.seen = live_now(db)?;
+    item.state = State::Listing;
+    Ok(list_call(item))
 }
 
 /// How a request went, for a record.
@@ -338,6 +361,7 @@ pub(super) fn step(
                 known_ids: r.str("known_ids"),
                 version: r.i64("version"),
                 refused: r.bool("refused"),
+                seen: None,
                 state: State::Done,
             };
             match creds {
@@ -388,8 +412,7 @@ fn first_call(
 ) -> ApiResult<Option<HttpCall>> {
     if !item.creds.needs_refresh(now) {
         item.fresh = item.creds.auth == Auth::ApiKey || item.creds.expires_at.is_none_or(|e| e > now);
-        item.state = State::Listing;
-        return Ok(Some(list_call(item)));
+        return listing(db, item).map(Some);
     }
     let lease = match item.live {
         // The saved sign-in: renewed through its own lease, never with a copy.
@@ -400,8 +423,7 @@ fn first_call(
             }
             Renewal::UseCurrent(creds) => {
                 item.creds = creds;
-                item.state = State::Listing;
-                return Ok(Some(list_call(item)));
+                return listing(db, item).map(Some);
             }
             Renewal::Wait | Renewal::Changed => {
                 later(db, cfg, c, staged, item, "the sign-in was being renewed or changed", now)?;
@@ -441,22 +463,19 @@ fn renewed(
         Some(l) => oauth::apply_refresh(db, cfg, &mut item.creds, &item.connection, l, reply, now)?,
         None => match crate::connect::standard_token("BambooHR", reply) {
             Ok(tokens) => {
-                let spent = item.creds.cred.refresh_token.clone().unwrap_or_default();
+                // Only this connection's record holds these: nothing else to hand them to.
                 item.creds.take(tokens, now);
                 save_creds(db, cfg, &item.connection, &item.creds)?;
-                hand_over(db, cfg, &spent, &item.creds)?;
                 Ok(())
             }
             Err(why) => Err(why),
         },
     };
-    let list = |item: &mut Item| {
-        item.fresh = true;
-        item.state = State::Listing;
-        vec![list_call(item)]
-    };
     match result {
-        Ok(()) => Ok(list(item)),
+        Ok(()) => {
+            item.fresh = true;
+            Ok(vec![listing(db, item)?])
+        }
         // The live connection: retired meanwhile (its tokens went to its record), or refused because
         // another renewal spent the token first. The next pass reloads.
         Err(why) if lease.is_some() || transient => later(db, cfg, c, staged, item, &why, now).map(|_| vec![]),
@@ -502,12 +521,23 @@ fn listed(
     if setup::saving(db, now)? {
         return later(db, cfg, c, staged, item, "a save was under way", now).map(|_| vec![]);
     }
+    // A new connection, or a new live webhook, since the list was asked for (a reconnect added its
+    // own, say): the answer may not show what's live now. The next pass asks again. (The live
+    // webhook only going away, as when this pass found it lost, changes nothing to protect.)
+    let now_live = live_now(db)?;
+    let (seen_connection, seen_id) = item.seen.clone().unwrap_or_default();
+    let (now_connection, now_id) = now_live.clone().unwrap_or_default();
+    if now_connection != seen_connection || (now_id.is_some() && now_id != seen_id) {
+        item.state = State::Done;
+        return let_go(db, c, item).map(|_| vec![]);
+    }
     let live = db.one("SELECT subdomain, webhook_id FROM people_sync WHERE id = 1", &[])?;
     let live_id = live.as_ref().filter(|l| l.str("subdomain") == item.subdomain).and_then(|l| l.opt_str("webhook_id"));
     let v = reply.json();
     let mine: Vec<String> =
         v["webhooks"].as_array().into_iter().flatten().filter(|w| ours(w, &c.tag)).map(|w| super::text(&w["id"])).collect();
     if item.live
+        && now_live == item.seen
         && let Some(id) = &live_id
         && !mine.contains(id)
     {

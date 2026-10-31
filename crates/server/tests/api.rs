@@ -7420,6 +7420,69 @@ mod syncs {
     }
 
     #[test]
+    fn people_sync_cleanup_keeps_each_connections_tokens_its_own() {
+        let mut h = H::new();
+        let (admin, _) = h.setup();
+        with_key(&mut h);
+        with_bamboohr_app(&mut h);
+        let fake = FakeBamboo::new(200);
+        let answer = |c: &HttpCall| fake.answer(c);
+        // acme and then beta are signed in with the same refresh token value (rt-1), and both
+        // retired: gamma is the saved sign-in now.
+        bamboo_sign_in(&h, &admin, "acme", &answer);
+        fake.tokens.set(0);
+        bamboo_sign_in(&h, &admin, "beta", &answer);
+        bamboo_sign_in(&h, &admin, "gamma", &answer);
+        let acme = "subdomain = 'acme'";
+        let beta = "subdomain = 'beta'";
+        assert_eq!(count(&h, &format!("SELECT COUNT(*) FROM people_sync_cleanup WHERE {acme} OR {beta}")), 2);
+        // A pass renews acme's copy, and only acme's: beta's waits.
+        db_run(&h, |db| {
+            db.execute(&format!("UPDATE people_sync_cleanup SET expires_at = '2026-01-01T00:00:00.000Z' WHERE {acme}"), &[])?;
+            db.execute("UPDATE people_sync_cleanup SET next_attempt_at = '2099-01-01T00:00:00.000Z' WHERE subdomain <> 'acme'", &[])
+        });
+        let r = h.call("GET", "/api/v1/people-sync", None, &admin);
+        let (_, sent) = drive(&h, background_of(&r), &answer);
+        assert!(sent[0].url.starts_with("https://acme.") && sent[0].body.as_deref().unwrap().contains("refresh_token=rt-1"), "{sent:?}");
+        // beta's record still holds beta's own tokens: its pass uses them.
+        db_run(&h, |db| db.execute(&format!("UPDATE people_sync_cleanup SET next_attempt_at = NULL WHERE {beta}"), &[]));
+        let r = h.call("GET", "/api/v1/people-sync", None, &admin);
+        let (_, sent) = drive(&h, background_of(&r), &answer);
+        let list = sent.iter().find(|c| c.url == "https://beta.bamboohr.com/api/v1/webhooks").unwrap();
+        assert!(list.headers.contains(&bearer("at-1")), "{sent:?}");
+        assert!(!fake.ids().iter().any(|id| id == "201"), "beta's old webhook is gone: {:?}", fake.ids());
+    }
+
+    #[test]
+    fn people_sync_a_stalled_pass_never_disables_a_new_webhook() {
+        let mut h = H::new();
+        let (admin, _) = h.setup();
+        with_key(&mut h);
+        let fake = FakeBamboo::new(210);
+        let answer = |c: &HttpCall| fake.answer(c);
+        save_people(&h, &admin, json!({ "subdomain": "acme", "api_key": "key-1" }), &answer);
+
+        // A pass lists acme's webhooks (210, live), then stalls.
+        let r = h.call("GET", "/api/v1/people-sync", None, &admin);
+        let mut pass = background_of(&r);
+        let calls = fetched(people_step(&h, &mut pass, vec![]));
+        let listed: Vec<HttpReply> = calls.iter().map(answer).collect();
+        // Meanwhile a new key for the same company replaces the webhook with 211.
+        let (v, _) = save_people(&h, &admin, json!({ "subdomain": "acme", "api_key": "key-2" }), &answer);
+        assert_eq!(v["automatic_webhook"], true);
+        assert_eq!(fake.ids(), ["211"]);
+        // The pass resumes with its old list, which lacks 211: it leaves everything to the next pass.
+        let step = people_step(&h, &mut pass, listed);
+        assert!(matches!(step, Step::Done(Finish::Fill(_))), "{step:?}");
+        let v = h.ok("GET", "/api/v1/people-sync", None, &admin);
+        assert_eq!((v["automatic_webhook"].as_bool(), &v["webhook_error"]), (Some(true), &Value::Null), "{v}");
+        let r = people_hook(&h, "pk-211");
+        assert_eq!(r.status, 200, "the new webhook still works: {}", r.body);
+        drive(&h, job_of(&r), &answer);
+        assert_eq!(fake.ids(), ["211"]);
+    }
+
+    #[test]
     fn people_sync_a_late_pass_leaves_a_record_made_anew() {
         let mut h = H::new();
         let (admin, _) = h.setup();
