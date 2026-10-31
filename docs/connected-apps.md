@@ -12,7 +12,7 @@ Everyone uses their own account, so results and previews hold only what that per
 - Credentials are encrypted in the workspace database with the server's connector key (AES-256-GCM, bound to the person and the app). No operation returns them.
 - The core builds every request to an app and reads every answer. The host only sends the requests: over https, without following redirects, within 8 seconds, reading at most 4 MB. The self-hosted server also refuses private network addresses, like it does for webhooks.
 - Links in results and previews must be `http(s)` links, and everything an app returns is shown as plain text.
-- Tokens that expire (Google, Box, Dropbox, Atlassian and others) are refreshed with their refresh token in the five minutes before they expire, by one request at a time: some apps accept each refresh token only once.
+- Tokens that expire (Google, Box, Dropbox, Atlassian and others) are refreshed with their refresh token in the five minutes before they expire, by one request at a time: some apps accept each refresh token only once. Zendesk also revokes the old access token when it refreshes. So while one request refreshes a Zendesk token, the others ask the person to try again in a moment instead of sending the old token, and a request refused because another one just refreshed tries once more with the new token.
 
 ## Turning it on
 

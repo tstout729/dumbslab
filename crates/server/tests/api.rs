@@ -2940,6 +2940,133 @@ mod connected {
     }
 
     #[test]
+    fn a_zendesk_refresh_revokes_the_old_token_without_stranding_other_requests() {
+        let mut h = H::new();
+        let (admin, _) = h.setup();
+        with_key(&mut h);
+        h.cfg.connectors.apps.insert("zendesk".into(), OAuthApp { client_id: "zdg-dumbslab".into(), client_secret: "zsecret".into() });
+        let user_id = h.ok("GET", "/api/v1/me", None, &admin)["user"]["id"].as_str().unwrap().to_string();
+        let now = chrono::Utc::now;
+        // What's stored: a signed-in Zendesk connection at acme.zendesk.com.
+        let set = |token: &str, refresh: &str, expires: chrono::DateTime<chrono::Utc>| {
+            let cred = connect::Credential {
+                token: token.into(),
+                refresh_token: Some(refresh.into()),
+                fields: [("subdomain".to_string(), "acme".to_string())].into(),
+            };
+            let sealed = connect::seal("connector-key", &user_id, "zendesk", &cred).unwrap();
+            let settings = json!({ "host": "acme.zendesk.com", "user_id": 7 }).to_string();
+            let (expires, at) = (dumbslab_core::util::ts(expires), dumbslab_core::util::ts(now()));
+            h.store
+                .with_tx(|db| {
+                    db.execute("DELETE FROM connections", &[]).unwrap();
+                    (db.execute(
+                        "INSERT INTO connections (user_id, provider, account, settings, secret, expires_at, created_at, updated_at) VALUES (?, 'zendesk', 'ada@acme.com (acme.zendesk.com)', ?, ?, ?, ?, ?)",
+                        &dumbslab_core::params![user_id.clone(), settings, sealed, expires, at.clone(), at],
+                    ), true)
+                })
+                .unwrap()
+                .unwrap();
+        };
+        // Zendesk, which revokes the access token it replaces the moment it refreshes, and refuses
+        // any other with 401 invalid_token.
+        let live = std::cell::RefCell::new(("zd-at-1".to_string(), "zd-rt-1".to_string()));
+        let zendesk = |call: &HttpCall| -> HttpReply {
+            let url = call.url.as_str();
+            if url == "https://acme.zendesk.com/oauth/tokens" {
+                let body: Value = serde_json::from_str(call.body.as_deref().unwrap()).unwrap();
+                if body["refresh_token"] != live.borrow().1.as_str() {
+                    return HttpReply { status: 400, body: json!({ "error": "invalid_grant" }).to_string() };
+                }
+                let n: u32 = live.borrow().1.trim_start_matches("zd-rt-").parse().unwrap();
+                *live.borrow_mut() = (format!("zd-at-{}", n + 1), format!("zd-rt-{}", n + 1));
+                let (at, rt) = live.borrow().clone();
+                return HttpReply {
+                    status: 201,
+                    body: json!({ "access_token": at, "refresh_token": rt, "expires_in": 28800 }).to_string(),
+                };
+            }
+            let bearer = call.headers.iter().find(|(k, _)| k == "authorization").map(|(_, v)| v.clone()).unwrap_or_default();
+            if bearer != format!("Bearer {}", live.borrow().0) {
+                return HttpReply { status: 401, body: json!({ "error": "invalid_token" }).to_string() };
+            }
+            if url.contains("/api/v2/search.json") {
+                ok(json!({ "results": [{ "result_type": "ticket", "id": 12, "subject": "Printer jams", "status": "open" }] }))
+            } else if url.contains("/api/v2/tickets/9.json") {
+                ok(json!({ "ticket": { "id": 9, "subject": "Refund", "status": "open" } }))
+            } else {
+                ok(json!({ "results": [] }))
+            }
+        };
+        let revoke_to = |token: &str| live.borrow_mut().0 = token.into();
+        let search = || job_of(&h.call("GET", "/api/v1/search/connected?q=printer", None, &admin));
+        let preview = || {
+            let link = urlencoding::encode("https://acme.zendesk.com/agent/tickets/9").into_owned();
+            job_of(&h.call("GET", &format!("/api/v1/connections/preview?url={link}"), None, &admin))
+        };
+        let bearers = |calls: &[HttpCall]| -> Vec<String> {
+            calls.iter().filter_map(|c| c.headers.iter().find(|(k, _)| k == "authorization").map(|(_, v)| v.clone())).collect()
+        };
+        let answer = |calls: &[HttpCall]| -> Vec<HttpReply> { calls.iter().map(zendesk).collect() };
+        let app_error = |v: &Value| v["apps"][0]["error"].as_str().unwrap_or_default().to_string();
+
+        // 1. One request refreshes; the others, which Google Drive would let use the current token
+        // meanwhile, wait instead: the refresh revokes it.
+        set("zd-at-1", "zd-rt-1", now() + chrono::Duration::minutes(2));
+        let (mut first, mut second, mut third) = (search(), search(), preview());
+        let refreshing = fetches(step(&h, &mut first, vec![]));
+        assert_eq!(refreshing[0].url, "https://acme.zendesk.com/oauth/tokens");
+        let v = result(step(&h, &mut second, vec![]));
+        assert!(app_error(&v).contains("Try again in a moment"), "{v}");
+        assert!(result(step(&h, &mut third, vec![]))["error"].as_str().unwrap().contains("Try again in a moment"));
+        // The refresh revokes zd-at-1; the first searches with the new token.
+        let searching = fetches(step(&h, &mut first, answer(&refreshing)));
+        assert!(bearers(&searching).iter().all(|b| b == "Bearer zd-at-2"), "{searching:?}");
+        let v = result(step(&h, &mut first, answer(&searching)));
+        assert_eq!((v["apps"][0]["ok"].as_bool(), v["items"][0]["title"].as_str()), (Some(true), Some("Printer jams")), "{v}");
+
+        // 2. A search already sent with the old token when another request refreshed: refused, it
+        // tries once more with the token saved meanwhile, rather than asking to reconnect.
+        let mut late = search();
+        let sent = fetches(step(&h, &mut late, vec![]));
+        assert!(bearers(&sent).iter().all(|b| b == "Bearer zd-at-2"));
+        set("zd-at-3", "zd-rt-3", now() + chrono::Duration::hours(8));
+        revoke_to("zd-at-3");
+        let again = fetches(step(&h, &mut late, answer(&sent)));
+        assert!(!again.is_empty() && bearers(&again).iter().all(|b| b == "Bearer zd-at-3"), "{again:?}");
+        let v = result(step(&h, &mut late, answer(&again)));
+        assert_eq!(v["apps"][0]["ok"], true, "{v}");
+        // The same for a preview.
+        let mut late = preview();
+        let sent = fetches(step(&h, &mut late, vec![]));
+        set("zd-at-4", "zd-rt-4", now() + chrono::Duration::hours(8));
+        revoke_to("zd-at-4");
+        let again = fetches(step(&h, &mut late, answer(&sent)));
+        assert_eq!(bearers(&again), ["Bearer zd-at-4"]);
+        assert_eq!(result(step(&h, &mut late, answer(&again)))["preview"]["title"], "Refund");
+
+        // 3. Refused while another request is still refreshing (its new token isn't saved yet):
+        // try again in a moment, not reconnect.
+        let mut caught = search();
+        let sent = fetches(step(&h, &mut caught, vec![]));
+        let lease = format!("{} other", dumbslab_core::util::ts(now() + chrono::Duration::seconds(30)));
+        h.store
+            .with_tx(|db| (db.execute("UPDATE connections SET refreshing_until = ?", &dumbslab_core::params![lease]), true))
+            .unwrap()
+            .unwrap();
+        revoke_to("zd-at-5");
+        let v = result(step(&h, &mut caught, answer(&sent)));
+        assert!(app_error(&v).contains("Try again in a moment"), "{v}");
+
+        // 4. A refusal with nothing newer saved and nobody refreshing still asks to reconnect.
+        h.store.with_tx(|db| (db.execute("UPDATE connections SET refreshing_until = NULL", &[]), true)).unwrap().unwrap();
+        let mut refused = search();
+        let sent = fetches(step(&h, &mut refused, vec![]));
+        let v = result(step(&h, &mut refused, answer(&sent)));
+        assert!(app_error(&v).contains("Reconnect Zendesk"), "{v}");
+    }
+
+    #[test]
     fn one_atlassian_app_keeps_both_jira_and_confluence_granted() {
         let mut h = H::new();
         let (admin, _) = h.setup();
@@ -2979,6 +3106,83 @@ mod connected {
         } else {
             HttpReply { status: 404, body: "{}".into() }
         }
+    }
+
+    #[test]
+    fn upgrading_drops_personal_data_from_atlassian_and_trello_connections() {
+        let mut h = H::new();
+        let (admin, _) = h.setup();
+        with_key(&mut h);
+        let (lin, _) = h.user(&admin, "lin@acme.test", "Lin", "member");
+        let (bo, _) = h.user(&admin, "bo@acme.test", "Bo", "member");
+        let me = h.ok("GET", "/api/v1/me", None, &admin)["user"]["id"].as_str().unwrap().to_string();
+        // Rows as earlier versions saved them, each with its sealed credential.
+        let rows: Vec<(String, &str, &str, Value)> = vec![
+            (me.clone(), "jira", "Ada Lovelace on acme.atlassian.net", json!({ "site": "acme.atlassian.net", "cloud_id": "1324a887" })),
+            (me.clone(), "confluence", "ada@acme.com on wiki.atlassian.net", json!({ "site": "wiki.atlassian.net" })),
+            (me.clone(), "trello", "@ada", json!({ "id": "5abbe4b7ddc1b351ef961414", "username": "ada" })),
+            (me.clone(), "github", "@ada", json!({ "login": "ada", "search_in": "user:ada" })),
+            (lin.clone(), "jira", "ada@acme.com on acme.atlassian.net", json!({})),
+            (bo.clone(), "jira", "bo@acme.com on acme.atlassian.net", json!("not an object")),
+        ];
+        let mut secrets = vec![];
+        h.store
+            .with_tx(|db| {
+                for (user, app, label, settings) in &rows {
+                    let cred = connect::Credential { token: format!("{app}-token"), ..Default::default() };
+                    let sealed = connect::seal("connector-key", user, app, &cred).unwrap();
+                    secrets.push(sealed.clone());
+                    db.execute(
+                        "INSERT INTO connections (user_id, provider, account, settings, secret, created_at, updated_at) VALUES (?, ?, ?, ?, ?, '2026-10-30T00:00:00.000Z', '2026-10-30T00:00:00.000Z')",
+                        &dumbslab_core::params![user.clone(), *app, *label, settings.to_string(), sealed],
+                    )
+                    .unwrap();
+                }
+                // A row whose settings aren't JSON at all doesn't stop the upgrade.
+                db.execute("UPDATE connections SET settings = 'oops' WHERE user_id = ? AND provider = 'jira'", &dumbslab_core::params![bo.clone()]).unwrap();
+                ((), true)
+            })
+            .unwrap();
+
+        // Run 0015 (the last migration) again, as an upgrade from before it would.
+        let at = dumbslab_core::db::MIGRATIONS.iter().position(|m| m.contains("keep no personal data from Atlassian")).unwrap();
+        assert_eq!(at, dumbslab_core::db::MIGRATIONS.len() - 1, "0015 is listed last");
+        h.store
+            .with_tx(|db| (db.execute("UPDATE meta SET value = ? WHERE key = 'schema_version'", &[at.to_string().into()]), true))
+            .unwrap()
+            .unwrap();
+        let _reopened = Store::open(&h._dir.path().join("t.db")).unwrap();
+
+        let after: Vec<(String, String, String)> = h
+            .store
+            .with_tx(|db| {
+                let found = rows
+                    .iter()
+                    .map(|(user, app, _, _)| {
+                        let r = db
+                            .one(
+                                "SELECT account, settings, secret FROM connections WHERE user_id = ? AND provider = ?",
+                                &dumbslab_core::params![user.clone(), *app],
+                            )
+                            .unwrap()
+                            .unwrap();
+                        (r.str("account"), r.str("settings"), r.str("secret"))
+                    })
+                    .collect();
+                (found, true)
+            })
+            .unwrap();
+        let labels: Vec<&str> = after.iter().map(|(label, _, _)| label.as_str()).collect();
+        assert_eq!(labels, ["acme.atlassian.net", "wiki.atlassian.net", "Trello", "@ada", "", ""]);
+        assert_eq!(after[0].1, json!({ "site": "acme.atlassian.net", "cloud_id": "1324a887" }).to_string(), "Jira settings stay");
+        assert_eq!(after[2].1, "{}", "Trello's member id and username go");
+        assert_eq!(after[3].1, json!({ "login": "ada", "search_in": "user:ada" }).to_string(), "other apps are untouched");
+        let kept: Vec<&String> = after.iter().map(|(_, _, secret)| secret).collect();
+        assert_eq!(kept, secrets.iter().collect::<Vec<_>>(), "credentials stay as they are");
+        // The connections still work, labeled by site.
+        let list = h.ok("GET", "/api/v1/connections", None, &admin);
+        let jira = list["apps"].as_array().unwrap().iter().find(|a| a["id"] == "jira").unwrap();
+        assert_eq!(jira["connected"]["account"], "acme.atlassian.net");
     }
 
     #[test]

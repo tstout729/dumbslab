@@ -184,6 +184,8 @@ pub const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0008_sso.sql"),
     include_str!("migrations/0009_slack.sql"),
     include_str!("migrations/0010_sync.sql"),
+    // 0011 to 0014 come from other branches and must be listed before this, in order.
+    include_str!("migrations/0015_connections_without_personal_data.sql"),
 ];
 
 /// Brings the schema up to date. Safe to call on every start.

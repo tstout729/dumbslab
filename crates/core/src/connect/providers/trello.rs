@@ -50,6 +50,7 @@ static INFO: ProviderInfo = ProviderInfo {
         extra: &[("prompt", "consent")],
         pkce: true,
         site: None,
+        refresh_revokes: false,
     }),
     token_fields: &[
         Field {

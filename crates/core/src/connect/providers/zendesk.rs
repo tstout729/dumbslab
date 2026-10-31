@@ -10,7 +10,10 @@
 //!   PKCE with the client secret, and asks for `read` (every GET; no granular scope covers search
 //!   across tickets and Help Center). Access tokens expire and come with a refresh token that
 //!   Zendesk replaces on every refresh; DumbSlab asks for 8-hour access tokens and 90-day refresh
-//!   tokens (Zendesk's longest), so a connection lasts while it's used at least every 90 days.
+//!   tokens (Zendesk's longest), so a connection lasts while it's used at least every 90 days. A
+//!   refresh also revokes the old access token at once, so while one request refreshes, the others
+//!   wait for the new token rather than use the old one, and a request refused because another just
+//!   refreshed tries once more with the new token (`refresh_revokes`).
 //! - **An API token**, with the subdomain and an agent's email, sent as Basic auth
 //!   (`<email>/token:<token>`). Zendesk is retiring them: since October 27, 2026 no account can
 //!   create one (accounts opened since July 28, 2026 never could), tokens unused for 30 days are
@@ -77,6 +80,8 @@ static INFO: ProviderInfo = ProviderInfo {
         extra: &[],
         pkce: true,
         site: Some(SUBDOMAIN),
+        // Each refresh revokes the access token it replaces, not just the refresh token.
+        refresh_revokes: true,
     }),
     token_fields: &[
         SUBDOMAIN,

@@ -62,6 +62,7 @@ pub const fn oauth(scopes: &'static [&'static str]) -> OAuthSpec {
         extra: &[("audience", "api.atlassian.com"), ("prompt", "consent")],
         pkce: false,
         site: None,
+        refresh_revokes: false,
     }
 }
 

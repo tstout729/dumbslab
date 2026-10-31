@@ -55,6 +55,7 @@ static INFO: ProviderInfo = ProviderInfo {
         extra: &[("force_install_if_needed", "true")],
         pkce: true,
         site: None,
+        refresh_revokes: false,
     }),
     token_fields: &[Field {
         key: "token",

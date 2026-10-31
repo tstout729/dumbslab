@@ -181,6 +181,10 @@ pub struct OAuthSpec {
     /// what the person fills in first. [`Connector::sign_in_site`] checks it; the credential keeps
     /// it under this field's key, so its tokens only ever go back to that site.
     pub site: Option<Field>,
+    /// Refreshing revokes the access token it replaces, not just the refresh token (Zendesk). While
+    /// one request refreshes, no other may use the old token (see [`renewal`]), and a token the app
+    /// refuses may just have been replaced by another request (see [`recover`]).
+    pub refresh_revokes: bool,
 }
 
 /// A customer's own site, for apps that sign in there (see [`OAuthSpec::site`]).
@@ -1158,8 +1162,12 @@ enum SearchPhase {
     Start,
     /// Refreshing these connections' tokens first; then the rest, and the apps that failed.
     Refreshing(Vec<Connection>, Vec<Connection>, Vec<AppResult>),
-    /// Waiting for search answers: each connection and how many requests it sent.
-    Searching(Vec<(Connection, usize)>, Vec<AppResult>),
+    /// Waiting for search answers: each connection and how many requests it sent, and the results
+    /// so far.
+    Searching(Vec<(Connection, usize)>, ConnectedResults),
+    /// Waiting for searches sent again with tokens other requests saved meanwhile (see
+    /// [`recover`]); they're read as they come.
+    Retrying(Vec<(Connection, usize)>, ConnectedResults),
 }
 
 impl SearchJob {
@@ -1183,6 +1191,8 @@ enum PreviewPhase {
     Start,
     Refreshing,
     Fetching,
+    /// Fetching again with the token another request saved meanwhile (see [`recover`]).
+    Retrying,
 }
 
 impl PreviewJob {
@@ -1307,8 +1317,14 @@ enum Renewal {
     Refresh,
     /// Another request is refreshing it, and the current token still works until it expires.
     UseCurrent,
-    /// Another request is refreshing it, and the current token has expired.
+    /// Another request is refreshing it, and the current token has expired, or is about to be
+    /// revoked by that refresh ([`OAuthSpec::refresh_revokes`]).
     Wait,
+}
+
+/// Refreshing `provider`'s tokens revokes the access token being replaced.
+fn refresh_revokes(provider: &str) -> bool {
+    providers::get(provider).and_then(|p| p.info().oauth).is_some_and(|o| o.refresh_revokes)
 }
 
 /// How long one request may take refreshing a token before another may try.
@@ -1317,7 +1333,9 @@ const REFRESH_LEASE_SECS: i64 = 30;
 /// Lets one request at a time refresh a connection's token. Apps that hand out a new refresh token
 /// each time (Box, Atlassian, monday) refuse the old one once it's used, so two requests refreshing
 /// together would leave one asking the person to reconnect. Refreshing starts
-/// [`REFRESH_MARGIN_SECS`] before the token expires, so the others can keep using it meanwhile.
+/// [`REFRESH_MARGIN_SECS`] before the token expires, so the others can keep using it meanwhile,
+/// except where the refresh revokes it ([`OAuthSpec::refresh_revokes`]): there they never send the
+/// old token, which could be refused at any moment, and wait for the new one instead.
 fn renewal(db: &dyn Db, user_id: &str, conn: &mut Connection, now: DateTime<Utc>) -> ApiResult<Renewal> {
     // When it runs out, then a random id: each lease is this request's alone.
     let lease = format!("{} {}", ts(now + Duration::seconds(REFRESH_LEASE_SECS)), crate::util::new_id());
@@ -1330,7 +1348,7 @@ fn renewal(db: &dyn Db, user_id: &str, conn: &mut Connection, now: DateTime<Utc>
             conn.lease = Some(lease);
             Renewal::Refresh
         }
-        false if conn.expires_at.is_some_and(|e| e > now) => Renewal::UseCurrent,
+        false if conn.expires_at.is_some_and(|e| e > now) && !refresh_revokes(conn.provider) => Renewal::UseCurrent,
         false => Renewal::Wait,
     })
 }
@@ -1381,6 +1399,41 @@ fn apply_refresh(
         return Ok(Err(reconnected_message(p.info().name)));
     }
     Ok(Ok(()))
+}
+
+/// What to do when an app refused a connection's token (HTTP 401).
+#[derive(Debug)]
+enum Recovery {
+    /// Another request refreshed it meanwhile: try once more with what it saved.
+    Retry(Box<Connection>),
+    /// Another request is refreshing it right now: the person should try again in a moment.
+    Busy,
+}
+
+/// For apps whose refresh revokes the token it replaces ([`OAuthSpec::refresh_revokes`]): when
+/// `replies` include a refusal, whether that's only because another request is renewing the
+/// token, or has just renewed it. `None` otherwise (other apps, or no refusal), so the answer is
+/// read as usual and may ask the person to reconnect.
+fn recover(
+    db: &dyn Db,
+    cfg: &HostConfig,
+    user_id: &str,
+    conn: &Connection,
+    replies: &[HttpReply],
+    now: DateTime<Utc>,
+) -> ApiResult<Option<Recovery>> {
+    if !refresh_revokes(conn.provider) || !replies.iter().any(|r| r.status == 401) {
+        return Ok(None);
+    }
+    let saved = connections(db, cfg, user_id)?.into_iter().find(|c| c.provider == conn.provider);
+    if let Some(saved) = saved.filter(|s| s.cred.token != conn.cred.token && !needs_refresh(cfg, s, now)) {
+        return Ok(Some(Recovery::Retry(Box::new(saved))));
+    }
+    let renewing = db.one(
+        "SELECT provider FROM connections WHERE user_id = ? AND provider = ? AND refreshing_until > ?",
+        &params![user_id, conn.provider, ts(now)],
+    )?;
+    Ok(renewing.map(|_| Recovery::Busy))
 }
 
 fn failed_app(provider: &'static str, error: String) -> AppResult {
@@ -1498,7 +1551,19 @@ fn preview_step(db: &dyn Db, cfg: &HostConfig, j: &mut PreviewJob, replies: Vec<
                 Err(message) => done(Err(message)),
             }
         }
-        PreviewPhase::Fetching => done(p.read_preview(&j.conn.account, &j.target, &replies)),
+        PreviewPhase::Fetching => match recover(db, cfg, &j.user_id, &j.conn, &replies, now)? {
+            Some(Recovery::Retry(saved)) => {
+                j.conn = *saved;
+                if !j.retarget() {
+                    return done(Err(reconnected_message(p.info().name)));
+                }
+                j.phase = PreviewPhase::Retrying;
+                Ok(Step::Fetch(p.preview(&j.conn.cred, &j.conn.account, &j.target)))
+            }
+            Some(Recovery::Busy) => done(Err(busy_message(p.info().name))),
+            None => done(p.read_preview(&j.conn.account, &j.target, &replies)),
+        },
+        PreviewPhase::Retrying => done(p.read_preview(&j.conn.account, &j.target, &replies)),
     }
 }
 
@@ -1552,44 +1617,72 @@ fn search_step(db: &dyn Db, cfg: &HostConfig, j: &mut SearchJob, replies: Vec<Ht
             }
             start_searching(j, fresh, failed)
         }
-        SearchPhase::Searching(plan, mut apps) => {
-            let mut items = vec![];
+        SearchPhase::Searching(plan, mut results) => {
+            let mut retry = vec![];
             let mut replies = replies.into_iter();
             for (c, n) in plan {
-                let p = providers::get(c.provider).expect("known provider");
                 let these: Vec<HttpReply> = replies.by_ref().take(n).collect();
-                match p.read_search(&c.account, &these, j.limit) {
-                    Ok(mut hits) => {
-                        hits.truncate(j.limit);
-                        for hit in &mut hits {
-                            hit.url = web_link(&hit.url);
-                        }
-                        apps.push(AppResult {
-                            provider: c.provider.into(),
-                            name: p.info().name.into(),
-                            ok: true,
-                            error: None,
-                            count: hits.len(),
-                        });
-                        items.extend(hits);
+                match recover(db, cfg, &j.user_id, &c, &these, now)? {
+                    Some(Recovery::Retry(saved)) => retry.push(*saved),
+                    Some(Recovery::Busy) => {
+                        let name = providers::get(c.provider).expect("known provider").info().name;
+                        results.apps.push(failed_app(c.provider, busy_message(name)));
                     }
-                    Err(e) => apps.push(failed_app(c.provider, e)),
+                    None => read_results(j, &c, &these, &mut results),
                 }
             }
-            let value = serde_json::to_value(ConnectedResults { items, apps }).map_err(|e| ApiError::internal(e.to_string()))?;
-            Ok(Step::Done(Finish::Fill(value)))
+            let (calls, plan) = search_calls(j, retry);
+            if calls.is_empty() {
+                return finish_search(results);
+            }
+            j.phase = SearchPhase::Retrying(plan, results);
+            Ok(Step::Fetch(calls))
+        }
+        SearchPhase::Retrying(plan, mut results) => {
+            let mut replies = replies.into_iter();
+            for (c, n) in plan {
+                let these: Vec<HttpReply> = replies.by_ref().take(n).collect();
+                read_results(j, &c, &these, &mut results);
+            }
+            finish_search(results)
         }
     }
 }
 
+/// Reads one connection's search answers into `results`.
+fn read_results(j: &SearchJob, c: &Connection, replies: &[HttpReply], results: &mut ConnectedResults) {
+    let p = providers::get(c.provider).expect("known provider");
+    match p.read_search(&c.account, replies, j.limit) {
+        Ok(mut hits) => {
+            hits.truncate(j.limit);
+            for hit in &mut hits {
+                hit.url = web_link(&hit.url);
+            }
+            results.apps.push(AppResult {
+                provider: c.provider.into(),
+                name: p.info().name.into(),
+                ok: true,
+                error: None,
+                count: hits.len(),
+            });
+            results.items.extend(hits);
+        }
+        Err(e) => results.apps.push(failed_app(c.provider, e)),
+    }
+}
+
+fn finish_search(results: ConnectedResults) -> ApiResult<Step> {
+    let value = serde_json::to_value(results).map_err(|e| ApiError::internal(e.to_string()))?;
+    Ok(Step::Done(Finish::Fill(value)))
+}
+
 fn start_searching(j: &mut SearchJob, conns: Vec<Connection>, failed: Vec<AppResult>) -> ApiResult<Step> {
     let (calls, plan) = search_calls(j, conns);
+    let results = ConnectedResults { items: vec![], apps: failed };
     if calls.is_empty() {
-        let value =
-            serde_json::to_value(ConnectedResults { items: vec![], apps: failed }).map_err(|e| ApiError::internal(e.to_string()))?;
-        return Ok(Step::Done(Finish::Fill(value)));
+        return finish_search(results);
     }
-    j.phase = SearchPhase::Searching(plan, failed);
+    j.phase = SearchPhase::Searching(plan, results);
     Ok(Step::Fetch(calls))
 }
 

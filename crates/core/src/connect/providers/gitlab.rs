@@ -33,6 +33,7 @@ static INFO: ProviderInfo = ProviderInfo {
         extra: &[],
         pkce: true,
         site: None,
+        refresh_revokes: false,
     }),
     token_fields: &[
         Field {

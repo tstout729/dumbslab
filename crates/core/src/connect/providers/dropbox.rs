@@ -36,6 +36,7 @@ static INFO: ProviderInfo = ProviderInfo {
         extra: &[("token_access_type", "offline")],
         pkce: true,
         site: None,
+        refresh_revokes: false,
     }),
     token_fields: &[],
     token_help: "",

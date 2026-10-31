@@ -25,6 +25,7 @@ static INFO: ProviderInfo = ProviderInfo {
         extra: &[("access_type", "offline"), ("prompt", "consent"), ("include_granted_scopes", "true")],
         pkce: true,
         site: None,
+        refresh_revokes: false,
     }),
     token_fields: &[],
     token_help: "",

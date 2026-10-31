@@ -29,6 +29,7 @@ static INFO: ProviderInfo = ProviderInfo {
         extra: &[("allow_signup", "false")],
         pkce: false,
         site: None,
+        refresh_revokes: false,
     }),
     token_fields: &[
         Field {
