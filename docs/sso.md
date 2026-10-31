@@ -20,13 +20,13 @@ DumbSlab reads your organization from the account you sign in with:
 | Microsoft | your Microsoft Entra directory (the account's `tid`) | your email's domain, when Microsoft confirms its owner (`xms_edov`) |
 | Slack | your Slack workspace (`https://slack.com/team_id`) | none at first: Slack confirms your address, not that its domain is your organization's. Settings suggests it, and one click allows it |
 
-Personal Google accounts and personal Microsoft accounts can't be used: they have no organization. DumbSlab never allows or suggests a free-mail domain such as gmail.com, outlook.com or tutamail.com. When it can't take a domain from your sign-in, Settings says so, and you add your email domains there (or allow the one it suggests).
+Personal Google accounts and personal Microsoft accounts can't be used: they have no organization. DumbSlab never allows or suggests a free-mail domain from Microsoft or Slack, such as gmail.com, outlook.com or tutamail.com (Google's domain is always your Workspace's own). When it can't take a domain from your sign-in, Settings says so, and you add your email domains there (or allow the one it suggests).
 
 **Microsoft approval.** Some organizations let only their administrators approve new apps. If yours does, Microsoft asks for an administrator, and DumbSlab says so. A Microsoft Entra administrator can approve DumbSlab (under Enterprise applications › Admin consent requests, when your organization uses them), or do the setup themselves if they're an admin here too.
 
 **Replacing other settings.** If single sign-on is already set up with your own app, or with another provider, Settings asks before replacing it. Accounts linked at the old provider stop signing in.
 
-**Switching apps.** You can switch between DumbSlab's app and your own at any time; linked accounts carry over. Microsoft gives each app a different `sub` for the same person, so DumbSlab links Microsoft accounts by their `oid`, which is the same for every app in your directory. Microsoft accounts linked before that (self-hosted servers that used single sign-on earlier) are linked by `sub`; each moves to its `oid` the next time that person signs in. If you switch Microsoft apps before everyone has, the links that couldn't move are forgotten, and if "Require single sign-on" is on and anyone besides admins lost a link, it's turned off and Settings says why. Those people sign in with Microsoft (matched by verified email) or with their password, and link Microsoft in Settings › Profile. Then turn "Require single sign-on" back on.
+**Switching apps.** You can switch between DumbSlab's app and your own at any time; linked accounts carry over. Microsoft gives each app a different `sub` for the same person, so DumbSlab links Microsoft accounts by their `oid`, which is the same for every app in your directory. Microsoft accounts linked before that (self-hosted servers that used single sign-on earlier) are linked by `sub`; each moves to its `oid` the next time that person signs in. If you switch Microsoft apps before everyone has, the links that couldn't move are forgotten, and if "Require single sign-on" is on and anyone besides admins lost a link, it's turned off and Settings says why. Those people sign in with Microsoft (matched by verified email) or with their password, and link Microsoft in Settings › Profile. Then turn "Require single sign-on" back on; Settings asks you to confirm they have (agents pass `relinked: true` with `require_sso: true`), so an old form or script can't turn it on by accident.
 
 **If the server loses its app.** Single sign-on turns itself off, so "Require single sign-on" never locks anyone out, and Settings says why. Everyone can sign in with a password until the app is back, or until you set up your own app.
 
@@ -146,7 +146,7 @@ Auth0, Keycloak, JumpCloud, Ping, Authentik and others work the same way.
 
 ## For agents and scripts
 
-The operations are `get_sso`, `update_sso`, `setup_sso`, `list_sso_identities`, `link_sso` and `unlink_sso`.
+The operations are `get_sso`, `update_sso`, `setup_sso`, `allow_suggested_sso_domain`, `list_sso_identities`, `link_sso` and `unlink_sso`. `allow_suggested_sso_domain` allows Slack's suggested domain: it takes the `suggested_domain` and `suggestion_id` from `get_sso`, adds the domain to the allowed domains as they are now, and refuses if the suggestion or the provider changed since.
 
 `setup_sso` needs a person signing in from a browser, so it works only from the web app. An agent can set up shared mode with `update_sso` and `shared: true`, giving the domain, tenant or team itself. `get_sso` lists the providers the server has its own app for in `shared_providers`:
 

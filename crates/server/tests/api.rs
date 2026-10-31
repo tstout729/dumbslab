@@ -4125,8 +4125,9 @@ mod sso {
             assert_eq!((s["client_id"].as_str(), s["client_secret_set"].as_bool()), (Some(""), Some(false)));
             if provider == "slack" {
                 assert_eq!((s["allowed_domains"].clone(), s["suggested_domain"].as_str()), (json!([]), Some("acme.test")));
-                let v = set_up(&h, &admin, json!({ "allowed_domains": ["acme.test"] }), SLACK);
-                assert!(v["suggested_domain"].is_null(), "{v}");
+                let allow = json!({ "domain": "acme.test", "suggestion_id": s["suggestion_id"] });
+                let v = h.ok("POST", "/api/v1/sso/suggested-domain", Some(allow), &admin);
+                assert!(v["suggested_domain"].is_null() && v["suggestion_id"].is_null(), "{v}");
             } else {
                 assert!(s["suggested_domain"].is_null());
             }
@@ -4567,8 +4568,15 @@ mod sso {
         // Zed's verified email matches again, with no old link in the way.
         let zed = ms_sign_in(&h, "microsoft-app", "shared-app-sub-zed", "zed@acme.test", json!({ "tid": TENANT, "xms_edov": true }));
         assert_eq!(zed, Ok(zed_id));
-        // Turning it back on clears the note.
-        let v = set_up(&h, &admin, json!({ "require_sso": true }), &issuer);
+        // A form re-sending its old checkbox, or an agent's plain `require_sso: true`, can't turn it
+        // back on by accident; nor does re-sending `false` clear the note.
+        let r = h.call("PATCH", "/api/v1/sso", Some(json!({ "require_sso": true, "auto_provision": false })), &admin);
+        assert_eq!((r.status, r.body["error"]["code"].as_str()), (409, Some("sso_relink_pending")), "{}", r.body);
+        let v = set_up(&h, &admin, json!({ "require_sso": false }), &issuer);
+        assert_eq!((v["require_sso"].as_bool(), v["require_sso_paused"].as_bool()), (Some(false), Some(true)));
+        assert_eq!(password(&h, "zed@acme.test"), 200);
+        // Confirming that people linked again turns it back on and clears the note.
+        let v = set_up(&h, &admin, json!({ "require_sso": true, "relinked": true }), &issuer);
         assert_eq!((v["require_sso"].as_bool(), v["require_sso_paused"].as_bool()), (Some(true), Some(false)));
 
         // The same when an agent switches apps with update_sso.
@@ -4577,7 +4585,7 @@ mod sso {
         assert_eq!((v["require_sso"].as_bool(), v["require_sso_paused"].as_bool()), (Some(false), Some(true)), "{v}");
         assert_eq!(password(&h, "bo@acme.test"), 200);
         // Without anyone left to link again, "Require single sign-on" stays as it is.
-        set_up(&h, &admin, json!({ "require_sso": true }), &issuer);
+        set_up(&h, &admin, json!({ "require_sso": true, "relinked": true }), &issuer);
         let v = set_up(&h, &admin, json!({ "shared": true }), &issuer);
         assert_eq!((v["require_sso"].as_bool(), v["require_sso_paused"].as_bool()), (Some(true), Some(false)), "{v}");
     }
@@ -4614,6 +4622,72 @@ mod sso {
         assert_eq!(count(&h, "SELECT COUNT(*) FROM sso_requests"), 0, "no sign-in was started");
         let s = h.ok("GET", "/api/v1/sso", None, &admin);
         assert_eq!((s["provider"].as_str(), s["allowed_domains"].clone()), (Some("microsoft"), json!(["acme.test"])));
+    }
+
+    #[test]
+    fn allowing_a_suggested_domain_keeps_newer_settings() {
+        let (h, admin) = shared_workspace();
+        let (_, mo) = h.user(&admin, "mo@acme.test", "Mo", "member");
+        let slack_setup = |team: &str, replace: bool| {
+            let url = start_setup(&h, &admin, json!({ "provider": "slack", "replace": replace }));
+            let c = admin_token("slack", json!({ "https://slack.com/team_id": team, "email_verified": true }));
+            assert_eq!(finish_setup(&h, &url, &admin, c, None).0.location, format!("{SETTINGS}?sso_setup=domain_needed"));
+            let s = h.ok("GET", "/api/v1/sso", None, &admin);
+            assert_eq!(s["suggested_domain"], "acme.test");
+            s["suggestion_id"].as_str().unwrap().to_string()
+        };
+        let allow = |id: &str, auth: &Auth| {
+            h.call("POST", "/api/v1/sso/suggested-domain", Some(json!({ "domain": "acme.test", "suggestion_id": id })), auth)
+        };
+        let id = slack_setup("T0ACME", false);
+        assert_eq!(allow(&id, &mo).status, 403, "admins only");
+        // Another domain saved after the page loaded stays: the suggestion is added to the list as it is now.
+        set_up(&h, &admin, json!({ "allowed_domains": ["other.test"] }), SLACK);
+        let r = allow(&id, &admin);
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert_eq!(
+            (r.body["allowed_domains"].clone(), r.body["suggested_domain"].clone()),
+            (json!(["other.test", "acme.test"]), Value::Null)
+        );
+        let activity = h.ok("GET", "/api/v1/activity?limit=5", None, &admin).to_string();
+        assert!(activity.contains("allowed acme.test for single sign-on"), "{activity}");
+        // It's gone once allowed.
+        assert_eq!(allow(&id, &admin).body["error"]["code"], "sso_suggestion_changed");
+
+        // A tab still showing an old suggestion can't add it to a newer setup: another Slack
+        // workspace, or another provider.
+        let id = slack_setup("T0OLD", true);
+        slack_setup("T0NEW", true);
+        assert_eq!(allow(&id, &admin).body["error"]["code"], "sso_suggestion_changed");
+        let id = slack_setup("T0NEW", false);
+        let url = start_setup(&h, &admin, json!({ "provider": "google", "replace": true }));
+        let c = admin_token("google", json!({ "hd": "beta.test", "email_verified": true }));
+        finish_setup(&h, &url, &admin, c, None);
+        let r = allow(&id, &admin);
+        assert_eq!((r.status, r.body["error"]["code"].as_str()), (409, Some("sso_suggestion_changed")));
+        assert_eq!(h.ok("GET", "/api/v1/sso", None, &admin)["allowed_domains"], json!(["beta.test"]));
+    }
+
+    #[test]
+    fn company_domains_are_never_mistaken_for_free_mail() {
+        let (h, admin) = shared_workspace();
+        // Google's hosted domain is Google's word: it's the organization's.
+        let url = start_setup(&h, &admin, json!({ "provider": "google" }));
+        let landing = finish_setup(&h, &url, &admin, admin_token("google", json!({ "hd": "live.abc.de", "email_verified": true })), None).0;
+        assert_eq!(landing.location, format!("{SETTINGS}?sso_setup=done"), "{}", landing.error());
+        assert_eq!(h.ok("GET", "/api/v1/sso", None, &admin)["allowed_domains"], json!(["live.abc.de"]));
+        // Microsoft's, with xms_edov.
+        let url = start_setup(&h, &admin, json!({ "provider": "microsoft", "replace": true }));
+        let mut c = admin_token("microsoft", organization("microsoft"));
+        c["email"] = json!("ada@gmx.acme.com");
+        assert_eq!(finish_setup(&h, &url, &admin, c, None).0.location, format!("{SETTINGS}?sso_setup=done"));
+        assert_eq!(h.ok("GET", "/api/v1/sso", None, &admin)["allowed_domains"], json!(["gmx.acme.com"]));
+        // Slack's, suggested.
+        let url = start_setup(&h, &admin, json!({ "provider": "slack", "replace": true }));
+        let mut c = admin_token("slack", organization("slack"));
+        c["email"] = json!("ada@mail.acme.co.uk");
+        finish_setup(&h, &url, &admin, c, None);
+        assert_eq!(h.ok("GET", "/api/v1/sso", None, &admin)["suggested_domain"], "mail.acme.co.uk");
     }
 
     #[test]

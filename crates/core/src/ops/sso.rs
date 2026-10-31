@@ -29,6 +29,10 @@ pub fn ops() -> Vec<Op> {
             .title("Set up single sign-on by signing in")
             .desc("Sets up single sign-on with this server's own Google, Microsoft or Slack app (one of `shared_providers` from get_sso), with nothing to register. Answers with an `authorize_url` to open in the same signed-in browser. Sign in there with your organization's account: a Google Workspace account, a Microsoft work or school account, or your Slack workspace's. DumbSlab takes your organization from it (Google's domain, Microsoft's directory, Slack's workspace), and an allowed email domain when the provider vouches for one that isn't free mail. It shows “Sign in with …” on the sign-in page, links your account, and sends you back to Settings › Single sign-on (`?sso_setup=done`, `domain_needed` when you still need to add your email domains, or `?sso_error=` a code). `require_sso` and `auto_provision` stay as they were. Replacing single sign-on set up with your own app or another provider needs `replace: true`. Only from a signed-in browser; scripts and agents use update_sso with `shared: true`.")
             .build(),
+        op("sso", "allow_suggested_sso_domain", "POST", "/sso/suggested-domain", Access::Admin, allow_suggested_domain)
+            .title("Allow the suggested email domain")
+            .desc("Adds get_sso's `suggested_domain` to `allowed_domains`, keeping the domains already there. Slack, set up by signing in, suggests the domain of the admin's address: Slack confirmed the address, not that the domain is the organization's, so an admin confirms it here. Pass the `domain` and `suggestion_id` get_sso showed; if single sign-on changed since (another provider or workspace, or no such suggestion), it's refused, so nothing is added to settings you haven't seen.")
+            .build(),
         op("sso", "list_sso_identities", "GET", "/sso/identities", Access::Read, list_identities)
             .title("Linked sign-in accounts")
             .desc("The accounts at the identity provider linked to people here, which they sign in with. Yours by default; admins can pass `user`, or `all`.")
@@ -70,8 +74,10 @@ pub struct UpdateSsoInput {
     pub allowed_domains: Option<Vec<String>>,
     /// Add people the provider vouches for, from `allowed_domains`, as members when nobody here has their email. Off by default.
     pub auto_provision: Option<bool>,
-    /// Only admins may sign in with a password; everyone else signs in with the provider. API tokens and MCP connections keep working.
+    /// Only admins may sign in with a password; everyone else signs in with the provider. API tokens and MCP connections keep working. While it's paused (`require_sso_paused` in get_sso), turning it back on also needs `relinked: true`.
     pub require_sso: Option<bool>,
+    /// While "Require single sign-on" is paused (`require_sso_paused`), confirm that the people whose Microsoft links were forgotten have linked again. Turning `require_sso` back on then needs it; it also clears the pause note.
+    pub relinked: Option<bool>,
     /// Show "Sign in with …" on the sign-in page. Needs the provider, client ID and secret set up.
     pub enabled: Option<bool>,
     /// `oidc`: the name on the button, e.g. `Acme SSO` for "Sign in with Acme SSO".
@@ -205,8 +211,21 @@ fn update_sso(ctx: &mut Ctx, input: UpdateSsoInput) -> ApiResult<Deferred<SsoSet
     if let Some(b) = input.auto_provision {
         conf.auto_provision = b;
     }
-    if let Some(b) = input.require_sso {
+    // Paused because people's links were forgotten: turning it back on must be meant, not a
+    // form re-sending an old checkbox.
+    if let Some(b) = input.require_sso
+        && b != conf.require_sso
+    {
+        if b && conf.require_sso_paused && input.relinked != Some(true) {
+            return Err(ApiError::new(
+                409,
+                "sso_relink_pending",
+                "\"Require single sign-on\" is paused: some people's Microsoft accounts were linked through the old app and must be linked again, or they can't get in. Once they have, pass `relinked: true` with `require_sso: true`.",
+            ));
+        }
         conf.require_sso = b;
+    }
+    if input.relinked == Some(true) {
         conf.require_sso_paused = false;
     }
     if let Some(b) = input.enabled {
@@ -267,6 +286,39 @@ fn update_sso(ctx: &mut Ctx, input: UpdateSsoInput) -> ApiResult<Deferred<SsoSet
         return Ok(Deferred::Pending);
     }
     Ok(Deferred::Ready(sso::settings_view(ctx.db, ctx.cfg, &ctx.base_url, None)?))
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AllowDomainInput {
+    /// The `suggested_domain` from get_sso.
+    pub domain: String,
+    /// The `suggestion_id` from get_sso, which names the suggestion and the organization it's for.
+    pub suggestion_id: String,
+}
+
+fn allow_suggested_domain(ctx: &mut Ctx, input: AllowDomainInput) -> ApiResult<SsoSettings> {
+    let mut conf = sso::load(ctx.db)?;
+    let domain = sso::normalize_domain(&input.domain).unwrap_or_default();
+    let current = sso::suggestion_id(&conf);
+    if domain.is_empty() || domain != conf.suggested_domain || current.as_deref() != Some(input.suggestion_id.trim()) {
+        return Err(ApiError::new(
+            409,
+            "sso_suggestion_changed",
+            "Single sign-on changed since you looked, and that domain isn't suggested for it any more. Look at the settings again.",
+        ));
+    }
+    // Onto the list as it is now, so domains saved meanwhile stay.
+    if conf.allowed_domains.len() >= 50 {
+        return Err(ApiError::bad_request("list at most 50 domains"));
+    }
+    conf.allowed_domains.push(domain.clone());
+    conf.suggested_domain.clear();
+    sso::save(ctx.db, &conf)?;
+    let data =
+        json!({ "provider": conf.provider.map(Provider::as_str), "allowed_domain": domain, "allowed_domains": conf.allowed_domains });
+    emit(ctx, Event::new("sso.updated", "settings", "sso", format!("allowed {domain} for single sign-on")).data(data).admin_only())?;
+    sso::settings_view(ctx.db, ctx.cfg, &ctx.base_url, None)
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]

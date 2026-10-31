@@ -249,7 +249,8 @@ pub struct Config {
     pub require_sso: bool,
     /// "Require single sign-on" was turned off for the admin when the workspace's Microsoft app
     /// changed, because accounts linked through the old app had to be linked again (see
-    /// [`forget_app_bound`]). Cleared when an admin sets `require_sso` again.
+    /// [`forget_app_bound`]). Cleared only when an admin confirms those people linked again
+    /// (`relinked` in `update_sso`), which turning it back on needs.
     pub require_sso_paused: bool,
     /// Other OIDC providers: the name on the button.
     pub label: String,
@@ -384,21 +385,103 @@ fn redirect_uri(cfg: &HostConfig, conf: &Config, base_url: &str) -> String {
     }
 }
 
-/// Domains anyone can have an address at, by provider, with where each list comes from. Setting
-/// up never allows or suggests one: every account there could then match people here by email. No
-/// list is complete, so this is a backstop: setting up allows only a domain the provider vouches is
-/// the organization's (Google's `hd`, Microsoft's `xms_edov`), and Slack's is only suggested.
+/// Domains anyone can have an address at, by provider, with where each list comes from: exact
+/// domains only, so no company's own domain is ever mistaken for one. Setting up never allows or
+/// suggests one from Microsoft or Slack: every account there could then match people here by email.
+/// No list is complete, so this is a backstop: Microsoft's domain is allowed only with `xms_edov`,
+/// and Slack's is only suggested. (Google's `hd` needs no check: Google sets it only for Google
+/// Workspace and Cloud Identity domains, which their organizations verified.)
 const FREE_MAIL: &[&[&str]] = &[
     // Google: gmail.com, and googlemail.com where Gmail once couldn't use its name.
     &["gmail.com", "googlemail.com"],
     // Microsoft: https://support.microsoft.com/en-us/outlook/premium-features-in-outlook-com-for-microsoft-365-subscribers
     // (outlook.com, hotmail.com, live.com, msn.com); legacy passport.com and windowslive.com
-    // (https://en.wikipedia.org/wiki/Outlook.com); regional ones are caught by FREE_MAIL_BRANDS.
-    &["outlook.com", "hotmail.com", "live.com", "msn.com", "passport.com", "windowslive.com"],
-    // Yahoo: https://help.yahoo.com/kb/SLN2153.html (yahoo.com, myyahoo.com, regional yahoo.*),
-    // https://help.yahoo.com/kb/SLN3407.html (ymail.com, rocketmail.com), and y7mail.com
-    // (https://dmarc.org/2016/03/yahoo-protects-62-additional-domains-with-dmarc/).
-    &["yahoo.com", "myyahoo.com", "ymail.com", "rocketmail.com", "y7mail.com"],
+    // (https://en.wikipedia.org/wiki/Outlook.com). Microsoft publishes no list of its regional
+    // domains; these are from https://www.badsender.com/en/2015/07/09/list-domain-email-group-destination-webmail-fai/
+    &[
+        "outlook.com",
+        "hotmail.com",
+        "live.com",
+        "msn.com",
+        "passport.com",
+        "windowslive.com",
+        "hotmail.co.uk",
+        "hotmail.fr",
+        "hotmail.de",
+        "hotmail.it",
+        "hotmail.es",
+        "hotmail.be",
+        "hotmail.nl",
+        "hotmail.se",
+        "outlook.fr",
+        "live.co.uk",
+        "live.fr",
+        "live.de",
+        "live.it",
+        "live.nl",
+        "live.be",
+        "live.se",
+        "live.dk",
+        "live.ca",
+        "live.com.pt",
+        "msn.be",
+    ],
+    // Yahoo: https://help.yahoo.com/kb/SLN2153.html (yahoo.com, myyahoo.com, regional yahoo
+    // domains), https://help.yahoo.com/kb/SLN3407.html (ymail.com, rocketmail.com). Yahoo publishes
+    // no list of its regional domains; these are from its DMARC announcement
+    // (https://dmarc.org/2016/03/yahoo-protects-62-additional-domains-with-dmarc/) and
+    // https://www.badsender.com/en/2015/07/09/list-domain-email-group-destination-webmail-fai/.
+    // yahoo.co.jp is Yahoo! JAPAN's.
+    &[
+        "yahoo.com",
+        "myyahoo.com",
+        "ymail.com",
+        "rocketmail.com",
+        "y7mail.com",
+        "yahoo.at",
+        "yahoo.be",
+        "yahoo.bg",
+        "yahoo.ca",
+        "yahoo.cl",
+        "yahoo.co.hu",
+        "yahoo.co.id",
+        "yahoo.co.il",
+        "yahoo.co.in",
+        "yahoo.co.kr",
+        "yahoo.co.nz",
+        "yahoo.co.th",
+        "yahoo.co.uk",
+        "yahoo.co.za",
+        "yahoo.com.ar",
+        "yahoo.com.au",
+        "yahoo.com.br",
+        "yahoo.com.co",
+        "yahoo.com.hk",
+        "yahoo.com.hr",
+        "yahoo.com.mx",
+        "yahoo.com.my",
+        "yahoo.com.pe",
+        "yahoo.com.ph",
+        "yahoo.com.sg",
+        "yahoo.com.tr",
+        "yahoo.com.tw",
+        "yahoo.com.ua",
+        "yahoo.com.ve",
+        "yahoo.com.vn",
+        "yahoo.cz",
+        "yahoo.de",
+        "yahoo.dk",
+        "yahoo.ee",
+        "yahoo.es",
+        "yahoo.fi",
+        "yahoo.fr",
+        "yahoo.gr",
+        "yahoo.hr",
+        "yahoo.hu",
+        "yahoo.it",
+        "yahoo.se",
+        "yahoo.co.jp",
+    ],
     // Apple: https://support.apple.com/en-us/118230
     &["icloud.com", "me.com", "mac.com"],
     // AOL.
@@ -407,9 +490,11 @@ const FREE_MAIL: &[&[&str]] = &[
     &["proton.me", "protonmail.com", "protonmail.ch", "pm.me"],
     // Tuta: https://tuta.com/blog/anonymous-email
     &["tuta.com", "tutanota.com", "tutanota.de", "tutamail.com", "tuta.io", "keemail.me"],
-    // GMX: https://www.gmx.com/mail/alias-addresses/ (gmx.com, gmx.us, gmx.co.uk, gmx.ca), and its
-    // home markets' gmx.net, gmx.de, gmx.at, gmx.ch; web.de is the same company's.
-    &["gmx.com", "gmx.us", "gmx.co.uk", "gmx.ca", "gmx.net", "gmx.de", "gmx.at", "gmx.ch", "web.de"],
+    // GMX: https://www.gmx.com/mail/alias-addresses/ (gmx.com, gmx.us, gmx.co.uk, gmx.ca), and
+    // gmx.net, gmx.de, gmx.at, gmx.fr and caramail.com from
+    // https://www.badsender.com/en/2015/07/09/list-domain-email-group-destination-webmail-fai/;
+    // gmx.ch and web.de (the same company's) are widely used too.
+    &["gmx.com", "gmx.us", "gmx.co.uk", "gmx.ca", "gmx.net", "gmx.de", "gmx.at", "gmx.fr", "gmx.ch", "caramail.com", "web.de"],
     // mail.com: the commonest of the domains on https://www.mail.com/mail/domains/
     &[
         "mail.com",
@@ -584,6 +669,7 @@ const FREE_MAIL: &[&[&str]] = &[
         "att.net",
         "verizon.net",
         "orange.fr",
+        "wanadoo.fr",
         "free.fr",
         "t-online.de",
         "libero.it",
@@ -591,38 +677,23 @@ const FREE_MAIL: &[&[&str]] = &[
         "hushmail.com",
     ],
 ];
-/// Free-mail brands with a domain in many countries, such as `yahoo.co.uk`, `hotmail.fr`,
-/// `outlook.com.br` or `gmx.es`. Microsoft and Yahoo publish no full list of theirs.
-const FREE_MAIL_BRANDS: &[&str] = &[
-    "gmail",
-    "googlemail",
-    "outlook",
-    "hotmail",
-    "live",
-    "msn",
-    "windowslive",
-    "yahoo",
-    "aol",
-    "gmx",
-    "yandex",
-    "proton",
-    "protonmail",
-    "tutanota",
-    "fastmail",
-    "zohomail",
-];
-
 /// Whether `domain` is a free-mail domain (see [`FREE_MAIL`]).
 pub fn free_mail(domain: &str) -> bool {
     let d = domain.trim().trim_end_matches('.').to_ascii_lowercase();
-    if FREE_MAIL.iter().any(|list| list.contains(&d.as_str())) {
-        return true;
+    FREE_MAIL.iter().any(|list| list.contains(&d.as_str()))
+}
+
+/// Identifies the domain suggestion `conf` has, with the organization it was made for: allowing a
+/// suggestion needs this, so nothing is added to settings an admin hasn't seen (another provider,
+/// workspace or suggestion). `None` without a suggestion, or once the domain is allowed.
+pub fn suggestion_id(conf: &Config) -> Option<String> {
+    let d = &conf.suggested_domain;
+    if d.is_empty() || conf.domain_allowed(d) {
+        return None;
     }
-    // A brand under a country's suffix: `hotmail.fr`, `yahoo.co.uk`, `outlook.com.br`.
-    let Some((brand, suffix)) = d.split_once('.') else { return false };
-    let labels: Vec<&str> = suffix.split('.').collect();
-    let country = labels.len() <= 2 && labels.iter().all(|l| l.len() <= 3) && labels.last().is_some_and(|tld| tld.len() == 2);
-    country && FREE_MAIL_BRANDS.contains(&brand)
+    let provider = conf.provider.map(Provider::as_str).unwrap_or_default();
+    let id = sha256_hex(&format!("{provider}|{}|{}|{}|{}|{d}", conf.shared, conf.issuer, conf.tenant, conf.team));
+    Some(id[..24].to_string())
 }
 
 /// A Slack workspace (team) ID as stored: uppercase, like `T0123ABCD`. `None` when it isn't one.
@@ -746,13 +817,16 @@ pub struct SsoSettings {
     /// address, not that the domain is the organization's, so it isn't allowed until an admin
     /// adds it to `allowed_domains`.
     pub suggested_domain: Option<String>,
+    /// Identifies `suggested_domain` and the organization it's for. Pass both to
+    /// `allow_suggested_sso_domain` to allow it.
+    pub suggestion_id: Option<String>,
     pub auto_provision: bool,
     pub require_sso: bool,
     /// "Require single sign-on" was turned off automatically when the workspace switched Microsoft
     /// apps: accounts linked through the old app before links were by Microsoft's `oid` had to be
     /// linked again, and those people would otherwise have had no way in. They sign in with
     /// Microsoft (matched by verified email) or with their password and link in Settings › Profile.
-    /// Turn it back on (`require_sso: true`) once they have.
+    /// Turn it back on once they have, with `require_sso: true` and `relinked: true`.
     pub require_sso_paused: bool,
     /// Other OIDC providers: the name on the button.
     pub label: Option<String>,
@@ -783,6 +857,7 @@ pub fn settings_view(db: &dyn Db, cfg: &HostConfig, base_url: &str, check: Optio
         client_secret_unreadable: secret_unreadable(cfg, &conf),
         allowed_domains: conf.allowed_domains.clone(),
         suggested_domain: some(&conf.suggested_domain).filter(|d| !conf.domain_allowed(d)),
+        suggestion_id: suggestion_id(&conf),
         auto_provision: conf.auto_provision,
         require_sso: conf.require_sso,
         require_sso_paused: conf.require_sso_paused,
@@ -978,8 +1053,8 @@ struct Domains {
 /// Setting up: reads the admin's organization from their own ID token and checks the token
 /// against it. `target` is where setting up started ([`setup_target`]). Answers with the settings
 /// for that organization (Google's hosted domain, Microsoft's directory and its issuer, Slack's
-/// workspace) and what it learned about email domains. Free-mail domains are never allowed or
-/// suggested. Microsoft's directory must be in the issuer exactly, as Microsoft says multi-tenant
+/// workspace) and what it learned about email domains. Microsoft and Slack never give a free-mail
+/// domain. Microsoft's directory must be in the issuer exactly, as Microsoft says multi-tenant
 /// apps check; personal Google and Microsoft accounts have no organization.
 fn setup_org(target: &Config, claims: &Value, nonce: &str, now: DateTime<Utc>) -> Result<(Config, Domains), Problem> {
     let mut conf = target.clone();
@@ -1002,7 +1077,8 @@ fn setup_org(target: &Config, claims: &Value, nonce: &str, now: DateTime<Utc>) -
     };
     let domains = match provider {
         Provider::Google => {
-            let hd = claims["hd"].as_str().and_then(normalize_domain).filter(|d| !free_mail(d)).ok_or(Problem::PersonalAccount)?;
+            // Authoritative: Google sets `hd` only for a Workspace or Cloud Identity domain.
+            let hd = claims["hd"].as_str().and_then(normalize_domain).ok_or(Problem::PersonalAccount)?;
             conf.allowed_domains = vec![hd.clone()];
             Domains { allowed: Some(hd), suggested: None }
         }
@@ -2422,7 +2498,6 @@ mod tests {
             "hotmail.co.uk",
             "yahoo.co.jp",
             "live.fr",
-            "outlook.com.br",
             "icloud.com",
             "proton.me",
             "myyahoo.com",
@@ -2431,7 +2506,7 @@ mod tests {
             "tutamail.com",
             "tutanota.de",
             "keemail.me",
-            "gmx.es",
+            "gmx.fr",
             "email.com",
             "ya.ru",
             "zohomail.com",
@@ -2440,7 +2515,19 @@ mod tests {
         ] {
             assert!(free_mail(free), "{free}");
         }
-        for org in ["acme.com", "live.acmecorp.com", "gmail-tools.io", "outlook.acme.com", "yahoo.example.org"] {
+        // Exact domains only: a company's own domain is never mistaken for free mail.
+        for org in [
+            "acme.com",
+            "live.acmecorp.com",
+            "gmail-tools.io",
+            "outlook.acme.com",
+            "yahoo.example.org",
+            "live.abc.de",
+            "mail.acme.co.uk",
+            "gmx.acme.com",
+            "hotmail.acme.fr",
+            "outlook.co",
+        ] {
             assert!(!free_mail(org), "{org}");
         }
         assert_eq!(normalize_team(" t0acme ").as_deref(), Some("T0ACME"));
@@ -2474,7 +2561,10 @@ mod tests {
             org(Provider::Google, token(g, "google-app", json!({ "email": "ada@gmail.com", "email_verified": true }))).unwrap_err(),
             Problem::PersonalAccount
         );
-        assert_eq!(org(Provider::Google, token(g, "google-app", json!({ "hd": "gmail.com" }))).unwrap_err(), Problem::PersonalAccount);
+        // `hd` is Google's word that the domain is a Workspace organization's: no free-mail guess
+        // second-guesses it.
+        let (_, domains) = org(Provider::Google, token(g, "google-app", json!({ "hd": "live.abc.de" }))).unwrap();
+        assert_eq!(domains, allowed("live.abc.de"));
         // The usual checks: another app's token, another sign-in's.
         assert_eq!(org(Provider::Google, token(g, "someone-elses", json!({ "hd": "acme.com" }))).unwrap_err(), Problem::InvalidToken);
         let mut replayed = token(g, "google-app", json!({ "hd": "acme.com" }));

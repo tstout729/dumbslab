@@ -640,15 +640,38 @@ function ssoSetupButtons(s, providers) {
     h('p', { class: 'field-hint' }, 'Sign in once with your organization’s account: a Google Workspace account, a Microsoft work or school account, or your Slack workspace’s. DumbSlab takes your organization from it. Nothing to register or paste.'));
 }
 
+/**
+ * Turning "Require single sign-on" back on while it's paused (people's Microsoft links were
+ * forgotten) must be meant: asks, and adds `relinked`. False when the admin says no.
+ */
+async function ssoRequireConfirmed(s, body) {
+  if (!s.require_sso_paused || !body.require_sso) return true;
+  const ok = await confirmDialog({
+    title: 'Turn “Require single sign-on” back on?',
+    message: 'Some people’s Microsoft accounts were linked through the old app. Until they’ve signed in with Microsoft again, or linked it in Settings › Profile, they can’t get in once passwords are off. Only turn it on once they have.',
+    confirmLabel: 'Turn it on',
+  });
+  if (ok) body.relinked = true;
+  return ok;
+}
+
 /** Slack's suggested domain: Slack confirmed the admin's address, not that its domain is the organization's. */
-function ssoSuggestion(s, reload) {
+function ssoSuggestion(s, onSaved, reload) {
   const d = s.suggested_domain;
-  if (!d) return null;
+  if (!d || !s.suggestion_id) return null;
   const allow = button(`Allow ${d}`, { variant: 'primary', size: 'sm' });
   allow.addEventListener('click', () => busy(allow, async () => {
-    await api.patch('/sso', { allowed_domains: [...(s.allowed_domains || []), d] });
+    // The server adds it to the domains as they are now, and only if this is still the suggestion.
+    let saved;
+    try {
+      saved = await api.post('/sso/suggested-domain', { domain: d, suggestion_id: s.suggestion_id });
+    } catch (err) {
+      toastError(err);
+      reload();
+      return;
+    }
+    onSaved(saved);
     toast(`People at ${d} can now be found by email`);
-    reload();
   }).catch(toastError));
   return h('div', { class: 'callout callout-warn', role: 'status' }, icon('alert', { size: 15 }),
     h('div', { class: 'stack' },
@@ -662,23 +685,21 @@ function ssoSharedForm(s, onSaved, reload) {
   const derived = s.provider === 'microsoft' ? s.tenant : s.provider === 'slack' ? s.team : null;
   const domains = input({ value: (s.allowed_domains || []).join(', '), spellcheck: 'false', autocapitalize: 'off', placeholder: 'acme.com' });
   const toggles = ssoToggles(s);
-  const checks = h('div', { class: 'stack' });
   const domainsHint = s.provider === 'google'
     ? 'Your Google Workspace domains, separated by commas. Only accounts in them can sign in.'
     : 'Separated by commas. A first sign-in finds someone here by email only when the provider says it’s verified and it’s at one of these.';
   return form(async () => {
-    const saved = await api.patch('/sso', { allowed_domains: splitDomains(domains.value), ...toggles.values() });
-    checks.replaceChildren(...[ssoCheckNote(saved.check)].filter(Boolean));
-    onSaved(saved);
+    const body = { allowed_domains: splitDomains(domains.value), ...toggles.values() };
+    if (!(await ssoRequireConfirmed(s, body))) return;
+    onSaved(await api.patch('/sso', body));
     toast('Single sign-on saved');
   },
   h('p', { class: 'small' }, `Signs in through DumbSlab’s own ${info.label} app: nothing to register, renew or paste.`),
-  ssoSuggestion(s, reload),
+  ssoSuggestion(s, onSaved, reload),
   derived ? h('div', { class: 'field' }, h('span', { class: 'field-label' }, info.org), h('p', null, h('code', null, derived)),
     h('p', { class: 'field-hint' }, `Only people in this ${s.provider === 'slack' ? 'Slack workspace' : 'directory'} can sign in. To change it, set up again with another account.`)) : null,
   field('Allowed email domains', domains, { hint: domainsHint }),
   toggles.fieldset,
-  checks,
   h('div', null, button('Save single sign-on', { variant: 'primary', type: 'submit' })));
 }
 
@@ -719,7 +740,6 @@ function ssoOwnForm(s, onSaved) {
   };
   provider.addEventListener('change', show);
   show();
-  const checks = h('div', { class: 'stack' });
   return form(async () => {
     const p = provider.value;
     if (!p) {
@@ -737,11 +757,8 @@ function ssoOwnForm(s, onSaved) {
     if (p === 'slack') body.team = team.value.trim();
     if (p === 'oidc') body.label = label.value.trim();
     if (clientSecret.value.trim()) body.client_secret = clientSecret.value.trim();
-    const saved = await api.patch('/sso', body);
-    clientSecret.value = '';
-    clientSecret.placeholder = secretHint(saved);
-    checks.replaceChildren(...[ssoCheckNote(saved.check)].filter(Boolean));
-    onSaved(saved);
+    if (!(await ssoRequireConfirmed(s, body))) return;
+    onSaved(await api.patch('/sso', body));
     toast('Single sign-on saved');
   },
   field('Provider', provider, { hint: help }),
@@ -751,29 +768,22 @@ function ssoOwnForm(s, onSaved) {
   h('div', { class: 'grid-2' }, field('Client ID', clientId), field('Client secret', clientSecret, { hint: 'Stored encrypted and never shown again.' })),
   domainsField,
   toggles.fieldset,
-  checks,
   h('div', null, button('Save single sign-on', { variant: 'primary', type: 'submit' })));
 }
 
-async function ssoSection(ctx) {
-  const s = await api.get('/sso');
+/**
+ * The Single sign-on panel, built from the settings `s`. Every save builds it again from what the
+ * server saved, so no control keeps a value the server changed (such as "Require single sign-on"
+ * paused when the workspace switched Microsoft apps).
+ */
+function ssoPanel(s, { note = null, check = null, onSaved, reload }) {
   const shared = (s.shared_providers || []).filter((p) => Object.hasOwn(SSO_SHARED, p));
-  if (!s.available && !shared.length && !s.shared) {
-    return h('section', { class: 'panel' }, emptyState({ iconName: 'lock', title: 'Single sign-on isn’t available on this server',
-      body: 'Whoever runs the server can add DumbSlab’s own Google, Microsoft or Slack sign-in apps, or a connector key (CONNECTOR_KEY, or DUMBSLAB_CONNECTOR_KEY when self-hosting) for apps you register yourself.' }));
-  }
-  const status = h('div', { class: 'stack' }, ssoStatus(s));
-  const onSaved = (saved) => {
-    status.replaceChildren(ssoStatus(saved));
-    // The sign-in page's button follows the new settings.
-    state.auth.sso = saved.active ? { name: saved.name, url: `${location.origin}/sso/start`, required: saved.require_sso } : null;
-  };
   const own = s.available
     ? ssoOwnForm(s, onSaved)
     : h('p', { class: 'muted small' }, 'Using your own app needs a connector key on this server, to encrypt its client secret. Whoever runs the server can set CONNECTOR_KEY (or DUMBSLAB_CONNECTOR_KEY when self-hosting).');
   const ownApp = s.provider && !s.shared;
   const body = [];
-  if (s.shared && s.provider) body.push(ssoSharedForm(s, onSaved, () => ctx.reload()));
+  if (s.shared && s.provider) body.push(ssoSharedForm(s, onSaved, reload));
   if (shared.length) {
     const buttons = ssoSetupButtons(s, shared);
     body.push(s.shared ? h('details', { class: 'sso-more' }, h('summary', null, 'Set up again, or with another provider'), buttons) : buttons);
@@ -787,9 +797,32 @@ async function ssoSection(ctx) {
   const description = shared.length
     ? 'People sign in with your organization’s identity provider. Set it up by signing in once with Google, Microsoft or Slack, or use your own app for any provider.'
     : 'People sign in with your organization’s identity provider. You register an app with the provider and paste its details here.';
+  return panel('Single sign-on', description, ...ssoStatus(s).filter(Boolean), note, ssoCheckNote(check), ...body);
+}
 
-  const linked = await api.get('/sso/identities', { user: 'all' });
+async function ssoSection(ctx) {
+  const s = await api.get('/sso');
+  const shared = (s.shared_providers || []).filter((p) => Object.hasOwn(SSO_SHARED, p));
+  if (!s.available && !shared.length && !s.shared) {
+    return h('section', { class: 'panel' }, emptyState({ iconName: 'lock', title: 'Single sign-on isn’t available on this server',
+      body: 'Whoever runs the server can add DumbSlab’s own Google, Microsoft or Slack sign-in apps, or a connector key (CONNECTOR_KEY, or DUMBSLAB_CONNECTOR_KEY when self-hosting) for apps you register yourself.' }));
+  }
   const reload = () => ctx.reload();
+  let current = null;
+  const show = (settings, extra) => {
+    const next = ssoPanel(settings, { ...extra, onSaved, reload });
+    if (current) current.replaceWith(next);
+    current = next;
+    return next;
+  };
+  function onSaved(saved) {
+    // The sign-in page's button follows the new settings.
+    state.auth.sso = saved.active ? { name: saved.name, url: `${location.origin}/sso/start`, required: saved.require_sso } : null;
+    show(saved, { check: saved.check });
+    // Switching apps can forget links.
+    showLinked().catch(toastError);
+  }
+
   const row = (i) => {
     const unlink = button('Unlink', { size: 'xs', variant: 'ghost', cls: 'text-danger' });
     unlink.addEventListener('click', async () => {
@@ -808,10 +841,16 @@ async function ssoSection(ctx) {
         h('div', { class: 'person-meta' }, h('span', null, i.email || i.issuer), h('span', null, 'Linked ', timeEl(i.linked_at)), i.last_used_at ? h('span', null, 'Used ', timeEl(i.last_used_at)) : null)),
       unlink);
   };
-  return frag(
-    panel('Single sign-on', description, status, ssoSetupNote(s), ...body),
-    panel('Linked accounts', 'Accounts at the provider that sign in as people here.',
-      linked.items.length ? h('ul', { class: 'people-list' }, linked.items.map(row)) : h('p', { class: 'muted small' }, 'Nobody has signed in with single sign-on yet.')));
+  let linkedPanel = null;
+  async function showLinked() {
+    const linked = await api.get('/sso/identities', { user: 'all' });
+    const next = panel('Linked accounts', 'Accounts at the provider that sign in as people here.',
+      linked.items.length ? h('ul', { class: 'people-list' }, linked.items.map(row)) : h('p', { class: 'muted small' }, 'Nobody has signed in with single sign-on yet.'));
+    if (linkedPanel) linkedPanel.replaceWith(next);
+    linkedPanel = next;
+    return next;
+  }
+  return frag(show(s, { note: ssoSetupNote(s) }), await showLinked());
 }
 
 // ---------------------------------------------------------------------------
