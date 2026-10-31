@@ -39,6 +39,7 @@ static INFO: ProviderInfo = ProviderInfo {
         scope_separator: " ",
         extra: &[],
         pkce: true,
+        site: None,
     }),
     token_fields: &[Field {
         key: "token",
@@ -296,7 +297,11 @@ mod tests {
         assert!(spec.pkce);
         assert!(spec.scopes.contains(&"workspaces.typeahead:read"));
         let app = OAuthApp { client_id: "id".into(), client_secret: "sec".into() };
-        let call = Asana.token_request(&app, vec![("grant_type".into(), "refresh_token".into()), ("refresh_token".into(), "r".into())]);
+        let call = Asana.token_request(
+            &app,
+            INFO.oauth.unwrap().token_url,
+            vec![("grant_type".into(), "refresh_token".into()), ("refresh_token".into(), "r".into())],
+        );
         assert_eq!(call.url, "https://app.asana.com/-/oauth_token");
         assert_eq!(call.body.as_deref(), Some("grant_type=refresh_token&refresh_token=r&client_id=id&client_secret=sec"));
         // A refresh answers without a new refresh token; the core keeps the old one.

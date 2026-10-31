@@ -35,6 +35,7 @@ static INFO: ProviderInfo = ProviderInfo {
         scope_separator: " ",
         extra: &[("token_access_type", "offline")],
         pkce: true,
+        site: None,
     }),
     token_fields: &[],
     token_help: "",
@@ -125,11 +126,11 @@ impl Connector for Dropbox {
 
     /// Sign-ins use PKCE, so the code verifier stands in for the client secret, here and on
     /// refreshes, as Dropbox documents for PKCE.
-    fn token_request(&self, app: &OAuthApp, form: Vec<(String, String)>) -> HttpCall {
+    fn token_request(&self, app: &OAuthApp, token_url: &str, form: Vec<(String, String)>) -> HttpCall {
         let mut all = form;
         all.push(("client_id".into(), app.client_id.clone()));
         let pairs: Vec<(&str, &str)> = all.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-        HttpCall::post_form(INFO.oauth.expect("Dropbox signs in").token_url, &pairs).header("accept", "application/json")
+        HttpCall::post_form(token_url, &pairs).header("accept", "application/json")
     }
 
     /// Some of Dropbox's examples give `expires_in` as a string; read both, so tokens are
@@ -162,7 +163,7 @@ mod tests {
             ("redirect_uri".into(), "https://w.test/connect/callback".into()),
             ("code_verifier".into(), "v".into()),
         ];
-        let call = Dropbox.token_request(&app, form);
+        let call = Dropbox.token_request(&app, INFO.oauth.unwrap().token_url, form);
         assert_eq!((call.method, call.url.as_str()), ("POST", "https://api.dropboxapi.com/oauth2/token"));
         assert_eq!(
             call.body.as_deref(),
@@ -170,8 +171,11 @@ mod tests {
                 "grant_type=authorization_code&code=c&redirect_uri=https%3A%2F%2Fw.test%2Fconnect%2Fcallback&code_verifier=v&client_id=key"
             )
         );
-        let refresh =
-            Dropbox.token_request(&app, vec![("grant_type".into(), "refresh_token".into()), ("refresh_token".into(), "r".into())]);
+        let refresh = Dropbox.token_request(
+            &app,
+            INFO.oauth.unwrap().token_url,
+            vec![("grant_type".into(), "refresh_token".into()), ("refresh_token".into(), "r".into())],
+        );
         assert!(!refresh.body.unwrap().contains("secret"));
         let first =
             json!({ "access_token": "sl.a", "expires_in": 14400, "token_type": "bearer", "refresh_token": "r", "account_id": "dbid:1" });

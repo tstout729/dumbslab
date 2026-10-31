@@ -1,20 +1,35 @@
 //! Zendesk: tickets and Help Center articles the connected agent can see, and previews of linked
-//! tickets. People connect with their Zendesk subdomain, email and an API token, sent as Basic auth
-//! (`<email>/token:<token>`); every request goes to that one subdomain.
+//! tickets. Every request goes to the connection's one subdomain, kept sealed with its token.
+//! People connect one of two ways:
 //!
-//! - No sign-in: a Zendesk OAuth client belongs to one Zendesk account, with sign-in URLs on its
-//!   subdomain, and Zendesk's terms don't let an app made for many customers use their own clients
-//!   or API tokens. That takes a global OAuth client, which Zendesk approves. A self-hosted server
-//!   connecting its own company's Zendesk is internal use, which the terms allow.
-//! - Zendesk is retiring API tokens: since October 27, 2026 no account can create one (accounts
-//!   opened since July 28, 2026 never could), tokens unused for 30 days are switched off, and all
-//!   stop working on April 30, 2027.
-//! - An API token works with any user's email in the account, so a connection acts as whoever's
-//!   email is given. Tokens come from admins, who decide who gets one.
+//! - **Signing in** (OAuth), once the host has a Zendesk *global* OAuth client: a client Zendesk
+//!   approves for an app made for many customers. Its sign-in page and token endpoint are on each
+//!   customer's own `https://<subdomain>.zendesk.com` (`/oauth/authorizations/new`,
+//!   `/oauth/tokens`, JSON bodies), so the person names their subdomain first; the core keeps it
+//!   with the sign-in and the credential (see [`crate::connect::OAuthSpec::site`]). Sign-in uses
+//!   PKCE with the client secret, and asks for `read` (every GET; no granular scope covers search
+//!   across tickets and Help Center). Access tokens expire and come with a refresh token that
+//!   Zendesk replaces on every refresh; DumbSlab asks for 8-hour access tokens and 90-day refresh
+//!   tokens (Zendesk's longest), so a connection lasts while it's used at least every 90 days.
+//! - **An API token**, with the subdomain and an agent's email, sent as Basic auth
+//!   (`<email>/token:<token>`). Zendesk is retiring them: since October 27, 2026 no account can
+//!   create one (accounts opened since July 28, 2026 never could), tokens unused for 30 days are
+//!   switched off, and all stop working on April 30, 2027. Zendesk's terms don't let an app made
+//!   for many customers use customers' own tokens or OAuth clients; a self-hosted server connecting
+//!   its own company's Zendesk is internal use, which they allow. An API token works with any
+//!   user's email in the account, so such a connection acts as whoever's email is given.
+//!
+//! The subdomain is checked strictly (one DNS label, lowercase letters, digits and hyphens) before
+//! it's used, and again before every request; a link is previewed only when it's on the
+//! connection's own subdomain.
 //!
 //! Docs: https://developer.zendesk.com/api-reference/introduction/security-and-auth/,
 //! https://support.zendesk.com/hc/en-us/articles/10851263566234,
 //! https://developer.zendesk.com/documentation/api-basics/authentication/oauth-migration/,
+//! https://developer.zendesk.com/documentation/marketplace/building-a-marketplace-app/set-up-a-global-oauth-client/,
+//! https://support.zendesk.com/hc/en-us/articles/4408845965210 (authorization requests, refresh tokens),
+//! https://developer.zendesk.com/api-reference/ticketing/oauth/grant_type_tokens/ (token requests, scopes, expiry),
+//! https://developer.zendesk.com/documentation/api-basics/authentication/oauth-pkce/,
 //! https://developer.zendesk.com/api-reference/ticketing/users/users/#show-self,
 //! https://developer.zendesk.com/api-reference/ticketing/ticket-management/search/,
 //! https://developer.zendesk.com/api-reference/help_center/help-center-api/help_center_search/,
@@ -23,14 +38,28 @@
 
 use std::collections::BTreeMap;
 
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 use crate::connect::{
-    Account, Connector, Credential, Detail, Field, Hit, HttpCall, HttpReply, Preview, ProviderInfo, excerpt, host_of, html_text,
-    http_error, opt, path_of, s,
+    Account, Connector, Credential, Detail, Field, Hit, HttpCall, HttpReply, OAuthApp, OAuthSpec, Preview, ProviderInfo, Site, excerpt,
+    host_of, html_text, http_error, opt, path_of, s,
 };
 
 pub struct Zendesk;
+
+/// How long access tokens from signing in last: a working day between refreshes.
+const ACCESS_TOKEN_SECS: i64 = 8 * 60 * 60;
+/// How long refresh tokens last: 90 days, the most Zendesk allows. Each refresh brings a new one.
+const REFRESH_TOKEN_SECS: i64 = 90 * 24 * 60 * 60;
+
+/// The subdomain, asked for both before signing in and with an API token.
+const SUBDOMAIN: Field = Field {
+    key: "subdomain",
+    label: "Zendesk subdomain",
+    help: "The part before .zendesk.com, like `acme` for acme.zendesk.com. Not a custom domain.",
+    secret: false,
+    optional: false,
+};
 
 static INFO: ProviderInfo = ProviderInfo {
     id: "zendesk",
@@ -38,15 +67,19 @@ static INFO: ProviderInfo = ProviderInfo {
     about: "Search tickets and Help Center articles, and preview linked tickets.",
     search: true,
     preview: true,
-    oauth: None,
+    oauth: Some(OAuthSpec {
+        // Paths on the customer's own https://<subdomain>.zendesk.com.
+        authorize_url: "/oauth/authorizations/new",
+        token_url: "/oauth/tokens",
+        scopes: &["read"],
+        scope_param: "scope",
+        scope_separator: " ",
+        extra: &[],
+        pkce: true,
+        site: Some(SUBDOMAIN),
+    }),
     token_fields: &[
-        Field {
-            key: "subdomain",
-            label: "Zendesk subdomain",
-            help: "The part before .zendesk.com, like `acme` for acme.zendesk.com.",
-            secret: false,
-            optional: false,
-        },
+        SUBDOMAIN,
         Field { key: "email", label: "Email", help: "The email you sign in to Zendesk with.", secret: false, optional: false },
         Field {
             key: "token",
@@ -99,10 +132,23 @@ fn host(account: &Account) -> Option<String> {
     valid_label(host.strip_suffix(".zendesk.com")?).then(|| host.to_string())
 }
 
+/// The host the credential belongs to: its own sealed subdomain, which must also be the account's.
+/// So a token only ever goes to the Zendesk it came from, whatever the saved settings say.
+fn cred_host(cred: &Credential, account: &Account) -> Option<String> {
+    let own = format!("{}.zendesk.com", subdomain(cred.field("subdomain")).ok()?);
+    (host(account)? == own).then_some(own)
+}
+
+/// Connected by signing in: an OAuth access token, without the email an API token goes with.
+fn signed_in(cred: &Credential) -> bool {
+    !cred.fields.contains_key("email")
+}
+
 fn api(host: &str, path: &str, cred: &Credential) -> HttpCall {
-    HttpCall::get(format!("https://{host}/api/v2/{path}"))
-        .basic(&format!("{}/token", cred.field("email").trim()), &cred.token)
-        .header("accept", "application/json")
+    let call = HttpCall::get(format!("https://{host}/api/v2/{path}"));
+    let call =
+        if signed_in(cred) { call.bearer(&cred.token) } else { call.basic(&format!("{}/token", cred.field("email").trim()), &cred.token) };
+    call.header("accept", "application/json")
 }
 
 /// Sideloaded users' names by ID.
@@ -152,8 +198,9 @@ impl Connector for Zendesk {
     }
 
     fn profile(&self, cred: &Credential) -> Vec<HttpCall> {
-        match (subdomain(cred.field("subdomain")), valid_email(cred.field("email"))) {
-            (Ok(sub), Ok(_)) => vec![api(&format!("{sub}.zendesk.com"), "users/me.json", cred)],
+        let email_ok = signed_in(cred) || valid_email(cred.field("email")).is_ok();
+        match subdomain(cred.field("subdomain")) {
+            Ok(sub) if email_ok => vec![api(&format!("{sub}.zendesk.com"), "users/me.json", cred)],
             // Nothing to ask; read_profile says what to fix.
             _ => vec![],
         }
@@ -161,29 +208,33 @@ impl Connector for Zendesk {
 
     fn read_profile(&self, cred: &Credential, replies: &[HttpReply]) -> Result<Account, String> {
         let host = format!("{}.zendesk.com", subdomain(cred.field("subdomain"))?);
-        let email = valid_email(cred.field("email"))?;
+        let email = if signed_in(cred) { None } else { Some(valid_email(cred.field("email"))?) };
         let r = replies.first().cloned().unwrap_or_default();
         if !r.ok() {
-            return Err(match r.status {
-                401 => format!("{host} rejected that email and API token. Check both, and that the token is still active."),
-                404 => format!("There's no Zendesk at {host}. Check the subdomain."),
+            return Err(match (r.status, &email) {
+                (401, None) => format!("{host} didn't accept the sign-in. Try connecting again."),
+                (401, Some(_)) => format!("{host} rejected that email and API token. Check both, and that the token is still active."),
+                (404, _) => format!("There's no Zendesk at {host}. Check the subdomain."),
                 _ => http_error("Zendesk", &r),
             });
         }
         let user = &r.json()["user"];
         // Without credentials Zendesk answers with an anonymous user, who has no ID.
-        let Some(id) = user["id"].as_i64() else { return Err(format!("{host} didn't recognize that email and API token.")) };
+        let Some(id) = user["id"].as_i64() else {
+            return Err(match email {
+                None => format!("{host} didn't recognize the sign-in. Try connecting again."),
+                Some(_) => format!("{host} didn't recognize that email and API token."),
+            });
+        };
+        let shown = opt(&user["email"]).or(email).or_else(|| opt(&user["name"])).unwrap_or_else(|| format!("User {id}"));
         if user["role"] == "end-user" {
-            return Err(format!(
-                "{email} is an end user in Zendesk. Only agents and admins can search tickets, so connect with an agent's email."
-            ));
+            return Err(format!("{shown} is an end user in Zendesk. Only agents and admins can search tickets, so connect as an agent."));
         }
-        let shown = opt(&user["email"]).unwrap_or(email);
         Ok(Account { label: format!("{shown} ({host})"), settings: json!({ "host": host, "user_id": id }) })
     }
 
     fn search(&self, cred: &Credential, account: &Account, q: &str, limit: usize) -> Vec<HttpCall> {
-        let Some(host) = host(account) else { return vec![] };
+        let Some(host) = cred_host(cred, account) else { return vec![] };
         let n = limit.clamp(1, 20);
         let tickets = urlencoding::encode(&format!("type:ticket {q}")).into_owned();
         let articles = urlencoding::encode(q).into_owned();
@@ -244,7 +295,7 @@ impl Connector for Zendesk {
     }
 
     fn preview(&self, cred: &Credential, account: &Account, target: &str) -> Vec<HttpCall> {
-        match (host(account), target.parse::<u64>()) {
+        match (cred_host(cred, account), target.parse::<u64>()) {
             (Some(host), Ok(id)) => vec![api(&host, &format!("tickets/{id}.json?include=users"), cred)],
             _ => vec![],
         }
@@ -285,6 +336,25 @@ impl Connector for Zendesk {
             description: excerpt(t["description"].as_str().unwrap_or_default(), 300),
             details,
         })
+    }
+
+    /// `acme`, `acme.zendesk.com` or a link into it → `https://acme.zendesk.com`. Anything that
+    /// isn't one Zendesk subdomain (another domain, more labels, a port, a user name, characters
+    /// outside `[a-z0-9-]`) is refused rather than tidied up.
+    fn sign_in_site(&self, input: &str) -> Result<Site, String> {
+        let name = subdomain(input)?;
+        Ok(Site { origin: format!("https://{name}.zendesk.com"), name })
+    }
+
+    /// Zendesk takes token requests as JSON, with the scope and how long the tokens should last.
+    fn token_request(&self, app: &OAuthApp, token_url: &str, form: Vec<(String, String)>) -> HttpCall {
+        let mut body: Map<String, Value> = form.into_iter().map(|(k, v)| (k, Value::String(v))).collect();
+        body.insert("client_id".into(), app.client_id.clone().into());
+        body.insert("client_secret".into(), app.client_secret.clone().into());
+        body.insert("scope".into(), INFO.oauth.expect("Zendesk signs in").scopes.join(" ").into());
+        body.insert("expires_in".into(), ACCESS_TOKEN_SECS.into());
+        body.insert("refresh_token_expires_in".into(), REFRESH_TOKEN_SECS.into());
+        HttpCall::post_json(token_url, &Value::Object(body)).header("accept", "application/json")
     }
 }
 
@@ -447,6 +517,104 @@ mod tests {
         assert!(Zendesk.read_preview(&a, "123", &[reply(404, json!({}))]).unwrap_err().contains("can't see"));
         assert!(Zendesk.read_preview(&a, "123", &[reply(401, json!({}))]).unwrap_err().contains("Reconnect"));
         assert!(Zendesk.read_preview(&a, "123", &[reply(0, json!(null))]).unwrap_err().contains("in time"));
+    }
+
+    fn signed_in_cred(subdomain: &str) -> Credential {
+        Credential {
+            token: "oauth-at".into(),
+            refresh_token: Some("oauth-rt".into()),
+            fields: [("subdomain".to_string(), subdomain.to_string())].into(),
+        }
+    }
+
+    #[test]
+    fn sign_in_happens_only_on_one_zendesk_subdomain() {
+        for (input, name) in
+            [("acme", "acme"), (" ACME ", "acme"), ("Acme.Zendesk.com", "acme"), ("https://acme.zendesk.com/agent", "acme")]
+        {
+            let site = Zendesk.sign_in_site(input).unwrap();
+            assert_eq!((site.name.as_str(), site.origin.as_str()), (name, "https://acme.zendesk.com"), "{input}");
+        }
+        // Whatever tries to name another host, or smuggle one in, is refused, not tidied up.
+        for bad in [
+            "evil.com#",
+            "evil.com",
+            "a.b",
+            "acme.zendesk.com.",
+            "acme.zendesk.com:443",
+            "acme.zendesk.com@evil.com",
+            "https://acme.zendesk.com@evil.com/",
+            "https://evil.com#.zendesk.com",
+            "https://evil.com/.zendesk.com",
+            "acme%2eevil.com",
+            "acme\\evil.com",
+            "ac me",
+            "acme\n.evil.com",
+            "ácme",
+            "acme\u{2024}evil",
+            "аcme", // Cyrillic а
+            "",
+            "-acme",
+            "zendesk.com",
+            "//evil.com",
+        ] {
+            assert!(Zendesk.sign_in_site(bad).is_err(), "{bad:?}");
+        }
+        assert!(Zendesk.sign_in_site(&"a".repeat(64)).is_err());
+
+        // The core puts the spec's paths on that origin, and nowhere else.
+        let urls = crate::connect::oauth_urls(&Zendesk, &signed_in_cred("acme")).unwrap();
+        assert_eq!(urls, ("https://acme.zendesk.com/oauth/authorizations/new".into(), "https://acme.zendesk.com/oauth/tokens".into()));
+        assert!(crate::connect::oauth_urls(&Zendesk, &signed_in_cred("evil.com#")).is_err());
+        assert!(crate::connect::oauth_urls(&Zendesk, &Credential::default()).is_err());
+    }
+
+    #[test]
+    fn tokens_are_asked_for_as_json_with_read_scope() {
+        let app = OAuthApp { client_id: "zdg-dumbslab".into(), client_secret: "s3cret".into() };
+        let form =
+            vec![("grant_type".into(), "authorization_code".into()), ("code".into(), "c1".into()), ("code_verifier".into(), "v1".into())];
+        let call = Zendesk.token_request(&app, "https://acme.zendesk.com/oauth/tokens", form);
+        assert_eq!((call.method, call.url.as_str()), ("POST", "https://acme.zendesk.com/oauth/tokens"));
+        assert!(call.headers.contains(&("content-type".into(), "application/json".into())));
+        let body: Value = serde_json::from_str(call.body.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            body,
+            json!({ "grant_type": "authorization_code", "code": "c1", "code_verifier": "v1", "client_id": "zdg-dumbslab",
+                "client_secret": "s3cret", "scope": "read", "expires_in": 28800, "refresh_token_expires_in": 7776000 })
+        );
+        let tokens = Zendesk
+            .read_token(&reply(201, json!({ "access_token": "at", "refresh_token": "rt", "token_type": "bearer", "scope": "read", "expires_in": 28800, "refresh_token_expires_in": 7776000 })))
+            .unwrap();
+        assert_eq!((tokens.access_token.as_str(), tokens.refresh_token.as_deref(), tokens.expires_in), ("at", Some("rt"), Some(28800)));
+    }
+
+    #[test]
+    fn signed_in_connections_use_bearer_tokens_on_their_own_subdomain() {
+        let c = signed_in_cred("acme");
+        let calls = Zendesk.profile(&c);
+        assert_eq!(calls[0].url, "https://acme.zendesk.com/api/v2/users/me.json");
+        assert!(calls[0].headers.contains(&("authorization".into(), "Bearer oauth-at".into())));
+        let me = json!({ "user": { "id": 7, "name": "Ada", "email": "ada@acme.com", "role": "agent" } });
+        let account = Zendesk.read_profile(&c, &[reply(200, me)]).unwrap();
+        assert_eq!(
+            (account.label.as_str(), &account.settings),
+            ("ada@acme.com (acme.zendesk.com)", &json!({ "host": "acme.zendesk.com", "user_id": 7 }))
+        );
+        assert!(Zendesk.read_profile(&c, &[reply(401, json!({}))]).unwrap_err().contains("didn't accept the sign-in"));
+        let end_user = json!({ "user": { "id": 8, "email": "cy@example.com", "role": "end-user" } });
+        assert!(Zendesk.read_profile(&c, &[reply(200, end_user)]).unwrap_err().contains("end user"));
+
+        // Searches and previews go only where the sealed credential belongs, and only when the saved
+        // account agrees: a token for one subdomain is never sent to another.
+        let searches = Zendesk.search(&c, &acme(), "printer", 4);
+        assert!(searches.iter().all(|call| call.url.starts_with("https://acme.zendesk.com/api/v2/")));
+        assert!(searches.iter().all(|call| call.headers.contains(&("authorization".into(), "Bearer oauth-at".into()))));
+        let beta = Account { settings: json!({ "host": "beta.zendesk.com", "user_id": 1 }), ..Default::default() };
+        assert!(Zendesk.search(&c, &beta, "printer", 4).is_empty());
+        assert!(Zendesk.preview(&c, &beta, "9").is_empty());
+        assert!(Zendesk.search(&signed_in_cred("evil.com#"), &acme(), "printer", 4).is_empty());
+        assert_eq!(Zendesk.preview(&c, &acme(), "9")[0].url, "https://acme.zendesk.com/api/v2/tickets/9.json?include=users");
     }
 
     #[test]

@@ -32,6 +32,7 @@ static INFO: ProviderInfo = ProviderInfo {
         scope_separator: " ",
         extra: &[],
         pkce: true,
+        site: None,
     }),
     token_fields: &[
         Field {

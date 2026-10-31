@@ -2797,6 +2797,173 @@ mod connected {
         assert!(query_of(&url)["state"].starts_with("acme."));
     }
 
+    /// Zendesk at `acme.zendesk.com`, answering a global OAuth client's sign-in and the API.
+    fn zendesk(call: &HttpCall) -> HttpReply {
+        let url = call.url.as_str();
+        if url == "https://acme.zendesk.com/oauth/tokens" {
+            let body: Value = serde_json::from_str(call.body.as_deref().unwrap_or("{}")).unwrap();
+            let n = if body["grant_type"] == "refresh_token" { 2 } else { 1 };
+            HttpReply {
+                status: 201,
+                body: json!({ "access_token": format!("zd-at-{n}"), "refresh_token": format!("zd-rt-{n}"), "token_type": "bearer",
+                    "scope": "read", "expires_in": 28800, "refresh_token_expires_in": 7776000 })
+                .to_string(),
+            }
+        } else if url == "https://acme.zendesk.com/api/v2/users/me.json" {
+            ok(json!({ "user": { "id": 7, "name": "Ada", "email": "ada@acme.com", "role": "agent" } }))
+        } else if url.starts_with("https://acme.zendesk.com/api/v2/search.json") {
+            ok(json!({ "results": [{ "result_type": "ticket", "id": 12, "subject": "Printer jams", "status": "open" }] }))
+        } else if url.starts_with("https://acme.zendesk.com/api/v2/help_center/") {
+            ok(json!({ "results": [] }))
+        } else {
+            HttpReply { status: 404, body: "{}".into() }
+        }
+    }
+
+    #[test]
+    fn signing_in_with_zendesk_stays_on_the_persons_subdomain() {
+        let mut h = H::new();
+        let (admin, _) = h.setup();
+        with_key(&mut h);
+        let user_id = h.ok("GET", "/api/v1/me", None, &admin)["user"]["id"].as_str().unwrap().to_string();
+        let app = |h: &H| {
+            let list = h.ok("GET", "/api/v1/connections", None, &admin);
+            list["apps"].as_array().unwrap().iter().find(|a| a["id"] == "zendesk").unwrap().clone()
+        };
+        let start = |h: &H, body: Value| h.call("POST", "/api/v1/connections", Some(body), &admin);
+
+        // Without a global OAuth client, Zendesk takes only tokens.
+        let z = app(&h);
+        assert_eq!((z["sign_in"].as_bool(), z["sign_in_field"].is_null()), (Some(false), true));
+        assert_eq!(start(&h, json!({ "app": "zendesk", "site": "acme" })).status, 400);
+
+        h.cfg.connectors.apps.insert("zendesk".into(), OAuthApp { client_id: "zdg-dumbslab".into(), client_secret: "zsecret".into() });
+        h.cfg.connectors.apps.insert("github".into(), OAuthApp { client_id: "cid".into(), client_secret: "csecret".into() });
+        let z = app(&h);
+        assert_eq!((z["sign_in"].as_bool(), z["sign_in_field"]["key"].as_str()), (Some(true), Some("subdomain")));
+        assert_eq!(z["token_fields"][0]["key"], "subdomain", "tokens still work");
+
+        // The subdomain is required and checked strictly; nothing is recorded for a refused one.
+        for bad in [
+            json!(null),
+            json!(" "),
+            json!("evil.test#"),
+            json!("a.b"),
+            json!("acme.zendesk.com.evil.test"),
+            json!("acme.zendesk.com:8443"),
+            json!("https://acme.zendesk.com@evil.test/"),
+            json!("ácme"),
+        ] {
+            let r = start(&h, json!({ "app": "zendesk", "site": bad }));
+            assert_eq!(r.status, 400, "{bad}: {}", r.body);
+        }
+        assert_eq!(count(&h, "SELECT COUNT(*) FROM connect_requests"), 0);
+        // Apps with one sign-in for everyone refuse a site, and tokens don't take one.
+        assert_eq!(start(&h, json!({ "app": "github", "site": "acme" })).status, 400);
+        let token = json!({ "app": "zendesk", "site": "acme", "fields": { "subdomain": "acme", "email": "ada@acme.com", "token": "t" } });
+        assert_eq!(start(&h, token).status, 400);
+
+        // Signing in starts on the person's own subdomain.
+        let url = start(&h, json!({ "app": "zendesk", "site": " ACME.zendesk.com " })).body["authorize_url"].as_str().unwrap().to_string();
+        assert!(url.starts_with("https://acme.zendesk.com/oauth/authorizations/new?"), "{url}");
+        let q = query_of(&url);
+        assert_eq!(
+            (q["client_id"].as_str(), q["redirect_uri"].as_str(), q["scope"].as_str(), q["response_type"].as_str()),
+            ("zdg-dumbslab", "https://kb.test/connect/callback", "read", "code")
+        );
+        assert_eq!(q["code_challenge_method"], "S256");
+        // The subdomain stays on the server, out of the state the browser carries.
+        assert!(!q["state"].contains("acme"));
+
+        // Coming back: anything the browser adds can't move the exchange to another Zendesk.
+        let r = h.call(
+            "GET",
+            &format!("/connect/callback?code=zd-code&subdomain=evil&site=evil.test&state={}", urlencoding::encode(&q["state"])),
+            None,
+            &admin,
+        );
+        let (finish, sent) = drive(&h, job_of(&r), &zendesk);
+        assert!(matches!(&finish, Finish::Redirect(u) if u == "https://kb.test/settings/connections?connected=zendesk"), "{finish:?}");
+        assert!(sent.iter().all(|c| c.url.starts_with("https://acme.zendesk.com/")), "{sent:?}");
+        let exchange = &sent[0];
+        assert_eq!((exchange.method, exchange.url.as_str()), ("POST", "https://acme.zendesk.com/oauth/tokens"));
+        let body: Value = serde_json::from_str(exchange.body.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            (&body["grant_type"], &body["code"], &body["client_id"], &body["client_secret"], &body["scope"]),
+            (&json!("authorization_code"), &json!("zd-code"), &json!("zdg-dumbslab"), &json!("zsecret"), &json!("read"))
+        );
+        assert_eq!(body["redirect_uri"], "https://kb.test/connect/callback");
+        let verifier = body["code_verifier"].as_str().unwrap();
+        let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
+        assert_eq!(challenge, q["code_challenge"], "PKCE with the verifier kept on the server");
+        assert!(sent[1].headers.contains(&("authorization".into(), "Bearer zd-at-1".into())));
+        assert_eq!(app(&h)["connected"]["account"], "ada@acme.com (acme.zendesk.com)");
+        // The token is sealed with its subdomain.
+        let secret =
+            || h.store.with_tx(|db| (db.one("SELECT secret FROM connections", &[]).unwrap().unwrap().str("secret"), true)).unwrap();
+        assert!(!secret().contains("zd-at-1"));
+        let cred = connect::open("connector-key", &user_id, "zendesk", &secret()).unwrap();
+        assert_eq!((cred.token.as_str(), cred.refresh_token.as_deref(), cred.field("subdomain")), ("zd-at-1", Some("zd-rt-1"), "acme"));
+
+        // Searching uses the token on that subdomain; once it nearly expires, it's refreshed there first.
+        let search = || {
+            let r = h.call("GET", "/api/v1/search/connected?q=printer", None, &admin);
+            let (finish, sent) = drive(&h, job_of(&r), &zendesk);
+            (filled(&r, finish), sent)
+        };
+        let (v, sent) = search();
+        assert_eq!(v["items"][0]["url"], "https://acme.zendesk.com/agent/tickets/12", "{v}");
+        assert!(sent.iter().all(|c| c.headers.contains(&("authorization".into(), "Bearer zd-at-1".into()))));
+        let soon = dumbslab_core::util::ts(chrono::Utc::now() + chrono::Duration::minutes(1));
+        h.store.with_tx(|db| (db.execute("UPDATE connections SET expires_at = ?", &dumbslab_core::params![soon]), true)).unwrap().unwrap();
+        let (v, sent) = search();
+        assert_eq!(v["apps"][0]["ok"], true, "{v}");
+        assert_eq!(sent[0].url, "https://acme.zendesk.com/oauth/tokens");
+        let refresh: Value = serde_json::from_str(sent[0].body.as_deref().unwrap()).unwrap();
+        assert_eq!((&refresh["grant_type"], &refresh["refresh_token"]), (&json!("refresh_token"), &json!("zd-rt-1")));
+        assert!(sent[1..].iter().all(|c| c.headers.contains(&("authorization".into(), "Bearer zd-at-2".into()))));
+        assert_eq!(connect::open("connector-key", &user_id, "zendesk", &secret()).unwrap().refresh_token.as_deref(), Some("zd-rt-2"));
+
+        // Even if the saved settings named another Zendesk, the token never goes there.
+        let beta = json!({ "host": "beta.zendesk.com", "user_id": 7 }).to_string();
+        h.store.with_tx(|db| (db.execute("UPDATE connections SET settings = ?", &dumbslab_core::params![beta]), true)).unwrap().unwrap();
+        let (_, sent) = search();
+        assert!(sent.is_empty(), "{sent:?}");
+        let r = h.call(
+            "GET",
+            &format!("/api/v1/connections/preview?url={}", urlencoding::encode("https://beta.zendesk.com/agent/tickets/9")),
+            None,
+            &admin,
+        );
+        let (_, sent) = drive(&h, job_of(&r), &zendesk);
+        assert!(sent.is_empty(), "{sent:?}");
+    }
+
+    #[test]
+    fn one_atlassian_app_keeps_both_jira_and_confluence_granted() {
+        let mut h = H::new();
+        let (admin, _) = h.setup();
+        with_key(&mut h);
+        let scope = |h: &H, app: &str| {
+            let url =
+                h.ok("POST", "/api/v1/connections", Some(json!({ "app": app })), &admin)["authorize_url"].as_str().unwrap().to_string();
+            assert!(url.starts_with("https://auth.atlassian.com/authorize?"), "{url}");
+            query_of(&url)["scope"].clone()
+        };
+        // The host's settings name one Atlassian app for both (ATLASSIAN_CLIENT_ID and _SECRET).
+        let vars: std::collections::HashMap<&str, &str> =
+            [("ATLASSIAN_CLIENT_ID", "atl"), ("ATLASSIAN_CLIENT_SECRET", "atl-secret")].into();
+        h.cfg.connectors.apps = connect::oauth_apps(|name| vars.get(name).map(|v| v.to_string()));
+        // Atlassian keeps one grant per person and app, replaced by each consent: each sign-in asks
+        // for both products' scopes, so connecting one never takes away the other's.
+        assert_eq!(scope(&h, "jira"), "read:jira-work read:me offline_access search:confluence");
+        assert_eq!(scope(&h, "confluence"), "search:confluence read:me offline_access read:jira-work");
+        // Separate apps ask only for their own.
+        h.cfg.connectors.apps.insert("confluence".into(), OAuthApp { client_id: "conf".into(), client_secret: "conf-secret".into() });
+        assert_eq!(scope(&h, "jira"), "read:jira-work read:me offline_access");
+        assert_eq!(scope(&h, "confluence"), "search:confluence read:me offline_access");
+    }
+
     #[test]
     fn a_late_refresh_never_lands_on_a_replaced_connection() {
         let mut h = H::new();

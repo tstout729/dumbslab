@@ -48,6 +48,7 @@ pub const fn oauth(scopes: &'static [&'static str]) -> OAuthSpec {
         scope_separator: " ",
         extra: &[("audience", "api.atlassian.com"), ("prompt", "consent")],
         pkce: false,
+        site: None,
     }
 }
 
@@ -193,11 +194,11 @@ pub fn read_account(name: &str, scope: &str, cred: &Credential, replies: &[HttpR
 }
 
 /// Atlassian takes token requests as JSON.
-pub fn token_call(app: &OAuthApp, form: Vec<(String, String)>) -> HttpCall {
+pub fn token_call(app: &OAuthApp, token_url: &str, form: Vec<(String, String)>) -> HttpCall {
     let mut body: Map<String, Value> = form.into_iter().map(|(k, v)| (k, Value::String(v))).collect();
     body.insert("client_id".into(), app.client_id.clone().into());
     body.insert("client_secret".into(), app.client_secret.clone().into());
-    HttpCall::post_json(TOKEN_URL, &Value::Object(body)).header("accept", "application/json")
+    HttpCall::post_json(token_url, &Value::Object(body)).header("accept", "application/json")
 }
 
 /// An Atlassian time (`2026-10-01T09:30:00.000+0000`, or RFC 3339) the way DumbSlab writes times.
@@ -382,8 +383,8 @@ impl Connector for Jira {
         })
     }
 
-    fn token_request(&self, app: &OAuthApp, form: Vec<(String, String)>) -> HttpCall {
-        token_call(app, form)
+    fn token_request(&self, app: &OAuthApp, token_url: &str, form: Vec<(String, String)>) -> HttpCall {
+        token_call(app, token_url, form)
     }
 }
 
@@ -483,7 +484,11 @@ mod tests {
         assert!(spec.extra.contains(&("audience", "api.atlassian.com")) && spec.extra.contains(&("prompt", "consent")));
         assert!(spec.scopes.contains(&"offline_access") && spec.scopes.contains(&"read:jira-work"));
         let app = OAuthApp { client_id: "cid".into(), client_secret: "sec".into() };
-        let call = Jira.token_request(&app, vec![("grant_type".into(), "refresh_token".into()), ("refresh_token".into(), "rt".into())]);
+        let call = Jira.token_request(
+            &app,
+            INFO.oauth.unwrap().token_url,
+            vec![("grant_type".into(), "refresh_token".into()), ("refresh_token".into(), "rt".into())],
+        );
         assert_eq!(call.url, "https://auth.atlassian.com/oauth/token");
         assert_eq!(header(&call, "content-type"), Some("application/json"));
         let body: Value = serde_json::from_str(call.body.as_deref().unwrap()).unwrap();

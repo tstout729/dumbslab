@@ -39,6 +39,7 @@ static INFO: ProviderInfo = ProviderInfo {
         scope_separator: " ",
         extra: &[("prompt", "consent")],
         pkce: true,
+        site: None,
     }),
     token_fields: &[
         Field {
@@ -195,11 +196,11 @@ impl Connector for Trello {
     }
 
     /// Atlassian takes the token request as JSON.
-    fn token_request(&self, app: &OAuthApp, form: Vec<(String, String)>) -> HttpCall {
+    fn token_request(&self, app: &OAuthApp, token_url: &str, form: Vec<(String, String)>) -> HttpCall {
         let mut body: Map<String, Value> = form.into_iter().map(|(k, v)| (k, Value::String(v))).collect();
         body.insert("client_id".into(), app.client_id.clone().into());
         body.insert("client_secret".into(), app.client_secret.clone().into());
-        HttpCall::post_json(INFO.oauth.expect("Trello signs in").token_url, &Value::Object(body)).header("accept", "application/json")
+        HttpCall::post_json(token_url, &Value::Object(body)).header("accept", "application/json")
     }
 }
 
@@ -249,7 +250,11 @@ mod tests {
     #[test]
     fn signs_in_with_atlassian() {
         let app = OAuthApp { client_id: "cid".into(), client_secret: "sec".into() };
-        let call = Trello.token_request(&app, vec![("grant_type".into(), "authorization_code".into()), ("code".into(), "c1".into())]);
+        let call = Trello.token_request(
+            &app,
+            INFO.oauth.unwrap().token_url,
+            vec![("grant_type".into(), "authorization_code".into()), ("code".into(), "c1".into())],
+        );
         assert_eq!(call.url, "https://auth.atlassian.com/oauth/token");
         assert!(call.headers.contains(&("content-type".into(), "application/json".into())));
         let body: Value = serde_json::from_str(call.body.as_deref().unwrap()).unwrap();

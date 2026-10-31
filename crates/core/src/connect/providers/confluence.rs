@@ -120,8 +120,8 @@ impl Connector for Confluence {
             .collect())
     }
 
-    fn token_request(&self, app: &OAuthApp, form: Vec<(String, String)>) -> HttpCall {
-        jira::token_call(app, form)
+    fn token_request(&self, app: &OAuthApp, token_url: &str, form: Vec<(String, String)>) -> HttpCall {
+        jira::token_call(app, token_url, form)
     }
 }
 
@@ -182,7 +182,8 @@ mod tests {
         assert_eq!(account.label, "Ada on wiki.atlassian.net");
         assert_eq!(account.settings, json!({ "site": "wiki.atlassian.net", "cloud_id": CLOUD }));
         assert!(Confluence.read_profile(&cred, &[reply(0, json!(null)), reply(0, json!(null))]).unwrap_err().contains("in time"));
-        let call = Confluence.token_request(&OAuthApp { client_id: "c".into(), client_secret: "s".into() }, vec![]);
+        let call =
+            Confluence.token_request(&OAuthApp { client_id: "c".into(), client_secret: "s".into() }, INFO.oauth.unwrap().token_url, vec![]);
         assert_eq!(
             (call.url.as_str(), header(&call, "content-type")),
             ("https://auth.atlassian.com/oauth/token", Some("application/json"))

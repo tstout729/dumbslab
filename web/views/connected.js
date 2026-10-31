@@ -222,7 +222,10 @@ function appCard(app, rerender) {
     return h('div', { class: 'app-card' }, head, body);
   }
   const actions = h('div', { class: 'plan-actions' });
-  if (app.sign_in) {
+  if (app.sign_in && app.sign_in_field) {
+    // Apps on the company's own address (Zendesk): ask which one, then sign in there.
+    body.append(siteForm(app));
+  } else if (app.sign_in) {
     const connect = button(`Sign in with ${app.name}`, { variant: 'primary', size: 'sm', icon: 'external' });
     connect.addEventListener('click', () => busy(connect, async () => {
       const r = await api.post('/connections', { app: app.id });
@@ -244,6 +247,28 @@ function appCard(app, rerender) {
     body.append(h('p', { class: 'muted small' }, `Signing in with ${app.name} isn’t set up on this server yet.`));
   }
   return h('div', { class: 'app-card' }, head, body);
+}
+
+/** Signing in to an app on the company's own address: its field (Zendesk's subdomain), then the app's sign-in page. */
+function siteForm(app) {
+  const f = app.sign_in_field;
+  const el = input({ type: 'text', required: true, autocomplete: 'off', spellcheck: 'false', name: f.key });
+  const submit = button(`Sign in with ${app.name}`, { variant: 'primary', size: 'sm', icon: 'external', type: 'submit' });
+  const form = h('form', { class: 'stack token-form', novalidate: true },
+    field(f.label, el, { hint: richText(f.help) }),
+    h('div', null, submit));
+  form.addEventListener('submit', (e) => {
+    e.preventDefault();
+    if (!form.checkValidity()) {
+      form.reportValidity();
+      return;
+    }
+    busy(submit, async () => {
+      const r = await api.post('/connections', { app: app.id, site: el.value.trim() });
+      location.assign(r.authorize_url);
+    }).catch(toastError);
+  });
+  return form;
 }
 
 /** Help text with `code` spans, as nodes: never as HTML. */

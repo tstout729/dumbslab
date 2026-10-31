@@ -30,6 +30,7 @@ static INFO: ProviderInfo = ProviderInfo {
         scope_separator: " ",
         extra: &[],
         pkce: false,
+        site: None,
     }),
     token_fields: &[],
     token_help: "",
@@ -125,7 +126,11 @@ mod tests {
     #[test]
     fn refreshes_keep_the_new_refresh_token() {
         let app = OAuthApp { client_id: "id".into(), client_secret: "sec".into() };
-        let call = BoxCom.token_request(&app, vec![("grant_type".into(), "refresh_token".into()), ("refresh_token".into(), "r1".into())]);
+        let call = BoxCom.token_request(
+            &app,
+            INFO.oauth.unwrap().token_url,
+            vec![("grant_type".into(), "refresh_token".into()), ("refresh_token".into(), "r1".into())],
+        );
         assert_eq!((call.method, call.url.as_str()), ("POST", "https://api.box.com/oauth2/token"));
         assert_eq!(call.body.as_deref(), Some("grant_type=refresh_token&refresh_token=r1&client_id=id&client_secret=sec"));
         // Box spends the old refresh token: the answer's new one must be kept.
