@@ -184,7 +184,8 @@ pub const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0008_sso.sql"),
     include_str!("migrations/0009_slack.sql"),
     include_str!("migrations/0010_sync.sql"),
-    // Listed last. When main gains a migration first, this one takes the next free number and stays last.
+    include_str!("migrations/0011_connections_without_personal_data.sql"),
+    // Docs sync through DumbSlab's GitHub and GitLab apps. Listed last.
     include_str!("migrations/0012_docs_sync_apps.sql"),
 ];
 

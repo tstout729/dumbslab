@@ -218,11 +218,14 @@ function appCard(app, rerender) {
         await rerender();
       }).catch(toastError);
     });
-    body.append(h('p', { class: 'small' }, `Connected as ${app.connected.account}.`), h('div', null, disconnect));
+    body.append(h('p', { class: 'small' }, connectedAs(app.name, app.connected.account)), h('div', null, disconnect));
     return h('div', { class: 'app-card' }, head, body);
   }
   const actions = h('div', { class: 'plan-actions' });
-  if (app.sign_in) {
+  if (app.sign_in && app.sign_in_field) {
+    // Apps on the company's own address (Zendesk): ask which one, then sign in there.
+    body.append(siteForm(app));
+  } else if (app.sign_in) {
     const connect = button(`Sign in with ${app.name}`, { variant: 'primary', size: 'sm', icon: 'external' });
     connect.addEventListener('click', () => busy(connect, async () => {
       const r = await api.post('/connections', { app: app.id });
@@ -246,6 +249,33 @@ function appCard(app, rerender) {
   return h('div', { class: 'app-card' }, head, body);
 }
 
+/** Signing in to an app on the company's own address: its field (Zendesk's subdomain), then the app's sign-in page. */
+function siteForm(app) {
+  const f = app.sign_in_field;
+  const el = input({ type: 'text', required: true, autocomplete: 'off', spellcheck: 'false', name: f.key });
+  const submit = button(`Sign in with ${app.name}`, { variant: 'primary', size: 'sm', icon: 'external', type: 'submit' });
+  const form = h('form', { class: 'stack token-form', novalidate: true },
+    field(f.label, el, { hint: richText(f.help) }),
+    h('div', null, submit));
+  form.addEventListener('submit', (e) => {
+    e.preventDefault();
+    if (!form.checkValidity()) {
+      form.reportValidity();
+      return;
+    }
+    busy(submit, async () => {
+      const r = await api.post('/connections', { app: app.id, site: el.value.trim() });
+      location.assign(r.authorize_url);
+    }).catch(toastError);
+  });
+  return form;
+}
+
+/** Which account is connected. Some apps keep nothing that names a person (Trello's label is just "Trello"), or only a site. */
+function connectedAs(appName, account) {
+  return account && account !== appName ? `Connected as ${account}.` : 'Connected.';
+}
+
 /** Help text with `code` spans, as nodes: never as HTML. */
 function richText(text) {
   return String(text || '').split('`').map((part, i) => (i % 2 ? h('code', null, part) : part));
@@ -267,7 +297,7 @@ function tokenForm(app, rerender) {
     const fields = Object.fromEntries(inputs.map(([f, el]) => [f.key, el.value.trim()]).filter(([, v]) => v));
     busy(submit, async () => {
       const r = await api.post('/connections', { app: app.id, fields });
-      toast(`${app.name} connected as ${r.connection.account}`);
+      toast(`${app.name} connected`);
       await rerender();
     }).catch(toastError);
   });

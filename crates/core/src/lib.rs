@@ -64,6 +64,9 @@ pub struct HostConfig {
     pub connectors: connect::Connectors,
     /// DumbSlab's own GitHub App, so docs sync needs no token (see [`sync::github_app`]).
     pub github_app: Option<sync::github_app::GitHubApp>,
+    /// The host's own Google, Microsoft and Slack sign-in apps, so admins set up single sign-on by
+    /// signing in (see [`sso::SharedApps`]). None by default.
+    pub sso_apps: sso::SharedApps,
     /// The web app's session recordings and error reports. Off unless the host configures them.
     pub telemetry: telemetry::Telemetry,
 }
