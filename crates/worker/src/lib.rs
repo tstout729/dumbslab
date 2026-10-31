@@ -159,26 +159,13 @@ async fn forward(env: &Env, object: &str, mut req: Request, workspace: Option<&s
 
 /// One request to a workspace object. `route` is (requested address, the workspace's home address).
 async fn send(env: &Env, object: &str, req: &Request, body: Option<&[u8]>, route: Option<(&str, &str)>) -> Result<Response> {
-    send_to(env, object, req.url()?.as_str(), req, body, route, None).await
+    send_to(env, object, req.url()?.as_str(), req, body, route).await
 }
 
-/// [`send`], at another URL, and for Slack's requests naming the install whose claim routed them.
-async fn send_to(
-    env: &Env,
-    object: &str,
-    url: &str,
-    req: &Request,
-    body: Option<&[u8]>,
-    route: Option<(&str, &str)>,
-    slack_install: Option<&str>,
-) -> Result<Response> {
+/// [`send`], at another URL.
+async fn send_to(env: &Env, object: &str, url: &str, req: &Request, body: Option<&[u8]>, route: Option<(&str, &str)>) -> Result<Response> {
     let stub = env.durable_object("WORKSPACE")?.id_from_name(object)?.get_stub()?;
     let headers = req.headers().clone();
-    // Only this Worker may say which install a Slack request was routed by.
-    headers.delete(slack::INSTALL_HEADER)?;
-    if let Some(install) = slack_install {
-        headers.set(slack::INSTALL_HEADER, install)?;
-    }
     // Only this Worker may say which workspace a request is for.
     match route {
         Some((slug, home)) => {
@@ -266,8 +253,9 @@ fn root_origin(url: &Url, root: &str) -> String {
 
 /// A command or event from DumbSlab's own Slack app. The core checks Slack's signature with the
 /// shared signing secret and finds the Slack workspace it's for; the directory says which
-/// workspace claimed it; the request goes there unchanged, at that workspace's address, and the
-/// workspace checks it again and handles it.
+/// workspace holds it; the request goes there unchanged, at that workspace's address, and the
+/// workspace checks it again and handles it. Slack saying the app was removed is checked here, with
+/// no workspace involved (see `slack::UninstallCheck`).
 async fn slack_root(mut req: Request, env: &Env, root: &str, path: &str) -> Result<Response> {
     let Some(secret) = var(env, "SLACK_SIGNING_SECRET") else {
         return error_response(404, "slack_off", "This server has no shared Slack app.");
@@ -279,20 +267,33 @@ async fn slack_root(mut req: Request, env: &Env, root: &str, path: &str) -> Resu
     let (timestamp, signature) = (header("x-slack-request-timestamp"), header("x-slack-signature"));
     let team = match slack::route(&secret, path, timestamp.as_deref(), signature.as_deref(), &body, Utc::now().timestamp()) {
         slack::Routed::Answer(r) => return workspace::to_response(r),
+        slack::Routed::Uninstalled(team) => return uninstall_check(env, &team).await,
         slack::Routed::Forward(team) => team,
     };
     let (status, found) =
         call_object(env, "DIRECTORY", "directory", Method::Post, "/slack/lookup", Some(&json!({ "team_id": team }))).await?;
-    let (Some(home), Some(address), Some(install)) =
-        (found["home"].as_str().filter(|_| status == 200), found["address"].as_str(), found["install_id"].as_str())
-    else {
+    let (Some(home), Some(address)) = (found["home"].as_str().filter(|_| status == 200), found["address"].as_str()) else {
         return workspace::to_response(slack::unknown_team(path));
     };
-    // At the workspace's own address, so its links and replies name it, and naming the install
-    // the claim belongs to, so the workspace can let go of exactly that claim if it isn't its own.
+    // At the workspace's own address, so its links and replies name it.
     let mut url = req.url()?;
     url.set_host(Some(&format!("{address}.{root}"))).map_err(|e| worker::Error::RustError(e.to_string()))?;
-    send_to(env, &format!("ws:{home}"), url.as_str(), &req, Some(&body), Some((address, home)), Some(install)).await
+    send_to(env, &format!("ws:{home}"), url.as_str(), &req, Some(&body), Some((address, home))).await
+}
+
+/// Checks the token of a Slack workspace Slack says removed the app, and forgets the installation
+/// if the token is dead. Answers Slack with a 500 when that's unclear, so Slack sends it again.
+async fn uninstall_check(env: &Env, team: &str) -> Result<Response> {
+    let key = var(env, "CONNECTOR_KEY");
+    let (mut check, mut call) = slack::UninstallCheck::start(team);
+    for _ in 0..dumbslab_core::connect::MAX_STEPS {
+        let reply = connect::send_for_root(env, &call).await;
+        match check.next(key.as_deref(), &reply) {
+            slack::CheckStep::Fetch(next) => call = next,
+            slack::CheckStep::Done(r) => return workspace::to_response(r),
+        }
+    }
+    error_response(500, "internal", "the uninstall check took too many steps")
 }
 
 /// A plain-text file for crawlers and agents. It changes only when the Worker deploys.

@@ -239,23 +239,26 @@ CREATE TABLE IF NOT EXISTS billing (
   updated_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS billing_home ON billing(home);
--- Slack workspaces added with the shared Slack app (Add to Slack), and the workspace (by its first
--- address) each belongs to. Slack sends every Slack workspace's commands and events to the root
--- domain, which forwards them, with the claim's install id, to that workspace. One Slack workspace,
--- one DumbSlab workspace: this table decides which. A claim is provisional until the install has
--- saved and confirms it; only confirmed claims route, and a provisional one by another workspace
--- runs out. Every change names the install's id.
-CREATE TABLE IF NOT EXISTS slack_teams (
+-- Slack workspaces added with DumbSlab's own Slack app (Add to Slack): the installation itself,
+-- bot token included, and the one workspace (by its first address) that holds it. This table is
+-- the only record of who holds a Slack workspace and the only copy of its token: Slack sends
+-- every Slack workspace's commands and events to the root domain, which forwards them to the
+-- holder, and a workspace gets the token from here each time it acts on Slack, only while it's
+-- the holder.
+CREATE TABLE IF NOT EXISTS slack_installs (
   team_id TEXT PRIMARY KEY,
   home TEXT NOT NULL,
-  -- The install that holds it (the workspace's random install id).
-  install_id TEXT NOT NULL,
-  confirmed INTEGER NOT NULL DEFAULT 0,
-  -- A provisional claim runs out then.
-  expires_at TEXT,
-  claimed_at TEXT NOT NULL
+  -- Sealed with the connector key by the workspace that installed it; opaque here.
+  bot_token TEXT NOT NULL,
+  -- The SHA-256 of the token: a check that found a token dead forgets the row only while it
+  -- still holds that token.
+  token_fingerprint TEXT NOT NULL,
+  bot_user_id TEXT,
+  team_name TEXT NOT NULL DEFAULT '',
+  scopes TEXT NOT NULL DEFAULT '',
+  installed_at TEXT NOT NULL
 );
-CREATE INDEX IF NOT EXISTS slack_teams_home ON slack_teams(home);
+CREATE INDEX IF NOT EXISTS slack_installs_home ON slack_installs(home);
 ";
 
 /// The most addresses one workspace can use, counting its first.
@@ -389,7 +392,7 @@ pub fn remove(db: &dyn Db, home: &str) -> ApiResult<()> {
     db.execute("DELETE FROM addresses WHERE home = ?", &params![home])?;
     db.execute("DELETE FROM usage WHERE home = ?", &params![home])?;
     db.execute("UPDATE billing SET detached = 1 WHERE home = ?", &params![home])?;
-    db.execute("DELETE FROM slack_teams WHERE home = ?", &params![home])?;
+    db.execute("DELETE FROM slack_installs WHERE home = ?", &params![home])?;
     Ok(())
 }
 
@@ -452,16 +455,6 @@ fn check_team(team_id: &str) -> ApiResult<()> {
     if ok { Ok(()) } else { Err(ApiError::bad_request("team_id must be a Slack workspace's ID, like T0123ABCD")) }
 }
 
-/// How long a provisional claim lasts: an install claims, saves and confirms within seconds.
-pub const PROVISIONAL_CLAIM_SECS: i64 = 15 * 60;
-
-fn check_install(install_id: &str) -> ApiResult<()> {
-    if install_id.is_empty() || install_id.len() > 64 {
-        return Err(ApiError::bad_request("send the install's id"));
-    }
-    Ok(())
-}
-
 fn active_home(db: &dyn Db, home: &str) -> ApiResult<()> {
     match db.one("SELECT slug FROM workspaces WHERE slug = ? AND status = 'active'", &params![home])? {
         Some(_) => Ok(()),
@@ -469,73 +462,146 @@ fn active_home(db: &dyn Db, home: &str) -> ApiResult<()> {
     }
 }
 
-fn taken() -> ApiError {
-    ApiError::new(409, "slack_team_taken", "That Slack workspace is connected to another DumbSlab workspace.")
+/// An installation of DumbSlab's own Slack app into one Slack workspace, as a workspace sends it
+/// to the directory. The token is sealed; the directory never reads it.
+#[derive(Debug, Clone, Default, Serialize, serde::Deserialize)]
+pub struct SlackInstall {
+    pub team_id: String,
+    pub bot_token: String,
+    pub token_fingerprint: String,
+    pub bot_user_id: Option<String>,
+    pub team_name: String,
+    pub scopes: String,
 }
 
-/// Claims a Slack workspace, provisionally, for an install of the workspace whose first address is
-/// `home`. Refused (409 `slack_team_taken`) while another workspace holds it confirmed, or claimed
-/// it provisionally less than [`PROVISIONAL_CLAIM_SECS`] ago. Claiming it again for the same
-/// install changes nothing (adding a Slack workspace again keeps its install); the same workspace
-/// with another install replaces its claim, provisionally.
-pub fn claim_slack_team(db: &dyn Db, team_id: &str, home: &str, install_id: &str, now: DateTime<Utc>) -> ApiResult<()> {
-    check_team(team_id)?;
-    check_install(install_id)?;
+/// The token a workspace may act on Slack with, as stored: sealed, its fingerprint, and the bot's
+/// Slack user.
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+pub struct SlackToken {
+    pub bot_token: String,
+    pub token_fingerprint: String,
+    pub bot_user_id: Option<String>,
+}
+
+/// Records the installation for the workspace whose first address is `home`. Refused (409
+/// `slack_team_taken`) while another workspace holds the Slack workspace; the same workspace
+/// installing again replaces its own (the newest install wins).
+pub fn slack_install(db: &dyn Db, home: &str, install: &SlackInstall, now: DateTime<Utc>) -> ApiResult<()> {
+    check_team(&install.team_id)?;
+    let sealed = |v: &str| !v.is_empty() && v.len() <= 2000;
+    if !sealed(&install.bot_token) || !sealed(&install.token_fingerprint) {
+        return Err(ApiError::bad_request("send the sealed bot token and its fingerprint"));
+    }
     active_home(db, home)?;
-    let row = db.one("SELECT home, install_id, confirmed, expires_at FROM slack_teams WHERE team_id = ?", &params![team_id])?;
-    match row {
-        Some(r) if r.str("home") == home && r.str("install_id") == install_id => return Ok(()),
-        Some(r) if r.str("home") != home && (r.bool("confirmed") || r.opt_str("expires_at").is_none_or(|e| e > ts(now))) => {
-            return Err(taken());
-        }
-        _ => {}
+    let holder = db.one("SELECT home FROM slack_installs WHERE team_id = ?", &params![install.team_id.clone()])?.map(|r| r.str("home"));
+    if holder.is_some_and(|h| h != home) {
+        return Err(ApiError::new(409, "slack_team_taken", "That Slack workspace is connected to another DumbSlab workspace."));
     }
     db.execute(
-        "INSERT INTO slack_teams (team_id, home, install_id, confirmed, expires_at, claimed_at) VALUES (?, ?, ?, 0, ?, ?)
-         ON CONFLICT(team_id) DO UPDATE SET home = excluded.home, install_id = excluded.install_id, confirmed = 0,
-           expires_at = excluded.expires_at, claimed_at = excluded.claimed_at",
-        &params![team_id, home, install_id, ts(now + Duration::seconds(PROVISIONAL_CLAIM_SECS)), ts(now)],
+        "INSERT INTO slack_installs (team_id, home, bot_token, token_fingerprint, bot_user_id, team_name, scopes, installed_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(team_id) DO UPDATE SET home = excluded.home, bot_token = excluded.bot_token,
+           token_fingerprint = excluded.token_fingerprint, bot_user_id = excluded.bot_user_id, team_name = excluded.team_name,
+           scopes = excluded.scopes, installed_at = excluded.installed_at",
+        &params![
+            install.team_id.clone(),
+            home,
+            install.bot_token.clone(),
+            install.token_fingerprint.clone(),
+            install.bot_user_id.clone(),
+            install.team_name.clone(),
+            install.scopes.clone(),
+            ts(now)
+        ],
     )?;
     Ok(())
 }
 
-/// Confirms an install's claim once the install is saved: from now on the Slack workspace routes
-/// to it. Confirming a confirmed claim again changes nothing. Refused (409) when the claim isn't
-/// this install's (it ran out and another workspace took it, or another install of the workspace
-/// replaced it), and 404 when the workspace was deleted: the install must then forget it.
-pub fn confirm_slack_team(db: &dyn Db, team_id: &str, home: &str, install_id: &str) -> ApiResult<()> {
+/// Lets go of a Slack workspace, only if `home` holds it. `false` when it didn't.
+pub fn slack_release(db: &dyn Db, team_id: &str, home: &str) -> ApiResult<bool> {
     check_team(team_id)?;
-    check_install(install_id)?;
-    active_home(db, home)?;
-    let n = db.execute(
-        "UPDATE slack_teams SET confirmed = 1, expires_at = NULL WHERE team_id = ? AND home = ? AND install_id = ?",
-        &params![team_id, home, install_id],
-    )?;
-    if n == 0 {
-        return Err(ApiError::new(409, "slack_team_taken", "This install no longer holds that Slack workspace."));
+    Ok(db.execute("DELETE FROM slack_installs WHERE team_id = ? AND home = ?", &params![team_id, home])? > 0)
+}
+
+/// The token to act on a Slack workspace with, only for the workspace that holds it.
+pub fn slack_token(db: &dyn Db, team_id: &str, home: &str) -> ApiResult<Option<SlackToken>> {
+    check_team(team_id)?;
+    Ok(db
+        .one(
+            "SELECT bot_token, token_fingerprint, bot_user_id FROM slack_installs WHERE team_id = ? AND home = ?",
+            &params![team_id, home],
+        )?
+        .map(|r| SlackToken {
+            bot_token: r.str("bot_token"),
+            token_fingerprint: r.str("token_fingerprint"),
+            bot_user_id: r.opt_str("bot_user_id"),
+        }))
+}
+
+/// What the directory says about a workspace's Slack connection, for its settings.
+#[derive(Debug, Clone, Default, Serialize, serde::Deserialize, PartialEq)]
+pub struct SlackStatus {
+    /// `home` holds the Slack workspace it asked about.
+    pub owned: bool,
+    /// That Slack workspace's name, when it does.
+    pub team_name: Option<String>,
+    /// Any other Slack workspaces `home` holds: left over from a switch that didn't finish letting
+    /// go of the previous one, or an install whose workspace never saved it.
+    pub others: Vec<String>,
+}
+
+/// Whether `home` holds `team_id` (none: just what else it holds).
+pub fn slack_status(db: &dyn Db, team_id: Option<&str>, home: &str) -> ApiResult<SlackStatus> {
+    if let Some(t) = team_id {
+        check_team(t)?;
     }
-    Ok(())
+    let mut status = SlackStatus::default();
+    for r in db.query("SELECT team_id, team_name FROM slack_installs WHERE home = ? ORDER BY team_id", &params![home])? {
+        if Some(r.str("team_id").as_str()) == team_id {
+            status.owned = true;
+            status.team_name = Some(r.str("team_name"));
+        } else {
+            status.others.push(r.str("team_id"));
+        }
+    }
+    Ok(status)
 }
 
-/// Lets go of an install's claim: only that exact install's, so letting go of an earlier one never
-/// removes a later one.
-pub fn release_slack_team(db: &dyn Db, team_id: &str, home: &str, install_id: &str) -> ApiResult<()> {
+/// Forgets a Slack workspace's installation once its token is known to be dead, only if the row
+/// still holds that token (and, when `home` is given, belongs to it): an install made since, with
+/// another token, stays. `false` when nothing was forgotten.
+pub fn slack_forget_if(db: &dyn Db, team_id: &str, token_fingerprint: &str, home: Option<&str>) -> ApiResult<bool> {
     check_team(team_id)?;
-    check_install(install_id)?;
-    db.execute("DELETE FROM slack_teams WHERE team_id = ? AND home = ? AND install_id = ?", &params![team_id, home, install_id])?;
-    Ok(())
+    let n = match home {
+        Some(h) => db.execute(
+            "DELETE FROM slack_installs WHERE team_id = ? AND token_fingerprint = ? AND home = ?",
+            &params![team_id, token_fingerprint, h],
+        )?,
+        None => {
+            db.execute("DELETE FROM slack_installs WHERE team_id = ? AND token_fingerprint = ?", &params![team_id, token_fingerprint])?
+        }
+    };
+    Ok(n > 0)
 }
 
-/// The workspace that holds a Slack workspace, confirmed: its first address (which names its
-/// storage), the address it lives at now, and the install that holds it. Provisional claims don't
-/// route.
-pub fn slack_team_home(db: &dyn Db, team_id: &str) -> ApiResult<Option<(String, String, String)>> {
-    let Some(row) = db.one("SELECT home, install_id FROM slack_teams WHERE team_id = ? AND confirmed = 1", &params![team_id])? else {
+/// The root domain's own look at an installation (whoever holds it): its sealed token, to check
+/// with Slack when Slack says the app was removed.
+pub fn slack_row(db: &dyn Db, team_id: &str) -> ApiResult<Option<SlackToken>> {
+    check_team(team_id)?;
+    Ok(db.one("SELECT bot_token, token_fingerprint, bot_user_id FROM slack_installs WHERE team_id = ?", &params![team_id])?.map(|r| {
+        SlackToken { bot_token: r.str("bot_token"), token_fingerprint: r.str("token_fingerprint"), bot_user_id: r.opt_str("bot_user_id") }
+    }))
+}
+
+/// The workspace that holds a Slack workspace: its first address (which names its storage) and
+/// the address it lives at now.
+pub fn slack_team_home(db: &dyn Db, team_id: &str) -> ApiResult<Option<(String, String)>> {
+    let Some(row) = db.one("SELECT home FROM slack_installs WHERE team_id = ?", &params![team_id])? else {
         return Ok(None);
     };
     let home = row.str("home");
     let current = db.one("SELECT slug FROM addresses WHERE home = ? AND current = 1", &params![home.clone()])?.map(|r| r.str("slug"));
-    Ok(Some((home.clone(), current.unwrap_or(home), row.str("install_id"))))
+    Ok(Some((home.clone(), current.unwrap_or(home))))
 }
 
 // ---------------------------------------------------------------------------

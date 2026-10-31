@@ -85,12 +85,10 @@ pub struct SlackSettings {
     pub mode: Option<SlackMode>,
     /// Add to Slack: an admin opens this URL in a browser where they're signed in to DumbSlab, and approves in Slack. Nothing to create or paste. Null when this server has no shared Slack app; then use your own app (`manifest`).
     pub install_url: Option<String>,
-    /// The bot token and signing secret are both available, so Slack works.
+    /// Slack works: the bot token and signing secret are both available. With DumbSlab's own Slack app on hosted DumbSlab, the server's directory says this workspace holds that Slack workspace.
     pub connected: bool,
-    /// A bot token is saved. It's never shown.
+    /// A bot token is saved (with DumbSlab's own Slack app on hosted DumbSlab, the server's directory holds it). It's never shown.
     pub bot_token_saved: bool,
-    /// Added with Add to Slack, but the server hasn't confirmed this workspace holds that Slack workspace yet. Until it has, DumbSlab posts nothing, answers no commands and previews no links. Reading these settings tries again.
-    pub confirming: bool,
     /// A signing secret is saved. It's never shown.
     pub signing_secret_saved: bool,
     /// The Slack workspace the bot token belongs to.
@@ -113,7 +111,9 @@ pub struct SlackSettings {
     pub channels: Vec<SlackChannel>,
 }
 
-pub(crate) fn settings_view(ctx: &Ctx) -> ApiResult<SlackSettings> {
+/// The settings. `held`: with DumbSlab's own Slack app on hosted DumbSlab, whether the directory
+/// says this workspace holds its Slack workspace (`None`: it wasn't asked).
+pub(crate) fn settings_view(ctx: &Ctx, held: Option<bool>) -> ApiResult<SlackSettings> {
     let app = slack::load(ctx.db, ctx.cfg)?;
     let workspace = crate::ops::admin::setting(ctx.db, "workspace_name")?.unwrap_or_else(|| crate::PRODUCT.into());
     let rows = ctx.db.query(
@@ -146,13 +146,16 @@ pub(crate) fn settings_view(ctx: &Ctx) -> ApiResult<SlackSettings> {
         a if a.bot_token.is_some() || a.signing_secret.is_some() => Some(SlackMode::Own),
         _ => None,
     };
+    let token = match slack::via_directory(ctx.cfg, &a) {
+        true => held == Some(true),
+        false => a.bot_token.is_some(),
+    };
     Ok(SlackSettings {
         available: slack::available(ctx.cfg),
         mode,
         install_url: slack::shared(ctx.cfg).map(|_| ctx.url(slack::INSTALL_PATH)),
-        connected: a.bot_token.is_some() && a.signing_secret.is_some(),
-        bot_token_saved: a.saved_token.is_some(),
-        confirming: a.confirming(),
+        connected: token && a.signing_secret.is_some(),
+        bot_token_saved: token,
         signing_secret_saved: a.signing_secret.is_some(),
         slack_workspace: Some(a.team_name.clone()).filter(|n| !n.is_empty()),
         slack_workspace_id: a.team_id.clone(),
@@ -167,21 +170,8 @@ pub(crate) fn settings_view(ctx: &Ctx) -> ApiResult<SlackSettings> {
     })
 }
 
-fn get_slack(ctx: &mut Ctx, _: NoInput) -> ApiResult<SlackSettings> {
-    let view = settings_view(ctx)?;
-    if ctx.cfg.hosting.is_some() {
-        // An Add to Slack whose confirmation never ran (its job died): try again, after the answer.
-        if view.confirming
-            && let Some(app) = slack::load(ctx.db, ctx.cfg)?
-        {
-            ctx.effects.push(Effect::Background(crate::connect::Job::Slack(SlackJob::confirm(&ctx.base_url, slack::At::of(&app)))));
-        }
-        // Claims a disconnect or a switch didn't finish letting go of, each by its exact install.
-        for (team, id) in slack::queued_releases(ctx.db)? {
-            ctx.effects.push(Effect::Background(crate::connect::Job::Slack(slack::release_job(&ctx.base_url, &team, &id))));
-        }
-    }
-    Ok(view)
+fn get_slack(ctx: &mut Ctx, _: NoInput) -> ApiResult<Deferred<SlackSettings>> {
+    slack::settings(ctx)
 }
 
 /// Saving your own app's secrets while DumbSlab's is connected.
@@ -232,38 +222,32 @@ fn update_slack(ctx: &mut Ctx, input: UpdateSlackInput) -> ApiResult<Deferred<Sl
         return Err(shared_refusal());
     }
     if change.bot_token.is_some() {
-        // The host checks the token with Slack, then saves the change if the connection is still
-        // the one checked against.
-        let expect = there.and_then(|a| a.install_id);
+        // The host checks the token with Slack, then saves the change if the saved connection is
+        // still exactly this one.
+        let expect = slack::Snapshot::of(there.as_ref());
         ctx.effects.push(Effect::Connect(crate::connect::Job::Slack(SlackJob::save(&ctx.base_url, &ctx.actor, change, expect))));
         return Ok(Deferred::Pending);
     }
     if change.signing_secret.is_some() || change.unfurls.is_some() {
         slack::save_now(ctx, &change)?;
     }
-    Ok(Deferred::Ready(settings_view(ctx)?))
+    slack::settings(ctx)
 }
 
 fn disconnect_slack(ctx: &mut Ctx, _: NoInput) -> ApiResult<Deferred<Done>> {
     let app = slack::load(ctx.db, ctx.cfg)?;
+    // DumbSlab's own Slack app, hosted: the directory lets go of the Slack workspace first, so
+    // another DumbSlab workspace can add it at once; then it's forgotten here. Its token isn't
+    // revoked: it's every install's.
+    if let Some(app) = app.filter(|a| slack::via_directory(ctx.cfg, a)) {
+        ctx.effects.push(Effect::Connect(crate::connect::Job::Slack(SlackJob::disconnect(&ctx.base_url, &ctx.actor, &app))));
+        return Ok(Deferred::Pending);
+    }
     if !slack::remove(ctx.db)? {
         return Err(ApiError::not_found("Slack connection"));
     }
-    // An Add to Slack under way mustn't reconnect it afterwards.
-    slack::clear_install_lock(ctx.db)?;
     emit(ctx, Event::new("slack.disconnected", "settings", "slack", "disconnected Slack").admin_only())?;
-    // DumbSlab's own Slack app, hosted: let go of the Slack workspace before answering, so another
-    // DumbSlab workspace can add it at once. Its token isn't revoked: it's every install's.
-    // By its exact install; recorded until the directory has let go, so a failure here is
-    // finished on the next visit to Settings › Slack.
-    match (app.filter(|a| a.shared).and_then(|a| Some((a.team_id?, a.install_id?))), ctx.cfg.hosting.is_some()) {
-        (Some((team, id)), true) => {
-            slack::queue_release(ctx.db, &team, &id, ctx.now)?;
-            ctx.effects.push(Effect::Connect(crate::connect::Job::Slack(slack::release_job(&ctx.base_url, &team, &id))));
-            Ok(Deferred::Pending)
-        }
-        _ => Ok(Deferred::Ready(DONE)),
-    }
+    Ok(Deferred::Ready(DONE))
 }
 
 /// A Slack channel's ID, like `C0123ABCD` (`G…` for older private channels). Only IDs: a channel
@@ -286,7 +270,7 @@ fn check_topic(ctx: &Ctx, topic_id: Option<String>) -> ApiResult<Option<String>>
 }
 
 fn read_channel(ctx: &Ctx, id: &str) -> ApiResult<SlackChannel> {
-    settings_view(ctx)?.channels.into_iter().find(|c| c.id == id).ok_or_else(|| ApiError::not_found("Slack channel"))
+    settings_view(ctx, None)?.channels.into_iter().find(|c| c.id == id).ok_or_else(|| ApiError::not_found("Slack channel"))
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -394,10 +378,11 @@ fn test_channel(ctx: &mut Ctx, input: ChannelIdInput) -> ApiResult<Deferred<Slac
     if slack::channel_row(ctx.db, &input.id)?.is_none() {
         return Err(ApiError::not_found("Slack channel"));
     }
-    let Some(app) = slack::load(ctx.db, ctx.cfg)?.filter(|a| a.bot_token.is_some()) else {
+    let Some(app) = slack::load(ctx.db, ctx.cfg)?.filter(|a| a.can_act(ctx.cfg)) else {
         return Err(ApiError::bad_request("Connect Slack first: save the bot token in Settings › Slack."));
     };
-    // From the connection as it is now: a test that waits on the directory acts on no other.
+    // From the connection as it is now, and on hosted DumbSlab with its own Slack app only once
+    // the directory gives the token.
     ctx.effects.push(Effect::Connect(crate::connect::Job::Slack(SlackJob::test(&ctx.base_url, &input.id, &app))));
     Ok(Deferred::Pending)
 }

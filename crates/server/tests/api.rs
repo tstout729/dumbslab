@@ -6031,7 +6031,7 @@ mod slack {
 // directory code, on its own database), and run each job's steps like a host.
 
 mod add_to_slack {
-    use std::cell::{Cell, RefCell};
+    use std::cell::RefCell;
     use std::collections::BTreeMap;
 
     use super::*;
@@ -6042,6 +6042,7 @@ mod add_to_slack {
     const HOST_SECRET: &str = "a0c1e2f3a4b5c6d7e8f9a0b1c2d3e4f5";
     const CLIENT_ID: &str = "111.222";
     const CLIENT_SECRET: &str = "the-client-secret";
+    const KEY: &str = "connector-key";
     const REPLY_TO: &str = "https://hooks.slack.com/commands/T1/1234/abcXYZ";
 
     /// Slack, for DumbSlab's app: one live bot token per Slack workspace, which every install of
@@ -6056,14 +6057,12 @@ mod add_to_slack {
         lost: u32,
     }
 
-    /// Slack and hosted DumbSlab's directory.
+    /// Slack and hosted DumbSlab's directory (the real directory code, on its own database).
     struct World {
         slack: RefCell<FakeSlack>,
         directory: Store,
         /// Directory routes whose next call gets no answer (and changes nothing).
         down: RefCell<Vec<&'static str>>,
-        /// Seconds the directory's clock is ahead.
-        ahead: Cell<i64>,
         _dir: tempfile::TempDir,
     }
 
@@ -6074,22 +6073,18 @@ mod add_to_slack {
             let directory = Store::open(&dir.path().join("directory.db")).unwrap();
             let now = chrono::Utc::now();
             let limits = Limits { per_ip_per_day: 10, per_day: 10, max_workspaces: 10, free: ROOMY };
-            directory
-                .with_tx(|db| {
-                    let r = (|| {
-                        tenancy::directory_migrate(db)?;
-                        for slug in ["acme", "beta"] {
-                            tenancy::reserve(db, slug, "Name", slug, now, limits)?;
-                            tenancy::activate(db, slug, now)?;
-                        }
-                        Ok::<_, dumbslab_core::ApiError>(())
-                    })();
-                    let ok = r.is_ok();
-                    (r, ok)
+            let world = World { slack: RefCell::default(), directory, down: RefCell::default(), _dir: dir };
+            world
+                .dir(|db| {
+                    tenancy::directory_migrate(db)?;
+                    for slug in ["acme", "beta"] {
+                        tenancy::reserve(db, slug, "Name", slug, now, limits)?;
+                        tenancy::activate(db, slug, now)?;
+                    }
+                    Ok(())
                 })
-                .unwrap()
                 .unwrap();
-            World { slack: RefCell::default(), directory, down: RefCell::default(), ahead: Cell::new(0), _dir: dir }
+            world
         }
 
         fn dir<T>(&self, f: impl FnOnce(&dyn dumbslab_core::Db) -> dumbslab_core::ApiResult<T>) -> dumbslab_core::ApiResult<T> {
@@ -6102,24 +6097,28 @@ mod add_to_slack {
                 .unwrap()
         }
 
-        /// Which workspace Slack's requests for a Slack workspace go to (confirmed claims only).
+        /// The workspace the directory says holds a Slack workspace (Slack's requests go there).
         fn holder(&self, team: &str) -> Option<String> {
-            self.dir(|db| tenancy::slack_team_home(db, team)).unwrap().map(|(home, _, _)| home)
+            self.dir(|db| tenancy::slack_team_home(db, team)).unwrap().map(|(home, _)| home)
         }
 
-        /// What the root does with a request from Slack: names the install whose claim routes it.
-        fn route(&self, mut req: Request, team: &str) -> Request {
-            if let Some((_, _, install)) = self.dir(|db| tenancy::slack_team_home(db, team)).unwrap() {
-                req.headers.push((dumbslab_core::slack::INSTALL_HEADER.into(), install));
-            }
-            req
-        }
-
-        /// The claim on a Slack workspace: (home, install id, confirmed).
-        fn claim(&self, team: &str) -> Option<(String, String, bool)> {
-            self.dir(|db| db.one("SELECT home, install_id, confirmed FROM slack_teams WHERE team_id = ?", &[team.into()]))
+        /// The fingerprint of the token the directory holds for a Slack workspace.
+        fn held_token(&self, team: &str) -> Option<String> {
+            self.dir(|db| db.one("SELECT token_fingerprint FROM slack_installs WHERE team_id = ?", &[team.into()]))
                 .unwrap()
-                .map(|r| (r.str("home"), r.str("install_id"), r.bool("confirmed")))
+                .map(|r| r.str("token_fingerprint"))
+        }
+
+        /// Whether the directory says `home` holds the Slack workspace whose token this is, now.
+        fn holds(&self, home: &str, token: &str) -> bool {
+            self.dir(|db| {
+                db.one(
+                    "SELECT 1 AS ok FROM slack_installs WHERE home = ? AND token_fingerprint = ?",
+                    &[home.into(), sha256_hex(token).into()],
+                )
+            })
+            .unwrap()
+            .is_some()
         }
 
         fn live(&self, team: &str) -> Option<String> {
@@ -6131,11 +6130,37 @@ mod add_to_slack {
             self.slack.borrow_mut().live.remove(team);
         }
 
-        /// Answers a call from the workspace whose first address is `home` (the Worker names it,
-        /// whatever the call says).
+        /// The root's check of an uninstall event for `team`, as the Worker runs it: Slack's answer and
+        /// the calls it made.
+        fn uninstall_check(&self, team: &str) -> (u16, Vec<HttpCall>) {
+            let (mut check, mut call) = dumbslab_core::slack::UninstallCheck::start(team);
+            let mut calls = vec![];
+            loop {
+                let reply = self.answer(None, &call);
+                calls.push(call);
+                match check.next(Some(KEY), &reply) {
+                    dumbslab_core::slack::CheckStep::Fetch(next) => call = next,
+                    dumbslab_core::slack::CheckStep::Done(r) => return (r.status, calls),
+                }
+            }
+        }
+
+        /// Answers a call from the workspace whose first address is `home`, or from the root domain
+        /// (`None`). Like the Worker, it names the workspace itself, whatever the call says.
         fn answer(&self, home: Option<&str>, call: &HttpCall) -> HttpReply {
             let ok = |v: Value| HttpReply { status: 200, body: v.to_string() };
             let token = call.headers.iter().find(|(k, _)| k == "authorization").and_then(|(_, v)| v.strip_prefix("Bearer ")).unwrap_or("");
+            // The invariant: a hosted workspace acts on Slack with DumbSlab's token only while the
+            // directory says it holds that Slack workspace with that very token.
+            let acting = |what: &str| {
+                if let Some(home) = home
+                    && !token.starts_with("xoxb-own")
+                {
+                    assert!(self.holds(home, token), "{home} called {what} with a token it doesn't hold");
+                }
+            };
+            let alive = || self.slack.borrow().live.values().any(|t| t == token);
+            let dead = || ok(json!({ "ok": false, "error": "invalid_auth" }));
             match call.url.as_str() {
                 "https://slack.com/api/oauth.v2.access" => {
                     let mut slack = self.slack.borrow_mut();
@@ -6153,12 +6178,16 @@ mod add_to_slack {
                         "enterprise": null, "is_enterprise_install": false }))
                 }
                 "https://slack.com/api/auth.revoke" => panic!("a shared-app token was revoked"),
-                "https://slack.com/api/chat.postMessage" => {
-                    assert!(self.slack.borrow().live.values().any(|t| t == token), "posted with a dead token");
-                    ok(json!({ "ok": true, "ts": "1.2" }))
+                "https://slack.com/api/chat.postMessage" | "https://slack.com/api/chat.unfurl" => {
+                    acting(&call.url);
+                    if alive() { ok(json!({ "ok": true, "ts": "1.2" })) } else { dead() }
                 }
                 "https://slack.com/api/users.info?user=UMO" => {
-                    ok(json!({ "ok": true, "user": { "id": "UMO", "team_id": "T1", "deleted": false, "is_bot": false,
+                    acting(&call.url);
+                    // Ada, in the Slack workspace the token belongs to.
+                    let team = self.slack.borrow().live.iter().find(|(_, t)| t.as_str() == token).map(|(team, _)| team.clone());
+                    let Some(team) = team else { return dead() };
+                    ok(json!({ "ok": true, "user": { "id": "UMO", "team_id": team, "deleted": false, "is_bot": false,
                         "is_email_confirmed": true, "profile": { "email": "ada@acme.test" } } }))
                 }
                 "https://slack.com/api/auth.test" => {
@@ -6172,30 +6201,50 @@ mod add_to_slack {
                     }
                     match slack.live.iter().find(|(_, t)| t.as_str() == token) {
                         Some((team, _)) => ok(json!({ "ok": true, "team_id": team })),
-                        None => ok(json!({ "ok": false, "error": "invalid_auth" })),
+                        None => dead(),
                     }
                 }
-                url if url.starts_with("https://hooks.slack.com/") => ok(json!({ "ok": true })),
+                url if url.starts_with("https://hooks.slack.com/") => {
+                    assert!(token.is_empty(), "a token went to a response_url");
+                    ok(json!({ "ok": true }))
+                }
                 url if url.starts_with("dumbslab-directory:") => {
                     let path = url.strip_prefix("dumbslab-directory:").unwrap();
+                    assert!(!call.headers.iter().any(|(k, _)| k == "authorization"), "the directory never gets a bearer token");
                     let mut down = self.down.borrow_mut();
                     if let Some(i) = down.iter().position(|p| *p == path) {
                         down.remove(i);
                         return HttpReply::default();
                     }
                     let body: Value = serde_json::from_str(call.body.as_deref().unwrap()).unwrap();
-                    let team = body["team_id"].as_str().unwrap().to_string();
-                    let id = body["install_id"].as_str().map(str::to_string);
-                    let home = home.expect("only hosted workspaces reach the directory").to_string();
-                    let now = chrono::Utc::now() + chrono::Duration::seconds(self.ahead.get());
-                    let r = self.dir(|db| match path {
-                        "/slack/claim" => tenancy::claim_slack_team(db, &team, &home, id.as_deref().unwrap(), now),
-                        "/slack/confirm" => tenancy::confirm_slack_team(db, &team, &home, id.as_deref().unwrap()),
-                        "/slack/release" => tenancy::release_slack_team(db, &team, &home, id.as_deref().unwrap()),
-                        other => panic!("directory route {other}"),
+                    let named = body["team_id"].as_str().map(str::to_string);
+                    let team = || named.clone().expect("a team_id");
+                    let fp = body["token_fingerprint"].as_str().map(str::to_string);
+                    let now = chrono::Utc::now();
+                    let r: dumbslab_core::ApiResult<Value> = self.dir(|db| match (home, path) {
+                        (Some(home), "/slack/install") => {
+                            let install: tenancy::SlackInstall = serde_json::from_value(body.clone()).unwrap();
+                            tenancy::slack_install(db, home, &install, now).map(|_| json!({ "ok": true }))
+                        }
+                        (Some(home), "/slack/release") => tenancy::slack_release(db, &team(), home).map(|r| json!({ "released": r })),
+                        (Some(home), "/slack/token") => match tenancy::slack_token(db, &team(), home)? {
+                            Some(t) => Ok(serde_json::to_value(t).unwrap()),
+                            None => Err(dumbslab_core::ApiError::not_found("that Slack workspace")),
+                        },
+                        (Some(home), "/slack/status") => {
+                            tenancy::slack_status(db, named.as_deref(), home).map(|s| serde_json::to_value(s).unwrap())
+                        }
+                        (_, "/slack/forget") => {
+                            tenancy::slack_forget_if(db, &team(), &fp.clone().unwrap(), home).map(|f| json!({ "forgot": f }))
+                        }
+                        (None, "/slack/row") => match tenancy::slack_row(db, &team())? {
+                            Some(t) => Ok(serde_json::to_value(t).unwrap()),
+                            None => Err(dumbslab_core::ApiError::not_found("an installation")),
+                        },
+                        (home, other) => panic!("{home:?} may not call the directory's {other}"),
                     });
                     match r {
-                        Ok(()) => ok(json!({ "ok": true })),
+                        Ok(v) => ok(v),
                         Err(e) => HttpReply { status: e.status, body: e.to_json().to_string() },
                     }
                 }
@@ -6206,7 +6255,7 @@ mod add_to_slack {
 
     /// Gives the host DumbSlab's shared Slack app (and a connector key).
     fn share(h: &mut H) {
-        h.cfg.connectors.key = Some("connector-key".into());
+        h.cfg.connectors.key = Some(KEY.into());
         h.cfg.connectors.apps.insert("slack".into(), OAuthApp { client_id: CLIENT_ID.into(), client_secret: CLIENT_SECRET.into() });
         h.cfg.slack.signing_secret = Some(HOST_SECRET.into());
     }
@@ -6265,17 +6314,12 @@ mod add_to_slack {
 
     /// One step, like a host: the step and the host's own check in one transaction, rolled back
     /// on failure, and the notice to send then.
-    fn step(
-        h: &H,
-        job: &mut Job,
-        replies: Vec<HttpReply>,
-        refuse: Option<dumbslab_core::ApiError>,
-    ) -> (dumbslab_core::ApiResult<Step>, Option<HttpCall>) {
+    fn step(h: &H, job: &mut Job, replies: Vec<HttpReply>) -> dumbslab_core::ApiResult<Step> {
         h.store
             .with_tx(|db| {
-                let (step, notice) = connect::guarded_step(db, &h.cfg, job, replies, chrono::Utc::now(), |_| refuse);
+                let (step, _) = connect::guarded_step(db, &h.cfg, job, replies, chrono::Utc::now(), |_| None);
                 let ok = step.is_ok();
-                ((step, notice), ok)
+                (step, ok)
             })
             .unwrap()
     }
@@ -6283,13 +6327,12 @@ mod add_to_slack {
     /// Runs a job to the end with the world's answers: how it finished, every call it made, and
     /// what it left for the host.
     fn drive(h: &H, world: &World, mut job: Job) -> (Finish, Vec<HttpCall>, Vec<Effect>) {
-        let home = home(h);
         let (mut replies, mut sent) = (vec![], vec![]);
         for _ in 0..connect::MAX_STEPS {
-            match step(h, &mut job, replies, None).0.unwrap() {
+            match step(h, &mut job, replies).unwrap() {
                 Step::Done(f) => return (f, sent, job.take_effects()),
                 Step::Fetch(calls) => {
-                    replies = calls.iter().map(|c| world.answer(home.as_deref(), c)).collect();
+                    replies = answers(h, world, &calls);
                     sent.extend(calls);
                 }
             }
@@ -6297,10 +6340,9 @@ mod add_to_slack {
         panic!("job didn't finish");
     }
 
-    /// One step with the world's answers to what the last asked; what this one asks.
-    fn advance(h: &H, world: &World, job: &mut Job, replies: Vec<HttpReply>) -> Vec<HttpCall> {
-        let _ = world;
-        match step(h, job, replies, None).0.unwrap() {
+    /// One step with the answers to what the last asked; what this one asks.
+    fn advance(h: &H, job: &mut Job, replies: Vec<HttpReply>) -> Vec<HttpCall> {
+        match step(h, job, replies).unwrap() {
             Step::Fetch(calls) => calls,
             other => panic!("{other:?}"),
         }
@@ -6310,9 +6352,15 @@ mod add_to_slack {
         calls.iter().map(|c| world.answer(home(h).as_deref(), c)).collect()
     }
 
-    /// Runs the jobs left for after an answer; every call they made.
+    /// Runs the jobs left for after an answer, and the ones they leave; every call they made.
     fn run_later(h: &H, world: &World, effects: &[Effect]) -> Vec<HttpCall> {
-        later_of(effects).into_iter().flat_map(|j| drive(h, world, j).1).collect()
+        let mut calls = vec![];
+        for job in later_of(effects) {
+            let (_, sent, more) = drive(h, world, job);
+            calls.extend(sent);
+            calls.extend(run_later(h, world, &more));
+        }
+        calls
     }
 
     fn get(h: &H, path: &str, auth: &Auth) -> Res {
@@ -6353,12 +6401,12 @@ mod add_to_slack {
         job_of(&r).expect("a job")
     }
 
-    /// Add to Slack from start to finish: where the admin lands, the calls, and the calls of the
-    /// jobs it left (run too).
-    fn install(h: &H, admin: &Auth, world: &World, team: &str) -> (String, Vec<HttpCall>, Vec<HttpCall>) {
+    /// Add to Slack from start to finish: where the admin lands, and the calls.
+    fn install(h: &H, admin: &Auth, world: &World, team: &str) -> (String, Vec<HttpCall>) {
         let (finish, calls, effects) = drive(h, world, install_job(h, admin, team));
+        assert!(later_of(&effects).is_empty());
         let Finish::Redirect(to) = finish else { panic!("{finish:?}") };
-        (to, calls, run_later(h, world, &effects))
+        (to, calls)
     }
 
     fn urls(calls: &[HttpCall]) -> Vec<&str> {
@@ -6369,22 +6417,49 @@ mod add_to_slack {
         serde_json::from_str(call.body.as_deref().unwrap()).unwrap()
     }
 
-    fn settings(h: &H, admin: &Auth) -> Value {
-        h.ok("GET", "/api/v1/slack", None, admin)
+    /// The answer an operation's job finished with, and its calls (and its later jobs').
+    fn finish_op(h: &H, world: &World, r: &Res) -> (Result<Value, String>, Vec<HttpCall>) {
+        assert_eq!(r.status, 200, "{}", r.body);
+        let Some(job) = job_of(r) else { return (Ok(r.body.clone()), vec![]) };
+        let (finish, mut calls, effects) = drive(h, world, job);
+        calls.extend(run_later(h, world, &effects));
+        match finish {
+            Finish::Fill(v) => (Ok(v), calls),
+            Finish::Fail(e) => (Err(e.code.to_string()), calls),
+            other => panic!("{other:?}"),
+        }
     }
 
-    /// The saved install's id.
-    fn install_id(h: &H) -> Option<String> {
-        db_run(h, |db| db.one("SELECT install_id FROM slack_app", &[])).and_then(|r| r.opt_str("install_id"))
+    /// Settings › Slack, and the calls it made (hosted: to the directory).
+    fn settings_calls(h: &H, world: &World, admin: &Auth) -> (Value, Vec<HttpCall>) {
+        let (view, calls) = finish_op(h, world, &h.call("GET", "/api/v1/slack", None, admin));
+        (view.expect("the settings"), calls)
     }
 
-    fn locks(h: &H) -> i64 {
-        count(h, "SELECT COUNT(*) FROM slack_install_lock")
+    fn settings(h: &H, world: &World, admin: &Auth) -> Value {
+        settings_calls(h, world, admin).0
     }
 
-    fn signed(path: &str, body: &str) -> Request {
+    fn patch(h: &H, world: &World, admin: &Auth, change: Value) -> Result<Value, String> {
+        let r = h.call("PATCH", "/api/v1/slack", Some(change), admin);
+        if r.status != 200 {
+            return Err(r.body["error"]["code"].as_str().unwrap_or_default().to_string());
+        }
+        finish_op(h, world, &r).0
+    }
+
+    /// Disconnects as `admin`: how it went (an error code), and the calls.
+    fn disconnect(h: &H, world: &World, admin: &Auth) -> (Result<Value, String>, Vec<HttpCall>) {
+        let r = h.call("DELETE", "/api/v1/slack", None, admin);
+        if r.status != 200 {
+            return (Err(r.body["error"]["code"].as_str().unwrap_or_default().to_string()), vec![]);
+        }
+        finish_op(h, world, &r)
+    }
+
+    fn signed_with(path: &str, body: &str, secret: &str) -> Request {
         let at = chrono::Utc::now().timestamp();
-        let signature = format!("v0={}", hmac_sha256_hex(HOST_SECRET, &format!("v0:{at}:{body}")));
+        let signature = format!("v0={}", hmac_sha256_hex(secret, &format!("v0:{at}:{body}")));
         let content_type = if path.ends_with("commands") { "application/x-www-form-urlencoded" } else { "application/json" };
         Request {
             method: "POST".into(),
@@ -6400,6 +6475,10 @@ mod add_to_slack {
         }
     }
 
+    fn signed(path: &str, body: &str) -> Request {
+        signed_with(path, body, HOST_SECRET)
+    }
+
     fn command(team: &str) -> String {
         format!(
             "token=x&team_id={team}&channel_id=C1&user_id=UMO&command=%2Fdumbslab&text=search+x&response_url={}&trigger_id={}",
@@ -6408,34 +6487,38 @@ mod add_to_slack {
         )
     }
 
-    fn event(team: &str, event: Value, at: i64) -> String {
+    fn event(team: &str, event: Value) -> String {
         json!({ "token": "x", "team_id": team, "api_app_id": "A1", "type": "event_callback", "event": event,
-            "event_id": format!("Ev{}", dumbslab_core::util::new_id()), "event_time": at,
+            "event_id": format!("Ev{}", dumbslab_core::util::new_id()), "event_time": chrono::Utc::now().timestamp(),
             "authorizations": [{ "enterprise_id": null, "team_id": team, "user_id": "UBOT", "is_bot": true, "is_enterprise_install": false }] })
         .to_string()
     }
 
-    /// Disconnects as `admin`, running the job that lets go of the Slack workspace; its calls.
-    fn disconnect(h: &H, world: &World, admin: &Auth) -> Vec<HttpCall> {
-        let r = h.call("DELETE", "/api/v1/slack", None, admin);
-        assert_eq!(r.status, 200, "{}", r.body);
-        match job_of(&r) {
-            Some(job) => {
-                let (finish, calls, _) = drive(h, world, job);
-                assert!(matches!(finish, Finish::Fill(ref v) if v["ok"] == true), "{finish:?}");
-                calls
-            }
-            None => vec![],
-        }
+    /// A link to a post shared in Slack, as Slack sends it.
+    fn shared_link(url: &Value) -> Value {
+        json!({ "type": "link_shared", "channel": "C1", "user": "UMO", "message_ts": "1.2", "unfurl_id": "U1",
+            "source": "conversations_history", "links": [{ "url": url, "domain": "kb.test" }] })
     }
 
-    /// Slack channel messages a change sent: as webhooks, or (DumbSlab's own app, hosted) by the job
-    /// that has the directory confirm the install first.
+    /// Slack channel messages a change sent: as webhooks (a token kept here), or by the job that
+    /// asks the directory for the token first.
     fn messages(h: &H, world: &World, effects: &[Effect]) -> usize {
         let webhooks =
             effects.iter().filter(|e| matches!(e, Effect::Webhook(d) if d.url == "https://slack.com/api/chat.postMessage")).count();
         let jobs = run_later(h, world, effects).iter().filter(|c| c.url == "https://slack.com/api/chat.postMessage").count();
         webhooks + jobs
+    }
+
+    fn publish(h: &H, admin: &Auth, title: &str) -> Res {
+        h.call("POST", "/api/v1/posts", Some(json!({ "title": title, "status": "published" })), admin)
+    }
+
+    fn saved_team(h: &H) -> Option<String> {
+        db_run(h, |db| db.one("SELECT team_id FROM slack_app", &[])).and_then(|r| r.opt_str("team_id"))
+    }
+
+    fn activity(h: &H, admin: &Auth, event: &str) -> Vec<Value> {
+        h.ok("GET", &format!("/api/v1/activity?event={event}"), None, admin)["items"].as_array().unwrap().clone()
     }
 
     #[test]
@@ -6445,14 +6528,14 @@ mod add_to_slack {
         let (admin, admin_token) = h.setup();
         h.user(&admin, "mo@acme.test", "Mo", "member");
         let mo = login(&h, "mo@acme.test", "password123");
-        h.cfg.connectors.key = Some("connector-key".into());
+        h.cfg.connectors.key = Some(KEY.into());
 
         // Without the shared app, there's nothing to click: an admin creates their own app.
-        assert!(settings(&h, &admin)["install_url"].is_null());
+        assert!(settings(&h, &world, &admin)["install_url"].is_null());
         assert!(location(&get(&h, "/slack/install", &admin)).ends_with("/settings/slack?slack_error=unavailable"));
 
         share(&mut h);
-        let s = settings(&h, &admin);
+        let s = settings(&h, &world, &admin);
         assert_eq!((s["install_url"].as_str(), &s["mode"]), (Some("https://kb.test/slack/install"), &Value::Null), "{s}");
         // Admins only, in a browser: members are told, and anyone else signs in first.
         assert_eq!(location(&get(&h, "/slack/install", &mo)), "https://kb.test/settings/slack?slack_error=not_admin");
@@ -6468,8 +6551,8 @@ mod add_to_slack {
         assert_eq!(query_param(&to, "redirect_uri"), "https://kb.test/slack/install/callback");
         assert!(!to.contains("user_scope"), "{to}");
         let state = query_param(&to, "state");
-        assert_eq!(count(&h, &format!("SELECT COUNT(*) FROM slack_installs WHERE state_hash = '{}'", sha256_hex(&state))), 1);
-        assert_eq!(count(&h, &format!("SELECT COUNT(*) FROM slack_installs WHERE state_hash = '{state}'")), 0);
+        assert_eq!(count(&h, &format!("SELECT COUNT(*) FROM slack_install_requests WHERE state_hash = '{}'", sha256_hex(&state))), 1);
+        assert_eq!(count(&h, &format!("SELECT COUNT(*) FROM slack_install_requests WHERE state_hash = '{state}'")), 0);
 
         // Another session, even the same admin's, can't finish it; and then it's spent.
         let elsewhere = login(&h, "ada@acme.test", "correct horse");
@@ -6487,11 +6570,10 @@ mod add_to_slack {
         assert!(back(&admin, format!("error=server_error&state={state}")).ends_with("slack_error=slack_error"));
 
         // Approving: the code is exchanged with the client's credentials, and that's all. Off
-        // hosted DumbSlab there's no directory: it's confirmed at once.
-        let (to, calls, later) = install(&h, &admin, &world, "T1");
+        // hosted DumbSlab there's no directory: the token is kept here, sealed.
+        let (to, calls) = install(&h, &admin, &world, "T1");
         assert_eq!(to, "https://kb.test/settings/slack?slack=connected");
         assert_eq!(urls(&calls), vec!["https://slack.com/api/oauth.v2.access"]);
-        assert!(later.is_empty());
         let basic = base64::engine::general_purpose::STANDARD.encode(format!("{CLIENT_ID}:{CLIENT_SECRET}"));
         assert!(calls[0].headers.contains(&("authorization".into(), format!("Basic {basic}"))), "{:?}", calls[0].headers);
         let form = calls[0].body.clone().unwrap();
@@ -6499,12 +6581,8 @@ mod add_to_slack {
         assert!(!form.contains(CLIENT_SECRET));
         let token = world.live("T1").unwrap();
 
-        let s = settings(&h, &admin);
-        assert_eq!(
-            (s["mode"].as_str(), s["connected"].as_bool(), s["confirming"].as_bool()),
-            (Some("shared"), Some(true), Some(false)),
-            "{s}"
-        );
+        let s = settings(&h, &world, &admin);
+        assert_eq!((s["mode"].as_str(), s["connected"].as_bool()), (Some("shared"), Some(true)), "{s}");
         assert_eq!((s["slack_workspace"].as_str(), s["slack_workspace_id"].as_str()), (Some("T1 Slack"), Some("T1")));
         assert_eq!(s["granted_scopes"], json!(["commands", "chat:write", "links:read"]));
         let shown = s.to_string();
@@ -6513,8 +6591,7 @@ mod add_to_slack {
         }
         let stored = db_run(&h, |db| db.one("SELECT bot_token, signing_secret, shared FROM slack_app", &[])).unwrap();
         assert!(!stored.str("bot_token").contains(&token) && stored.opt_str("signing_secret").is_none() && stored.bool("shared"));
-        let activity = h.ok("GET", "/api/v1/activity?event=slack.installed", None, &admin);
-        assert_eq!(activity["items"].as_array().unwrap().len(), 1, "{activity}");
+        assert_eq!(activity(&h, &admin, "slack.installed").len(), 1);
 
         // Slack's requests, signed with the shared app's secret, work for this Slack workspace only.
         let r = h.send(&signed("/slack/commands", &command("T1")));
@@ -6528,23 +6605,55 @@ mod add_to_slack {
 
         // Its own app's secrets can't be pasted over it; previews can still be turned off.
         for change in [json!({ "bot_token": "xoxb-own" }), json!({ "signing_secret": "0123456789abcdef0123" })] {
-            let r = h.call("PATCH", "/api/v1/slack", Some(change), &admin);
-            assert_eq!((r.status, r.body["error"]["code"].as_str()), (409, Some("slack_shared")), "{}", r.body);
+            assert_eq!(patch(&h, &world, &admin, change), Err("slack_shared".into()));
         }
-        assert_eq!(h.ok("PATCH", "/api/v1/slack", Some(json!({ "unfurls": false })), &admin)["unfurls"], false);
+        assert_eq!(patch(&h, &world, &admin, json!({ "unfurls": false })).unwrap()["unfurls"], false);
 
         // Disconnecting forgets it here, and touches nothing in Slack: the app stays until a Slack
         // admin removes it there.
-        assert!(disconnect(&h, &world, &admin).is_empty());
-        assert!(settings(&h, &admin)["mode"].is_null());
+        let (done, calls) = disconnect(&h, &world, &admin);
+        assert!(done.is_ok() && calls.is_empty(), "{done:?} {calls:?}");
+        assert!(settings(&h, &world, &admin)["mode"].is_null());
         assert_eq!(world.live("T1"), Some(token));
         let r = h.send(&signed("/slack/commands", &command("T1")));
         assert!(r.body.to_string().contains("isn't connected"), "{}", r.body);
-        assert_eq!(h.call("DELETE", "/api/v1/slack", None, &admin).status, 404, "nothing left to disconnect");
+        assert_eq!(disconnect(&h, &world, &admin).0, Err("not_found".into()), "nothing left to disconnect");
     }
 
+    /// Off hosted DumbSlab, the workspace hears Slack say the app was removed, and checks the token
+    /// before Slack hears back. An unclear check answers 500, so Slack sends the event again.
     #[test]
-    fn add_to_slack_claims_one_slack_workspace_for_one_workspace() {
+    fn self_hosted_add_to_slack_checks_uninstalls_itself() {
+        let mut h = H::new();
+        let world = World::new();
+        let (admin, _) = h.setup();
+        share(&mut h);
+        install(&h, &admin, &world, "T1");
+        let removed = || -> (u16, Vec<HttpCall>) {
+            let r = h.send(&signed("/slack/events", &event("T1", json!({ "type": "app_uninstalled" }))));
+            let (finish, calls, _) = drive(&h, &world, job_of(&r).expect("checked before Slack hears back"));
+            let Finish::Respond(answer) = finish else { panic!("{finish:?}") };
+            (answer.status, calls)
+        };
+
+        // The token still works (the event was about an earlier install): kept.
+        let (status, calls) = removed();
+        assert_eq!((status, urls(&calls)), (200, vec!["https://slack.com/api/auth.test"]));
+        world.slack.borrow_mut().lost = 1;
+        assert_eq!(removed().0, 500, "unclear: Slack sends it again");
+        assert_eq!(settings(&h, &world, &admin)["mode"], "shared");
+
+        // Removed in Slack: disconnected here, by Slack.
+        world.uninstall("T1");
+        assert_eq!(removed().0, 200);
+        assert!(settings(&h, &world, &admin)["mode"].is_null());
+        assert_eq!(activity(&h, &admin, "slack.uninstalled")[0]["via"], "slack");
+    }
+
+    /// One Slack workspace, one DumbSlab workspace: the directory records the installation, token
+    /// and all, and only its holder ever gets the token. Nothing here keeps it.
+    #[test]
+    fn only_the_holder_gets_the_token() {
         let world = World::new();
         let (acme, admin) = hosted_at("acme");
         let (beta, beta_admin) = hosted_at("beta");
@@ -6554,132 +6663,165 @@ mod add_to_slack {
         assert_eq!(query_param(&to, "redirect_uri"), "https://kb.test/slack/install/callback");
         assert!(query_param(&to, "state").starts_with("acme."));
 
-        // Beta has T1. Acme can't: nothing is saved, and nothing of beta's is touched.
-        assert!(install(&beta, &beta_admin, &world, "T1").0.ends_with("slack=connected"));
-        let (to, calls, _) = install(&acme, &admin, &world, "T1");
-        assert!(to.ends_with("/settings/slack?slack_error=slack_team_taken"), "{to}");
-        assert_eq!(urls(&calls), vec!["https://slack.com/api/oauth.v2.access", "dumbslab-directory:/slack/claim"]);
-        let claim = body(&calls[1]);
-        assert_eq!((claim["team_id"].as_str(), claim["home"].as_str()), (Some("T1"), Some("acme")));
-        assert!(claim["install_id"].as_str().is_some_and(|c| !c.is_empty()));
-        assert!(!calls[1].headers.iter().any(|(k, _)| k == "authorization"), "the directory never sees a token");
-        assert!(settings(&acme, &admin)["mode"].is_null());
-        assert_eq!(world.holder("T1").as_deref(), Some("beta"));
-
-        // The directory doesn't answer the claim: it may have been made, so acme lets go of its own.
-        world.down.borrow_mut().push("/slack/claim");
-        let (to, calls, _) = install(&acme, &admin, &world, "T2");
-        assert!(to.ends_with("slack_error=failed"), "{to}");
-        assert_eq!(urls(&calls)[2], "dumbslab-directory:/slack/release");
-        assert_eq!(body(&calls[2])["install_id"], body(&calls[1])["install_id"]);
-        assert_eq!(world.claim("T2"), None);
-
-        // Claimed, saved, confirmed: connected, and Slack's requests for T2 go to acme.
-        let (to, calls, _) = install(&acme, &admin, &world, "T2");
+        // Beta adds T1: the directory gets the token sealed, and its fingerprint.
+        let (to, calls) = install(&beta, &beta_admin, &world, "T1");
         assert!(to.ends_with("slack=connected"), "{to}");
+        assert_eq!(urls(&calls), vec!["https://slack.com/api/oauth.v2.access", "dumbslab-directory:/slack/install"]);
+        let token = world.live("T1").unwrap();
+        let recorded = body(&calls[1]);
+        assert!(!recorded.to_string().contains(&token), "{recorded}");
+        assert_eq!(recorded["token_fingerprint"].as_str(), Some(sha256_hex(&token).as_str()));
+        assert_eq!((recorded["team_id"].as_str(), recorded["home"].as_str()), (Some("T1"), None), "the host names the workspace");
+        assert_eq!(world.holder("T1").as_deref(), Some("beta"));
+        let row = db_run(&beta, |db| db.one("SELECT bot_token, shared, team_id FROM slack_app", &[])).unwrap();
+        assert!(row.opt_str("bot_token").is_none() && row.bool("shared"), "no token kept in the workspace");
+
+        // Acme can't have T1: nothing is saved there, and nothing of beta's is touched. Nor can it
+        // get T1's token from the directory.
+        let (to, calls) = install(&acme, &admin, &world, "T1");
+        assert!(to.ends_with("/settings/slack?slack_error=slack_team_taken"), "{to}");
+        assert_eq!(urls(&calls), vec!["https://slack.com/api/oauth.v2.access", "dumbslab-directory:/slack/install"]);
+        assert!(settings(&acme, &world, &admin)["mode"].is_null());
+        assert_eq!((world.holder("T1").as_deref(), world.held_token("T1")), (Some("beta"), Some(sha256_hex(&token))));
+        let asked = world
+            .answer(Some("acme"), &HttpCall::post_json("dumbslab-directory:/slack/token", &json!({ "team_id": "T1", "home": "beta" })));
+        assert_eq!(asked.status, 404, "the host names the workspace, whatever the call says");
+
+        // Acme adds T2. Settings asks the directory whether acme holds it.
+        assert!(install(&acme, &admin, &world, "T2").0.ends_with("slack=connected"));
+        let (s, calls) = settings_calls(&acme, &world, &admin);
+        assert_eq!(urls(&calls), vec!["dumbslab-directory:/slack/status"]);
+        assert_eq!(
+            (s["mode"].as_str(), s["connected"].as_bool(), s["bot_token_saved"].as_bool(), s["slack_workspace_id"].as_str()),
+            (Some("shared"), Some(true), Some(true), Some("T2")),
+            "{s}"
+        );
+        // Every job that acts on Slack asks for the token right before it does.
+        let r = acme.send(&signed("/slack/commands", &command("T2")));
+        let calls = run_later(&acme, &world, &r.effects);
+        assert_eq!(urls(&calls), vec!["dumbslab-directory:/slack/token", "https://slack.com/api/users.info?user=UMO", REPLY_TO]);
+        let post = acme.ok("POST", "/api/v1/posts", Some(json!({ "title": "Shared", "status": "published" })), &admin);
+        let r = acme.send(&signed("/slack/events", &event("T2", shared_link(&post["url"]))));
+        let calls = run_later(&acme, &world, &r.effects);
         assert_eq!(
             urls(&calls),
-            vec!["https://slack.com/api/oauth.v2.access", "dumbslab-directory:/slack/claim", "dumbslab-directory:/slack/confirm"]
+            vec!["dumbslab-directory:/slack/token", "https://slack.com/api/users.info?user=UMO", "https://slack.com/api/chat.unfurl"]
         );
-        assert_eq!(world.claim("T2"), Some(("acme".into(), install_id(&acme).unwrap(), true)));
-        acme.ok("POST", "/api/v1/slack/channels", Some(json!({ "channel": "C0CHANNEL01" })), &admin);
+        let channel = acme.ok("POST", "/api/v1/slack/channels", Some(json!({ "channel": "C0CHANNEL01" })), &admin)["id"].clone();
+        let r = publish(&acme, &admin, "News");
+        assert!(!r.effects.iter().any(|e| matches!(e, Effect::Webhook(_))), "no message carries a token from here");
+        assert_eq!(
+            urls(&run_later(&acme, &world, &r.effects)),
+            vec!["dumbslab-directory:/slack/token", "https://slack.com/api/chat.postMessage"]
+        );
+        let r = acme.call("POST", &format!("/api/v1/slack/channels/{}/test", channel.as_str().unwrap()), None, &admin);
+        let (tested, calls) = finish_op(&acme, &world, &r);
+        assert_eq!(tested.unwrap()["ok"], true);
+        assert_eq!(urls(&calls), vec!["dumbslab-directory:/slack/token", "https://slack.com/api/chat.postMessage"]);
 
-        // Moving to T3: claim T3, save it (T2 is no longer acted on), confirm T3 and let go of T2 by
-        // its own install id. No revoke.
-        let t2 = install_id(&acme).unwrap();
-        let (to, calls, later) = install(&acme, &admin, &world, "T3");
+        // Switching to T3: recorded, saved here (another Slack workspace's channels go), then T2 let
+        // go of. No revoke.
+        let (to, calls) = install(&acme, &admin, &world, "T3");
         assert!(to.ends_with("slack=connected"));
         assert_eq!(
             urls(&calls),
-            vec![
-                "https://slack.com/api/oauth.v2.access",
-                "dumbslab-directory:/slack/claim",
-                "dumbslab-directory:/slack/confirm",
-                "dumbslab-directory:/slack/release"
-            ]
+            vec!["https://slack.com/api/oauth.v2.access", "dumbslab-directory:/slack/install", "dumbslab-directory:/slack/release"]
         );
-        assert_eq!((body(&calls[3])["team_id"].as_str(), body(&calls[3])["install_id"].as_str()), (Some("T2"), Some(t2.as_str())));
-        assert!(later.is_empty());
-        assert_eq!(count(&acme, "SELECT COUNT(*) FROM slack_releases"), 0, "let go of, so no record waits");
-        let s = settings(&acme, &admin);
+        assert_eq!(body(&calls[2])["team_id"], "T2");
+        let s = settings(&acme, &world, &admin);
         assert_eq!((s["slack_workspace_id"].as_str(), s["channels"].as_array().unwrap().len()), (Some("T3"), 0), "{s}");
-        assert_eq!((world.claim("T2"), world.holder("T3").as_deref()), (None, Some("acme")));
-        // Adding the Slack workspace acme holds again updates that install in place: same install
-        // id, same claim (claiming it again changes nothing), channels kept.
+        assert_eq!((world.holder("T2"), world.holder("T3").as_deref()), (None, Some("acme")));
+        // Adding T3 again is just another install: recorded again, channels kept, nothing let go of.
         acme.ok("POST", "/api/v1/slack/channels", Some(json!({ "channel": "C0CHANNEL02" })), &admin);
-        let t3 = install_id(&acme).unwrap();
-        let (_, calls, later) = install(&acme, &admin, &world, "T3");
-        assert_eq!((calls.len(), later.len()), (3, 0), "{calls:?}");
-        assert_eq!(body(&calls[1])["install_id"].as_str(), Some(t3.as_str()));
-        assert_eq!(install_id(&acme), Some(t3.clone()));
-        assert_eq!(settings(&acme, &admin)["channels"].as_array().unwrap().len(), 1);
-        assert_eq!(world.claim("T3"), Some(("acme".into(), t3, true)));
+        let (_, calls) = install(&acme, &admin, &world, "T3");
+        assert_eq!(urls(&calls), vec!["https://slack.com/api/oauth.v2.access", "dumbslab-directory:/slack/install"]);
+        assert_eq!(settings(&acme, &world, &admin)["channels"].as_array().unwrap().len(), 1);
+        assert_eq!(activity(&acme, &admin, "slack.installed").len(), 3);
 
         // Org-wide installs are refused, and not revoked (the fake Slack would panic): an org-wide
         // token also reaches the org's workspaces that installed the app themselves.
         world.slack.borrow_mut().org_wide = true;
-        let (to, calls, _) = install(&acme, &admin, &world, "E1");
+        let (to, calls) = install(&acme, &admin, &world, "E1");
         world.slack.borrow_mut().org_wide = false;
         assert!(to.ends_with("slack_error=enterprise_install"));
         assert_eq!(urls(&calls), vec!["https://slack.com/api/oauth.v2.access"]);
-        assert_eq!(settings(&acme, &admin)["slack_workspace_id"], "T3", "nothing changed");
+        assert_eq!(saved_team(&acme).as_deref(), Some("T3"), "nothing changed");
 
-        // A request for a Slack workspace acme doesn't hold, which no claim routed: it hears how
-        // to connect, and nothing is let go of (only a routed claim's exact install ever is).
-        let r = acme.send(&signed("/slack/commands", &command("T2")));
-        assert!(r.body.to_string().contains("isn't connected"), "{}", r.body);
-        assert!(later_of(&r.effects).is_empty());
-        // A client can't name an install: on hosted DumbSlab only the root sets that header, and it
-        // removes any a client sent. (The workspace trusts it for exactly that reason.)
-        assert_eq!(locks(&acme), 0);
+        // The directory doesn't answer: nothing is saved here.
+        world.down.borrow_mut().push("/slack/install");
+        assert!(install(&acme, &admin, &world, "T4").0.ends_with("slack_error=failed"));
+        assert_eq!(saved_team(&acme).as_deref(), Some("T3"));
     }
 
-    /// A slow install whose provisional claim ran out, and another workspace took the Slack
-    /// workspace meanwhile: its confirmation is refused, and it keeps nothing.
+    /// A job that was waiting when another workspace took its Slack workspace over gets no token:
+    /// it stops, and says so to whoever typed the command.
     #[test]
-    fn a_late_install_whose_claim_ran_out_keeps_nothing() {
+    fn a_takeover_while_a_job_waits_gets_no_token() {
         let world = World::new();
         let (acme, admin) = hosted_at("acme");
         let (beta, beta_admin) = hosted_at("beta");
-        let mut job = install_job(&acme, &admin, "T1");
-        let calls = advance(&acme, &world, &mut job, vec![]);
-        let calls = advance(&acme, &world, &mut job, answers(&acme, &world, &calls));
-        let claimed = answers(&acme, &world, &calls);
-        assert_eq!(claimed[0].status, 200);
-        assert_eq!(world.claim("T1").map(|c| (c.0, c.2)), Some(("acme".into(), false)), "provisional");
-        assert_eq!(world.holder("T1"), None, "provisional claims don't route");
+        install(&acme, &admin, &world, "T1");
+        acme.ok("POST", "/api/v1/slack/channels", Some(json!({ "channel": "C0CHANNEL01" })), &admin);
+        acme.ok("POST", "/api/v1/posts", Some(json!({ "title": "Secret plan", "status": "published" })), &admin);
+        let r = acme.send(&signed("/slack/commands", &command("T1")));
+        let mut command_job = later_of(&r.effects).remove(0);
+        let r = publish(&acme, &admin, "Announcement");
+        let mut post_job = later_of(&r.effects).remove(0);
+        let asked = advance(&acme, &mut command_job, vec![]);
+        let asked_too = advance(&acme, &mut post_job, vec![]);
+        assert_eq!(urls(&asked), vec!["dumbslab-directory:/slack/token"]);
 
-        // Acme stalls past the claim's 15 minutes; beta takes T1.
-        world.ahead.set(tenancy::PROVISIONAL_CLAIM_SECS + 60);
+        // Meanwhile Slack's admin removes the app (the root forgets acme's installation) and adds
+        // DumbSlab again, from beta. Nobody told acme: its saved connection still names T1.
+        world.uninstall("T1");
+        assert_eq!(world.uninstall_check("T1").0, 200);
         assert!(install(&beta, &beta_admin, &world, "T1").0.ends_with("slack=connected"));
+        assert_eq!(saved_team(&acme).as_deref(), Some("T1"));
 
-        // Acme saves, and its confirmation is refused: it forgets the install.
-        let confirm = advance(&acme, &world, &mut job, claimed);
-        assert_eq!(urls(&confirm), vec!["dumbslab-directory:/slack/confirm"]);
-        assert!(install_id(&acme).is_some(), "saved, unconfirmed");
-        let (Ok(Step::Done(Finish::Redirect(to))), _) = step(&acme, &mut job, answers(&acme, &world, &confirm), None) else { panic!() };
-        assert!(to.ends_with("slack_error=slack_team_taken"), "{to}");
-        assert!(settings(&acme, &admin)["mode"].is_null());
-        assert_eq!(install_id(&acme), None);
+        // The directory refuses acme the token: the command only hears so, and acme's stale
+        // connection is forgotten, recorded as Slack's doing.
+        let next = advance(&acme, &mut command_job, answers(&acme, &world, &asked));
+        assert_eq!(urls(&next), vec![REPLY_TO]);
+        let text = body(&next[0]).to_string();
+        assert!(text.contains("no longer connected") && !text.contains("Secret plan"), "{text}");
+        assert!(matches!(step(&acme, &mut command_job, answers(&acme, &world, &next)).unwrap(), Step::Done(_)));
+        assert_eq!(saved_team(&acme), None);
+        assert_eq!(activity(&acme, &admin, "slack.disconnected")[0]["via"], "slack");
+        // The channel message waiting for its token sends nothing.
+        assert!(matches!(step(&acme, &mut post_job, answers(&acme, &world, &asked_too)).unwrap(), Step::Done(_)));
         assert_eq!(world.holder("T1").as_deref(), Some("beta"));
-        assert_eq!(locks(&acme), 0);
+
+        // A job whose workspace disconnected meanwhile doesn't even ask.
+        install(&acme, &admin, &world, "T2");
+        let post = acme.ok("POST", "/api/v1/posts", Some(json!({ "title": "Shared", "status": "published" })), &admin);
+        let r = acme.send(&signed("/slack/events", &event("T2", shared_link(&post["url"]))));
+        let mut unfurl = later_of(&r.effects).remove(0);
+        assert!(disconnect(&acme, &world, &admin).0.is_ok());
+        assert!(install(&beta, &beta_admin, &world, "T2").0.ends_with("slack=connected"));
+        assert!(matches!(step(&acme, &mut unfurl, vec![]).unwrap(), Step::Done(_)), "no token asked for, no chat.unfurl");
     }
 
-    /// Disconnecting lets go of the Slack workspace before it answers, and touches nothing in
-    /// Slack: another workspace can add it at once, and nothing the first does after affects it.
+    /// Disconnecting lets go of the Slack workspace before it's forgotten here, and touches nothing
+    /// in Slack: another workspace can add it at once, and nothing the first does after affects it.
     #[test]
-    fn after_a_disconnect_the_next_owner_is_untouched() {
+    fn after_a_disconnect_another_workspace_adds_it() {
         let world = World::new();
         let (acme, admin) = hosted_at("acme");
         let (beta, beta_admin) = hosted_at("beta");
         install(&acme, &admin, &world, "T1");
         let token = world.live("T1").unwrap();
-        let first = install_id(&acme).unwrap();
 
-        let calls = disconnect(&acme, &world, &admin);
-        assert_eq!(urls(&calls), vec!["dumbslab-directory:/slack/release"]);
-        assert_eq!(body(&calls[0])["install_id"].as_str(), Some(first.as_str()));
-        assert_eq!(world.claim("T1"), None);
+        // The directory doesn't answer: still connected, and the admin hears so.
+        world.down.borrow_mut().push("/slack/release");
+        assert_eq!(disconnect(&acme, &world, &admin).0, Err("slack_unavailable".into()));
+        assert_eq!(settings(&acme, &world, &admin)["connected"], true);
+        assert_eq!(world.holder("T1").as_deref(), Some("acme"));
+
+        let (done, calls) = disconnect(&acme, &world, &admin);
+        assert!(done.is_ok(), "{done:?}");
+        assert_eq!((urls(&calls), body(&calls[0])["team_id"].as_str()), (vec!["dumbslab-directory:/slack/release"], Some("T1")));
+        assert_eq!((world.holder("T1"), saved_team(&acme)), (None, None));
+        assert_eq!(activity(&acme, &admin, "slack.disconnected").len(), 1);
 
         // Beta adds T1 right away, and Slack hands it the same token.
         assert!(install(&beta, &beta_admin, &world, "T1").0.ends_with("slack=connected"));
@@ -6688,788 +6830,397 @@ mod add_to_slack {
 
         // Whatever reaches acme afterwards changes nothing of beta's.
         let r = acme.send(&signed("/slack/commands", &command("T1")));
-        run_later(&acme, &world, &r.effects);
-        let r = acme.send(&signed("/slack/events", &event("T1", json!({ "type": "app_uninstalled" }), chrono::Utc::now().timestamp())));
-        run_later(&acme, &world, &r.effects);
-        assert_eq!(acme.call("DELETE", "/api/v1/slack", None, &admin).status, 404);
-        let r = acme.call("POST", "/api/v1/posts", Some(json!({ "title": "Hi", "status": "published" })), &admin);
-        assert_eq!(messages(&acme, &world, &r.effects), 0);
+        assert!(r.body.to_string().contains("isn't connected"), "{}", r.body);
+        assert_eq!(urls(&run_later(&acme, &world, &r.effects)), vec!["dumbslab-directory:/slack/status"]);
+        assert_eq!(disconnect(&acme, &world, &admin).0, Err("not_found".into()));
+        assert_eq!(messages(&acme, &world, &publish(&acme, &admin, "Hi").effects), 0);
         assert_eq!((world.holder("T1").as_deref(), world.live("T1")), (Some("beta"), Some(token)));
-        assert_eq!(settings(&beta, &beta_admin)["mode"], "shared");
+        assert_eq!(settings(&beta, &world, &beta_admin)["connected"], true);
     }
 
-    /// The operator deletes a workspace while its Add to Slack is under way: its claim goes with
-    /// it, its confirmation is refused, and the Slack workspace is free.
+    /// Slack says the app was removed: the root checks the token the directory holds, and forgets
+    /// the installation only while it still holds that very token. A reinstall since, with a new
+    /// token, stays.
     #[test]
-    fn deleting_a_workspace_mid_install_frees_the_slack_workspace() {
+    fn uninstalls_forget_only_the_token_they_checked() {
+        let world = World::new();
+        let (acme, admin) = hosted_at("acme");
+        install(&acme, &admin, &world, "T1");
+        let first = world.live("T1").unwrap();
+
+        // The root checks these; a workspace that hears one anyway leaves it alone.
+        let r = acme.send(&signed("/slack/events", &event("T1", json!({ "type": "app_uninstalled" }))));
+        assert_eq!((r.status, r.effects.len()), (200, 0), "{}", r.body);
+        // It still works: kept.
+        let (status, calls) = world.uninstall_check("T1");
+        assert_eq!((status, urls(&calls)), (200, vec!["dumbslab-directory:/slack/row", "https://slack.com/api/auth.test"]));
+        assert!(calls[1].headers.contains(&("authorization".into(), format!("Bearer {first}"))));
+        assert_eq!(world.holder("T1").as_deref(), Some("acme"));
+
+        // Removed, and the check finds the token dead, but before it forgets, acme adds T1 again
+        // and gets a new token. The late forget names the old one: nothing changes.
+        world.uninstall("T1");
+        let (mut check, call) = dumbslab_core::slack::UninstallCheck::start("T1");
+        let row = world.answer(None, &call);
+        let dumbslab_core::slack::CheckStep::Fetch(test) = check.next(Some(KEY), &row) else { panic!() };
+        let dumbslab_core::slack::CheckStep::Fetch(forget) = check.next(Some(KEY), &world.answer(None, &test)) else { panic!() };
+        assert!(install(&acme, &admin, &world, "T1").0.ends_with("slack=connected"));
+        let second = world.live("T1").unwrap();
+        assert_ne!(first, second);
+        let dumbslab_core::slack::CheckStep::Done(answer) = check.next(Some(KEY), &world.answer(None, &forget)) else { panic!() };
+        assert_eq!(answer.status, 200);
+        assert_eq!(world.held_token("T1"), Some(sha256_hex(&second)));
+        assert_eq!(settings(&acme, &world, &admin)["connected"], true);
+
+        // Removed for real: forgotten in the directory. Acme finds out the next time it looks.
+        world.uninstall("T1");
+        let (status, calls) = world.uninstall_check("T1");
+        assert_eq!(
+            (status, urls(&calls)),
+            (200, vec!["dumbslab-directory:/slack/row", "https://slack.com/api/auth.test", "dumbslab-directory:/slack/forget"])
+        );
+        assert_eq!(world.holder("T1"), None);
+        let s = settings(&acme, &world, &admin);
+        assert!(s["mode"].is_null(), "{s}");
+        assert_eq!(activity(&acme, &admin, "slack.disconnected")[0]["via"], "slack");
+        // Nobody holds it now: nothing to check.
+        assert_eq!(
+            world.uninstall_check("T1"),
+            (200, vec![HttpCall::post_json("dumbslab-directory:/slack/row", &json!({ "team_id": "T1" }))])
+        );
+    }
+
+    /// A check Slack or the directory didn't answer clearly is answered with a 500, so Slack sends
+    /// the event again; nothing is forgotten.
+    #[test]
+    fn an_unclear_uninstall_check_answers_500() {
+        let world = World::new();
+        let (acme, admin) = hosted_at("acme");
+        install(&acme, &admin, &world, "T1");
+        world.uninstall("T1");
+        world.slack.borrow_mut().lost = 1;
+        assert_eq!(world.uninstall_check("T1").0, 500);
+        world.down.borrow_mut().push("/slack/row");
+        assert_eq!(world.uninstall_check("T1").0, 500);
+        world.down.borrow_mut().push("/slack/forget");
+        assert_eq!(world.uninstall_check("T1").0, 500);
+        assert_eq!(world.holder("T1").as_deref(), Some("acme"), "kept until a check is sure");
+        // Slack's next try is sure.
+        assert_eq!(world.uninstall_check("T1").0, 200);
+        assert_eq!(world.holder("T1"), None);
+    }
+
+    /// A token Slack calls dead while a job acts is forgotten in the directory, only while it still
+    /// holds that very token.
+    #[test]
+    fn a_dead_token_found_while_acting_is_forgotten() {
+        let world = World::new();
+        let (acme, admin) = hosted_at("acme");
+        install(&acme, &admin, &world, "T1");
+        acme.ok("POST", "/api/v1/slack/channels", Some(json!({ "channel": "C0CHANNEL01" })), &admin);
+
+        // Removed in Slack, and the event never came. A channel message finds the token dead.
+        let held = world.held_token("T1").unwrap();
+        world.uninstall("T1");
+        let r = publish(&acme, &admin, "News");
+        let calls = run_later(&acme, &world, &r.effects);
+        assert_eq!(
+            urls(&calls),
+            vec!["dumbslab-directory:/slack/token", "https://slack.com/api/chat.postMessage", "dumbslab-directory:/slack/forget"]
+        );
+        assert_eq!((body(&calls[2])["team_id"].as_str(), body(&calls[2])["token_fingerprint"].as_str()), (Some("T1"), Some(held.as_str())));
+        assert_eq!(world.holder("T1"), None);
+        assert!(settings(&acme, &world, &admin)["mode"].is_null(), "and acme finds out when it looks");
+
+        // A command finds it dead: the person hears the app was removed.
+        install(&acme, &admin, &world, "T1");
+        world.uninstall("T1");
+        let r = acme.send(&signed("/slack/commands", &command("T1")));
+        let calls = run_later(&acme, &world, &r.effects);
+        assert_eq!(
+            urls(&calls),
+            vec![
+                "dumbslab-directory:/slack/token",
+                "https://slack.com/api/users.info?user=UMO",
+                REPLY_TO,
+                "dumbslab-directory:/slack/forget"
+            ]
+        );
+        assert!(body(&calls[2]).to_string().contains("was removed from this Slack workspace"));
+        assert_eq!(world.holder("T1"), None);
+
+        // A forget that comes after a reinstall names the old token: the new install stays.
+        install(&acme, &admin, &world, "T1");
+        acme.ok("POST", "/api/v1/slack/channels", Some(json!({ "channel": "C0CHANNEL01" })), &admin);
+        let old = world.held_token("T1").unwrap();
+        world.uninstall("T1");
+        let r = publish(&acme, &admin, "More news");
+        let mut post = later_of(&r.effects).remove(0);
+        let asked = advance(&acme, &mut post, vec![]);
+        let sent = advance(&acme, &mut post, answers(&acme, &world, &asked));
+        let dead = answers(&acme, &world, &sent);
+        assert!(matches!(step(&acme, &mut post, dead).unwrap(), Step::Done(_)));
+        assert!(install(&acme, &admin, &world, "T1").0.ends_with("slack=connected"));
+        assert_ne!(world.held_token("T1"), Some(old));
+        let forgets = run_later(&acme, &world, &post.take_effects());
+        assert_eq!(urls(&forgets), vec!["dumbslab-directory:/slack/forget"]);
+        assert_eq!(world.holder("T1").as_deref(), Some("acme"));
+        assert_eq!(settings(&acme, &world, &admin)["connected"], true);
+    }
+
+    /// Switching Slack workspaces records the new one, saves it, then lets go of the old. A switch
+    /// that stopped before letting go leaves the old one held: Settings, or Slack's next request
+    /// for it, lets go of it.
+    #[test]
+    fn a_switch_that_stopped_before_letting_go_is_repaired() {
         let world = World::new();
         let (acme, admin) = hosted_at("acme");
         let (beta, beta_admin) = hosted_at("beta");
-        let mut job = install_job(&acme, &admin, "T1");
-        let calls = advance(&acme, &world, &mut job, vec![]);
-        let calls = advance(&acme, &world, &mut job, answers(&acme, &world, &calls));
-        let claimed = answers(&acme, &world, &calls);
-        assert!(world.claim("T1").is_some());
+        install(&acme, &admin, &world, "T1");
+        let stops_before_letting_go = |team: &str| {
+            let mut job = install_job(&acme, &admin, team);
+            let calls = advance(&acme, &mut job, vec![]);
+            let calls = advance(&acme, &mut job, answers(&acme, &world, &calls));
+            let last = advance(&acme, &mut job, answers(&acme, &world, &calls));
+            assert_eq!(urls(&last), vec!["dumbslab-directory:/slack/release"]);
+        };
 
-        world.dir(|db| tenancy::remove(db, "acme")).unwrap();
-        assert_eq!(world.claim("T1"), None);
-        let confirm = advance(&acme, &world, &mut job, claimed);
-        let refused = answers(&acme, &world, &confirm);
-        assert_eq!(refused[0].status, 404);
-        let (Ok(Step::Done(Finish::Redirect(to))), _) = step(&acme, &mut job, refused, None) else { panic!() };
-        assert!(to.ends_with("slack_error=slack_team_taken"), "{to}");
-        assert_eq!((install_id(&acme), world.claim("T1")), (None, None));
+        stops_before_letting_go("T2");
+        assert_eq!(saved_team(&acme).as_deref(), Some("T2"), "saved: T1 is no longer acted on");
+        assert_eq!((world.holder("T1").as_deref(), world.holder("T2").as_deref()), (Some("acme"), Some("acme")));
+        assert!(install(&beta, &beta_admin, &world, "T1").0.ends_with("slack_error=slack_team_taken"));
+
+        // Slack's next request for T1, which the root still sends to acme: acme asks the directory
+        // what it holds, and lets go of T1.
+        let r = acme.send(&signed("/slack/commands", &command("T1")));
+        assert!(r.body.to_string().contains("isn't connected"), "{}", r.body);
+        let calls = run_later(&acme, &world, &r.effects);
+        assert_eq!(urls(&calls), vec!["dumbslab-directory:/slack/status", "dumbslab-directory:/slack/release"]);
+        assert_eq!(body(&calls[1])["team_id"], "T1");
+        assert_eq!((world.holder("T1"), world.holder("T2").as_deref()), (None, Some("acme")));
         assert!(install(&beta, &beta_admin, &world, "T1").0.ends_with("slack=connected"));
+
+        // Or Settings › Slack does it.
+        stops_before_letting_go("T3");
+        let (s, calls) = settings_calls(&acme, &world, &admin);
+        assert_eq!(urls(&calls), vec!["dumbslab-directory:/slack/status", "dumbslab-directory:/slack/release"]);
+        assert_eq!((s["slack_workspace_id"].as_str(), s["connected"].as_bool()), (Some("T3"), Some(true)), "{s}");
+        assert_eq!((world.holder("T2"), world.holder("T3").as_deref()), (None, Some("acme")));
+        // An install acme never saved (its job stopped once the directory recorded it) goes too.
+        let mut job = install_job(&acme, &admin, "T4");
+        let calls = advance(&acme, &mut job, vec![]);
+        let recorded = advance(&acme, &mut job, answers(&acme, &world, &calls));
+        answers(&acme, &world, &recorded);
+        assert_eq!(world.holder("T4").as_deref(), Some("acme"));
+        assert_eq!(urls(&settings_calls(&acme, &world, &admin).1)[1], "dumbslab-directory:/slack/release");
+        assert_eq!((world.holder("T4"), saved_team(&acme).as_deref()), (None, Some("T3")));
     }
 
-    /// Slack's uninstall and revoke events are checked against the token itself, and change only
-    /// the install saved when the check started: install ids are random, so one never comes back.
+    /// A workspace restored from a backup still names the Slack workspace it held, with no token.
+    /// It can't act: the directory gives the token only to the workspace that holds it now.
     #[test]
-    fn uninstall_events_change_only_their_own_install() {
+    fn a_restored_backup_cannot_act() {
         let world = World::new();
         let (acme, admin) = hosted_at("acme");
-        let now = chrono::Utc::now().timestamp();
-        let send = |e: Value, at: i64| acme.send(&signed("/slack/events", &event("T1", e, at)));
-        let uninstalled = json!({ "type": "app_uninstalled" });
+        let (beta, beta_admin) = hosted_at("beta");
         install(&acme, &admin, &world, "T1");
+        let channel = acme.ok("POST", "/api/v1/slack/channels", Some(json!({ "channel": "C0CHANNEL01" })), &admin)["id"].clone();
+        assert_eq!(messages(&acme, &world, &publish(&acme, &admin, "Before").effects), 1);
+        let backup = db_run(&acme, |db| db.one("SELECT * FROM slack_app", &[])).unwrap();
+        assert!(backup.opt_str("bot_token").is_none(), "nothing to restore a token from");
 
-        // Revoked in Slack, though the event says it was sent long before: the token is dead, so
-        // Slack is disconnected and the claim let go of.
-        world.uninstall("T1");
-        let revoked = json!({ "type": "tokens_revoked", "tokens": { "oauth": [], "bot": ["UBOTT1"] } });
-        let r = send(revoked, now - 3600);
-        assert_eq!((r.status, &r.body), (200, &json!({ "ok": true })));
-        let calls = run_later(&acme, &world, &r.effects);
-        assert_eq!(urls(&calls), vec!["https://slack.com/api/auth.test", "dumbslab-directory:/slack/release"]);
-        assert!(settings(&acme, &admin)["mode"].is_null());
-        assert_eq!(world.claim("T1"), None);
-        let activity = acme.ok("GET", "/api/v1/activity?event=slack.uninstalled", None, &admin);
-        assert_eq!(activity["items"][0]["via"], "slack", "{activity}");
+        assert!(disconnect(&acme, &world, &admin).0.is_ok());
+        assert!(install(&beta, &beta_admin, &world, "T1").0.ends_with("slack=connected"));
+        let restore = || {
+            db_run(&acme, |db| {
+                db.execute("DELETE FROM slack_app", &[])?;
+                db.execute(
+                    "INSERT INTO slack_app (id, team_id, team_name, bot_user_id, unfurls, shared, scopes, version, updated_at)
+                     VALUES (1, ?, ?, ?, 1, 1, ?, ?, ?)",
+                    &[
+                        backup.str("team_id").into(),
+                        backup.str("team_name").into(),
+                        backup.str("bot_user_id").into(),
+                        backup.str("scopes").into(),
+                        backup.str("version").into(),
+                        backup.str("updated_at").into(),
+                    ],
+                )?;
+                db.execute("INSERT INTO slack_channels (id, channel, new_posts, updated_posts, created_at, updated_at) VALUES (?, 'C0CHANNEL01', 1, 0, ?, ?) ON CONFLICT(id) DO NOTHING", &[channel.as_str().unwrap().into(), backup.str("updated_at").into(), backup.str("updated_at").into()])
+            })
+        };
 
-        // Across a disconnect and a reinstall: the check for the first install is under way when
-        // acme disconnects and adds T1 again. Its token is dead, but it was another install's.
+        // A channel message: refused the token, sends nothing, and forgets the stale connection.
+        restore();
+        let r = publish(&acme, &admin, "After");
+        assert_eq!(urls(&run_later(&acme, &world, &r.effects)), vec!["dumbslab-directory:/slack/token"]);
+        assert_eq!(saved_team(&acme), None);
+        // A test message.
+        restore();
+        let r = acme.call("POST", &format!("/api/v1/slack/channels/{}/test", channel.as_str().unwrap()), None, &admin);
+        let (tested, calls) = finish_op(&acme, &world, &r);
+        assert_eq!((tested, urls(&calls)), (Err("slack_disconnected".into()), vec!["dumbslab-directory:/slack/token"]));
+        assert_eq!(saved_team(&acme), None);
+        // Settings.
+        restore();
+        let s = settings(&acme, &world, &admin);
+        assert!(s["mode"].is_null() && s["connected"] == false, "{s}");
+        // Even with a token restored from somewhere, nothing acts with it.
+        restore();
+        let sealed = connect::seal(
+            KEY,
+            "@workspace",
+            "slack-bot-token",
+            &connect::Credential { token: world.live("T1").unwrap(), ..Default::default() },
+        )
+        .unwrap();
+        db_run(&acme, |db| db.execute("UPDATE slack_app SET bot_token = ?", &[sealed.into()]));
+        let r = publish(&acme, &admin, "Again");
+        assert_eq!(messages(&acme, &world, &r.effects), 0);
+        assert_eq!(world.holder("T1").as_deref(), Some("beta"));
+    }
+
+    /// The operator deletes a workspace: the directory forgets its Slack workspaces with it, and
+    /// another workspace can add them. An install under way then can't record one.
+    #[test]
+    fn deleting_a_workspace_frees_its_slack_workspace() {
+        let world = World::new();
+        let (acme, admin) = hosted_at("acme");
+        let (beta, beta_admin) = hosted_at("beta");
         install(&acme, &admin, &world, "T1");
-        let first = install_id(&acme).unwrap();
-        world.uninstall("T1");
-        let r = send(uninstalled.clone(), now);
-        let mut check = later_of(&r.effects).remove(0);
-        let test = advance(&acme, &world, &mut check, vec![]);
-        disconnect(&acme, &world, &admin);
-        install(&acme, &admin, &world, "T1");
-        let second = install_id(&acme).unwrap();
-        assert_ne!(first, second);
-        let (Ok(Step::Done(_)), _) = step(&acme, &mut check, answers(&acme, &world, &test), None) else { panic!() };
-        assert_eq!((settings(&acme, &admin)["mode"].as_str(), install_id(&acme)), (Some("shared"), Some(second.clone())));
-        assert_eq!(world.holder("T1").as_deref(), Some("acme"));
-        // The same uninstall again, now about the new install: its token works, so nothing changes.
-        let r = send(uninstalled.clone(), now);
-        assert_eq!(urls(&run_later(&acme, &world, &r.effects)), vec!["https://slack.com/api/auth.test"]);
-        assert_eq!(install_id(&acme), Some(second));
+        let mut job = install_job(&acme, &admin, "T2");
+        let exchange = advance(&acme, &mut job, vec![]);
 
-        // No answer from Slack, twice: kept (an admin can still disconnect).
-        world.slack.borrow_mut().lost = 2;
-        let r = send(uninstalled, now);
-        assert_eq!(urls(&run_later(&acme, &world, &r.effects)), vec!["https://slack.com/api/auth.test"; 2]);
-        assert_eq!(settings(&acme, &admin)["mode"], "shared");
-        // Someone else's tokens, or an event naming no Slack workspace, start nothing.
-        let others = json!({ "type": "tokens_revoked", "tokens": { "oauth": ["UPERSON"], "bot": ["USOMEONE"] } });
-        assert!(later_of(&send(others, now).effects).is_empty());
-        let nameless = json!({ "token": "x", "type": "event_callback", "event": { "type": "app_uninstalled" }, "event_id": "EvNoTeam", "event_time": now });
-        let r = acme.send(&signed("/slack/events", &nameless.to_string()));
-        assert!(r.status == 200 && later_of(&r.effects).is_empty());
-        assert_eq!(settings(&acme, &admin)["mode"], "shared");
+        world.dir(|db| tenancy::remove(db, "acme")).unwrap();
+        assert_eq!(world.holder("T1"), None);
+        let record = advance(&acme, &mut job, answers(&acme, &world, &exchange));
+        let refused = answers(&acme, &world, &record);
+        assert_eq!(refused[0].status, 404);
+        let Step::Done(Finish::Redirect(to)) = step(&acme, &mut job, refused).unwrap() else { panic!() };
+        assert!(to.ends_with("slack_error=failed"), "{to}");
+        assert_eq!((world.holder("T2"), saved_team(&acme).as_deref()), (None, Some("T1")));
+        assert!(install(&beta, &beta_admin, &world, "T1").0.ends_with("slack=connected"));
     }
 
     /// Saving your own app's token checks it with Slack first; it's saved only if the connection is
-    /// still the one it was checked against.
+    /// still exactly the one it was checked against: whether there was one, and its version, which
+    /// every change moves on.
     #[test]
-    fn your_own_app_never_overwrites_add_to_slack() {
+    fn your_own_app_saves_only_over_what_it_checked() {
         let world = World::new();
         let (acme, admin) = hosted_at("acme");
-        let save = |token: &str| -> Job {
-            let r =
-                acme.call("PATCH", "/api/v1/slack", Some(json!({ "bot_token": token, "signing_secret": "0123456789abcdef0123" })), &admin);
+        let save = |token: &str, secret: &str| -> Job {
+            let r = acme.call("PATCH", "/api/v1/slack", Some(json!({ "bot_token": token, "signing_secret": secret })), &admin);
             assert_eq!(r.status, 200, "{}", r.body);
             job_of(&r).expect("a job that checks the token")
         };
-        let finish = |job: Job| -> Finish { drive(&acme, &world, job).0 };
-
-        // Add to Slack finishes while the own app's token is being checked: the token isn't saved.
-        let pasted = save("xoxb-own-1");
-        assert!(install(&acme, &admin, &world, "T1").0.ends_with("slack=connected"));
-        let refused = finish(pasted);
-        assert!(matches!(refused, Finish::Fail(ref e) if e.code == "slack_shared"), "{refused:?}");
-        assert_eq!(settings(&acme, &admin)["mode"], "shared");
-        assert_eq!(world.holder("T1").as_deref(), Some("acme"));
-
-        // Two own-app tokens at once: the second, checked against what the first replaced, isn't saved.
-        disconnect(&acme, &world, &admin);
-        let (first, second) = (save("xoxb-own-1"), save("xoxb-own-2"));
-        assert!(matches!(finish(first), Finish::Fill(_)));
-        let refused = finish(second);
-        assert!(matches!(refused, Finish::Fail(ref e) if e.code == "slack_changed"), "{refused:?}");
-        assert_eq!(settings(&acme, &admin)["mode"], "own");
-    }
-
-    /// The install lock goes on every way out of Add to Slack.
-    #[test]
-    fn the_install_lock_is_released_on_every_exit() {
-        let world = World::new();
-        let (acme, admin) = hosted_at("acme");
-        let (beta, beta_admin) = hosted_at("beta");
-        acme.user(&admin, "bo@acme.test", "Bo", "admin");
-        let bo = login(&acme, "bo@acme.test", "password123");
-        let ada = db_run(&acme, |db| db.one("SELECT id FROM users WHERE email = 'ada@acme.test'", &[])).unwrap().str("id");
-        let set_role = |role: &str| acme.ok("PATCH", &format!("/api/v1/users/{ada}"), Some(json!({ "role": role })), &bo);
-        let ends = |team: &str, want: &str| {
-            let (to, _, _) = install(&acme, &admin, &world, team);
-            assert!(to.ends_with(want), "{to} for {want}");
-            assert_eq!(locks(&acme), 0, "the lock after {want}");
-        };
-
-        ends("T1", "slack=connected");
-        install(&beta, &beta_admin, &world, "T2");
-        ends("T2", "slack_error=slack_team_taken");
-        world.down.borrow_mut().push("/slack/claim");
-        ends("T3", "slack_error=failed");
-        world.down.borrow_mut().push("/slack/confirm");
-        ends("T3", "slack_error=unconfirmed");
-        world.slack.borrow_mut().org_wide = true;
-        ends("E1", "slack_error=enterprise_install");
-        world.slack.borrow_mut().org_wide = false;
-
-        // Ada stops being an admin after the claim: acme lets go of its own claim, and the lock.
-        let mut job = install_job(&acme, &admin, "T4");
-        let calls = advance(&acme, &world, &mut job, vec![]);
-        let calls = advance(&acme, &world, &mut job, answers(&acme, &world, &calls));
-        assert_eq!(locks(&acme), 1);
-        set_role("member");
-        let (finish, _, _) = {
-            let mut replies = answers(&acme, &world, &calls);
-            loop {
-                match step(&acme, &mut job, replies, None).0.unwrap() {
-                    Step::Done(f) => break (f, (), ()),
-                    Step::Fetch(c) => replies = answers(&acme, &world, &c),
-                }
+        let finish = |job: Job| -> Result<Value, String> {
+            match drive(&acme, &world, job).0 {
+                Finish::Fill(v) => Ok(v),
+                Finish::Fail(e) => Err(e.code.to_string()),
+                other => panic!("{other:?}"),
             }
         };
-        assert!(matches!(finish, Finish::Redirect(ref to) if to.ends_with("slack_error=not_admin")), "{finish:?}");
-        assert_eq!((locks(&acme), world.claim("T4")), (0, None));
-        set_role("admin");
+        let (secret_a, secret_b, secret_c) = ("0123456789abcdef0123", "abcdef0123456789abcd", "fedcba9876543210fedc");
 
-        // A second install while one holds the lock is turned away and leaves it alone; the first
-        // still finishes and lets go.
-        let mut first = install_job(&acme, &admin, "T5");
-        let calls = advance(&acme, &world, &mut first, vec![]);
-        let calls = advance(&acme, &world, &mut first, answers(&acme, &world, &calls));
-        let (to, _, _) = install(&acme, &admin, &world, "T6");
-        assert!(to.ends_with("slack_error=slack_busy"), "{to}");
-        assert_eq!((locks(&acme), world.claim("T6")), (1, None));
-        let calls = advance(&acme, &world, &mut first, answers(&acme, &world, &calls));
-        let (Ok(Step::Done(_)), _) = step(&acme, &mut first, answers(&acme, &world, &calls), None) else { panic!() };
-        assert_eq!(locks(&acme), 0);
+        // Add to Slack finishes while the own app's token is being checked: the token isn't saved.
+        let pasted = save("xoxb-own-1", secret_a);
+        assert!(install(&acme, &admin, &world, "T1").0.ends_with("slack=connected"));
+        assert_eq!(finish(pasted), Err("slack_shared".into()));
+        assert_eq!(settings(&acme, &world, &admin)["mode"], "shared");
+        assert!(disconnect(&acme, &world, &admin).0.is_ok());
 
-        // An install that lost the lock (it ran out, another took it) gives up and lets go of its claim.
-        let mut slow = install_job(&acme, &admin, "T7");
-        let calls = advance(&acme, &world, &mut slow, vec![]);
-        let calls = advance(&acme, &world, &mut slow, answers(&acme, &world, &calls));
-        db_run(&acme, |db| db.execute("UPDATE slack_install_lock SET job = 'someone-else'", &[]));
-        let undo = advance(&acme, &world, &mut slow, answers(&acme, &world, &calls));
-        assert_eq!(urls(&undo), vec!["dumbslab-directory:/slack/release"]);
-        let (Ok(Step::Done(Finish::Redirect(to))), _) = step(&acme, &mut slow, answers(&acme, &world, &undo), None) else { panic!() };
-        assert!(to.ends_with("slack_error=slack_busy"), "{to}");
-        assert_eq!(world.claim("T7"), None);
-        db_run(&acme, |db| db.execute("DELETE FROM slack_install_lock", &[]));
+        // Two own-app tokens at once: the second, checked when there was no connection, isn't saved.
+        let (first, second) = (save("xoxb-own-1", secret_a), save("xoxb-own-2", secret_a));
+        assert!(finish(first).is_ok());
+        assert_eq!(finish(second), Err("slack_changed".into()));
 
-        // A save refused after the claim rolls back; the host's notice lets go of the claim. The
-        // lock it took runs out by itself.
-        let mut job = install_job(&acme, &admin, "T8");
-        let calls = advance(&acme, &world, &mut job, vec![]);
-        let calls = advance(&acme, &world, &mut job, answers(&acme, &world, &calls));
-        let full = dumbslab_core::plan::storage_full(&plans(None), dumbslab_core::plan::Plan::Free, false);
-        let (failed, notice) = step(&acme, &mut job, answers(&acme, &world, &calls), Some(full));
-        assert!(failed.is_err());
-        let notice = notice.expect("a notice that lets go of the claim");
-        assert_eq!(notice.url, "dumbslab-directory:/slack/release");
-        world.answer(Some("acme"), &notice);
-        assert_eq!(world.claim("T8"), None);
-        let until = db_run(&acme, |db| db.one("SELECT until FROM slack_install_lock", &[])).unwrap().str("until");
-        assert!(until <= dumbslab_core::util::ts(chrono::Utc::now() + chrono::Duration::seconds(61)), "{until}");
+        // A token checked before a newer signing secret was saved doesn't put an older one back.
+        let older = save("xoxb-own-3", secret_b);
+        assert!(patch(&acme, &world, &admin, json!({ "signing_secret": secret_c })).is_ok());
+        assert_eq!(finish(older), Err("slack_changed".into()));
+        let status = |secret: &str| acme.send(&signed_with("/slack/commands", &command("T9"), secret)).status;
+        assert_eq!((status(secret_c), status(secret_b)), (200, 401));
+
+        // A connection saved before versions existed: a save checked against it doesn't bring it
+        // back once it's disconnected.
+        db_run(&acme, |db| db.execute("UPDATE slack_app SET version = NULL", &[]));
+        let stale = save("xoxb-own-4", secret_a);
+        assert!(disconnect(&acme, &world, &admin).0.is_ok());
+        assert_eq!(finish(stale), Err("slack_changed".into()));
+        assert_eq!(count(&acme, "SELECT COUNT(*) FROM slack_app"), 0);
+        // And one checked against it as it is goes through.
+        assert!(finish(save("xoxb-own-5", secret_a)).is_ok());
+        assert_eq!(settings(&acme, &world, &admin)["mode"], "own");
     }
 
-    /// An install the directory hasn't confirmed acts on Slack in no way: no channel messages, no
-    /// command answers with its token, no test messages. Reading Settings tries again.
+    /// The directory holds each Slack workspace's installation, for one workspace (by its first
+    /// address), and gives its token only to that workspace.
     #[test]
-    fn an_unconfirmed_install_posts_nothing() {
+    fn the_directory_holds_one_installation_per_slack_workspace() {
+        use chrono::Utc;
         let world = World::new();
-        let (acme, admin) = hosted_at("acme");
-        acme.ok("POST", "/api/v1/slack/channels", Some(json!({ "channel": "C0CHANNEL01" })), &admin);
-        world.down.borrow_mut().push("/slack/confirm");
-        let (to, _, _) = install(&acme, &admin, &world, "T1");
-        assert!(to.ends_with("slack_error=unconfirmed"), "{to}");
-        assert_eq!(world.holder("T1"), None, "unconfirmed claims don't route");
-        let r = acme.call("GET", "/api/v1/slack", None, &admin);
-        let s = r.body.clone();
-        assert_eq!(
-            (s["mode"].as_str(), s["confirming"].as_bool(), s["connected"].as_bool()),
-            (Some("shared"), Some(true), Some(false)),
-            "{s}"
-        );
-        let retry = later_of(&r.effects);
-        assert_eq!(retry.len(), 1, "reading Settings tries the confirmation again");
-
-        // Nothing goes to Slack meanwhile.
-        let post = acme.call("POST", "/api/v1/posts", Some(json!({ "title": "Quiet", "status": "published" })), &admin);
-        assert_eq!(messages(&acme, &world, &post.effects), 0);
-        let channel = settings(&acme, &admin)["channels"][0]["id"].as_str().unwrap().to_string();
-        assert_eq!(acme.call("POST", &format!("/api/v1/slack/channels/{channel}/test"), None, &admin).status, 400);
-        let r = acme.send(&signed("/slack/commands", &command("T1")));
-        assert!(r.body.to_string().contains("still finishing"), "{}", r.body);
-        let jobs = later_of(&r.effects);
-        assert_eq!(jobs.len(), 1);
-        // The one job a request starts checks the token and asks the directory; it posts nothing.
-        let (_, calls, _) = drive(&acme, &world, jobs[0].clone());
-        assert_eq!(urls(&calls), vec!["https://slack.com/api/auth.test", "dumbslab-directory:/slack/confirm"]);
-
-        // Confirmed: from now on it acts.
-        assert_eq!(world.holder("T1").as_deref(), Some("acme"));
-        assert!(drive(&acme, &world, retry[0].clone()).1.is_empty(), "nothing left to confirm");
-        let s = settings(&acme, &admin);
-        assert_eq!((s["confirming"].as_bool(), s["connected"].as_bool()), (Some(false), Some(true)), "{s}");
-        let post = acme.call("POST", "/api/v1/posts", Some(json!({ "title": "Loud", "status": "published" })), &admin);
-        assert_eq!(messages(&acme, &world, &post.effects), 1);
-        let activity = acme.ok("GET", "/api/v1/activity?event=slack.installed", None, &admin);
-        assert_eq!(activity["items"].as_array().unwrap().len(), 1, "recorded once it's confirmed: {activity}");
-    }
-
-    /// The directory maps each Slack workspace to one DumbSlab workspace, by its first address.
-    /// Every change names the install.
-    #[test]
-    fn the_directory_maps_a_slack_workspace_to_one_workspace() {
-        use chrono::{Duration, Utc};
-        use dumbslab_core::tenancy::Limits;
-        let h = H::new();
-        let limits = Limits { per_ip_per_day: 10, per_day: 10, max_workspaces: 10, free: ROOMY };
         let now = Utc::now();
-        db_run(&h, |db| tenancy::directory_migrate(db));
-        for slug in ["acme", "beta", "gamma"] {
-            db_run(&h, |db| tenancy::reserve(db, slug, "Name", slug, now, limits).map(|_| ()));
-        }
-        db_run(&h, |db| tenancy::activate(db, "acme", now));
-        db_run(&h, |db| tenancy::activate(db, "beta", now));
-        let run = |f: &dyn Fn(&dyn dumbslab_core::Db) -> dumbslab_core::ApiResult<()>| {
-            h.store
-                .with_tx(|db| {
-                    let r = f(db);
-                    let ok = r.is_ok();
-                    (r, ok)
-                })
-                .unwrap()
-                .err()
-                .map(|e| e.code)
+        world
+            .dir(|db| {
+                tenancy::reserve(
+                    db,
+                    "gamma",
+                    "Name",
+                    "gamma",
+                    now,
+                    tenancy::Limits { per_ip_per_day: 10, per_day: 10, max_workspaces: 10, free: ROOMY },
+                )
+                .map(|_| ())
+            })
+            .unwrap();
+        let err = |r: dumbslab_core::ApiResult<()>| r.err().map(|e| e.code);
+        let token = |n: &str| tenancy::SlackInstall {
+            team_id: "T1".into(),
+            bot_token: format!("sealed-{n}"),
+            token_fingerprint: format!("fp-{n}"),
+            bot_user_id: Some("UBOT".into()),
+            team_name: "T1 Slack".into(),
+            scopes: "commands".into(),
         };
-        let lookup = |team: &str| db_run(&h, |db| tenancy::slack_team_home(db, team));
-        let claim = |team: &'static str, home: &'static str, id: &'static str, at| {
-            run(&move |db| tenancy::claim_slack_team(db, team, home, id, at))
-        };
-        let confirm =
-            |team: &'static str, home: &'static str, id: &'static str| run(&move |db| tenancy::confirm_slack_team(db, team, home, id));
-        let release =
-            |team: &'static str, home: &'static str, id: &'static str| run(&move |db| tenancy::release_slack_team(db, team, home, id));
-        let held = |home: &str, id: &str| Some((home.to_string(), home.to_string(), id.to_string()));
-        let later = now + Duration::seconds(tenancy::PROVISIONAL_CLAIM_SECS + 1);
+        let install = |home: &str, i: tenancy::SlackInstall| err(world.dir(|db| tenancy::slack_install(db, home, &i, now)));
+        let held = |home: &str| world.dir(|db| tenancy::slack_token(db, "T1", home)).unwrap().map(|t| t.bot_token);
 
-        // Provisional: routes nowhere, and holds the Slack workspace for a while.
-        assert_eq!(claim("T1", "acme", "a1", now), None);
-        assert_eq!(lookup("T1"), None);
-        assert_eq!(claim("T1", "beta", "b1", now), Some("slack_team_taken"));
-        // Once it runs out, another may take it; the first can't confirm any more.
-        assert_eq!(claim("T1", "beta", "b1", later), None);
-        assert_eq!(confirm("T1", "acme", "a1"), Some("slack_team_taken"));
-        assert_eq!(confirm("T1", "beta", "b1"), None);
-        assert_eq!(lookup("T1"), held("beta", "b1"), "routes name the install");
-        // Confirming again, or claiming again for the same install, changes nothing.
-        assert_eq!(confirm("T1", "beta", "b1"), None);
-        assert_eq!(claim("T1", "beta", "b1", now), None);
-        assert_eq!(lookup("T1"), held("beta", "b1"));
-        // Confirmed: nobody else, ever, until it's let go of.
-        assert_eq!(claim("T1", "acme", "a2", later + Duration::days(1)), Some("slack_team_taken"));
-        // Another install of the same workspace replaces the claim, provisionally; the earlier one
-        // can't confirm or let go of it.
-        assert_eq!(claim("T1", "beta", "b2", now), None);
-        assert_eq!(lookup("T1"), None);
-        assert_eq!(confirm("T1", "beta", "b1"), Some("slack_team_taken"));
-        assert_eq!(release("T1", "beta", "b1"), None);
-        assert_eq!(confirm("T1", "beta", "b2"), None);
-        assert_eq!(lookup("T1"), held("beta", "b2"));
-        // Letting go names the install, and only the holder's goes.
-        assert_eq!(release("T1", "acme", "b2"), None);
-        assert_eq!(lookup("T1"), held("beta", "b2"));
-        assert_eq!(release("T1", "beta", "b2"), None);
-        assert_eq!(lookup("T1"), None);
+        assert_eq!(install("acme", token("a")), None);
+        assert_eq!(install("beta", token("b")), Some("slack_team_taken"));
+        assert_eq!((held("acme").as_deref(), held("beta")), (Some("sealed-a"), None));
+        // The same workspace again: the newest install wins.
+        assert_eq!(install("acme", token("a2")), None);
+        assert_eq!(held("acme").as_deref(), Some("sealed-a2"));
+        let status = |team: Option<&str>, home: &str| world.dir(|db| tenancy::slack_status(db, team, home)).unwrap();
+        assert_eq!(status(Some("T1"), "acme"), tenancy::SlackStatus { owned: true, team_name: Some("T1 Slack".into()), others: vec![] });
+        assert_eq!(status(Some("T1"), "beta"), tenancy::SlackStatus::default());
+        assert_eq!(status(None, "acme").others, vec!["T1".to_string()]);
+        // Only the holder lets go; a forget names the token it found dead, and the holder if a
+        // workspace asks.
+        assert!(!world.dir(|db| tenancy::slack_release(db, "T1", "beta")).unwrap());
+        assert!(!world.dir(|db| tenancy::slack_forget_if(db, "T1", "fp-a", None)).unwrap());
+        assert!(!world.dir(|db| tenancy::slack_forget_if(db, "T1", "fp-a2", Some("beta"))).unwrap());
+        assert_eq!(world.dir(|db| tenancy::slack_row(db, "T1")).unwrap().map(|t| t.token_fingerprint).as_deref(), Some("fp-a2"));
+        assert!(world.dir(|db| tenancy::slack_forget_if(db, "T1", "fp-a2", None)).unwrap());
+        assert_eq!(world.holder("T1"), None);
+        assert_eq!(install("beta", token("b")), None);
+        assert!(world.dir(|db| tenancy::slack_release(db, "T1", "beta")).unwrap());
         // Requests go to the address the workspace lives at now.
-        assert_eq!(claim("T2", "acme", "a3", now), None);
-        assert_eq!(confirm("T2", "acme", "a3"), None);
-        db_run(&h, |db| tenancy::move_address(db, "acme", "wiki", now));
-        assert_eq!(lookup("T2"), Some(("acme".into(), "wiki".into(), "a3".into())));
-        // A reservation nobody set up, a bad ID or no install id can't claim or let go.
-        assert_eq!(claim("T3", "gamma", "g1", now), Some("not_found"));
-        assert_eq!(claim("T<3>", "acme", "a4", now), Some("bad_request"));
-        assert_eq!(claim("T3", "acme", "", now), Some("bad_request"));
-        assert_eq!(release("T2", "acme", ""), Some("bad_request"));
-        // Deleting a workspace frees its Slack workspaces, and it can't confirm or claim again.
-        assert_eq!(claim("T4", "acme", "a5", now), None);
-        db_run(&h, |db| tenancy::remove(db, "acme"));
-        assert_eq!((lookup("T2"), lookup("T4")), (None, None));
-        assert_eq!(confirm("T4", "acme", "a5"), Some("not_found"));
-        assert_eq!(claim("T4", "beta", "b4", now), None);
-    }
-
-    /// Round 3, S1: a cleanup that lets go of a claim names the exact install it was routed by. One
-    /// that lands after the workspace added the Slack workspace again leaves the new claim alone.
-    #[test]
-    fn a_late_stray_release_leaves_a_newer_claim() {
-        let world = World::new();
-        let (acme, admin) = hosted_at("acme");
-        let (beta, beta_admin) = hosted_at("beta");
-        install(&acme, &admin, &world, "T1");
-        let first = install_id(&acme).unwrap();
-
-        // Disconnected, but the directory didn't hear: T1 still routes to acme, by the first install.
-        world.down.borrow_mut().push("/slack/release");
-        disconnect(&acme, &world, &admin);
-        assert_eq!(world.claim("T1"), Some(("acme".into(), first.clone(), true)));
-        let r = acme.send(&world.route(signed("/slack/commands", &command("T1")), "T1"));
-        assert!(r.body.to_string().contains("isn't connected"), "{}", r.body);
-        let stray = later_of(&r.effects);
-        assert_eq!(stray.len(), 1);
-
-        // Before that cleanup runs, acme adds T1 again: a new install, which takes the claim over.
-        assert!(install(&acme, &admin, &world, "T1").0.ends_with("slack=connected"));
-        let second = install_id(&acme).unwrap();
-        assert_ne!(first, second);
-        assert_eq!(world.claim("T1"), Some(("acme".into(), second.clone(), true)));
-
-        // The cleanup, and the disconnect's own (retried on the next visit to Settings), name the
-        // first install: the new claim stays.
-        let (_, calls, _) = drive(&acme, &world, stray[0].clone());
-        assert_eq!(body(&calls[0])["install_id"].as_str(), Some(first.as_str()));
-        let r = acme.call("GET", "/api/v1/slack", None, &admin);
-        run_later(&acme, &world, &r.effects);
-        assert_eq!(count(&acme, "SELECT COUNT(*) FROM slack_releases"), 0);
-        assert_eq!(world.claim("T1"), Some(("acme".into(), second, true)));
-        assert!(install(&beta, &beta_admin, &world, "T1").0.ends_with("slack_team_taken"));
-        // Slack's requests reach acme's new install, which answers them.
-        let r = acme.send(&world.route(signed("/slack/commands", &command("T1")), "T1"));
-        assert_eq!(r.body, json!(""), "acknowledged, the answer follows");
-    }
-
-    /// Round 3, S2: adding the Slack workspace again keeps its install and claim. When the
-    /// confirmation is lost and acme then disconnects, the claim is let go of, and another
-    /// workspace can have it.
-    #[test]
-    fn adding_a_slack_workspace_again_then_disconnecting_lets_go() {
-        let world = World::new();
-        let (acme, admin) = hosted_at("acme");
-        let (beta, beta_admin) = hosted_at("beta");
-        install(&acme, &admin, &world, "T1");
-        let id = install_id(&acme).unwrap();
-        world.down.borrow_mut().push("/slack/confirm");
-        let (to, calls, _) = install(&acme, &admin, &world, "T1");
-        assert!(to.ends_with("slack_error=unconfirmed"), "{to}");
-        assert_eq!(body(&calls[1])["install_id"].as_str(), Some(id.as_str()), "the same install");
-        assert_eq!(world.claim("T1"), Some(("acme".into(), id.clone(), true)), "the claim didn't change");
-
-        let calls = disconnect(&acme, &world, &admin);
-        assert_eq!(body(&calls[0])["install_id"].as_str(), Some(id.as_str()));
-        assert_eq!(world.claim("T1"), None);
-        assert!(install(&beta, &beta_admin, &world, "T1").0.ends_with("slack=connected"));
-        assert_eq!(world.holder("T1").as_deref(), Some("beta"));
-    }
-
-    /// Round 3, S3: a command's job acts only for the install it came for. Paused on Slack, it
-    /// does nothing once acme disconnected and beta took the Slack workspace over.
-    #[test]
-    fn a_paused_command_does_nothing_after_a_takeover() {
-        let world = World::new();
-        let (acme, admin) = hosted_at("acme");
-        let (beta, beta_admin) = hosted_at("beta");
-        install(&acme, &admin, &world, "T1");
-        acme.ok("POST", "/api/v1/posts", Some(json!({ "title": "Secret plan", "status": "published" })), &admin);
-        let r = acme.send(&world.route(signed("/slack/commands", &command("T1")), "T1"));
-        let mut job = later_of(&r.effects).remove(0);
-        let asked = advance(&acme, &world, &mut job, vec![]);
-        assert_eq!(urls(&asked), vec!["https://slack.com/api/users.info?user=UMO"]);
-
-        disconnect(&acme, &world, &admin);
-        assert!(install(&beta, &beta_admin, &world, "T1").0.ends_with("slack=connected"));
-
-        // Slack answers who's asking; acme's job no longer has its install: it only says so.
-        let next = advance(&acme, &world, &mut job, answers(&acme, &world, &asked));
-        assert_eq!(urls(&next), vec![REPLY_TO]);
-        let text = body(&next[0]).to_string();
-        assert!(text.contains("no longer connected") && !text.contains("Secret plan"), "{text}");
-        let (Ok(Step::Done(_)), _) = step(&acme, &mut job, answers(&acme, &world, &next), None) else { panic!() };
-
-        // A link-preview job does nothing at all.
-        install(&acme, &admin, &world, "T2");
-        let post = acme.ok("POST", "/api/v1/posts", Some(json!({ "title": "Shared", "status": "published" })), &admin);
-        let links = json!({ "type": "link_shared", "channel": "C1", "user": "UMO", "message_ts": "1.2", "unfurl_id": "U1",
-            "source": "conversations_history", "links": [{ "url": post["url"], "domain": "kb.test" }] });
-        let r = acme.send(&world.route(signed("/slack/events", &event("T2", links, chrono::Utc::now().timestamp())), "T2"));
-        let mut unfurl = later_of(&r.effects).remove(0);
-        let asked = advance(&acme, &world, &mut unfurl, vec![]);
-        disconnect(&acme, &world, &admin);
-        let (Ok(Step::Done(_)), _) = step(&acme, &mut unfurl, answers(&acme, &world, &asked), None) else { panic!("no chat.unfurl") };
-    }
-
-    /// Round 3, S4: a confirmation tried again late, after the Slack workspace was added again,
-    /// changes nothing: confirming a confirmed claim of the same install does nothing.
-    #[test]
-    fn a_late_confirmation_changes_nothing() {
-        let world = World::new();
-        let (acme, admin) = hosted_at("acme");
-        world.down.borrow_mut().push("/slack/confirm");
-        install(&acme, &admin, &world, "T1");
-        let id = install_id(&acme).unwrap();
-        let r = acme.call("GET", "/api/v1/slack", None, &admin);
-        let retry = later_of(&r.effects);
-        assert_eq!(retry.len(), 1, "Settings tries the confirmation again");
-
-        // Before it runs, acme adds T1 again (the same install) and confirms.
-        assert!(install(&acme, &admin, &world, "T1").0.ends_with("slack=connected"));
-        drive(&acme, &world, retry[0].clone());
-        // And the directory confirming once more, as a late job would, changes nothing.
-        let again = world.answer(
-            Some("acme"),
-            &HttpCall::post_json("dumbslab-directory:/slack/confirm", &json!({ "team_id": "T1", "home": "acme", "install_id": id })),
-        );
-        assert_eq!(again.status, 200);
-        assert_eq!(world.claim("T1"), Some(("acme".into(), id.clone(), true)));
-        let s = settings(&acme, &admin);
-        assert_eq!((s["confirming"].as_bool(), install_id(&acme)), (Some(false), Some(id)), "{s}");
-    }
-
-    /// Switching Slack workspaces: T2 is claimed, saved and confirmed, and T1 let go of by its own
-    /// install. If the job dies before T1 is let go of, the next visit to Settings, or Slack's next
-    /// request for T1, finishes it.
-    #[test]
-    fn a_switch_that_died_is_finished_later() {
-        let world = World::new();
-        let (acme, admin) = hosted_at("acme");
-        let (beta, beta_admin) = hosted_at("beta");
-        install(&acme, &admin, &world, "T1");
-        let first = install_id(&acme).unwrap();
-
-        // The job saves T2, then dies before the directory answers.
-        let mut job = install_job(&acme, &admin, "T2");
-        let calls = advance(&acme, &world, &mut job, vec![]);
-        let calls = advance(&acme, &world, &mut job, answers(&acme, &world, &calls));
-        let last = advance(&acme, &world, &mut job, answers(&acme, &world, &calls));
-        assert_eq!(urls(&last), vec!["dumbslab-directory:/slack/confirm", "dumbslab-directory:/slack/release"]);
-        drop(job);
-        assert_eq!(settings(&acme, &admin)["slack_workspace_id"], "T2", "saved: T1 is no longer acted on");
-        assert_eq!(world.claim("T1"), Some(("acme".into(), first.clone(), true)));
-        assert_eq!(count(&acme, "SELECT COUNT(*) FROM slack_releases"), 1);
-
-        // Slack's next request for T1, routed by its claim: let go of, by that install.
-        let r = acme.send(&world.route(signed("/slack/commands", &command("T1")), "T1"));
-        let calls = run_later(&acme, &world, &r.effects);
+        assert_eq!(install("acme", token("a3")), None);
+        world.dir(|db| tenancy::move_address(db, "acme", "wiki", now)).unwrap();
+        assert_eq!(world.dir(|db| tenancy::slack_team_home(db, "T1")).unwrap(), Some(("acme".into(), "wiki".into())));
+        // A reservation nobody set up, a bad ID or a missing token can't install.
+        assert_eq!(install("gamma", tenancy::SlackInstall { team_id: "T2".into(), ..token("g") }), Some("not_found"));
+        assert_eq!(install("acme", tenancy::SlackInstall { team_id: "T<2>".into(), ..token("x") }), Some("bad_request"));
         assert_eq!(
-            (urls(&calls), body(&calls[0])["install_id"].as_str()),
-            (vec!["dumbslab-directory:/slack/release"], Some(first.as_str()))
+            install("acme", tenancy::SlackInstall { team_id: "T2".into(), bot_token: String::new(), ..token("x") }),
+            Some("bad_request")
         );
-        assert_eq!(world.claim("T1"), None);
-
-        // Settings finishes the rest: T2's confirmation, and T1's record.
-        let r = acme.call("GET", "/api/v1/slack", None, &admin);
-        run_later(&acme, &world, &r.effects);
-        assert_eq!(count(&acme, "SELECT COUNT(*) FROM slack_releases"), 0);
-        assert_eq!(world.holder("T2").as_deref(), Some("acme"));
-        assert!(install(&beta, &beta_admin, &world, "T1").0.ends_with("slack=connected"));
-    }
-
-    /// A workspace restored from a backup holds its old install, token and all, marked confirmed.
-    /// It still sends nothing to Slack unless the directory confirms that install, right then.
-    #[test]
-    fn a_restored_workspace_posts_only_with_a_confirmed_claim() {
-        let world = World::new();
-        let (acme, admin) = hosted_at("acme");
-        let (beta, beta_admin) = hosted_at("beta");
-        acme.ok("POST", "/api/v1/slack/channels", Some(json!({ "channel": "C0CHANNEL01" })), &admin);
-        install(&acme, &admin, &world, "T1");
-        let post = acme.call("POST", "/api/v1/posts", Some(json!({ "title": "Before", "status": "published" })), &admin);
-        assert_eq!(messages(&acme, &world, &post.effects), 1);
-        let backup = db_run(&acme, |db| db.one("SELECT * FROM slack_app", &[])).unwrap();
-
-        disconnect(&acme, &world, &admin);
-        assert!(install(&beta, &beta_admin, &world, "T1").0.ends_with("slack=connected"));
-
-        // The backup comes back.
-        db_run(&acme, |db| {
-            db.execute(
-                "INSERT INTO slack_app (id, bot_token, team_id, team_name, bot_user_id, unfurls, shared, scopes, install_id, confirmed, updated_at)
-                 VALUES (1, ?, ?, ?, ?, 1, 1, ?, ?, 1, ?)",
-                &[
-                    backup.str("bot_token").into(),
-                    backup.str("team_id").into(),
-                    backup.str("team_name").into(),
-                    backup.str("bot_user_id").into(),
-                    backup.str("scopes").into(),
-                    backup.str("install_id").into(),
-                    backup.str("updated_at").into(),
-                ],
-            )
-        });
-        acme.ok("POST", "/api/v1/slack/channels", Some(json!({ "channel": "C0CHANNEL01" })), &admin);
-        let post = acme.call("POST", "/api/v1/posts", Some(json!({ "title": "After", "status": "published" })), &admin);
-        assert_eq!(messages(&acme, &world, &post.effects), 0, "the directory refused, so nothing was sent");
-        assert!(settings(&acme, &admin)["mode"].is_null(), "and the stale install is forgotten");
-        assert_eq!(world.holder("T1").as_deref(), Some("beta"));
-    }
-
-    /// Round 4, S1: an uninstall check's late "invalid_auth" was about the token it tested. If acme
-    /// added the Slack workspace again meanwhile (same install id, new token, new revision), the
-    /// check changes nothing.
-    #[test]
-    fn a_stale_uninstall_check_leaves_a_fresh_readd() {
-        let world = World::new();
-        let (acme, admin) = hosted_at("acme");
-        install(&acme, &admin, &world, "T1");
-        let id = install_id(&acme).unwrap();
-        world.uninstall("T1");
-        let r = acme.send(
-            &world.route(signed("/slack/events", &event("T1", json!({ "type": "app_uninstalled" }), chrono::Utc::now().timestamp())), "T1"),
-        );
-        let mut check = later_of(&r.effects).remove(0);
-        let tested = advance(&acme, &world, &mut check, vec![]);
-        let dead = answers(&acme, &world, &tested);
-        assert!(dead[0].body.contains("invalid_auth"));
-
-        // Added again in place: the same install, a new token.
-        assert!(install(&acme, &admin, &world, "T1").0.ends_with("slack=connected"));
-        assert_eq!(install_id(&acme), Some(id.clone()));
-
-        let (Ok(Step::Done(_)), _) = step(&acme, &mut check, dead, None) else { panic!() };
-        let s = settings(&acme, &admin);
-        assert_eq!(
-            (s["mode"].as_str(), s["connected"].as_bool(), install_id(&acme)),
-            (Some("shared"), Some(true), Some(id.clone())),
-            "{s}"
-        );
-        assert_eq!(world.claim("T1"), Some(("acme".into(), id, true)));
-    }
-
-    /// Round 4, S2: a test message checks the connection it was asked of. If the directory refuses
-    /// that install after it was replaced by a new one, the new one stays.
-    #[test]
-    fn a_refused_test_message_leaves_a_new_install() {
-        let world = World::new();
-        let (acme, admin) = hosted_at("acme");
-        install(&acme, &admin, &world, "T1");
-        let first = install_id(&acme).unwrap();
-        let channel = acme.ok("POST", "/api/v1/slack/channels", Some(json!({ "channel": "C0CHANNEL01" })), &admin)["id"]
-            .as_str()
-            .unwrap()
-            .to_string();
-        let r = acme.call("POST", &format!("/api/v1/slack/channels/{channel}/test"), None, &admin);
-        let mut test = job_of(&r).expect("a job");
-        let asked = advance(&acme, &world, &mut test, vec![]);
-        assert_eq!(
-            (urls(&asked), body(&asked[0])["install_id"].as_str()),
-            (vec!["dumbslab-directory:/slack/confirm"], Some(first.as_str()))
-        );
-
-        // Meanwhile: disconnected, and added again as a new install.
-        disconnect(&acme, &world, &admin);
-        assert!(install(&acme, &admin, &world, "T1").0.ends_with("slack=connected"));
-        let second = install_id(&acme).unwrap();
-        assert_ne!(first, second);
-
-        // The directory refuses the first install: the test fails, and the new install stays.
-        let refused = answers(&acme, &world, &asked);
-        assert_eq!(refused[0].status, 409);
-        let (Ok(Step::Done(Finish::Fail(e))), _) = step(&acme, &mut test, refused, None) else { panic!() };
-        assert_eq!(e.code, "slack_team_taken");
-        assert_eq!(install_id(&acme), Some(second.clone()));
-        assert_eq!(world.claim("T1"), Some(("acme".into(), second, true)));
-    }
-
-    /// Round 4, S3: a confirmation tried again gets a late 409 after acme added the Slack workspace
-    /// again and confirmed it. The refusal was about the connection as it was: nothing changes.
-    #[test]
-    fn a_late_refused_confirmation_leaves_a_readd() {
-        let world = World::new();
-        let (acme, admin) = hosted_at("acme");
-        world.down.borrow_mut().push("/slack/confirm");
-        install(&acme, &admin, &world, "T1");
-        let id = install_id(&acme).unwrap();
-        let r = acme.call("GET", "/api/v1/slack", None, &admin);
-        let mut retry = later_of(&r.effects).remove(0);
-        let tested = advance(&acme, &world, &mut retry, vec![]);
-        assert_eq!(urls(&tested), vec!["https://slack.com/api/auth.test"], "the token first");
-        let asked = advance(&acme, &world, &mut retry, answers(&acme, &world, &tested));
-        assert_eq!(urls(&asked), vec!["dumbslab-directory:/slack/confirm"]);
-
-        assert!(install(&acme, &admin, &world, "T1").0.ends_with("slack=connected"));
-        let late = HttpReply { status: 409, body: json!({ "error": { "code": "slack_team_taken" } }).to_string() };
-        let (Ok(Step::Done(_)), _) = step(&acme, &mut retry, vec![late], None) else { panic!() };
-        let s = settings(&acme, &admin);
-        assert_eq!((s["connected"].as_bool(), install_id(&acme)), (Some(true), Some(id.clone())), "{s}");
-        assert_eq!(world.claim("T1"), Some(("acme".into(), id, true)));
-    }
-
-    /// A confirmation that succeeds after its install is gone here (replaced, or disconnected
-    /// without the directory hearing) leaves a confirmed claim no install holds: it's let go of,
-    /// by exactly that install's id. The same for an update in place that finds its install gone.
-    #[test]
-    fn a_confirmation_for_a_gone_install_lets_go_of_the_claim() {
-        let world = World::new();
-        let (acme, admin) = hosted_at("acme");
-        let forget_here = || db_run(&acme, |db| db.execute("DELETE FROM slack_app", &[]));
-
-        // A confirmation tried again.
-        world.down.borrow_mut().push("/slack/confirm");
-        install(&acme, &admin, &world, "T1");
-        let id = install_id(&acme).unwrap();
-        let r = acme.call("GET", "/api/v1/slack", None, &admin);
-        let mut retry = later_of(&r.effects).remove(0);
-        let tested = advance(&acme, &world, &mut retry, vec![]);
-        let asked = advance(&acme, &world, &mut retry, answers(&acme, &world, &tested));
-        forget_here();
-        let release = advance(&acme, &world, &mut retry, answers(&acme, &world, &asked));
-        assert_eq!(
-            (urls(&release), body(&release[0])["install_id"].as_str()),
-            (vec!["dumbslab-directory:/slack/release"], Some(id.as_str()))
-        );
-        let (Ok(Step::Done(_)), _) = step(&acme, &mut retry, answers(&acme, &world, &release), None) else { panic!() };
-        assert_eq!((world.claim("T1"), count(&acme, "SELECT COUNT(*) FROM slack_releases")), (None, 0));
-
-        // Add to Slack's own confirmation.
-        let mut job = install_job(&acme, &admin, "T2");
-        let calls = advance(&acme, &world, &mut job, vec![]);
-        let calls = advance(&acme, &world, &mut job, answers(&acme, &world, &calls));
-        let confirm = advance(&acme, &world, &mut job, answers(&acme, &world, &calls));
-        let id = install_id(&acme).unwrap();
-        forget_here();
-        let (Ok(Step::Done(Finish::Redirect(to))), _) = step(&acme, &mut job, answers(&acme, &world, &confirm), None) else { panic!() };
-        assert!(to.ends_with("slack_error=failed"), "{to}");
-        let calls = run_later(&acme, &world, &job.take_effects());
-        assert_eq!(body(&calls[0])["install_id"].as_str(), Some(id.as_str()));
-        assert_eq!((world.claim("T2"), locks(&acme)), (None, 0));
-
-        // Adding a Slack workspace again in place, whose install is gone by the time it saves.
-        install(&acme, &admin, &world, "T3");
-        let id = install_id(&acme).unwrap();
-        let mut job = install_job(&acme, &admin, "T3");
-        let calls = advance(&acme, &world, &mut job, vec![]);
-        let calls = advance(&acme, &world, &mut job, answers(&acme, &world, &calls));
-        forget_here();
-        let release = advance(&acme, &world, &mut job, answers(&acme, &world, &calls));
-        assert_eq!(
-            (urls(&release), body(&release[0])["install_id"].as_str()),
-            (vec!["dumbslab-directory:/slack/release"], Some(id.as_str()))
-        );
-        let (Ok(Step::Done(Finish::Redirect(to))), _) = step(&acme, &mut job, answers(&acme, &world, &release), None) else { panic!() };
-        assert!(to.ends_with("slack_error=failed"), "{to}");
-        assert_eq!((world.claim("T3"), locks(&acme), count(&acme, "SELECT COUNT(*) FROM slack_releases")), (None, 0, 0));
-    }
-
-    /// Round 5, S1: Add to Slack replaces only the connection saved when it started. A disconnect
-    /// or another save while its claim is pending wins: the job leaves the settings alone and lets
-    /// go of its own claim.
-    #[test]
-    fn a_settings_change_while_claiming_wins() {
-        let world = World::new();
-        let (acme, admin) = hosted_at("acme");
-        let claim_pending = |team: &str| -> (Job, Vec<HttpReply>) {
-            let mut job = install_job(&acme, &admin, team);
-            let calls = advance(&acme, &world, &mut job, vec![]);
-            let calls = advance(&acme, &world, &mut job, answers(&acme, &world, &calls));
-            let claimed = answers(&acme, &world, &calls);
-            assert_eq!((claimed[0].status, world.claim(team).map(|c| c.0)), (200, Some("acme".to_string())));
-            (job, claimed)
-        };
-        let gives_up = |mut job: Job, claimed: Vec<HttpReply>, team: &str| {
-            let undo = advance(&acme, &world, &mut job, claimed);
-            assert_eq!(urls(&undo), vec!["dumbslab-directory:/slack/release"]);
-            let (Ok(Step::Done(Finish::Redirect(to))), _) = step(&acme, &mut job, answers(&acme, &world, &undo), None) else { panic!() };
-            assert!(to.ends_with("slack_error=slack_busy"), "{to}");
-            assert_eq!((world.claim(team), locks(&acme)), (None, 0), "{team}'s abandoned claim is let go of");
-        };
-        let save_own = |token: &str| {
-            let r =
-                acme.call("PATCH", "/api/v1/slack", Some(json!({ "bot_token": token, "signing_secret": "0123456789abcdef0123" })), &admin);
-            assert!(matches!(drive(&acme, &world, job_of(&r).unwrap()).0, Finish::Fill(_)));
-        };
-
-        // Switching from T1 to T2, and acme disconnects meanwhile: it stays disconnected.
-        install(&acme, &admin, &world, "T1");
-        let (job, claimed) = claim_pending("T2");
-        disconnect(&acme, &world, &admin);
-        gives_up(job, claimed, "T2");
-        assert!(settings(&acme, &admin)["mode"].is_null());
-        assert_eq!(world.claim("T1"), None);
-
-        // Adding T3, and an admin saves their own Slack app meanwhile: it stays.
-        let (job, claimed) = claim_pending("T3");
-        save_own("xoxb-own-1");
-        gives_up(job, claimed, "T3");
-        let s = settings(&acme, &admin);
-        assert_eq!((s["mode"].as_str(), s["slack_workspace_id"].as_str()), (Some("own"), Some("T9")), "{s}");
-
-        // A change the lock doesn't see: the save itself is fenced on the connection it started from.
-        acme.ok("POST", "/api/v1/slack/channels", Some(json!({ "channel": "C0CHANNEL01" })), &admin);
-        let (job, claimed) = claim_pending("T4");
-        db_run(&acme, |db| db.execute("UPDATE slack_app SET revision = 'changed elsewhere'", &[]));
-        gives_up(job, claimed, "T4");
-        let s = settings(&acme, &admin);
-        assert_eq!((s["mode"].as_str(), s["channels"].as_array().unwrap().len()), (Some("own"), 1), "channels kept: {s}");
-    }
-
-    /// Round 5, S2: an uninstall while an install added again waits for its confirmation is still
-    /// checked. The dead token's install is forgotten and its claim let go of, and a confirmation
-    /// tried again later does nothing. If the check got no answer, the confirmation checks the
-    /// token itself first.
-    #[test]
-    fn an_uninstall_while_awaiting_confirmation_is_checked() {
-        let world = World::new();
-        let (acme, admin) = hosted_at("acme");
-        let (beta, beta_admin) = hosted_at("beta");
-        install(&acme, &admin, &world, "T1");
-        world.down.borrow_mut().push("/slack/confirm");
-        let (to, _, _) = install(&acme, &admin, &world, "T1");
-        assert!(to.ends_with("slack_error=unconfirmed"), "{to}");
-        assert_eq!(world.holder("T1").as_deref(), Some("acme"), "the claim is still confirmed, and routes");
-        let r = acme.call("GET", "/api/v1/slack", None, &admin);
-        let retry = later_of(&r.effects).remove(0);
-
-        world.uninstall("T1");
-        let r = acme.send(
-            &world.route(signed("/slack/events", &event("T1", json!({ "type": "app_uninstalled" }), chrono::Utc::now().timestamp())), "T1"),
-        );
-        let jobs = later_of(&r.effects);
-        assert_eq!(jobs.len(), 1);
-        let (_, calls, _) = drive(&acme, &world, jobs[0].clone());
-        assert_eq!(urls(&calls), vec!["https://slack.com/api/auth.test", "dumbslab-directory:/slack/release"]);
-        assert!(settings(&acme, &admin)["mode"].is_null());
-        assert_eq!(world.claim("T1"), None);
-        // The confirmation tried again later changes nothing.
-        assert!(drive(&acme, &world, retry).1.is_empty());
-        assert_eq!((world.claim("T1"), install_id(&acme)), (None, None));
-        assert!(install(&beta, &beta_admin, &world, "T1").0.ends_with("slack=connected"));
-        disconnect(&beta, &world, &beta_admin);
-
-        // Unconfirmed, then removed in Slack, with no check (its claim doesn't route yet): the
-        // confirmation tried again finds the token dead, forgets the install and lets go of its claim.
-        world.down.borrow_mut().push("/slack/confirm");
-        install(&acme, &admin, &world, "T1");
-        let r = acme.call("GET", "/api/v1/slack", None, &admin);
-        let retry = later_of(&r.effects).remove(0);
-        world.uninstall("T1");
-        let (_, calls, _) = drive(&acme, &world, retry);
-        assert_eq!(urls(&calls), vec!["https://slack.com/api/auth.test", "dumbslab-directory:/slack/release"]);
-        assert_eq!((install_id(&acme), world.claim("T1")), (None, None));
+        // Deleting a workspace forgets its installations.
+        world.dir(|db| tenancy::remove(db, "acme")).unwrap();
+        assert_eq!((world.holder("T1"), held("acme")), (None, None));
+        assert_eq!(install("acme", token("a4")), Some("not_found"));
     }
 
     #[test]

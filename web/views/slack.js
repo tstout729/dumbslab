@@ -25,8 +25,6 @@ const installErrors = {
   slack_error: 'Slack didn’t finish connecting. Try again.',
   enterprise_install: 'DumbSlab connects one Slack workspace at a time, not a whole Enterprise organization. An org admin can remove the org-wide install in Slack (Organization settings › Integrations › Installed apps). Then add DumbSlab to one workspace.',
   slack_team_taken: 'That Slack workspace is already connected to another DumbSlab workspace. Disconnect it there first, then try again.',
-  slack_busy: 'Another Add to Slack for this workspace is finishing. Try again in a minute.',
-  unconfirmed: 'Slack is connected, but DumbSlab couldn’t finish checking it. Until it has, it posts nothing in Slack. Reload this page in a minute.',
   failed: 'Connecting Slack didn’t work. Try again.',
 };
 
@@ -48,11 +46,11 @@ const REMOVE_APP_HELP = 'https://slack.com/help/articles/360003125231-Remove-app
 
 /** Connected with Add to Slack. */
 function sharedPanel(s) {
-  const status = s.confirming
-    ? h('p', { class: 'callout callout-warn', role: 'status' }, icon('alert'),
-      h('span', null, `DumbSlab is finishing connecting to ${s.slack_workspace || 'Slack'}. Until it has, it posts nothing in Slack. Reload this page in a minute.`))
-    : h('p', { class: 'callout', role: 'status' }, icon('checkCircle'),
-      h('span', null, `Connected to ${s.slack_workspace || 'Slack'} with DumbSlab’s Slack app.`));
+  const status = s.connected
+    ? h('p', { class: 'callout', role: 'status' }, icon('checkCircle'),
+      h('span', null, `Connected to ${s.slack_workspace || 'Slack'} with DumbSlab’s Slack app.`))
+    : h('p', { class: 'callout callout-warn', role: 'status' }, icon('alert'),
+      h('span', null, `DumbSlab’s Slack app isn’t working for ${s.slack_workspace || 'this Slack workspace'} right now, so DumbSlab posts nothing in Slack. Click Add to Slack to connect it again.`));
   return panel('Connected', null,
     status,
     s.install_url

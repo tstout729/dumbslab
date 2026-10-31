@@ -1138,9 +1138,8 @@ impl Job {
     }
 
     /// A request to send when a step failed with `error` and was rolled back (or the host couldn't
-    /// run it), for someone waiting elsewhere: a Slack command's answer, or Add to Slack undoing
-    /// the directory claim of an install that wasn't saved. Hosts send it once, best effort.
-    /// `None` for jobs whose failure answers the request itself.
+    /// run it), for someone waiting elsewhere: a Slack command's answer. Hosts send it once, best
+    /// effort. `None` for jobs whose failure answers the request itself.
     ///
     /// Ask the job as it was *before* the failed step: the rollback undoes whatever that step
     /// decided, such as having prepared its answer (see [`guarded_step`], which does this).

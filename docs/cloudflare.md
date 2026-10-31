@@ -118,7 +118,7 @@ Set the `CONNECTOR_KEY` secret to let people connect GitHub, Google Drive, Jira 
 
 ### Slack
 
-With DumbSlab's Slack app set up (`SLACK_CLIENT_ID` in `[vars]`, and the `SLACK_CLIENT_SECRET` and `SLACK_SIGNING_SECRET` secrets), admins connect Slack with one click: **Add to Slack** in Settings › Slack. Slack sends every workspace's commands and events to the root domain, and the Worker forwards each to the workspace that connected that Slack workspace. See [hosting/slack-app.md](hosting/slack-app.md).
+With DumbSlab's Slack app set up (`SLACK_CLIENT_ID` in `[vars]`, and the `SLACK_CLIENT_SECRET` and `SLACK_SIGNING_SECRET` secrets), admins connect Slack with one click: **Add to Slack** in Settings › Slack. Slack sends every workspace's commands and events to the root domain, and the Worker forwards each to the workspace that connected that Slack workspace. The `Directory` object keeps each connection's bot token. See [hosting/slack-app.md](hosting/slack-app.md).
 
 ### Operator API
 

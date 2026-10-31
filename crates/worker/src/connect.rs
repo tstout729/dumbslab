@@ -52,15 +52,39 @@ fn root_callback(env: &Env, origin: &str, path: &str) -> Option<String> {
 }
 
 /// Sends one request a workspace's job asked for. Calls to the directory (`slack::DIRECTORY`: Add
-/// to Slack claims, confirms and lets go of its Slack workspace) go to the `Directory` object, for
-/// this workspace only: the home is this object's, whatever the call says. Everything else is
-/// [`send`].
+/// to Slack records, lets go of, asks about and gets the token of its Slack workspace) go to the
+/// `Directory` object, for this workspace only: the home is this object's, whatever the call says.
+/// Only those routes: the root domain's own (`/slack/row`, `/slack/lookup`) are never a
+/// workspace's. Everything else is [`send`].
 pub async fn send_for(env: &Env, home: Option<&str>, call: &HttpCall) -> HttpReply {
     let Some(path) = call.url.strip_prefix(slack::DIRECTORY) else { return send(call).await };
-    let (Some(home), "/slack/claim" | "/slack/confirm" | "/slack/release") = (home, path) else { return HttpReply::default() };
+    let (Some(home), "/slack/install" | "/slack/release" | "/slack/token" | "/slack/status" | "/slack/forget") = (home, path) else {
+        return HttpReply::default();
+    };
     let mut body: serde_json::Value = call.body.as_deref().and_then(|b| serde_json::from_str(b).ok()).unwrap_or_default();
+    if !body.is_object() {
+        return HttpReply::default();
+    }
     body["home"] = serde_json::Value::from(home);
-    match crate::sql::call_object(env, "DIRECTORY", "directory", Method::Post, path, Some(&body)).await {
+    directory(env, path, &body).await
+}
+
+/// The root domain's own calls to the directory: an installation's token to check, and forgetting
+/// a dead one (see `slack::UninstallCheck`). They name no workspace.
+pub async fn send_for_root(env: &Env, call: &HttpCall) -> HttpReply {
+    let Some(path) = call.url.strip_prefix(slack::DIRECTORY) else { return send(call).await };
+    if !matches!(path, "/slack/row" | "/slack/forget") {
+        return HttpReply::default();
+    }
+    let mut body: serde_json::Value = call.body.as_deref().and_then(|b| serde_json::from_str(b).ok()).unwrap_or_default();
+    if let Some(fields) = body.as_object_mut() {
+        fields.remove("home");
+    }
+    directory(env, path, &body).await
+}
+
+async fn directory(env: &Env, path: &str, body: &serde_json::Value) -> HttpReply {
+    match crate::sql::call_object(env, "DIRECTORY", "directory", Method::Post, path, Some(body)).await {
         Ok((status, reply)) => HttpReply { status, body: reply.to_string() },
         Err(e) => {
             console_warn!("the directory didn't answer: {e}");

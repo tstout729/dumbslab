@@ -56,9 +56,16 @@ struct UsageInput {
 
 #[derive(Deserialize)]
 struct SlackTeamInput {
-    team_id: String,
+    team_id: Option<String>,
     home: Option<String>,
-    install_id: Option<String>,
+    token_fingerprint: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct SlackInstallInput {
+    home: Option<String>,
+    #[serde(flatten)]
+    install: tenancy::SlackInstall,
 }
 
 #[derive(Deserialize)]
@@ -97,6 +104,13 @@ fn respond(result: ApiResult<Value>) -> Result<Response> {
         Ok(v) => json_response(200, &v),
         Err(e) => api_error_response(&e),
     }
+}
+
+/// A workspace's call about one Slack workspace: both named.
+fn team_and_home(input: &SlackTeamInput) -> ApiResult<(&str, &str)> {
+    let team = input.team_id.as_deref().ok_or_else(|| ApiError::bad_request("send the Slack workspace's team_id"))?;
+    let home = input.home.as_deref().ok_or_else(|| ApiError::bad_request("send the workspace's home"))?;
+    Ok((team, home))
 }
 
 fn parse<T: for<'de> Deserialize<'de>>(body: &[u8]) -> ApiResult<T> {
@@ -230,40 +244,77 @@ impl DurableObject for Directory {
                     tenancy::record_risk(db, &input.customer, &input.kind.unwrap_or_default(), Utc::now()).map(|_| json!({ "ok": true }))
                 })?
             }
-            // Add to Slack: a workspace claims, confirms or lets go of a Slack workspace (from its
-            // jobs), and the root domain asks where to send a Slack workspace's commands and events.
-            (Method::Post, "/slack/claim") => {
-                let input: ApiResult<SlackTeamInput> = parse(&body);
+            // Add to Slack. From a workspace's jobs (the Worker names the workspace, `home`): record
+            // an installation, let go of one, get its token, ask what it holds, forget a dead
+            // token. From the root domain: where to send a Slack workspace's requests, and an
+            // installation's token to check when Slack says the app was removed.
+            (Method::Post, "/slack/install") => {
+                let input: ApiResult<SlackInstallInput> = parse(&body);
                 self.run(move |db| {
                     let input = input?;
                     let home = input.home.ok_or_else(|| ApiError::bad_request("send the workspace's home"))?;
-                    let id = input.install_id.unwrap_or_default();
-                    tenancy::claim_slack_team(db, &input.team_id, &home, &id, Utc::now()).map(|_| json!({ "ok": true }))
-                })?
-            }
-            (Method::Post, "/slack/confirm") => {
-                let input: ApiResult<SlackTeamInput> = parse(&body);
-                self.run(move |db| {
-                    let input = input?;
-                    let home = input.home.ok_or_else(|| ApiError::bad_request("send the workspace's home"))?;
-                    let id = input.install_id.unwrap_or_default();
-                    tenancy::confirm_slack_team(db, &input.team_id, &home, &id).map(|_| json!({ "ok": true }))
+                    tenancy::slack_install(db, &home, &input.install, Utc::now()).map(|_| json!({ "ok": true }))
                 })?
             }
             (Method::Post, "/slack/release") => {
                 let input: ApiResult<SlackTeamInput> = parse(&body);
                 self.run(move |db| {
                     let input = input?;
-                    let home = input.home.ok_or_else(|| ApiError::bad_request("send the workspace's home"))?;
-                    let id = input.install_id.unwrap_or_default();
-                    tenancy::release_slack_team(db, &input.team_id, &home, &id).map(|_| json!({ "ok": true }))
+                    let (team, home) = team_and_home(&input)?;
+                    tenancy::slack_release(db, team, home).map(|released| json!({ "ok": true, "released": released }))
+                })?
+            }
+            (Method::Post, "/slack/token") => {
+                let input: ApiResult<SlackTeamInput> = parse(&body);
+                self.run(move |db| {
+                    let input = input?;
+                    let (team, home) = team_and_home(&input)?;
+                    match tenancy::slack_token(db, team, home)? {
+                        Some(token) => serde_json::to_value(token).map_err(|e| ApiError::internal(e.to_string())),
+                        None => Err(ApiError::not_found("that Slack workspace for this workspace")),
+                    }
+                })?
+            }
+            (Method::Post, "/slack/status") => {
+                let input: ApiResult<SlackTeamInput> = parse(&body);
+                self.run(move |db| {
+                    let input = input?;
+                    let home = input.home.as_deref().ok_or_else(|| ApiError::bad_request("send the workspace's home"))?;
+                    let status = tenancy::slack_status(db, input.team_id.as_deref(), home)?;
+                    serde_json::to_value(status).map_err(|e| ApiError::internal(e.to_string()))
+                })?
+            }
+            (Method::Post, "/slack/forget") => {
+                let input: ApiResult<SlackTeamInput> = parse(&body);
+                self.run(move |db| {
+                    let input = input?;
+                    let team = input.team_id.as_deref().ok_or_else(|| ApiError::bad_request("send the Slack workspace's team_id"))?;
+                    let fingerprint =
+                        input.token_fingerprint.as_deref().ok_or_else(|| ApiError::bad_request("send the token's fingerprint"))?;
+                    tenancy::slack_forget_if(db, team, fingerprint, input.home.as_deref())
+                        .map(|forgot| json!({ "ok": true, "forgot": forgot }))
+                })?
+            }
+            (Method::Post, "/slack/row") => {
+                let input: ApiResult<SlackTeamInput> = parse(&body);
+                self.run(move |db| {
+                    let input = input?;
+                    let team = input.team_id.as_deref().ok_or_else(|| ApiError::bad_request("send the Slack workspace's team_id"))?;
+                    match tenancy::slack_row(db, team)? {
+                        Some(token) => serde_json::to_value(token).map_err(|e| ApiError::internal(e.to_string())),
+                        None => Err(ApiError::not_found("an installation for that Slack workspace")),
+                    }
                 })?
             }
             (Method::Post, "/slack/lookup") => {
                 let input: ApiResult<SlackTeamInput> = parse(&body);
-                self.run(move |db| match tenancy::slack_team_home(db, &input?.team_id)? {
-                    Some((home, address, install_id)) => Ok(json!({ "home": home, "address": address, "install_id": install_id })),
-                    None => Err(ApiError::not_found("a workspace for that Slack workspace")),
+                self.run(move |db| {
+                    let input = input?;
+                    let team = input.team_id.as_deref().ok_or_else(|| ApiError::bad_request("send the Slack workspace's team_id"))?;
+                    match tenancy::slack_team_home(db, team)? {
+                        Some((home, address)) => Ok(json!({ "home": home, "address": address })),
+                        None => Err(ApiError::not_found("a workspace for that Slack workspace")),
+                    }
                 })?
             }
             _ => Err(ApiError::not_found("directory route")),

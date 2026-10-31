@@ -601,8 +601,8 @@ fn run_later(state: &State, env: &Env, job: Job, cfg: HostConfig) {
     });
 }
 
-/// Delivers what a request or job left: webhooks, and jobs to run afterwards (Add to Slack leaves
-/// one that revokes the previous Slack workspace's token).
+/// Delivers what a request or job left: webhooks, and jobs to run afterwards (Slack's: channel
+/// messages that wait for the directory's token, forgetting a token Slack called dead).
 fn deliver(state: &State, env: &Env, cfg: &HostConfig, effects: Vec<Effect>) {
     let (later, effects): (Vec<Effect>, Vec<Effect>) = effects.into_iter().partition(|e| matches!(e, Effect::Background(_)));
     send_webhooks(state, effects);
@@ -619,7 +619,8 @@ fn deliver(state: &State, env: &Env, cfg: &HostConfig, effects: Vec<Effect>) {
 /// transaction ends, rolled back or not, like a request's: while the job waits on another app,
 /// other requests and jobs on this object check the allowance against them. Returns how it
 /// finished, the effects its operations left for the host (see `Job::take_effects`), and the rows
-/// its steps wrote. Calls to the directory (Add to Slack's claims) go to the `Directory` object.
+/// its steps wrote. Calls to the directory (Add to Slack's installation and its token) go to the
+/// `Directory` object.
 async fn drive_job(state: &State, env: &Env, mut job: Job, cfg: &HostConfig) -> Result<(Finish, Vec<Effect>, u64)> {
     let home = cfg.hosting.as_ref().map(|h| h.home.clone());
     let signs_in = job.is_sign_in();
@@ -681,7 +682,7 @@ async fn drive_job(state: &State, env: &Env, mut job: Job, cfg: &HostConfig) -> 
 }
 
 /// Sends a failed job's notice (see `connect::Job::failure_notice`), best effort: a Slack command's
-/// answer, or Add to Slack undoing its claim in the directory.
+/// answer.
 async fn notify_failure(env: &Env, home: Option<&str>, notice: Option<HttpCall>) {
     if let Some(call) = notice {
         crate::connect::send_for(env, home, &call).await;
