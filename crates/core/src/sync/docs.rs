@@ -342,8 +342,9 @@ impl DocsJob {
 #[derive(Clone, Debug)]
 enum Phase {
     Start,
-    /// GitHub App sources: waiting for this sync's installation token.
-    Minting,
+    /// GitHub App sources: waiting for this sync's installation token (and, when `true`, the
+    /// directory's answer to registering the installation again).
+    Minting(bool),
     /// GitLab app sources: waiting for a refreshed token.
     Refreshing,
     Listing,
@@ -423,8 +424,14 @@ pub fn step(db: &dyn Db, cfg: &HostConfig, j: &mut DocsJob, replies: Vec<HttpRep
                 };
                 match super::github_app::token_call(app, installation_id, repo_id, now) {
                     Ok(call) => {
-                        j.phase = Phase::Minting;
-                        Ok(Step::Fetch(vec![call]))
+                        // Hosted, until the directory has the installation, each sync asks again.
+                        let link = super::github_app::needs_link(db, cfg, installation_id)?;
+                        let mut calls = vec![call];
+                        if link {
+                            calls.push(super::github_app::link_call(installation_id));
+                        }
+                        j.phase = Phase::Minting(link);
+                        Ok(Step::Fetch(calls))
                     }
                     Err(message) => fail(db, j, &message, now),
                 }
@@ -443,7 +450,7 @@ pub fn step(db: &dyn Db, cfg: &HostConfig, j: &mut DocsJob, replies: Vec<HttpRep
                 Ok(Step::Fetch(j.source.repo.tree_calls(j.source.token())))
             }
         },
-        Phase::Minting => minted(db, j, &replies, now),
+        Phase::Minting(link) => minted(db, j, &replies, link, now),
         Phase::Refreshing => refreshed(db, cfg, j, &replies, now),
         Phase::Listing => listing(db, cfg, j, &replies, now),
         Phase::Reading(plan) => reading(db, cfg, j, plan, &replies, now),
@@ -666,11 +673,27 @@ fn set_status(ctx: &mut Ctx, post_id: &str, status: &str) -> ApiResult<bool> {
 
 /// A GitHub App source's token arrived: list the folder with it. A repository renamed on GitHub
 /// keeps its id; the source follows its new name, so links point at the right place.
-fn minted(db: &dyn Db, j: &mut DocsJob, replies: &[HttpReply], now: DateTime<Utc>) -> ApiResult<Step> {
-    let Link::GitHubApp { repo_id, .. } = j.source.link else { return Err(ApiError::internal("only GitHub App sources mint tokens")) };
-    let minted = match super::github_app::read_token(&replies.first().cloned().unwrap_or_default(), repo_id) {
+fn minted(db: &dyn Db, j: &mut DocsJob, replies: &[HttpReply], link: bool, now: DateTime<Utc>) -> ApiResult<Step> {
+    let Link::GitHubApp { installation_id, repo_id } = j.source.link else {
+        return Err(ApiError::internal("only GitHub App sources mint tokens"));
+    };
+    if link && let Some(reply) = replies.get(1) {
+        super::github_app::record_link(db, installation_id, super::github_app::read_link(reply))?;
+    }
+    let reply = replies.first().cloned().unwrap_or_default();
+    let minted = match super::github_app::read_token(&reply, repo_id) {
         Ok(m) => m,
-        Err(message) => return fail(db, j, &message, now),
+        Err(message) => {
+            // GitHub says the installation can't reach the repository: it waits, disconnected,
+            // until it's put back (see `github_app::ReposJob`).
+            if reply.status == 422 {
+                db.execute(
+                    "UPDATE docs_source_links SET disconnected = ? WHERE source_id = ? AND disconnected IS NULL",
+                    &params![super::github_app::REPOSITORY_REMOVED, j.source.id.clone()],
+                )?;
+            }
+            return fail(db, j, &message, now);
+        }
     };
     if let Some(name) = minted.full_name.filter(|n| *n != j.source.repo.repo) {
         db.execute("UPDATE docs_sources SET repo = ?, updated_at = ? WHERE id = ?", &params![name.clone(), ts(now), j.source.id.clone()])?;

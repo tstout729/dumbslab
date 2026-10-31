@@ -52,6 +52,9 @@ CREATE TABLE IF NOT EXISTS github_installations (
   suspended_at TEXT,
   -- The admin's account can read more repositories there than were kept.
   more_repositories INTEGER NOT NULL DEFAULT 0,
+  -- Hosted DumbSlab: whether the directory forwards this installation's deliveries here: `ok`,
+  -- `full` (it serves as many workspaces as it may), or NULL until it said (each sync asks again).
+  forwarding TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );

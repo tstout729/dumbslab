@@ -277,9 +277,14 @@ async fn github_hook(mut req: Request, env: &Env, root: &str) -> Result<Response
             send(env, &format!("ws:{home}"), &forwarded, Some(body), Some((address, home))).await.map(|r| r.status_code())
         }
     });
-    let delivered =
-        futures_util::future::join_all(sends).await.into_iter().filter(|r| matches!(r, Ok(s) if (200..300).contains(s))).count();
-    json_response(200, &json!({ "ok": true, "workspaces": targets.len(), "delivered": delivered }))
+    let answers = futures_util::future::join_all(sends).await;
+    let results: Vec<(String, Option<u16>)> = targets.iter().zip(answers).map(|((home, _), r)| (home.clone(), r.ok())).collect();
+    // Any workspace that didn't take it fails the delivery, so GitHub shows it for redelivery.
+    let (status, body, failed) = github_app::forwarded(&results);
+    if !failed.is_empty() {
+        console_warn!("a GitHub App delivery didn't reach {}", failed.join(", "));
+    }
+    json_response(status, &body)
 }
 
 /// A plain-text file for crawlers and agents. It changes only when the Worker deploys.

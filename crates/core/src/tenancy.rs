@@ -440,9 +440,10 @@ pub fn resolve(db: &dyn Db, slug: &str) -> ApiResult<Option<(String, Vec<String>
 // ---------------------------------------------------------------------------
 // GitHub App installations
 
-/// The most workspaces one installation's deliveries are forwarded to: each delivery wakes them
-/// all, and a workspace only connects an installation its admin's GitHub account can access.
-pub const MAX_WORKSPACES_PER_INSTALLATION: i64 = 20;
+/// The most workspaces one installation's deliveries are forwarded to. Each delivery wakes them
+/// all, in parallel, within GitHub's 10 seconds; a workspace only connects an installation its
+/// admin's GitHub account can access, so this is far more than one organization's teams need.
+pub const MAX_WORKSPACES_PER_INSTALLATION: i64 = 100;
 /// The most installations one workspace may connect.
 pub const MAX_INSTALLATIONS_PER_WORKSPACE: i64 = 100;
 
@@ -468,8 +469,15 @@ pub fn link_installation(db: &dyn Db, installation_id: i64, home: &str, linked: 
     }
     let sharing = db.scalar_i64("SELECT COUNT(*) FROM installation_workspaces WHERE installation_id = ?", &params![installation_id])?;
     let mine = db.scalar_i64("SELECT COUNT(*) FROM installation_workspaces WHERE home = ?", &params![home])?;
-    if sharing >= MAX_WORKSPACES_PER_INSTALLATION || mine >= MAX_INSTALLATIONS_PER_WORKSPACE {
-        return Err(ApiError::conflict("that GitHub App installation is connected to as many workspaces as it can be"));
+    if sharing >= MAX_WORKSPACES_PER_INSTALLATION {
+        return Err(ApiError::new(
+            409,
+            "installation_full",
+            "that GitHub App installation is connected to as many workspaces as it can be",
+        ));
+    }
+    if mine >= MAX_INSTALLATIONS_PER_WORKSPACE {
+        return Err(ApiError::new(409, "installation_full", "this workspace has connected as many GitHub App installations as it can"));
     }
     db.execute(
         "INSERT INTO installation_workspaces (installation_id, home, created_at) VALUES (?, ?, ?)",

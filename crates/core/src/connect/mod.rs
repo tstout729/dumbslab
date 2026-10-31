@@ -946,6 +946,8 @@ pub enum Job {
     Slack(crate::slack::SlackJob),
     /// Finishing Connect GitHub for docs sync (see [`crate::sync::github_app`]).
     GitHub(Box<crate::sync::github_app::InstallJob>),
+    /// Checking an installation's repositories after GitHub reported a change.
+    GitHubRepos(Box<crate::sync::github_app::ReposJob>),
     /// Docs sync with DumbSlab's GitLab app (see [`crate::sync::gitlab_app`]).
     GitLab(Box<crate::sync::gitlab_app::GitLabJob>),
 }
@@ -1265,6 +1267,7 @@ pub fn step(db: &dyn Db, cfg: &HostConfig, job: &mut Job, replies: Vec<HttpReply
         Job::Sso(j) => crate::sso::step(db, cfg, j, replies, now),
         Job::Slack(j) => crate::slack::step(db, cfg, j, replies, now),
         Job::GitHub(j) => crate::sync::github_app::install_step(db, cfg, j, replies, now),
+        Job::GitHubRepos(j) => crate::sync::github_app::repos_step(db, cfg, j, replies, now),
         Job::GitLab(j) => crate::sync::gitlab_app::step(db, cfg, j, replies, now),
     }
 }

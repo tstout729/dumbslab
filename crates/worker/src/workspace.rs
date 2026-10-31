@@ -302,7 +302,7 @@ impl Workspace {
     /// the webhooks its operations left. Its writes count against the plan step by step (see
     /// [`drive_job`]).
     async fn run_job(&self, job: Job, cfg: &HostConfig) -> Result<Finish> {
-        let (finish, effects, written) = drive_job(&self.state, job, cfg).await?;
+        let (finish, effects, written) = drive_job(&self.state, &self.env, job, cfg).await?;
         // A job can leave another to run after the answer (taking a webhook off GitLab again).
         let (later, effects): (Vec<Effect>, Vec<Effect>) = effects.into_iter().partition(|e| matches!(e, Effect::Background(_)));
         send_effects(&self.state, &self.env, cfg, effects);
@@ -326,7 +326,7 @@ impl Workspace {
         let state = State::from(raw.clone().unchecked_into::<worker::worker_sys::DurableObjectState>());
         let env = self.env.clone();
         self.state.wait_until(async move {
-            match drive_job(&state, job, &cfg).await {
+            match drive_job(&state, &env, job, &cfg).await {
                 Ok((finish, effects, _)) => {
                     if let Finish::Fail(e) = finish {
                         console_warn!("a background job failed: {} ({})", e.message, e.code);
@@ -620,7 +620,7 @@ impl DurableObject for Workspace {
 /// other requests and jobs on this object check the allowance against them. Returns how it
 /// finished, the effects its operations left for the host (see `Job::take_effects`), and the rows
 /// its steps wrote.
-async fn drive_job(state: &State, mut job: Job, cfg: &HostConfig) -> Result<(Finish, Vec<Effect>, u64)> {
+async fn drive_job(state: &State, env: &Env, mut job: Job, cfg: &HostConfig) -> Result<(Finish, Vec<Effect>, u64)> {
     let signs_in = job.is_sign_in();
     let mut replies = vec![];
     let mut written = 0;
@@ -671,10 +671,37 @@ async fn drive_job(state: &State, mut job: Job, cfg: &HostConfig) -> Result<(Fin
                 return Ok((Finish::Fail(e), job.take_effects(), written));
             }
             Ok(Step::Done(done)) => return Ok((done, job.take_effects(), written)),
-            Ok(Step::Fetch(calls)) => replies = futures_util::future::join_all(calls.iter().map(crate::connect::send)).await,
+            Ok(Step::Fetch(calls)) => {
+                let home = cfg.hosting.as_ref().map(|h| h.home.as_str());
+                replies = futures_util::future::join_all(calls.iter().map(|c| send_call(env, home, c))).await;
+            }
         }
     }
     Ok((Finish::Fail(ApiError::internal("connected apps took too many steps")), vec![], written))
+}
+
+/// Sends one request a job asked for. A request to record a GitHub App installation in the
+/// directory (`github_app::DIRECTORY_LINK_URL`) goes to the Directory object, for this workspace's
+/// home, and its answer is the reply; everything else goes out over https.
+async fn send_call(env: &Env, home: Option<&str>, call: &HttpCall) -> connect::HttpReply {
+    if call.url != dumbslab_core::sync::github_app::DIRECTORY_LINK_URL {
+        return crate::connect::send(call).await;
+    }
+    let Some(home) = home else { return connect::HttpReply::default() };
+    let mut body: Value = serde_json::from_str(call.body.as_deref().unwrap_or("{}")).unwrap_or_default();
+    body["home"] = json!(home);
+    match call_object(env, "DIRECTORY", "directory", Method::Post, "/github/link", Some(&body)).await {
+        Ok((status, reply)) => {
+            if status != 200 {
+                console_warn!("the directory didn't record a GitHub App installation ({status})");
+            }
+            connect::HttpReply { status, body: reply.to_string() }
+        }
+        Err(e) => {
+            console_error!("recording a GitHub App installation failed: {e}");
+            connect::HttpReply::default()
+        }
+    }
 }
 
 /// Sends a failed job's notice (see `connect::Job::failure_notice`), best effort.
