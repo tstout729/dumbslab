@@ -17,7 +17,15 @@
 - **Errors** are `ApiError`s. A failed operation rolls back the whole request, so validate before writing where you can.
 - **Server HTML** (post bodies, comments, search snippets) is sanitized by the core. The web app inserts everything else as text.
 
+## Release
+
+- Production is dumbslab.com: the Cloudflare Worker in `crates/worker`. `docs/cloudflare.md` covers deploys and secrets.
+- Ship under the [engineering delivery policy](https://github.com/164investments/team-agents/blob/main/policies/engineering-delivery.md). CI here is the GitHub Actions `CI` workflow, not Vercel CI.
+- Production check after a deploy: `curl -fsS https://dumbslab.com/healthz` shows the deployed commit as `git_sha`.
+
 ## Checks
+
+Run these before you push. CI runs them too, plus the web script and importer checks in `.github/workflows/ci.yml`.
 
 ```sh
 cargo fmt --all
