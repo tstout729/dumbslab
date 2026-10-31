@@ -29,6 +29,13 @@
 //!   refresh token ([`hand_over`]).
 //! - Passes wait while a save is under way, and decide what to delete against the live webhook as it
 //!   is then, so they never delete a webhook a save is adding.
+//! - A record's version goes up whenever a save or a removal records its connection again. A pass
+//!   ends, backs off or gives up on a record only at the version it began with; otherwise it lets
+//!   go, and leaves the new work to the next pass.
+//! - A renewal that finds the connection changed meanwhile (a reconnect) isn't a refusal: its tokens
+//!   went to the record, and the pass goes on with them. BambooHR refusing to renew a retired
+//!   connection's copy ends the record only the second time: a renewal still under way when it
+//!   retired may hand over new tokens meanwhile.
 //!
 //! A pass takes at most four steps: renew, list, delete, done.
 
@@ -97,7 +104,7 @@ pub(crate) fn record(
          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(connection) DO UPDATE SET subdomain = excluded.subdomain, auth = excluded.auth, secret = excluded.secret,
            expires_at = excluded.expires_at, refresh_hash = excluded.refresh_hash, failures = 0, next_attempt_at = NULL,
-           created_at = excluded.created_at",
+           refused = 0, version = people_sync_cleanup.version + 1, created_at = excluded.created_at",
         &params![
             connection,
             subdomain,
@@ -181,7 +188,7 @@ fn save_creds(db: &dyn Db, cfg: &HostConfig, connection: &str, creds: &Creds) ->
     let secret = crate::sync::seal(cfg, &owner(connection), PROVIDER, &creds.cred)?;
     let hash = creds.cred.refresh_token.as_deref().map(sha256_hex);
     db.execute(
-        "UPDATE people_sync_cleanup SET secret = ?, expires_at = ?, refresh_hash = ? WHERE connection = ?",
+        "UPDATE people_sync_cleanup SET secret = ?, expires_at = ?, refresh_hash = ?, refused = 0 WHERE connection = ?",
         &params![secret, creds.expires_at.map(ts), hash, connection],
     )?;
     Ok(())
@@ -214,6 +221,10 @@ struct Item {
     failures: i64,
     created_at: DateTime<Utc>,
     known_ids: String,
+    /// The record's version when this pass took it.
+    version: i64,
+    /// BambooHR refused to renew these credentials once before.
+    refused: bool,
     state: State,
 }
 
@@ -321,6 +332,8 @@ pub(super) fn step(
                 failures: r.i64("failures"),
                 created_at: r.opt_str("created_at").and_then(|s| parse_ts(&s)).unwrap_or(now),
                 known_ids: r.str("known_ids"),
+                version: r.i64("version"),
+                refused: r.bool("refused"),
                 state: State::Done,
             };
             match creds {
@@ -433,17 +446,28 @@ fn renewed(
             Err(why) => Err(why),
         },
     };
+    let list = |item: &mut Item| {
+        item.fresh = true;
+        item.state = State::Listing;
+        vec![list_call(item)]
+    };
     match result {
-        Ok(()) => {
-            item.fresh = true;
-            item.state = State::Listing;
-            Ok(vec![list_call(item)])
+        Ok(()) => Ok(list(item)),
+        // A reconnect retired the connection while BambooHR renewed it: the new tokens went to its
+        // record (handed over), and they work. Go on with them.
+        Err(why) if why == oauth::CHANGED => {
+            item.live = false;
+            Ok(list(item))
         }
         Err(why) if transient => later(db, cfg, c, staged, item, &why, now).map(|_| vec![]),
-        Err(_) => {
-            give_up(db, cfg, c, staged, item, "BambooHR refused to renew the sign-in", now)?;
-            Ok(vec![])
+        // A retired connection's copy: a renewal still under way when it retired may yet hand over
+        // new tokens, so only a second refusal ends it.
+        Err(why) if lease.is_none() && !item.refused => {
+            let refused = "UPDATE people_sync_cleanup SET refused = 1 WHERE connection = ? AND version = ?";
+            db.execute(refused, &params![item.connection.clone(), item.version])?;
+            later(db, cfg, c, staged, item, &why, now).map(|_| vec![])
         }
+        Err(_) => give_up(db, cfg, c, staged, item, "BambooHR refused to renew the sign-in", now).map(|_| vec![]),
     }
 }
 
@@ -480,7 +504,7 @@ fn listed(
     }
     let doomed: Vec<&String> = mine.iter().filter(|id| Some(*id) != live_id.as_ref() && !id.is_empty()).collect();
     if doomed.is_empty() {
-        return done(db, item).map(|_| vec![]);
+        return done(db, c, item).map(|_| vec![]);
     }
     for id in &doomed {
         know(db, &item.connection, id)?;
@@ -508,13 +532,28 @@ fn deleted(
             Outcome::Dead(why) => return give_up(db, cfg, c, staged, item, &why, now),
         }
     }
-    done(db, item)
+    done(db, c, item).map(|_| ())
 }
 
-/// Every webhook found is gone: drop the record and its credentials.
-fn done(db: &dyn Db, item: &mut Item) -> ApiResult<()> {
+/// Every webhook found is gone: drop the record and its credentials, unless it was recorded again
+/// meanwhile (new work for the next pass). `false` then.
+fn done(db: &dyn Db, c: &Cleanup, item: &mut Item) -> ApiResult<bool> {
     item.state = State::Done;
-    db.execute("DELETE FROM people_sync_cleanup WHERE connection = ?", &params![item.connection.clone()])?;
+    let dropped = db
+        .execute("DELETE FROM people_sync_cleanup WHERE connection = ? AND version = ?", &params![item.connection.clone(), item.version])?
+        > 0;
+    if !dropped {
+        let_go(db, c, item)?;
+    }
+    Ok(dropped)
+}
+
+/// Lets go of the record, as it is, for the next pass.
+fn let_go(db: &dyn Db, c: &Cleanup, item: &Item) -> ApiResult<()> {
+    db.execute(
+        "UPDATE people_sync_cleanup SET working_until = NULL WHERE connection = ? AND working_until = ?",
+        &params![item.connection.clone(), c.lease.clone()],
+    )?;
     Ok(())
 }
 
@@ -536,11 +575,12 @@ fn later(
     }
     let failures = item.failures + 1;
     let wait = (FIRST_WAIT_SECS << (failures - 1).clamp(0, 20)).min(MAX_WAIT_SECS);
+    // Recorded again meanwhile: the new work starts over, without waiting.
     db.execute(
-        "UPDATE people_sync_cleanup SET failures = ?, next_attempt_at = ?, working_until = NULL WHERE connection = ? AND working_until = ?",
-        &params![failures, ts(now + Duration::seconds(wait)), item.connection.clone(), c.lease.clone()],
+        "UPDATE people_sync_cleanup SET failures = ?, next_attempt_at = ? WHERE connection = ? AND working_until = ? AND version = ?",
+        &params![failures, ts(now + Duration::seconds(wait)), item.connection.clone(), c.lease.clone(), item.version],
     )?;
-    Ok(())
+    let_go(db, c, item)
 }
 
 /// Stops trying with these credentials: says so in the activity log for admins, naming the
@@ -556,7 +596,10 @@ fn give_up(
 ) -> ApiResult<()> {
     let known = item.known_ids.clone();
     let ids: Vec<&str> = known.split(',').filter(|s| !s.is_empty()).collect();
-    done(db, item)?;
+    if !done(db, c, item)? {
+        // Recorded again meanwhile, maybe with other credentials: the next pass tries those.
+        return Ok(());
+    }
     let which = match ids.as_slice() {
         [] => format!("the webhooks named \"DumbSlab people sync (…) {}\"", c.tag),
         [one] => format!("webhook {one}"),

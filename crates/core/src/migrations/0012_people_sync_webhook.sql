@@ -55,5 +55,11 @@ CREATE TABLE IF NOT EXISTS people_sync_cleanup (
   next_attempt_at TEXT,
   -- A pass working on it holds this lease: when it runs out, then a random id.
   working_until TEXT,
+  -- Goes up whenever a save or a removal records the connection again, so a pass that began before
+  -- leaves the new work for the next pass instead of dropping it.
+  version INTEGER NOT NULL DEFAULT 0,
+  -- BambooHR refused to renew these credentials once: the next refusal ends the record. A renewal
+  -- still under way may hand over new tokens meanwhile (which clears it).
+  refused INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL
 );

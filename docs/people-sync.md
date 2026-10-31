@@ -71,7 +71,7 @@ DumbSlab still cleans these webhooks up. It doesn't rely on remembering each web
 - A cleanup pass lists the webhooks each set of credentials can see, and deletes every one with the workspace's tag that posts to `/hooks/people`, except the live one. Then it forgets those credentials.
 - Passes run after saves, sign-ins and syncs, when Settings › People sync opens, and when a webhook DumbSlab doesn't recognize calls. So an orphaned webhook prompts its own deletion, even after the sync was removed.
 - After a failed pass DumbSlab waits before the next: a minute, then twice as long each time, up to a day. Timeouts, rate limits (429) and BambooHR errors (5xx) never make it give up.
-- It gives up only when the credentials are dead (BambooHR refuses to renew a sign-in, refuses fresh credentials with 401 or 403, or the company is gone), or after 30 days. Then it says so in the activity log for admins, with the company and the webhook ids it knows, so someone can delete them in BambooHR by hand. It forgets the credentials.
+- It gives up only when the credentials are dead (BambooHR refuses fresh credentials with 401 or 403, or the company is gone; for an old sign-in, BambooHR refuses to renew it twice in a row, since a renewal still under way may hand over new tokens), or after 30 days. Then it says so in the activity log for admins, with the company and the webhook ids it knows, so someone can delete them in BambooHR by hand. It forgets the credentials.
 
 Settings › People sync says when old webhooks are still being cleaned up. After signing in, it says when the webhook it replaced is still to be deleted (the `people_sync_notice=old_webhook` code).
 
@@ -79,7 +79,7 @@ If a save stops after BambooHR deleted the old webhook, Settings says so. Save a
 
 **If the workspace moves to another address**, the webhook still posts to the old one, which no longer works. Settings › People sync says so. Choose **Save again** to move the webhook.
 
-One change is saved at a time. While a save is under way, another save, or removing the sync, is refused with "try again in a minute". Removing the sync also waits while DumbSlab is renewing the BambooHR sign-in.
+One change is saved at a time. While a save is under way, another save, or removing the sync, is refused with "try again in a minute". Removing the sync, or connecting another sign-in, API key or company, also waits while DumbSlab is renewing the BambooHR sign-in ("try again in a moment"), so no renewal of a connection is left running when it's retired.
 
 Saving with new credentials (a new sign-in or API key) or another company starts a new connection. Syncs and renewals begun with the old one stop, even one that was only queued: they save nothing. So a sync can't fill in profiles, or store tokens, from the old company after you switched.
 

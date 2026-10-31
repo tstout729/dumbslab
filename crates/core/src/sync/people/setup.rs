@@ -476,6 +476,12 @@ pub(crate) fn setup_job(ctx: &Ctx, subdomain: String, api_key: Option<String>, w
         }
         (None, Some(_)) => None,
     };
+    // A new connection retires the saved one: not while a renewal of it is under way, which could
+    // spend the refresh token its cleanup needs. Saving again with the same one may go on.
+    let retires = new.is_some() || row.as_ref().is_some_and(|r| r.str("subdomain") != subdomain);
+    if retires && row.as_ref().is_some_and(|r| oauth::renewing(r, ctx.now)) {
+        return Err(ApiError::conflict(oauth::RENEWING));
+    }
     let Some(lease) = claim_save(ctx.db, ctx.now)? else { return Err(busy()) };
     let start = Start { admin: &ctx.actor, base_url: &ctx.base_url, subdomain, new, code: None, webhook_key, lease };
     begin(ctx.db, ctx.cfg, row.as_ref(), start)

@@ -366,6 +366,11 @@ pub fn callback(db: &dyn Db, cfg: &HostConfig, req: &Request) -> Outcome {
             (_, Some(_)) => return Ok(back("declined")),
             _ => return Ok(back("no_code")),
         };
+        // A new sign-in retires the saved connection: not while a renewal of it is under way.
+        let saved = db.one("SELECT refreshing_until FROM people_sync WHERE id = 1", &[])?;
+        if saved.is_some_and(|r| renewing(&r, now)) {
+            return Ok(back("busy"));
+        }
         let Some(lease) = setup::claim_save(db, now)? else { return Ok(back("busy")) };
         let job = setup::sign_in_job(db, cfg, &base, &actor, row.str("subdomain"), code, lease)?;
         let mut out = back("failed");
