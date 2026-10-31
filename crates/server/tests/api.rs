@@ -13364,6 +13364,41 @@ mod syncs {
     }
 
     #[test]
+    fn removing_the_folder_that_lent_its_tokens_takes_the_orphans_too() {
+        let (h, admin, lab, topic) = gitlab_setup();
+        let answer = |c: &HttpCall| lab.answer(c);
+        lab.others.borrow_mut().insert(5, ("acme/site".into(), lab.files.borrow().clone()));
+        // GitLab adds the webhook, but its answer never arrives.
+        let lost = |c: &HttpCall| {
+            let reply = lab.answer(c);
+            if c.method == "POST" && c.url.ends_with("/hooks") { HttpReply { status: 0, body: String::new() } } else { reply }
+        };
+        let input = |project: i64, path: &str| json!({ "provider": "gitlab", "gitlab_connection": true, "project_id": project, "repository": path, "folder": "docs", "topic_id": topic });
+        let add = |input: Value, reply: &dyn Fn(&HttpCall) -> HttpReply| {
+            drive(&h, job_of(&h.call("POST", "/api/v1/docs-sources", Some(input), &admin)), reply).0
+        };
+        let records = || count(&h, "SELECT COUNT(*) FROM docs_hook_cleanup");
+        connect_gitlab(&h, &admin, &lab);
+        // Two adds lose their answers: one on project 3, and one on project 5.
+        assert!(matches!(add(input(3, "acme/handbook"), &lost), Finish::Fail(_)));
+        assert!(matches!(add(input(5, "acme/site"), &lost), Finish::Fail(_)));
+        // The next try succeeds; the orphans' records now borrow its tokens.
+        let folder = filled(add(input(3, "acme/handbook"), &answer))["source"]["id"].as_str().unwrap().to_string();
+        assert_eq!((lab.hooks.borrow().len(), records()), (3, 2));
+        assert_eq!(count(&h, &format!("SELECT COUNT(*) FROM docs_hook_cleanup WHERE borrowed_source = '{folder}'")), 2);
+        // The admin removes that folder within the orphans' grace. Its removal record takes their
+        // webhooks over (the one on project 5 too), with the one set of tokens, and its pass deletes
+        // all three. Nothing is left behind.
+        let r = h.call("DELETE", &format!("/api/v1/docs-sources/{folder}"), None, &admin);
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert_eq!(records(), 1, "the folder's own record, with the others' work");
+        let jobs = background(&r);
+        assert_eq!(filled(drive(&h, jobs[0].clone(), &answer).0)["removed"], 3);
+        assert!(lab.hooks.borrow().is_empty(), "{:?}", lab.hooks.borrow());
+        assert_eq!(records(), 0);
+    }
+
+    #[test]
     fn a_refresh_that_lands_late_keeps_its_tokens() {
         let (h, admin, lab, topic) = gitlab_setup();
         let answer = |c: &HttpCall| lab.answer(c);

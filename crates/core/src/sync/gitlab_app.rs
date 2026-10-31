@@ -1051,6 +1051,39 @@ pub struct Cleanup {
     borrowed_source: Option<String>,
     /// That folder and its lease, while this pass holds it like a sync to use its tokens.
     source_lease: Option<(String, String)>,
+    /// Other projects whose webhooks it takes off too: those of records it took over when their
+    /// folder was removed (see [`record_cleanup`]).
+    extra_projects: Vec<i64>,
+    /// The webhooks on those projects this pass is deleting: (project, webhook).
+    deleting_extra: Vec<(i64, i64)>,
+}
+
+impl Cleanup {
+    /// The requests that list the webhooks of its project, then of the others it took over.
+    fn list_calls(&self) -> Vec<HttpCall> {
+        let mut calls = list_hooks_calls(&self.cred.token, self.project_id);
+        for p in &self.extra_projects {
+            calls.extend(list_hooks_calls(&self.cred.token, *p));
+        }
+        calls
+    }
+}
+
+/// The webhooks listed that post to exactly one of `trusted` (DumbSlab's own `/hooks/docs/<id>`
+/// addresses, a record's and those it took over), from the answers to [`list_hooks_calls`].
+fn listed_hooks(replies: &[HttpReply], trusted: &[String]) -> Vec<i64> {
+    let ours = |url: &str| {
+        address(url).is_some_and(|found| found.2.contains("/hooks/docs/") && trusted.iter().any(|t| address(t).as_ref() == Some(&found)))
+    };
+    let mut out: Vec<i64> = replies
+        .iter()
+        .flat_map(|r| r.json().as_array().cloned().unwrap_or_default())
+        .filter(|h| h["url"].as_str().is_some_and(ours))
+        .filter_map(|h| h["id"].as_i64())
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
 }
 
 /// An approval moved onto a folder (in the same transaction): cleanup records that borrowed its
@@ -1164,8 +1197,28 @@ pub(crate) fn record_cleanup(
 ) -> ApiResult<()> {
     let mut cred = source.cred.clone();
     let current = ctx.cfg.knows_its_address().then(|| ctx.url(&format!("/hooks/docs/{}", source.id)));
-    let addresses = hook_addresses(&cred, current.as_deref());
+    let mut addresses = hook_addresses(&cred, current.as_deref());
+    // Records that borrowed this folder's tokens (see `lend_to_source`) become this one's work:
+    // their exact webhook addresses (and their projects, if others) join it, and they go. This
+    // record holds the tokens, so one holder renews them, and nothing is left borrowing from a
+    // folder that's gone. (One whose tokens can't be read stays, and falls back to the admin's
+    // approval.)
+    let mut extra: BTreeSet<i64> = BTreeSet::new();
+    for d in ctx
+        .db
+        .query("SELECT source_id, project_id, secret FROM docs_hook_cleanup WHERE borrowed_source = ?", &params![source.id.clone()])?
+    {
+        let Ok(theirs) = super::open(ctx.cfg, &cleanup_owner(&d.str("source_id")), "gitlab", &d.str("secret")) else { continue };
+        addresses.extend(hook_addresses(&theirs, None).into_iter().filter(|a| !addresses.contains(a)).collect::<Vec<_>>());
+        if d.i64("project_id") != project_id {
+            extra.insert(d.i64("project_id"));
+        }
+        ctx.db.execute("DELETE FROM docs_hook_cleanup WHERE source_id = ?", &params![d.str("source_id")])?;
+    }
     cred.fields.insert("hook_urls".into(), addresses.join("\n"));
+    if !extra.is_empty() {
+        cred.fields.insert("extra_projects".into(), extra.iter().map(i64::to_string).collect::<Vec<_>>().join(","));
+    }
     let secret = super::seal(ctx.cfg, &cleanup_owner(&source.id), "gitlab", &cred)?;
     // (A record left from adding it, if any, gives way to this one: these are the folder's own.)
     ctx.db.execute(
@@ -1223,9 +1276,14 @@ pub(crate) fn resume_cleanups(db: &dyn Db, cfg: &HostConfig, base_url: &str, now
             approval: None,
             borrowed_source: r.opt_str("borrowed_source"),
             source_lease: None,
+            extra_projects: vec![],
+            deleting_extra: vec![],
         };
         match super::open(cfg, &cleanup_owner(&source_id), "gitlab", &r.str("secret")) {
-            Ok(cred) => c.cred = cred,
+            Ok(cred) => {
+                c.extra_projects = cred.field("extra_projects").split(',').filter_map(|p| p.parse().ok()).collect();
+                c.cred = cred;
+            }
             Err(_) => {
                 let why = "its saved GitLab access can't be read (the server's connector key changed)";
                 abandon(db, cfg, base_url, &r.str("removed_by"), &c, why, now)?;
@@ -1359,7 +1417,7 @@ fn cleanup_pass(db: &dyn Db, cfg: &HostConfig, j: &mut GitLabJob, replies: &[Htt
                 if !needs_refresh(&cred, expires_at, now) {
                     c.cred.token = cred.token;
                     j.phase = Phase::Working;
-                    return Ok(Step::Fetch(list_hooks_calls(&c.cred.token, c.project_id)));
+                    return Ok(Step::Fetch(c.list_calls()));
                 }
                 let spent = cred.refresh_token.clone().unwrap_or_default();
                 if super::docs::renewing(db, &source, &spent, now)? {
@@ -1403,7 +1461,7 @@ fn cleanup_pass(db: &dyn Db, cfg: &HostConfig, j: &mut GitLabJob, replies: &[Htt
                     }
                 }
                 j.phase = Phase::Working;
-                return Ok(Step::Fetch(list_hooks_calls(&c.cred.token, c.project_id)));
+                return Ok(Step::Fetch(c.list_calls()));
             }
             if needs_refresh(&c.cred, c.expires_at, now) {
                 let Some(app) = app(cfg) else { return back_off(db, c, "DumbSlab's GitLab app isn't set up on this server.".into(), now) };
@@ -1412,7 +1470,7 @@ fn cleanup_pass(db: &dyn Db, cfg: &HostConfig, j: &mut GitLabJob, replies: &[Htt
                 return Ok(Step::Fetch(vec![refresh_call(app, &c.cred)]));
             }
             j.phase = Phase::Working;
-            Ok(Step::Fetch(list_hooks_calls(&c.cred.token, c.project_id)))
+            Ok(Step::Fetch(c.list_calls()))
         }
         // The borrowed folder's renewal: kept in the folder if it still has the spent token; the pass
         // uses the folder's tokens as they are then.
@@ -1432,7 +1490,7 @@ fn cleanup_pass(db: &dyn Db, cfg: &HostConfig, j: &mut GitLabJob, replies: &[Htt
                 return cleaned(0);
             }
             j.phase = Phase::Working;
-            Ok(Step::Fetch(list_hooks_calls(&c.cred.token, c.project_id)))
+            Ok(Step::Fetch(c.list_calls()))
         }
         // The approval's renewal: kept in the approval, as any request would (`save_held`); the
         // pass uses the new access token.
@@ -1457,7 +1515,7 @@ fn cleanup_pass(db: &dyn Db, cfg: &HostConfig, j: &mut GitLabJob, replies: &[Htt
                 return cleaned(0);
             }
             j.phase = Phase::Working;
-            Ok(Step::Fetch(list_hooks_calls(&c.cred.token, c.project_id)))
+            Ok(Step::Fetch(c.list_calls()))
         }
         Phase::Refreshing => {
             let hash = crate::util::sha256_hex(&c.spent.take().unwrap_or_default());
@@ -1484,7 +1542,7 @@ fn cleanup_pass(db: &dyn Db, cfg: &HostConfig, j: &mut GitLabJob, replies: &[Htt
                         return cleaned(0);
                     }
                     j.phase = Phase::Working;
-                    Ok(Step::Fetch(list_hooks_calls(&c.cred.token, c.project_id)))
+                    Ok(Step::Fetch(c.list_calls()))
                 }
                 Err(message) => {
                     if !holds_cleanup(db, c)? {
@@ -1514,7 +1572,8 @@ fn cleanup_pass(db: &dyn Db, cfg: &HostConfig, j: &mut GitLabJob, replies: &[Htt
             }
         }
         Phase::Working => {
-            if let Some(bad) = replies.iter().find(|r| !r.ok()) {
+            let (own, others) = replies.split_at(HOOK_PAGES.min(replies.len()));
+            if let Some(bad) = own.iter().find(|r| !r.ok()) {
                 return match bad.status {
                     401 => give_up(c, "GitLab no longer accepts DumbSlab's access to the project"),
                     403 => give_up(c, "the person who connected the folder can no longer manage the project's webhooks"),
@@ -1526,11 +1585,21 @@ fn cleanup_pass(db: &dyn Db, cfg: &HostConfig, j: &mut GitLabJob, replies: &[Htt
                 };
             }
             let trusted = hook_addresses(&c.cred, None);
-            let mut ids = source_hooks(replies, &c.source_id, &trusted).unwrap_or_default();
+            let mut ids = listed_hooks(own, &trusted);
             ids.extend(c.known.iter().copied());
             ids.sort_unstable();
             ids.dedup();
-            if ids.is_empty() {
+            // The projects of records it took over: one GitLab no longer shows has none left.
+            let mut extra = vec![];
+            for (project, pages) in c.extra_projects.clone().into_iter().zip(others.chunks(HOOK_PAGES)) {
+                match pages.iter().find(|r| !r.ok()).map(|r| r.status) {
+                    None => extra.extend(listed_hooks(pages, &trusted).into_iter().map(|id| (project, id))),
+                    Some(404) => {}
+                    Some(401 | 403) => return give_up(c, "GitLab no longer lets DumbSlab manage that project's webhooks"),
+                    Some(_) => return back_off(db, c, "GitLab didn't list a project's webhooks just now.".into(), now),
+                }
+            }
+            if ids.is_empty() && extra.is_empty() {
                 db.execute(
                     "DELETE FROM docs_hook_cleanup WHERE source_id = ? AND working_until = ?",
                     &params![c.source_id.clone(), c.lease.clone()],
@@ -1538,29 +1607,31 @@ fn cleanup_pass(db: &dyn Db, cfg: &HostConfig, j: &mut GitLabJob, replies: &[Htt
                 return cleaned(0);
             }
             c.deleting = ids;
+            c.deleting_extra = extra;
             j.phase = Phase::Finishing;
-            Ok(Step::Fetch(c.deleting.iter().map(|id| remove_hook_call(&c.cred.token, c.project_id, *id)).collect()))
+            let mut calls: Vec<HttpCall> = c.deleting.iter().map(|id| remove_hook_call(&c.cred.token, c.project_id, *id)).collect();
+            calls.extend(c.deleting_extra.iter().map(|(project, id)| remove_hook_call(&c.cred.token, *project, *id)));
+            Ok(Step::Fetch(calls))
         }
         Phase::Finishing => {
             let deleting = std::mem::take(&mut c.deleting);
-            let left: Vec<(i64, u16)> = deleting
-                .iter()
-                .zip(replies.iter().map(|r| r.status).chain(std::iter::repeat(0)))
-                .filter(|(_, status)| !((200..300).contains(status) || *status == 404))
-                .map(|(id, status)| (*id, status))
-                .collect();
-            if left.is_empty() {
+            let extra = std::mem::take(&mut c.deleting_extra);
+            let mut statuses = replies.iter().map(|r| r.status).chain(std::iter::repeat(0));
+            let failed = |status: &u16| !((200..300).contains(status) || *status == 404);
+            let left: Vec<(i64, u16)> = deleting.iter().map(|id| (*id, statuses.next().unwrap_or(0))).filter(|(_, s)| failed(s)).collect();
+            let left_extra: Vec<u16> = extra.iter().map(|_| statuses.next().unwrap_or(0)).filter(failed).collect();
+            if left.is_empty() && left_extra.is_empty() {
                 db.execute(
                     "DELETE FROM docs_hook_cleanup WHERE source_id = ? AND working_until = ?",
                     &params![c.source_id.clone(), c.lease.clone()],
                 )?;
-                return cleaned(deleting.len());
+                return cleaned(deleting.len() + extra.len());
             }
             c.known = left.iter().map(|(id, _)| *id).collect();
-            if left.iter().any(|(_, status)| matches!(status, 401 | 403)) {
+            if left.iter().map(|(_, s)| s).chain(&left_extra).any(|s| matches!(s, 401 | 403)) {
                 return give_up(c, "GitLab refused to let DumbSlab delete them");
             }
-            back_off(db, c, format!("GitLab didn't delete {} of the folder's webhooks just now.", left.len()), now)
+            back_off(db, c, format!("GitLab didn't delete {} of the folder's webhooks just now.", left.len() + left_extra.len()), now)
         }
     }
 }
