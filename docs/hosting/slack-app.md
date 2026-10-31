@@ -2,6 +2,8 @@
 
 One Slack app serves every workspace on your server. With it, an admin clicks **Add to Slack** in Settings › Slack, approves in Slack, and is done (see [docs/slack.md](../slack.md)). The same app also lets people search Slack from DumbSlab ([connected apps](../connected-apps.md)) and sign in with Slack ([single sign-on](../sso.md)).
 
+Signing in with Slack through this app needs the shared sign-in feature ([docs/hosting/sign-in-apps.md](sign-in-apps.md)). That is what answers the manifest's `/sso/callback` redirect URL on the root domain.
+
 Without it, admins can still connect their own Slack app by hand.
 
 These steps use `dumbslab.com`. Put your own domain in its place.
@@ -75,6 +77,7 @@ In any workspace, open Settings › Slack as an admin. You should see **Add to S
 ## What to know
 
 - **One Slack workspace, one DumbSlab workspace.** The `Directory` object records which DumbSlab workspace connected each Slack workspace (the `slack_teams` table). Slack sends all requests to the root domain, and the Worker forwards each one there. Deleting a workspace with the operator API frees its Slack workspace.
+- **A Slack workspace stays claimed until its old token is revoked.** After a Disconnect, the claim goes only once Slack has answered the revoke. If Slack never answers, the workspace's admin sees **Try again** in Settings › Slack. Another workspace trying to add it meanwhile is told it's taken.
 - **Changing the root domain.** Open `/slack/app-manifest.json` on the new domain and paste it into the app's **App Manifest** page. Slack may ask workspaces to reinstall the app after its link domain changes.
 - **Rotating the signing secret.** Regenerate it in Slack, then run `npx wrangler secret put SLACK_SIGNING_SECRET` and deploy. Requests fail in between.
 - **Rate limits.** Slack's May 2025 limit cut for apps outside the Marketplace covers `conversations.history` and `conversations.replies` only. DumbSlab calls neither.

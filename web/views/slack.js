@@ -25,6 +25,7 @@ const installErrors = {
   slack_error: 'Slack didn’t finish connecting. Try again.',
   enterprise_install: 'DumbSlab connects one Slack workspace at a time, not a whole Enterprise organization. Add it to one workspace instead.',
   slack_team_taken: 'That Slack workspace is already connected to another DumbSlab workspace. Disconnect it there first, then try again.',
+  slack_busy: 'DumbSlab is still finishing an earlier change to Slack. Try again in a minute.',
   failed: 'Connecting Slack didn’t work. Try again.',
 };
 
@@ -49,6 +50,19 @@ function sharedPanel(s) {
     s.install_url
       ? h('p', { class: 'field-hint' }, 'To use another Slack workspace, click Add to Slack again and pick it there. ', h('a', { href: s.install_url, 'data-native': true }, 'Add to Slack'))
       : null);
+}
+
+/** A disconnected Slack workspace's bot token isn't confirmed revoked yet: Slack didn't answer. */
+function pendingPanel(reload) {
+  const retry = button('Try again', { variant: 'subtle', size: 'sm' });
+  retry.addEventListener('click', () => busy(retry, async () => {
+    await api.del('/slack');
+    toast('Trying again');
+    setTimeout(reload, 2000);
+  }).catch(toastError));
+  return h('div', { class: 'callout callout-warn', role: 'status' }, icon('alert'),
+    h('span', null, 'Slack hasn’t confirmed that it revoked DumbSlab’s token in a Slack workspace you disconnected. Until it does, that Slack workspace can’t be added to another DumbSlab workspace. '),
+    retry);
 }
 
 /** Own app connected, and the server offers Add to Slack too. */
@@ -254,6 +268,7 @@ export async function slackSection(ctx) {
     return frag(intro, ...notes, h('p', { class: 'callout callout-warn', role: 'alert' }, icon('alert'),
       h('span', null, 'Slack needs this server’s connector key to keep the Slack app’s secrets. Set DUMBSLAB_CONNECTOR_KEY (self-hosted) or the CONNECTOR_KEY secret (Cloudflare), then come back.')));
   }
+  if (s.pending_revoke) notes.push(pendingPanel(reload));
   const saved = s.bot_token_saved || s.signing_secret_saved || s.channels.length;
   const channels = channelsPanel(s, topics, reload);
   if (s.mode === 'shared') {

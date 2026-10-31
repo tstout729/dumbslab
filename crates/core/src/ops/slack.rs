@@ -29,7 +29,7 @@ pub fn ops() -> Vec<Op> {
             .build(),
         op("slack", "disconnect_slack", "DELETE", "/slack", Access::Admin, disconnect_slack)
             .title("Disconnect Slack")
-            .desc("Forget the Slack app's bot token and signing secret, and the channels that get posts. With DumbSlab's own Slack app (Add to Slack), the bot token is also revoked in Slack, and the Slack workspace can be added to another DumbSlab workspace. With your own app, delete it at api.slack.com/apps to remove it from Slack too.")
+            .desc("Forget the Slack app's bot token and signing secret, and the channels that get posts. With DumbSlab's own Slack app (Add to Slack), the bot token is also revoked in Slack, and once Slack confirms it the Slack workspace can be added to another DumbSlab workspace. When `pending_revoke` (get_slack) is true, calling this again retries the revoke. With your own app, delete it at api.slack.com/apps to remove it from Slack too.")
             .destructive()
             .build(),
         op("slack", "add_slack_channel", "POST", "/slack/channels", Access::Admin, add_channel)
@@ -108,6 +108,8 @@ pub struct SlackSettings {
     pub scopes: Vec<String>,
     /// The bot scopes Slack granted DumbSlab's own Slack app (Add to Slack).
     pub granted_scopes: Vec<String>,
+    /// A disconnected Slack workspace's bot token isn't confirmed revoked yet (Slack didn't answer). Until it is, that Slack workspace can't be added to another DumbSlab workspace. disconnect_slack tries again.
+    pub pending_revoke: bool,
     pub channels: Vec<SlackChannel>,
 }
 
@@ -160,6 +162,7 @@ pub(crate) fn settings_view(ctx: &Ctx) -> ApiResult<SlackSettings> {
         manifest: slack::manifest(&workspace, &ctx.base_url),
         scopes: slack::SCOPES.iter().map(|s| s.to_string()).collect(),
         granted_scopes: a.scopes.clone(),
+        pending_revoke: !slack::pending_teams(ctx.db)?.is_empty(),
         channels,
     })
 }
@@ -221,15 +224,24 @@ fn update_slack(ctx: &mut Ctx, input: UpdateSlackInput) -> ApiResult<Deferred<Sl
 }
 
 fn disconnect_slack(ctx: &mut Ctx, _: NoInput) -> ApiResult<Done> {
-    let app = slack::load(ctx.db, ctx.cfg)?;
-    if !slack::remove(ctx.db)? {
-        return Err(ApiError::not_found("Slack connection"));
+    let app = slack::load(ctx.db, ctx.cfg)?.filter(|a| a.shared);
+    // DumbSlab's own Slack app: its bot token is revoked in Slack after the answer, and only once
+    // Slack has answered is the Slack workspace free for another DumbSlab workspace.
+    if let Some((team, token)) = app.as_ref().and_then(|a| Some((a.team_id.clone()?, a.bot_token.clone()?))) {
+        slack::add_pending(ctx.db, ctx.cfg, &team, &token, app.as_ref().and_then(|a| a.claim.as_deref()), ctx.now)?;
     }
-    emit(ctx, Event::new("slack.disconnected", "settings", "slack", "disconnected Slack").admin_only())?;
-    // DumbSlab's own Slack app: its bot token goes in Slack too, and the Slack workspace is free
-    // for another DumbSlab workspace. Done after the answer; nobody waits on Slack.
-    if let Some(a) = app.filter(|a| a.shared) {
-        ctx.effects.push(Effect::Background(crate::connect::Job::Slack(SlackJob::forget(&ctx.base_url, a.bot_token, a.team_id))));
+    let mut teams: Vec<String> = app.as_ref().and_then(|a| a.team_id.clone()).into_iter().collect();
+    if slack::remove(ctx.db)? {
+        emit(ctx, Event::new("slack.disconnected", "settings", "slack", "disconnected Slack").admin_only())?;
+    } else {
+        // Nothing connected. An earlier disconnect may not have finished revoking: try again.
+        teams = slack::pending_teams(ctx.db)?;
+        if teams.is_empty() {
+            return Err(ApiError::not_found("Slack connection"));
+        }
+    }
+    for team in teams {
+        ctx.effects.push(Effect::Background(crate::connect::Job::Slack(SlackJob::release(&ctx.base_url, &team))));
     }
     Ok(DONE)
 }

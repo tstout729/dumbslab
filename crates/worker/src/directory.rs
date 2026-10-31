@@ -58,6 +58,7 @@ struct UsageInput {
 struct SlackTeamInput {
     team_id: String,
     home: Option<String>,
+    claim: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -236,7 +237,8 @@ impl DurableObject for Directory {
                 self.run(move |db| {
                     let input = input?;
                     let home = input.home.ok_or_else(|| ApiError::bad_request("send the workspace's home"))?;
-                    tenancy::claim_slack_team(db, &input.team_id, &home, Utc::now()).map(|_| json!({ "ok": true }))
+                    let claim = input.claim.unwrap_or_default();
+                    tenancy::claim_slack_team(db, &input.team_id, &home, &claim, Utc::now()).map(|_| json!({ "ok": true }))
                 })?
             }
             (Method::Post, "/slack/release") => {
@@ -244,7 +246,8 @@ impl DurableObject for Directory {
                 self.run(move |db| {
                     let input = input?;
                     let home = input.home.ok_or_else(|| ApiError::bad_request("send the workspace's home"))?;
-                    tenancy::release_slack_team(db, &input.team_id, &home).map(|_| json!({ "ok": true }))
+                    tenancy::release_slack_team(db, &input.team_id, &home, input.claim.as_deref(), Utc::now())
+                        .map(|_| json!({ "ok": true }))
                 })?
             }
             (Method::Post, "/slack/lookup") => {

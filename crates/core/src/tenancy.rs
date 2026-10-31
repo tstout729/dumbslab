@@ -245,6 +245,8 @@ CREATE INDEX IF NOT EXISTS billing_home ON billing(home);
 CREATE TABLE IF NOT EXISTS slack_teams (
   team_id TEXT PRIMARY KEY,
   home TEXT NOT NULL,
+  -- The id the workspace's install claimed it with: letting go names it.
+  claim TEXT NOT NULL,
   claimed_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS slack_teams_home ON slack_teams(home);
@@ -444,11 +446,19 @@ fn check_team(team_id: &str) -> ApiResult<()> {
     if ok { Ok(()) } else { Err(ApiError::bad_request("team_id must be a Slack workspace's ID, like T0123ABCD")) }
 }
 
-/// Claims a Slack workspace for the workspace whose first address is `home`, which lets go of any
-/// other it held: a workspace connects one Slack workspace. Refused (409 `slack_team_taken`) while
-/// another workspace holds it; claiming one's own again is fine.
-pub fn claim_slack_team(db: &dyn Db, team_id: &str, home: &str, now: DateTime<Utc>) -> ApiResult<()> {
+/// How old a claim must be before a workspace that doesn't hold its Slack workspace may let go of
+/// it without naming it: an install claims, then saves, within seconds.
+pub const STALE_CLAIM_SECS: i64 = 60;
+
+/// Claims a Slack workspace for the workspace whose first address is `home`, with an id the
+/// workspace's install chose. Refused (409 `slack_team_taken`) while another workspace holds it.
+/// Claiming one's own again replaces the id. A workspace's other claims stay: it lets go of its
+/// previous Slack workspace itself, once that one's bot token is revoked.
+pub fn claim_slack_team(db: &dyn Db, team_id: &str, home: &str, claim: &str, now: DateTime<Utc>) -> ApiResult<()> {
     check_team(team_id)?;
+    if claim.is_empty() || claim.len() > 64 {
+        return Err(ApiError::bad_request("send the claim's id"));
+    }
     if let Some(row) = db.one("SELECT home FROM slack_teams WHERE team_id = ?", &params![team_id])?
         && row.str("home") != home
     {
@@ -457,18 +467,26 @@ pub fn claim_slack_team(db: &dyn Db, team_id: &str, home: &str, now: DateTime<Ut
     if db.one("SELECT slug FROM workspaces WHERE slug = ? AND status = 'active'", &params![home])?.is_none() {
         return Err(ApiError::not_found(format!("workspace `{home}`")));
     }
-    db.execute("DELETE FROM slack_teams WHERE home = ? AND team_id != ?", &params![home, team_id])?;
     db.execute(
-        "INSERT INTO slack_teams (team_id, home, claimed_at) VALUES (?, ?, ?) ON CONFLICT(team_id) DO NOTHING",
-        &params![team_id, home, ts(now)],
+        "INSERT INTO slack_teams (team_id, home, claim, claimed_at) VALUES (?, ?, ?, ?)
+         ON CONFLICT(team_id) DO UPDATE SET claim = excluded.claim, claimed_at = excluded.claimed_at",
+        &params![team_id, home, claim, ts(now)],
     )?;
     Ok(())
 }
 
-/// Lets go of a Slack workspace, if `home` holds it.
-pub fn release_slack_team(db: &dyn Db, team_id: &str, home: &str) -> ApiResult<()> {
+/// Lets go of a Slack workspace `home` holds with this claim. Without a claim (the workspace doesn't
+/// know one: a request reached it for a Slack workspace it doesn't hold), only a claim older than
+/// [`STALE_CLAIM_SECS`] goes, so an install that has claimed but not yet saved keeps its own.
+pub fn release_slack_team(db: &dyn Db, team_id: &str, home: &str, claim: Option<&str>, now: DateTime<Utc>) -> ApiResult<()> {
     check_team(team_id)?;
-    db.execute("DELETE FROM slack_teams WHERE team_id = ? AND home = ?", &params![team_id, home])?;
+    match claim {
+        Some(c) => db.execute("DELETE FROM slack_teams WHERE team_id = ? AND home = ? AND claim = ?", &params![team_id, home, c])?,
+        None => db.execute(
+            "DELETE FROM slack_teams WHERE team_id = ? AND home = ? AND claimed_at < ?",
+            &params![team_id, home, ts(now - Duration::seconds(STALE_CLAIM_SECS))],
+        )?,
+    };
     Ok(())
 }
 

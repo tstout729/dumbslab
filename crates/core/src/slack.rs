@@ -54,9 +54,18 @@
 //! Slack keeps one bot token per app and Slack workspace (its docs and SDKs model an install as
 //! one bot token per workspace; they don't spell out reinstalls), so installing the shared app for
 //! a Slack workspace another DumbSlab workspace holds is taken to hand back that workspace's token.
-//! A token is therefore revoked only when no other DumbSlab workspace can hold it: never when the
-//! Slack workspace is taken, only for a refused org-wide install, on Disconnect, and for the
-//! shared app's previous Slack workspace once this workspace moved to another.
+//! So:
+//!
+//! - A token is revoked only when no other DumbSlab workspace can hold it: never when the Slack
+//!   workspace is taken; for a refused org-wide install; and on Disconnect and for the previous
+//!   Slack workspace after a switch, while this workspace still holds the claim. The claim is let
+//!   go of only once Slack has answered the revoke (`slack_releases`), so a late revoke can't kill
+//!   the token the next workspace was given. An unanswered revoke keeps the claim until it's tried
+//!   again (Disconnect, Add to Slack, or Slack's next request for that Slack workspace).
+//! - Claims carry the install's own id, and letting go names it; one install at a time goes from
+//!   claiming to saving, and one that claimed but wasn't saved puts the claim back as it was.
+//! - `app_uninstalled` and `tokens_revoked` are checked with `auth.test`, for the install
+//!   (`generation`) saved when they arrived: Slack's event times are whole seconds and out of order.
 
 mod shared_app;
 
@@ -80,7 +89,8 @@ pub use shared_app::{
     InstallError, Routed, Shared, SharedApp, create_app_link, install_callback, install_callback_url, install_start, manifest_route, route,
     shared, shared_manifest, team_of, unknown_team,
 };
-use shared_app::{Installed, home, ours, stray, uninstalled};
+use shared_app::{Installed, Pending, home, ours, stray};
+pub(crate) use shared_app::{add_pending, pending_teams};
 
 /// Where Slack sends the slash command.
 pub const COMMANDS_PATH: &str = "/slack/commands";
@@ -154,8 +164,10 @@ pub struct App {
     pub shared: bool,
     /// The bot scopes Slack granted the shared app.
     pub scopes: Vec<String>,
-    /// When Add to Slack last finished.
-    pub installed_at: Option<DateTime<Utc>>,
+    /// Goes up with every install (see the migration).
+    pub generation: i64,
+    /// Hosted: the id this install claimed its Slack workspace with in the directory.
+    pub claim: Option<String>,
 }
 
 impl fmt::Debug for App {
@@ -211,8 +223,14 @@ pub fn load(db: &dyn Db, cfg: &HostConfig) -> ApiResult<Option<App>> {
         unfurls: r.bool("unfurls"),
         shared,
         scopes: r.str("scopes").split(',').filter(|s| !s.is_empty()).map(str::to_string).collect(),
-        installed_at: r.opt_str("installed_at").and_then(|t| parse_ts(&t)),
+        generation: r.opt_i64("generation").unwrap_or(0),
+        claim: r.opt_str("claim"),
     }))
+}
+
+/// Decrypts a secret [`seal`] made, or `None` for another key.
+fn unseal(cfg: &HostConfig, kind: &str, sealed: &str) -> Option<String> {
+    connect::open(key(cfg)?, OWNER, kind, sealed).ok().map(|c| c.token)
 }
 
 /// What an admin changes about the Slack app. Never printed.
@@ -404,7 +422,7 @@ fn run(db: &dyn Db, cfg: &HostConfig, req: &Request) -> ApiResult<Outcome> {
     }
     let base = crate::http::base_url(cfg, req);
     // The shared app serves every Slack workspace: only the one this workspace holds gets in.
-    let Some(app) = app.filter(|a| !a.shared || ours(a, path, &req.body)) else { return stray(cfg, &base, path, &req.body) };
+    let Some(app) = app.filter(|a| !a.shared || ours(a, path, &req.body)) else { return stray(db, cfg, &base, path, &req.body) };
     if path == COMMANDS_PATH { command(db, &app, &base, &req.body) } else { event(db, cfg, &app, &base, &req.body, now) }
 }
 
@@ -506,7 +524,12 @@ fn event(db: &dyn Db, cfg: &HostConfig, app: &App, base: &str, body: &[u8], now:
             let bot_revoked = e["type"] == "tokens_revoked"
                 && app.bot_user_id.as_deref().is_some_and(|b| e["tokens"]["bot"].as_array().is_some_and(|ids| ids.iter().any(|i| i == b)));
             if app.shared && (e["type"] == "app_uninstalled" || bot_revoked) {
-                return uninstalled(db, cfg, app, base, &v, now);
+                // Slack doesn't keep events in order, and its times are whole seconds: this may be
+                // about an earlier install. Ask Slack whether the saved token still works.
+                return Ok(later(
+                    Response::json(200, &json!({ "ok": true })),
+                    SlackJob::new(base, Work::Check { generation: app.generation }),
+                ));
             }
             let user = e["user"].as_str().unwrap_or_default();
             if e["type"] != "link_shared" || !app.unfurls || app.bot_token.is_none() || !valid_id(user) {
@@ -897,8 +920,17 @@ pub struct SlackJob {
     effects: Vec<Effect>,
     /// Add to Slack: what Slack gave, while the directory claims its Slack workspace.
     installed: Option<Installed>,
-    /// Add to Slack: where to send the admin once a token is revoked.
+    /// Add to Slack: the id it claims the Slack workspace with.
+    claim: Option<String>,
+    /// Add to Slack, re-adding the Slack workspace this workspace holds: the claim it had, which
+    /// goes back if this install fails. `None` when the claim is simply let go of on failure.
+    restore: Option<String>,
+    /// Add to Slack: where to send the admin once the last request is answered.
     then: Option<String>,
+    /// The token being revoked.
+    pending: Option<Pending>,
+    /// Requests to Slack whose outcome was unknown are tried once more.
+    attempt: u8,
 }
 
 #[derive(Clone)]
@@ -915,10 +947,14 @@ enum Work {
     Test { channel_id: String },
     /// Add to Slack: Slack sent an admin back with a code. Exchange it for the bot token, claim the
     /// Slack workspace in the directory (hosted), then save it.
-    Install { admin: String, via: Via, code: String, redirect_uri: String },
-    /// The shared app is disconnected: revoke its bot token (when there's one) and let go of its
-    /// Slack workspace's claim (hosted), unless the workspace connected that Slack workspace again.
-    Forget { token: Option<String>, team_id: Option<String> },
+    Install { admin: String, via: Via, code: String, redirect_uri: String, home: Option<String> },
+    /// Revoke the shared app's bot token waiting in `slack_releases` for this Slack workspace, and
+    /// once Slack has answered, let go of its claim (hosted). With no token waiting, let go of a
+    /// stale claim only.
+    Release { team_id: String },
+    /// Slack said the shared app was removed or its bot token revoked: if the saved token is dead,
+    /// disconnect, but only the install (`generation`) the event arrived for.
+    Check { generation: i64 },
 }
 
 /// The message whose links Slack asked to preview.
@@ -947,10 +983,15 @@ enum Phase {
     Exchanging,
     /// Waiting for the directory to claim the Slack workspace.
     Claiming,
-    /// Waiting for `auth.revoke`, then sending the admin to [`SlackJob::then`].
+    /// Waiting for `auth.revoke`.
     Revoking,
-    /// Waiting for `auth.revoke` and the directory to let go.
-    Forgetting,
+    /// Waiting for the directory to undo a claim an install made, then sending the admin to
+    /// [`SlackJob::then`].
+    Undoing,
+    /// Waiting for the directory to let go of a claim.
+    Releasing,
+    /// Waiting for `auth.test` about a token Slack said was revoked.
+    Testing,
 }
 
 // Jobs carry tokens and what people typed; never print them.
@@ -963,7 +1004,8 @@ impl fmt::Debug for SlackJob {
             Work::Save { .. } => "save",
             Work::Test { .. } => "test",
             Work::Install { .. } => "install",
-            Work::Forget { .. } => "forget",
+            Work::Release { .. } => "release",
+            Work::Check { .. } => "check",
         };
         write!(f, "SlackJob({kind}, {:?})", self.phase)
     }
@@ -971,12 +1013,23 @@ impl fmt::Debug for SlackJob {
 
 impl SlackJob {
     fn new(base_url: &str, work: Work) -> SlackJob {
-        SlackJob { base_url: base_url.to_string(), work, phase: Phase::Start, effects: vec![], installed: None, then: None }
+        SlackJob {
+            base_url: base_url.to_string(),
+            work,
+            phase: Phase::Start,
+            effects: vec![],
+            installed: None,
+            claim: None,
+            restore: None,
+            then: None,
+            pending: None,
+            attempt: 0,
+        }
     }
 
-    /// Disconnecting the shared app: revokes its bot token and lets go of its Slack workspace.
-    pub(crate) fn forget(base_url: &str, token: Option<String>, team_id: Option<String>) -> SlackJob {
-        SlackJob::new(base_url, Work::Forget { token, team_id })
+    /// Revokes the shared app's bot token waiting for `team_id`, then lets go of its claim.
+    pub(crate) fn release(base_url: &str, team_id: &str) -> SlackJob {
+        SlackJob::new(base_url, Work::Release { team_id: team_id.to_string() })
     }
 
     /// Checks a new bot token with Slack, then saves it with the rest of `change`.
@@ -998,7 +1051,14 @@ impl SlackJob {
     /// about doesn't vanish: an ephemeral note at its `response_url`. Only messages written for
     /// people (a full workspace, a paused one) are passed on; anything else could describe
     /// internals. `None` once the answer went, and for jobs nobody is waiting on.
+    ///
+    /// Add to Slack has one too: a step that failed after the directory claimed the Slack
+    /// workspace (the save, refused or rolled back) undoes the claim, so the directory and the
+    /// saved connection stay in step.
     pub fn failure_notice(&self, error: &ApiError) -> Option<HttpCall> {
+        if let Work::Install { .. } = &self.work {
+            return (self.phase == Phase::Claiming).then(|| shared_app::undo_claim(self)).flatten();
+        }
         let (reply_to, what) = match &self.work {
             Work::NewDraft { reply_to, .. } => (reply_to, "Couldn't create the draft"),
             Work::Search { reply_to, .. } => (reply_to, "Couldn't search DumbSlab"),
@@ -1179,7 +1239,7 @@ pub fn step(db: &dyn Db, cfg: &HostConfig, job: &mut SlackJob, replies: Vec<Http
             }
         }
         // Add to Slack, and letting go of the shared app.
-        (_, Work::Install { .. } | Work::Forget { .. }) => shared_app::step(db, cfg, job, &app, answer, now),
+        (_, Work::Install { .. } | Work::Release { .. } | Work::Check { .. }) => shared_app::step(db, cfg, job, &app, answer, now),
         (phase, _) => Err(ApiError::internal(format!("a Slack job can't continue from {phase:?}"))),
     }
 }
@@ -1419,9 +1479,16 @@ mod tests {
         let app = App { bot_token: Some("xoxb-secret".into()), signing_secret: Some("s3cret".into()), ..Default::default() };
         let install = SlackJob::new(
             "https://kb.test",
-            Work::Install { admin: "u".into(), via: Via::Web, code: "secret-code".into(), redirect_uri: "https://kb.test/x".into() },
+            Work::Install {
+                admin: "u".into(),
+                via: Via::Web,
+                code: "secret-code".into(),
+                redirect_uri: "https://kb.test/x".into(),
+                home: None,
+            },
         );
-        let forget = SlackJob::forget("https://kb.test", Some("xoxb-secret".into()), Some("T1".into()));
+        let mut forget = SlackJob::release("https://kb.test", "T1");
+        forget.pending = Some(Pending::new("T1", "sealed", "xoxb-secret"));
         let host = SharedApp { signing_secret: Some("host-secret".into()), callback_url: None };
         let printed = format!("{job:?} {app:?} {install:?} {forget:?} {host:?}");
         for secret in ["xoxb-secret", "s3cret", "secret-code", "host-secret"] {
