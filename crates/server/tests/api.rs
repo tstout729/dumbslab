@@ -8148,8 +8148,10 @@ mod syncs {
         assert_eq!((v["automatic_webhook"].as_bool(), &v["webhook_error"]), (Some(false), &Value::Null));
         assert_eq!(v["webhook_url"], "https://kb.test/hooks/people");
         // Credentials are encrypted and never come back.
-        let stored =
-            count(&h, "SELECT COUNT(*) FROM people_sync WHERE secret LIKE '%bamboo-secret-key%' OR secret LIKE '%bamboo-hook-key%'");
+        let stored = count(
+            &h,
+            "SELECT COUNT(*) FROM people_sync WHERE instr(secret, 'bamboo-secret-key') > 0 OR instr(secret, 'bamboo-hook-key') > 0",
+        );
         assert_eq!(stored, 0);
         for r in [h.ok("GET", "/api/v1/people-sync", None, &admin), h.ok("GET", "/api/v1/activity", None, &admin)] {
             assert!(!r.to_string().contains("bamboo-secret-key") && !r.to_string().contains("bamboo-hook-key"), "{r}");
@@ -8315,7 +8317,7 @@ mod syncs {
         assert_eq!((&v["webhook_error"], v.get("notice")), (&Value::Null, None), "{v}");
 
         // The keys are encrypted and never shown, nor is the webhook's id.
-        assert_eq!(count(&h, "SELECT COUNT(*) FROM people_sync WHERE secret LIKE '%key-1%' OR secret LIKE '%pk-41%'"), 0);
+        assert_eq!(count(&h, "SELECT COUNT(*) FROM people_sync WHERE instr(secret, 'key-1') > 0 OR instr(secret, 'pk-41') > 0"), 0);
         for r in [h.ok("GET", "/api/v1/people-sync", None, &admin), h.ok("GET", "/api/v1/activity", None, &admin)] {
             let text = r.to_string();
             assert!(!text.contains("key-1") && !text.contains("pk-41") && !text.contains("webhook_id"), "{r}");
@@ -8662,7 +8664,7 @@ mod syncs {
         );
         assert_eq!(h.ok("GET", "/api/v1/activity", None, &admin)["items"][0]["data"]["auth"], "oauth");
         // Tokens are sealed and never shown.
-        assert_eq!(count(&h, "SELECT COUNT(*) FROM people_sync WHERE secret LIKE '%at-1%' OR secret LIKE '%rt-1%'"), 0);
+        assert_eq!(count(&h, "SELECT COUNT(*) FROM people_sync WHERE instr(secret, 'at-1') > 0 OR instr(secret, 'rt-1') > 0"), 0);
         for r in [h.ok("GET", "/api/v1/people-sync", None, &admin), h.ok("GET", "/api/v1/activity", None, &admin)] {
             let text = r.to_string();
             assert!(!text.contains("at-1") && !text.contains("rt-1") && !text.contains("bhr-secret") && !text.contains("pk-60"), "{r}");
@@ -8969,7 +8971,7 @@ mod syncs {
         assert!(landed.ends_with("&people_sync_notice=old_webhook"), "{landed}");
         assert!(!sent.iter().any(|c| c.url.starts_with("https://acme.")), "{sent:?}");
         assert_eq!(h.ok("GET", "/api/v1/people-sync", None, &admin)["webhook_cleanup"], 2);
-        assert_eq!(count(&h, "SELECT COUNT(*) FROM people_sync_cleanup WHERE secret LIKE '%rt-1%'"), 0, "sealed");
+        assert_eq!(count(&h, "SELECT COUNT(*) FROM people_sync_cleanup WHERE instr(secret, 'rt-1') > 0"), 0, "sealed");
         // The pass renews acme's sign-in, lists acme's webhooks, and deletes this workspace's.
         let (_, sent) = drive(&h, background_of(&r), &answer);
         let at = |m: &str, u: &str| sent.iter().position(|c| c.method == m && c.url == u).unwrap_or_else(|| panic!("{m} {u}: {sent:?}"));
@@ -9867,7 +9869,10 @@ mod syncs {
         let list = h.ok("GET", "/api/v1/docs-sources", None, &admin);
         assert_eq!(list["items"][0]["has_token"], true);
         assert!(!list.to_string().contains("ghp_docs_token") && !list.to_string().contains(&secret), "{list}");
-        assert_eq!(count(&h, "SELECT COUNT(*) FROM docs_sources WHERE secret LIKE '%ghp_docs_token%' OR secret LIKE '%whsec_%'"), 0);
+        assert_eq!(
+            count(&h, "SELECT COUNT(*) FROM docs_sources WHERE instr(secret, 'ghp_docs_token') > 0 OR instr(secret, 'whsec_') > 0"),
+            0
+        );
 
         let repo = Repo::new(&[
             (
@@ -10966,11 +10971,11 @@ mod syncs {
                 .unwrap();
         let now = chrono::Utc::now().timestamp();
         assert_eq!(claims["iss"], "Iv23liTEST");
-        assert!(
-            (now - 70..=now - 50).contains(&claims["iat"].as_i64().unwrap()) && claims["exp"].as_i64().unwrap() <= now + 600,
-            "{claims}"
-        );
-        assert_eq!(count(&h, "SELECT COUNT(*) FROM docs_sources WHERE secret LIKE '%ghs_%'"), 0, "tokens aren't kept");
+        // Backdated a minute and valid for ten (the unit test pins exact values); a slow run only
+        // moves `now` later, so the lower bound is loose.
+        let (iat, exp) = (claims["iat"].as_i64().unwrap(), claims["exp"].as_i64().unwrap());
+        assert!((now - 600..=now - 50).contains(&iat) && exp - iat == 600, "{claims}");
+        assert_eq!(count(&h, "SELECT COUNT(*) FROM docs_sources WHERE instr(secret, 'ghs_') > 0"), 0, "tokens aren't kept");
         assert_eq!(post(&h, &doc_ids(&h)["README.md"], &mo)["title"], "Handbook");
 
         // No token or webhook secret to change; the branch can.
@@ -12427,7 +12432,11 @@ mod syncs {
         assert!(location(&h.raw("GET", "/sync/gitlab/start", vec![], "", &mo_cookie)).ends_with("connect_error=not_admin&app=gitlab"));
 
         connect_gitlab(&h, &admin, &lab);
-        assert_eq!(count(&h, "SELECT COUNT(*) FROM docs_connections WHERE secret LIKE '%glo_%' OR secret LIKE '%glr_%'"), 0, "sealed");
+        assert_eq!(
+            count(&h, "SELECT COUNT(*) FROM docs_connections WHERE instr(secret, 'glo_') > 0 OR instr(secret, 'glr_') > 0"),
+            0,
+            "sealed"
+        );
         assert_eq!(count(&h, "SELECT COUNT(*) FROM activity WHERE event = 'gitlab.connected'"), 1);
         let r = h.call("GET", "/api/v1/docs-sources/gitlab", None, &admin);
         let listed = filled(drive(&h, job_of(&r), &answer).0);
@@ -13069,7 +13078,7 @@ mod syncs {
         assert!(matches!(step_with(&h, &mut a, a_refresh).0, Ok(Step::Done(Finish::Fail(_)))), "A lost its lease, its tokens kept");
         let r = remove(&source);
         assert_eq!(r.status, 200, "{}", r.body);
-        assert_eq!(count(&h, "SELECT COUNT(*) FROM docs_hook_cleanup WHERE secret LIKE '%glo_%'"), 0, "sealed");
+        assert_eq!(count(&h, "SELECT COUNT(*) FROM docs_hook_cleanup WHERE instr(secret, 'glo_') > 0"), 0, "sealed");
         let (finish, sent) = drive(&h, background(&r)[0].clone(), &answer);
         assert_eq!(filled(finish)["removed"], 1);
         assert!(sent.iter().all(|c| c.url != "https://gitlab.com/oauth/token"), "fresh tokens");
@@ -13326,7 +13335,7 @@ mod syncs {
         assert!(matches!(add(&lost), Finish::Fail(_)));
         // A webhook no folder knows of, but recorded before it was asked for, sealed.
         assert_eq!((lab.hooks.borrow().len(), sources(), records()), (1, 0, 1));
-        assert_eq!(count(&h, "SELECT COUNT(*) FROM docs_hook_cleanup WHERE secret LIKE '%glo_%' OR secret LIKE '%glr_%'"), 0);
+        assert_eq!(count(&h, "SELECT COUNT(*) FROM docs_hook_cleanup WHERE instr(secret, 'glo_') > 0 OR instr(secret, 'glr_') > 0"), 0);
         // While an add may still be under way, it's left alone.
         assert!(settings().is_empty());
         // Later, a pass finds it by its exact address and deletes it.
