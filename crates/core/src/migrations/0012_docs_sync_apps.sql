@@ -83,6 +83,9 @@ CREATE TABLE IF NOT EXISTS docs_connections (
   -- Encrypted: the access and refresh tokens.
   secret TEXT NOT NULL,
   expires_at TEXT,
+  -- Held while a request uses it (listing projects, adding a folder): when it runs out, then a
+  -- random id. Only the holder refreshes or takes it, so one approval never ends up in two sources.
+  claimed_until TEXT,
   created_at TEXT NOT NULL,
   UNIQUE (provider, user_id)
 );

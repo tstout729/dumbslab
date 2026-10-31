@@ -94,5 +94,5 @@ If a listing has no Markdown files at all (a renamed folder or a deleted branch,
 - **Where things are kept.** The `docs_items` table remembers each file's post, each image's upload and each folder's topic. `github_installations` and `github_repositories` keep the app installations admins here connected, and the repositories their GitHub accounts could read there. A new file's post id is chosen when it's first listed, so links to it work while a large first sync is still running.
 - **One sync at a time** per source.
 - **Plans.** Every post, version and upload counts against the plan's daily writes and storage, like any change.
-- **Removing.** Deleting the chosen topic removes its sources too. Its posts stay, as ordinary posts.
+- **Removing.** Deleting the chosen topic removes its sources too. Its posts stay, as ordinary posts. Removing a source, or its topic, waits for a running sync of it: it's refused until the sync is done.
 - **Workspace webhooks and Slack channels** hear of synced changes (`post.created`, `post.updated`, `post.archived`, `post.published` and the rest) like any change, once the sync's run finishes. Each event is recorded after the post is in its topics, so channels decide who may see it by where it ended up. If a later step of a run fails, the changes earlier steps saved are still announced.

@@ -6397,6 +6397,34 @@ mod syncs {
     }
 
     #[test]
+    fn removing_a_source_or_its_topic_waits_for_its_sync() {
+        let mut h = H::new();
+        let (admin, _) = h.setup();
+        with_key(&mut h);
+        let topic = h.ok("POST", "/api/v1/topics", Some(json!({ "name": "Handbook" })), &admin)["id"].as_str().unwrap().to_string();
+        let input = json!({ "provider": "github", "repository": "acme/docs", "folder": "handbook", "topic_id": topic, "token": "ghp_x" });
+        let source = h.ok("POST", "/api/v1/docs-sources", Some(input), &admin)["source"]["id"].as_str().unwrap().to_string();
+        let repo = Repo::new(&[("README.md", b"# Handbook\n")]);
+        let answer = |c: &HttpCall| repo.github(c);
+        filled(drive(&h, job_of(&h.call("POST", &format!("/api/v1/docs-sources/{source}/sync"), None, &admin)), &answer).0);
+
+        // While a sync runs, neither the source nor its topic can go.
+        let running = job_of(&h.call("POST", &format!("/api/v1/docs-sources/{source}/sync"), None, &admin));
+        let r = h.call("DELETE", &format!("/api/v1/docs-sources/{source}"), None, &admin);
+        assert_eq!(r.status, 409, "{}", r.body);
+        assert!(r.body["error"]["message"].as_str().unwrap().contains("Try again"));
+        assert_eq!(h.call("DELETE", &format!("/api/v1/topics/{topic}"), None, &admin).status, 409);
+        assert_eq!(count(&h, "SELECT COUNT(*) FROM topics WHERE name = 'Handbook'"), 1);
+        drive(&h, running, &answer);
+
+        // Deleting the topic then removes its source the same way, and its posts stay.
+        h.ok("DELETE", &format!("/api/v1/topics/{topic}"), None, &admin);
+        assert_eq!(count(&h, "SELECT COUNT(*) FROM docs_sources"), 0);
+        assert_eq!(count(&h, "SELECT COUNT(*) FROM activity WHERE event = 'docs_source.deleted'"), 1);
+        assert_eq!(count(&h, "SELECT COUNT(*) FROM posts WHERE title = 'Handbook' AND deleted_at IS NULL"), 1);
+    }
+
+    #[test]
     fn github_app_routes_need_the_app() {
         let mut h = H::new();
         let (admin, _) = h.setup();
