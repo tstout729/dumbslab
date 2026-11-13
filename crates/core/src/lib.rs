@@ -11,6 +11,7 @@
 //! and the CLI, so agents can do anything a person can do in the web app.
 
 pub mod auth;
+pub mod backup;
 pub mod connect;
 pub mod db;
 pub mod embed;

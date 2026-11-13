@@ -25,7 +25,7 @@ use tokio::sync::{Semaphore, mpsc, oneshot};
 use tracing::{info, warn};
 
 use dumbslab::store::Store;
-use dumbslab::web;
+use dumbslab::{backup, web};
 
 /// Connected apps' settings from the environment: `DUMBSLAB_CONNECTOR_KEY` encrypts people's
 /// credentials, and `DUMBSLAB_<APP>_CLIENT_ID` / `_CLIENT_SECRET` (e.g. `DUMBSLAB_GITHUB_CLIENT_ID`,
@@ -128,6 +128,77 @@ enum Command {
         #[arg(long, default_value = "http://localhost:8080")]
         base_url: String,
     },
+    /// Copy every workspace's data from one deployment to another, or to an encrypted file
+    /// (see docs/cloudflare.md). Operator tokens come from FROM_OPERATOR_TOKEN and TO_OPERATOR_TOKEN.
+    Backup {
+        #[command(subcommand)]
+        command: BackupCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum BackupCommand {
+    /// Copy every object from one deployment into a fresh one, then check each table by row count
+    /// and checksum. The source is frozen first and stays frozen (undo with `thaw`). Running it
+    /// again resumes: objects already copied are only checked.
+    Copy {
+        /// The deployment to copy from: its root URL, or a native server's database file.
+        #[arg(long)]
+        from: String,
+        /// The fresh deployment to copy into: its workers.dev address until its domain moves, or a
+        /// native server's database file (one workspace: pick it with --object).
+        #[arg(long)]
+        to: Option<String>,
+        /// Also write an encrypted backup file (never overwritten). Its passphrase comes from
+        /// BACKUP_PASSPHRASE, at least 12 characters.
+        #[arg(long)]
+        save: Option<PathBuf>,
+        /// Only this object, e.g. `directory` or `ws:acme`. Repeat for more.
+        #[arg(long = "object")]
+        objects: Vec<String>,
+        /// Leave the source open. If its data changes during the copy, the check fails.
+        #[arg(long)]
+        no_freeze: bool,
+    },
+    /// Restore an encrypted backup file (from `copy --save`) into a fresh deployment.
+    Restore {
+        #[arg(long)]
+        file: PathBuf,
+        #[arg(long)]
+        to: String,
+        #[arg(long = "object")]
+        objects: Vec<String>,
+    },
+    /// Compare every object on two deployments, table by table.
+    Verify {
+        #[arg(long)]
+        from: String,
+        #[arg(long)]
+        to: String,
+        #[arg(long = "object")]
+        objects: Vec<String>,
+    },
+    /// Freeze a deployment's objects: they refuse requests until thawed. `copy` does this itself.
+    Freeze {
+        #[arg(long)]
+        from: String,
+        #[arg(long = "object")]
+        objects: Vec<String>,
+    },
+    /// Unfreeze a deployment's objects, e.g. to roll back a move.
+    Thaw {
+        #[arg(long)]
+        from: String,
+        #[arg(long = "object")]
+        objects: Vec<String>,
+    },
+    /// Wipe an object on the target whose restore didn't finish, so the next copy starts it over.
+    Abort {
+        #[arg(long)]
+        to: String,
+        #[arg(long)]
+        object: String,
+    },
 }
 
 /// Deliveries that may wait for one webhook. Each webhook gets one delivery at a time, so a slow
@@ -191,6 +262,77 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Call { operation, input, user, base_url } => {
             call(cli.db, cli.allow_private_webhooks, operation, input, user, base_url).await
+        }
+        Command::Backup { command } => backup_command(command).await,
+    }
+}
+
+/// One end of a backup: a deployment's URL (its operator token from `token_var`), or a native
+/// server's database file. A source file must exist.
+fn backup_end(arg: &str, token_var: &str, source: bool, objects: &[String]) -> anyhow::Result<backup::Endpoint> {
+    if arg.starts_with("https://") || arg.starts_with("http://") {
+        let token = std::env::var(token_var).map_err(|_| anyhow!("set {token_var} to the operator token of {arg}"))?;
+        return backup::Endpoint::http(arg, token);
+    }
+    let path = std::path::Path::new(arg);
+    if source && !path.exists() {
+        anyhow::bail!("{arg} doesn't exist");
+    }
+    // A local database holds one workspace; it goes by the one object named, if any.
+    let name = match objects {
+        [one] => one.as_str(),
+        _ => "main",
+    };
+    Ok(backup::Endpoint::local(open(path)?, name))
+}
+
+/// Prints the final table and fails when any object didn't make it.
+fn backup_report(outcomes: &[backup::Outcome]) -> anyhow::Result<()> {
+    println!("{}", backup::table(outcomes));
+    let failed = outcomes.iter().filter(|o| !o.status.ok()).count();
+    if failed > 0 {
+        return Err(anyhow!(
+            "{failed} object(s) didn't check out. FAILED ones resume when you run the same command again; \
+             DIFFERS means the two ends hold different rows in the tables named."
+        ));
+    }
+    Ok(())
+}
+
+async fn backup_command(command: BackupCommand) -> anyhow::Result<()> {
+    let passphrase = || std::env::var("BACKUP_PASSPHRASE").map_err(|_| anyhow!("set BACKUP_PASSPHRASE to the backup file's passphrase"));
+    match command {
+        BackupCommand::Copy { from, to, save, objects, no_freeze } => {
+            let source = backup_end(&from, "FROM_OPERATOR_TOKEN", true, &objects)?;
+            let target = to.as_deref().map(|t| backup_end(t, "TO_OPERATOR_TOKEN", false, &objects)).transpose()?;
+            let mut writer = save.as_deref().map(|p| backup::BackupWriter::create(p, &passphrase()?)).transpose()?;
+            let opts = backup::Options { objects, freeze: !no_freeze };
+            let outcomes = backup::copy(&source, target.as_ref(), writer.as_mut(), &opts).await?;
+            if let Some(w) = writer {
+                w.finish()?;
+            }
+            backup_report(&outcomes)
+        }
+        BackupCommand::Restore { file, to, objects } => {
+            let target = backup_end(&to, "TO_OPERATOR_TOKEN", false, &objects)?;
+            let mut reader = backup::BackupReader::open(&file, &passphrase()?)?;
+            let outcomes = backup::restore_file(&mut reader, &target, &objects).await?;
+            backup_report(&outcomes)
+        }
+        BackupCommand::Verify { from, to, objects } => {
+            let source = backup_end(&from, "FROM_OPERATOR_TOKEN", true, &objects)?;
+            let target = backup_end(&to, "TO_OPERATOR_TOKEN", true, &objects)?;
+            backup_report(&backup::verify(&source, &target, &objects).await?)
+        }
+        BackupCommand::Freeze { from, objects } => {
+            backup::freeze(&backup_end(&from, "FROM_OPERATOR_TOKEN", true, &objects)?, &objects).await.map(|_| ())
+        }
+        BackupCommand::Thaw { from, objects } => backup::thaw(&backup_end(&from, "FROM_OPERATOR_TOKEN", true, &objects)?, &objects).await,
+        BackupCommand::Abort { to, object } => {
+            let target = backup_end(&to, "TO_OPERATOR_TOKEN", false, std::slice::from_ref(&object))?;
+            target.call::<serde_json::Value>("restore/abort", &object, &serde_json::json!({})).await?;
+            eprintln!("wiped {object} on {}", target.label());
+            Ok(())
         }
     }
 }
@@ -345,6 +487,13 @@ async fn serve(
     telemetry: Telemetry,
 ) -> anyhow::Result<()> {
     let store = open(&db)?;
+    // A database a restore went into part-way holds part of its workspace.
+    if store.with_tx(|db| (dumbslab_core::backup::lock(db), true))?? == dumbslab_core::backup::Lock::Restoring {
+        anyhow::bail!(
+            "a restore into {} hasn't finished: run the same `dumbslab backup` command again, or wipe it with `dumbslab backup abort`",
+            db.display()
+        );
+    }
     let needs_setup = store.with_tx(|db| (db.scalar_i64("SELECT COUNT(*) FROM users", &[]), true))?? == 0;
     let setup_token = match (needs_setup && !open_setup, setup_token) {
         (true, None) => Some(dumbslab_core::util::new_secret("")),

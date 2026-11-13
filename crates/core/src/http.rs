@@ -27,6 +27,9 @@ pub fn body_limit(path: &str) -> usize {
     match path.trim_end_matches('/') {
         "/api/v1/files" | "/api/v1/operations/upload_file" | "/mcp" => MAX_UPLOAD_BODY,
         p if p.starts_with("/slack/") => crate::slack::MAX_BODY,
+        // An operator's restore page (see `backup`) on its way into an object. The front Worker
+        // checks the operator token before it reads one.
+        "/_internal/restore/page" => crate::backup::MAX_RESTORE_BODY,
         _ => MAX_BODY,
     }
 }

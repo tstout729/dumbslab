@@ -16,6 +16,7 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use chrono::Utc;
+use dumbslab_core::backup::{self, Lock};
 use dumbslab_core::connect::{self, Finish, HttpCall, Job, Step};
 use dumbslab_core::db::{Db, DbExt};
 use dumbslab_core::plan::{self, Capacity, Plan, Subscription};
@@ -63,6 +64,8 @@ pub struct Workspace {
     capacity: Rc<Cell<Capacity>>,
     /// When this workspace last reported its usage (Unix seconds).
     reported_at: Cell<i64>,
+    /// Whether it's frozen for a copy or being restored (see `backup::lock`), once read.
+    lock: Cell<Option<Lock>>,
 }
 
 fn rust_err(e: ApiError) -> worker::Error {
@@ -148,6 +151,47 @@ impl Workspace {
         Ok(())
     }
 
+    /// Whether this object takes requests: not while it's frozen for a copy or being restored.
+    fn lock(&self) -> Result<Lock> {
+        if let Some(lock) = self.lock.get() {
+            return Ok(lock);
+        }
+        let lock = backup::lock(&self.db()).map_err(rust_err)?;
+        self.lock.set(Some(lock));
+        Ok(lock)
+    }
+
+    /// An operator's backup or restore action (see `dumbslab_core::backup`), from the front Worker.
+    async fn backup(&self, path: &str, req: &mut Request) -> Result<Response> {
+        let action = backup::action(path).unwrap_or_default();
+        let Some(body) = read_body(req).await? else {
+            return error_response(413, "too_large", "request body too large");
+        };
+        // A workspace being copied first catches up with this code's schema, as on its next
+        // request: the copy goes to a deployment of the same code. (Not while restoring: the
+        // object is half written, and `stored` would remember a pointer before its row arrives.)
+        if path.starts_with("/_internal/backup/") && matches!(self.stored()?, Stored::Workspace) {
+            self.migrate()?;
+        }
+        let storage = self.state.storage();
+        let result = transaction(&storage, self.db(), move |db| {
+            let r = backup::handle(db, action, &body, &[backup::Kind::Workspace, backup::Kind::Alias]);
+            let ok = r.is_ok();
+            (r, ok)
+        })
+        .unwrap_or_else(|e| Err(ApiError::internal(format!("the backup action failed: {e}"))));
+        // What this object takes and holds may have changed: read it again on the next request.
+        self.lock.set(None);
+        *self.alias.borrow_mut() = None;
+        if action == "abort" {
+            self.migrated.set(false);
+        }
+        match result {
+            Ok(v) => json_response(200, &v),
+            Err(e) => api_error_response(&e),
+        }
+    }
+
     fn disabled(&self) -> Result<bool> {
         let row =
             self.db().one("SELECT value FROM settings WHERE key = 'disabled'", &[]).map_err(|e| worker::Error::RustError(e.message))?;
@@ -157,6 +201,13 @@ impl Workspace {
     /// Operator actions and address moves, reachable only from the front Worker and other objects
     /// (the Worker never forwards `/_internal`).
     async fn internal(&self, path: &str, req: &mut Request) -> Result<Response> {
+        if backup::action(path).is_some() {
+            return self.backup(path, req).await;
+        }
+        // A frozen object changes nothing until its copy is done; a restoring one isn't whole yet.
+        if let Some(e) = self.lock()?.refusal() {
+            return api_error_response(&e);
+        }
         match path {
             "/_internal/alias" => {
                 let home = req.json::<Value>().await.ok().and_then(|v| v["home"].as_str().map(str::to_string)).unwrap_or_default();
@@ -172,7 +223,7 @@ impl Workspace {
                 let pointer = home.clone();
                 let saved = transaction(&storage, self.db(), move |db| {
                     let r = db
-                        .execute_batch("CREATE TABLE IF NOT EXISTS alias (home TEXT NOT NULL)")
+                        .execute_batch(tenancy::ALIAS_SCHEMA)
                         .and_then(|_| db.execute("DELETE FROM alias", &[]))
                         .and_then(|_| db.execute("INSERT INTO alias (home) VALUES (?)", &params![pointer]));
                     let ok = r.is_ok();
@@ -349,6 +400,7 @@ impl DurableObject for Workspace {
             setup_blocked: Cell::new(false),
             capacity: Rc::new(Cell::new(Capacity::default())),
             reported_at: Cell::new(0),
+            lock: Cell::new(None),
         }
     }
 
@@ -357,6 +409,11 @@ impl DurableObject for Workspace {
         let path = url.path().to_string();
         if path.starts_with("/_internal/") {
             return self.internal(&path, &mut req).await;
+        }
+        if let Some(e) = self.lock()?.refusal() {
+            let mut resp = api_error_response(&e)?;
+            resp.headers_mut().set("retry-after", "120")?;
+            return Ok(resp);
         }
         let method = req.method();
         let origin = match url.port() {

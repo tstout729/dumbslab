@@ -181,6 +181,18 @@ Hosted workspaces are free at https://{root}/ with no credit card. Each workspac
     )
 }
 
+/// Checks the operator API's `Authorization: Bearer <token>` against the `OPERATOR_TOKEN` secret.
+/// Without that secret there's no operator API at all (404).
+pub fn operator_check(expected: Option<&str>, authorization: Option<&str>) -> ApiResult<()> {
+    let Some(expected) = expected.filter(|t| !t.is_empty()) else {
+        return Err(ApiError::not_found("not found"));
+    };
+    match authorization.and_then(|h| h.strip_prefix("Bearer ")) {
+        Some(t) if secure_eq(t.trim(), expected) => Ok(()),
+        _ => Err(ApiError::new(401, "unauthorized", "operator token required")),
+    }
+}
+
 /// A sign-up link token: `{expiry}.{HMAC(secret, "setup|{workspace}|{expiry}")}`.
 pub fn signup_token(secret: &str, workspace: &str, expires_unix: i64) -> String {
     format!("{expires_unix}.{}", hmac_sha256_hex(secret, &format!("setup|{workspace}|{expires_unix}")))
@@ -278,6 +290,10 @@ CREATE TABLE IF NOT EXISTS slack_homes (
   generation INTEGER NOT NULL DEFAULT 0
 );
 ";
+
+/// An address a workspace moved to keeps only this: the workspace's first address, whose object
+/// holds its data.
+pub const ALIAS_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS alias (home TEXT NOT NULL)";
 
 /// The most addresses one workspace can use, counting its first.
 pub const MAX_ADDRESSES: i64 = 5;
@@ -993,6 +1009,18 @@ mod tests {
         for want in ["POST https://kb.test/api/signup", "https://<address>.kb.test/mcp", "{\"workspace_name\": \"Acme\""] {
             assert!(llms.contains(want), "missing {want}");
         }
+    }
+
+    #[test]
+    fn operator_token() {
+        assert_eq!(operator_check(Some("s3cret"), Some("Bearer s3cret")).map_err(|e| e.status), Ok(()));
+        assert_eq!(operator_check(Some("s3cret"), Some("Bearer s3cret ")).map_err(|e| e.status), Ok(()));
+        for wrong in [None, Some("Bearer nope"), Some("s3cret"), Some("Basic s3cret"), Some("Bearer "), Some("Bearer s3cre")] {
+            assert_eq!(operator_check(Some("s3cret"), wrong).map_err(|e| e.status), Err(401), "{wrong:?}");
+        }
+        // No token configured: the operator API doesn't exist, whatever is sent.
+        assert_eq!(operator_check(None, Some("Bearer ")).map_err(|e| e.status), Err(404));
+        assert_eq!(operator_check(Some(""), Some("Bearer ")).map_err(|e| e.status), Err(404));
     }
 
     #[test]

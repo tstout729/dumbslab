@@ -2,7 +2,7 @@
 
 ## Layout
 
-- `crates/core`: everything that isn't transport or storage. Start at `src/lib.rs` (host contract), `src/registry.rs` (operations), `src/ops/*` (features), `src/model.rs` (visibility rules), `src/http.rs` (routing), `src/mcp.rs`, `src/oauth.rs`.
+- `crates/core`: everything that isn't transport or storage. Start at `src/lib.rs` (host contract), `src/registry.rs` (operations), `src/ops/*` (features), `src/model.rs` (visibility rules), `src/http.rs` (routing), `src/mcp.rs`, `src/oauth.rs`, `src/backup.rs` (the operator's backup and restore, which `dumbslab backup` drives).
 - `crates/server`: the `dumbslab` binary. `store.rs` implements the `Db` trait with rusqlite; `main.rs` is the axum host and CLI; `tests/api.rs` holds the end-to-end tests.
 - `crates/worker`: the Cloudflare host (wasm). It must stay a thin adapter. `lib.rs` routes by host (hosted mode: sign-up site on the root domain, one `Workspace` object per subdomain), `workspace.rs` runs the core, and `directory.rs` tracks addresses. Shared tenancy rules (address validation, signed sign-up links, directory SQL) live in `crates/core/src/tenancy.rs` so they're tested natively.
 - `web/`: the web app. Plain ES modules, no build step, no third-party code except the telemetry SDKs in `web/vendor` (loaded only when the host configures them; see `web/vendor/README.md`), CSP `script-src 'self'`.

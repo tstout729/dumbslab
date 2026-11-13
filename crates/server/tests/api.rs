@@ -2576,11 +2576,11 @@ mod connected {
     use super::*;
     use dumbslab_core::connect::{self, Finish, HttpCall, HttpReply, Job, OAuthApp, Step};
 
-    fn with_key(h: &mut H) {
+    pub(super) fn with_key(h: &mut H) {
         h.cfg.connectors.key = Some("connector-key".into());
     }
 
-    fn job_of(r: &Res) -> Job {
+    pub(super) fn job_of(r: &Res) -> Job {
         r.effects
             .iter()
             .find_map(|e| match e {
@@ -2592,7 +2592,7 @@ mod connected {
 
     /// Runs a job, answering each step's requests with `answer`. Returns how it finished and every
     /// request it made.
-    fn drive(h: &H, mut job: Job, answer: &dyn Fn(&HttpCall) -> HttpReply) -> (Finish, Vec<HttpCall>) {
+    pub(super) fn drive(h: &H, mut job: Job, answer: &dyn Fn(&HttpCall) -> HttpReply) -> (Finish, Vec<HttpCall>) {
         let mut replies = vec![];
         let mut sent = vec![];
         for _ in 0..connect::MAX_STEPS {
@@ -2616,7 +2616,7 @@ mod connected {
         panic!("job didn't finish");
     }
 
-    fn filled(r: &Res, finish: Finish) -> Value {
+    pub(super) fn filled(r: &Res, finish: Finish) -> Value {
         match finish {
             Finish::Fill(v) => connect::fill(r.body.clone(), Ok(v)).expect("a placeholder to fill"),
             other => panic!("expected a result, got {other:?}"),
@@ -2654,7 +2654,7 @@ mod connected {
     }
 
     /// GitHub, answering as the account `ada` in org `acme`.
-    fn github(call: &HttpCall) -> HttpReply {
+    pub(super) fn github(call: &HttpCall) -> HttpReply {
         let url = call.url.as_str();
         if url.ends_with("/user") {
             ok(json!({ "login": "ada" }))
@@ -2678,7 +2678,7 @@ mod connected {
         }
     }
 
-    fn connect_github(h: &H, auth: &Auth) {
+    pub(super) fn connect_github(h: &H, auth: &Auth) {
         let r = h.call("POST", "/api/v1/connections", Some(json!({ "app": "github", "fields": { "token": "ghp_secret_token" } })), auth);
         assert_eq!(r.status, 200, "{}", r.body);
         let (finish, sent) = drive(h, job_of(&r), &github);
@@ -13860,5 +13860,437 @@ mod syncs {
         assert!(matches!(step_with(&h, &mut a, a_refresh).0, Ok(Step::Done(Finish::Fail(_)))), "A lost its lease");
         assert_eq!(disconnected(), Value::Null, "A's tokens put it back");
         works();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Operator backup and restore (`dumbslab backup`). Two native databases stand in for a Durable
+// Object on each deployment; the copy goes through the same core calls the Worker makes.
+
+mod backups {
+    use super::*;
+    use dumbslab::backup::{self as tool, BackupReader, BackupWriter, Endpoint, Options, Status};
+    use dumbslab::store::Sqlite;
+    use dumbslab_core::backup::{self, Kind, Lock, PageRequest};
+    use dumbslab_core::db::{Db, SqlValue};
+
+    fn run<T>(f: impl std::future::Future<Output = T>) -> T {
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(f)
+    }
+
+    /// Another connection to a test server's database, as one end of a copy.
+    fn end(h: &H) -> Endpoint {
+        Endpoint::local(Store::open(&h._dir.path().join("t.db")).unwrap(), "main")
+    }
+
+    fn tx<T>(h: &H, f: impl FnOnce(&dyn Db) -> dumbslab_core::ApiResult<T>) -> dumbslab_core::ApiResult<T> {
+        h.store
+            .with_tx(|db| {
+                let r = f(db);
+                let ok = r.is_ok();
+                (r, ok)
+            })
+            .unwrap()
+    }
+
+    fn copy(from: &H, to: &H) -> Vec<tool::Outcome> {
+        run(tool::copy(&end(from), Some(&end(to)), None, &Options { objects: vec![], freeze: false })).unwrap()
+    }
+
+    fn statuses(outcomes: &[tool::Outcome]) -> Vec<Status> {
+        outcomes.iter().map(|o| o.status.clone()).collect()
+    }
+
+    fn same(a: &H, b: &H) {
+        let checked = run(tool::verify(&end(a), &end(b), &[])).unwrap();
+        assert_eq!(statuses(&checked), [Status::Same], "{}", tool::table(&checked));
+    }
+
+    /// A workspace with something in every kind of table that matters: people, sessions, tokens,
+    /// topics, posts and their history, comments and a reply, a file in several chunks, a sealed
+    /// connection, the search index and an `AUTOINCREMENT` counter ahead of its rows.
+    fn populated() -> (H, Auth, Auth, Vec<u8>, String) {
+        let mut h = H::new();
+        super::connected::with_key(&mut h);
+        let (cookie, admin) = h.setup();
+        let (_, member) = h.user(&admin, "mo@acme.test", "Mo Member", "member");
+        let topic = h.ok("POST", "/api/v1/topics", Some(json!({ "name": "Runbooks" })), &admin);
+        let tid = topic["id"].as_str().unwrap().to_string();
+        let child = h.ok("POST", "/api/v1/topics", Some(json!({ "name": "Deploys" })), &admin);
+        // The older topic moves under the newer one: its row refers to a later row.
+        h.ok("PATCH", &format!("/api/v1/topics/{tid}"), Some(json!({ "parent_id": child["id"] })), &admin);
+        let bytes: Vec<u8> = (0..2_500_000u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8).collect();
+        let file = upload(&h, &member, "dump.bin", Some("application/octet-stream"), &bytes, None);
+        assert_eq!(file.status, 200, "{}", file.body);
+        let path = file.body["path"].as_str().unwrap().to_string();
+        let post = h.ok(
+            "POST",
+            "/api/v1/posts",
+            Some(json!({ "title": "Zebracorn deploys", "content": format!("Steps.\n\n[dump]({path})"), "status": "published", "topic_ids": [tid] })),
+            &member,
+        );
+        let pid = post["id"].as_str().unwrap().to_string();
+        h.ok("PATCH", &format!("/api/v1/posts/{pid}"), Some(json!({ "content": format!("Steps, revised.\n\n[dump]({path})") })), &member);
+        let comment = h.ok("POST", &format!("/api/v1/posts/{pid}/comments"), Some(json!({ "body": "Looks good" })), &admin);
+        let cid = comment["id"].as_str().or_else(|| comment["comment"]["id"].as_str()).unwrap().to_string();
+        h.ok("POST", &format!("/api/v1/posts/{pid}/comments"), Some(json!({ "body": "Thanks", "parent_id": cid })), &member);
+        // A deleted post leaves the search index's counter ahead of its rows.
+        let gone = h.ok("POST", "/api/v1/posts", Some(json!({ "title": "Scratch", "content": "x", "status": "published" })), &admin);
+        h.ok("DELETE", &format!("/api/v1/posts/{}?permanent=true", gone["id"].as_str().unwrap()), None, &admin);
+        super::connected::connect_github(&h, &admin);
+        (h, cookie, admin, bytes, path)
+    }
+
+    #[test]
+    fn a_workspace_copies_whole_and_people_stay_signed_in() {
+        let (src, cookie, admin, bytes, path) = populated();
+        let mut dst = H::new();
+        super::connected::with_key(&mut dst);
+        let before = tx(&src, |db| backup::manifest(db)).unwrap();
+        assert!(before.tables.iter().any(|t| t.name == "search_index" && t.virtual_table && t.rows > 0));
+        assert!(before.tables.iter().all(|t| !t.name.starts_with("search_index_")), "the index's own storage isn't copied");
+        assert!(before.sequences.iter().any(|q| q.name == "search_docs"));
+        let pos = |n: &str| before.tables.iter().position(|t| t.name == n).unwrap();
+        assert!(pos("users") < pos("posts") && pos("posts") < pos("comments") && pos("files") < pos("file_chunks"));
+
+        let outcomes = copy(&src, &dst);
+        assert_eq!(statuses(&outcomes), [Status::Copied], "{}", tool::table(&outcomes));
+        assert_eq!(outcomes[0].source, outcomes[0].target);
+        same(&src, &dst);
+        let after = tx(&dst, |db| backup::manifest(db)).unwrap();
+        assert_eq!(after.sequences, before.sequences);
+        assert_eq!(tx(&dst, |db| backup::lock(db)).unwrap(), Lock::Open);
+
+        // The same session cookie and API token work on the copy, and so do passwords.
+        let state = dst.ok("GET", "/api/v1/auth/state", None, &cookie);
+        assert_eq!(state["user"]["email"], "ada@acme.test", "{state}");
+        assert_eq!(dst.ok("GET", "/api/v1/posts", None, &admin)["items"], src.ok("GET", "/api/v1/posts", None, &admin)["items"]);
+        let mo = sign_in(&dst, "mo@acme.test", "password123");
+        sign_in(&dst, "ada@acme.test", "correct horse");
+        // The file's chunks, the search index and the topic tree came along.
+        assert_eq!(fetch(&dst, &path, &mo).bytes, bytes);
+        let found = dst.ok("GET", "/api/v1/search?q=zebracorn", None, &mo)["items"].clone();
+        assert!(!found.as_array().unwrap().is_empty());
+        assert_eq!(found, dst.ok("GET", "/api/v1/search?q=zebracorn", None, &admin)["items"]);
+        assert_eq!(found, src.ok("GET", "/api/v1/search?q=zebracorn", None, &admin)["items"]);
+        assert_eq!(dst.ok("GET", "/api/v1/topics", None, &admin), src.ok("GET", "/api/v1/topics", None, &admin));
+        // The sealed GitHub token opens with the same connector key.
+        let r = dst.call("GET", "/api/v1/connections/preview?url=https%3A%2F%2Fgithub.com%2Facme%2Fapi%2Fissues%2F7", None, &admin);
+        let (finish, sent) = super::connected::drive(&dst, super::connected::job_of(&r), &super::connected::github);
+        assert!(sent.iter().all(|c| c.headers.contains(&("authorization".into(), "Bearer ghp_secret_token".into()))));
+        assert_eq!(super::connected::filled(&r, finish)["preview"]["reference"], "acme/api #7");
+
+        // New rows continue after the source's counters, never reusing an id.
+        let top = |h: &H| count(h, "SELECT seq FROM sqlite_sequence WHERE name = 'search_docs'");
+        let seq = top(&dst);
+        dst.ok("POST", "/api/v1/posts", Some(json!({ "title": "After the move", "content": "y", "status": "published" })), &admin);
+        assert!(count(&dst, "SELECT MAX(id) FROM search_docs") > seq);
+        // Copying again changes nothing: it only checks.
+        let again = run(tool::copy(&end(&src), Some(&end(&dst)), None, &Options::default())).unwrap();
+        assert!(matches!(&again[0].status, Status::Differs(t) if t.contains(&"posts".to_string())), "the target moved on: {again:?}");
+    }
+
+    #[test]
+    fn copies_refuse_a_target_with_data_or_another_schema() {
+        let (src, ..) = populated();
+        // A target someone already set up keeps its own data.
+        let dst = H::new();
+        let (theirs, _) = dst.setup();
+        let outcomes = copy(&src, &dst);
+        assert!(matches!(&outcomes[0].status, Status::Differs(_)), "{outcomes:?}");
+        assert_eq!(dst.ok("GET", "/api/v1/auth/state", None, &theirs)["user"]["email"], "ada@acme.test");
+        assert_eq!(count(&dst, "SELECT COUNT(*) FROM users"), 1);
+        let manifest = tx(&src, |db| backup::manifest(db)).unwrap();
+        let refused = tx(&dst, |db| backup::begin(db, &[Kind::Workspace], &manifest)).unwrap_err();
+        assert_eq!((refused.status, refused.code), (409, "not_empty"));
+
+        // Another schema version, or other tables, are refused and leave nothing behind.
+        let empty = H::new();
+        for change in [
+            (&|m: &mut backup::Manifest| m.schema_version = Some(3)) as &dyn Fn(&mut backup::Manifest),
+            &|m| m.schema = "0".repeat(64),
+            &|m| m.format = 99,
+        ] {
+            let mut m = manifest.clone();
+            change(&mut m);
+            let e = tx(&empty, |db| backup::begin(db, &[Kind::Workspace], &m)).unwrap_err();
+            assert!(matches!(e.code, "schema_mismatch" | "bad_request"), "{}", e.message);
+            assert_eq!(tx(&empty, |db| backup::lock(db)).unwrap(), Lock::Open);
+        }
+        // A workspace object takes no directory, and pages need a restore under way.
+        let mut dir = manifest.clone();
+        dir.kind = Kind::Directory;
+        assert_eq!(tx(&empty, |db| backup::begin(db, &[Kind::Workspace, Kind::Alias], &dir)).unwrap_err().status, 400);
+        let page = tx(&src, |db| backup::dump(db, &PageRequest { table: "users".into(), after: None })).unwrap();
+        assert_eq!(tx(&empty, |db| backup::restore(db, &page)).unwrap_err().code, "not_restoring");
+        assert_eq!(count(&empty, "SELECT COUNT(*) FROM users"), 0);
+    }
+
+    #[test]
+    fn a_restore_cut_short_resumes_and_pages_can_be_sent_twice() {
+        let (src, cookie, ..) = populated();
+        let dst = H::new();
+        let manifest = tx(&src, |db| backup::manifest(db)).unwrap();
+        assert!(!tx(&dst, |db| backup::begin(db, &[Kind::Workspace], &manifest)).unwrap().resumed);
+        // The first page of each table arrives, some twice (a retried request); then the
+        // connection drops.
+        let mut chunk_pages = 0;
+        for t in &manifest.tables {
+            let page = tx(&src, |db| backup::dump(db, &PageRequest { table: t.name.clone(), after: None })).unwrap();
+            for _ in 0..2 {
+                assert_eq!(tx(&dst, |db| backup::restore(db, &page)).unwrap().rows, page.count);
+            }
+            if t.name == "file_chunks" {
+                assert!(page.next.is_some(), "a 2.5 MB file takes more than one page");
+                chunk_pages += 1;
+            }
+        }
+        assert_eq!(chunk_pages, 1);
+        // A damaged page is refused whole.
+        let mut page = tx(&src, |db| backup::dump(db, &PageRequest { table: "posts".into(), after: None })).unwrap();
+        page.rows[0][1] = backup::Cell::Text("tampered".into());
+        assert_eq!(tx(&dst, |db| backup::restore(db, &page)).unwrap_err().status, 400);
+        // Unfinished, the restore can't be finished and the object refuses requests.
+        assert_eq!(tx(&dst, |db| backup::finish(db, &manifest)).unwrap_err().code, "verify_failed");
+        assert_eq!(tx(&dst, |db| backup::lock(db)).unwrap(), Lock::Restoring);
+        assert_eq!(Lock::Restoring.refusal().unwrap().status, 503);
+
+        // Running the copy again picks up where it stopped.
+        let outcomes = copy(&src, &dst);
+        assert_eq!(statuses(&outcomes), [Status::Copied], "{}", tool::table(&outcomes));
+        same(&src, &dst);
+        assert_eq!(dst.ok("GET", "/api/v1/auth/state", None, &cookie)["user"]["email"], "ada@acme.test");
+        // Finishing twice changes nothing.
+        assert!(tx(&dst, |db| backup::finish(db, &manifest)).unwrap().already_finished);
+    }
+
+    #[test]
+    fn an_unfinished_restore_can_be_wiped_and_started_over() {
+        let (src, ..) = populated();
+        let dst = H::new();
+        let manifest = tx(&src, |db| backup::manifest(db)).unwrap();
+        tx(&dst, |db| backup::begin(db, &[Kind::Workspace], &manifest)).unwrap();
+        let page = tx(&src, |db| backup::dump(db, &PageRequest { table: "users".into(), after: None })).unwrap();
+        tx(&dst, |db| backup::restore(db, &page)).unwrap();
+        tx(&dst, |db| backup::abort(db)).unwrap();
+        assert_eq!(count(&dst, "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"), 0);
+        // Only an unfinished restore can be wiped.
+        assert_eq!(tx(&src, |db| backup::abort(db)).unwrap_err().code, "not_restoring");
+        assert!(count(&src, "SELECT COUNT(*) FROM users") > 0);
+        let outcomes = copy(&src, &dst);
+        assert_eq!(statuses(&outcomes), [Status::Copied]);
+        same(&src, &dst);
+    }
+
+    #[test]
+    fn frozen_objects_refuse_requests_and_the_freeze_stays_behind() {
+        let (src, ..) = populated();
+        assert!(tx(&src, |db| backup::freeze(db)).unwrap());
+        assert_eq!(tx(&src, |db| backup::lock(db)).unwrap(), Lock::Frozen);
+        assert_eq!(Lock::Frozen.refusal().unwrap().code, "moving");
+        assert!(tx(&src, |db| backup::manifest(db)).unwrap().frozen);
+        let dst = H::new();
+        assert_eq!(statuses(&copy(&src, &dst)), [Status::Copied]);
+        assert_eq!(tx(&dst, |db| backup::lock(db)).unwrap(), Lock::Open, "the target takes requests");
+        tx(&src, |db| backup::thaw(db)).unwrap();
+        assert_eq!(tx(&src, |db| backup::lock(db)).unwrap(), Lock::Open);
+        // An object with no tables has nothing to freeze, and gets no storage for it.
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        assert!(!backup::freeze(&Sqlite(&conn)).unwrap());
+        assert_eq!(backup::manifest(&Sqlite(&conn)).unwrap().kind, Kind::Empty);
+    }
+
+    #[test]
+    fn an_encrypted_backup_file_restores_and_refuses_a_wrong_passphrase_or_a_cut() {
+        let (src, cookie, ..) = populated();
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("dumbslab.backup");
+        let mut writer = BackupWriter::create(&file, "correct horse battery staple").unwrap();
+        let saved = run(tool::copy(&end(&src), None, Some(&mut writer), &Options::default())).unwrap();
+        writer.finish().unwrap();
+        assert_eq!(statuses(&saved), [Status::Saved]);
+        assert!(BackupWriter::create(&file, "correct horse battery staple").is_err(), "never overwritten");
+        let raw = std::fs::read(&file).unwrap();
+        assert!(!raw.windows(15).any(|w| w == b"Zebracorn deplo"), "nothing readable in the file");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+
+        let dst = H::new();
+        let mut reader = BackupReader::open(&file, "correct horse battery staple").unwrap();
+        let restored = run(tool::restore_file(&mut reader, &end(&dst), &[])).unwrap();
+        assert_eq!(statuses(&restored), [Status::Copied], "{}", tool::table(&restored));
+        same(&src, &dst);
+        assert_eq!(dst.ok("GET", "/api/v1/auth/state", None, &cookie)["user"]["email"], "ada@acme.test");
+
+        let mut wrong = BackupReader::open(&file, "battery staple horse correct").unwrap();
+        assert!(wrong.next_record().is_err());
+        // Cut short, the last object isn't finished: it stays an unfinished restore.
+        let cut = dir.path().join("cut.backup");
+        std::fs::write(&cut, &raw[..raw.len() - 100]).unwrap();
+        let dst = H::new();
+        let mut reader = BackupReader::open(&cut, "correct horse battery staple").unwrap();
+        let restored = run(tool::restore_file(&mut reader, &end(&dst), &[])).unwrap();
+        assert!(matches!(&restored[0].status, Status::Failed(_)), "{restored:?}");
+        assert_eq!(tx(&dst, |db| backup::lock(db)).unwrap(), Lock::Restoring);
+    }
+
+    /// Copies a database into another with the core alone, page by page.
+    fn copy_db(src: &dyn Db, dst: &dyn Db, allowed: &[Kind]) -> usize {
+        let m = backup::manifest(src).unwrap();
+        backup::begin(dst, allowed, &m).unwrap();
+        let mut pages = 0;
+        for t in &m.tables {
+            let mut after = None;
+            loop {
+                let page = backup::dump(src, &PageRequest { table: t.name.clone(), after }).unwrap();
+                backup::restore(dst, &page).unwrap();
+                pages += 1;
+                after = page.next;
+                if after.is_none() {
+                    break;
+                }
+            }
+        }
+        backup::finish(dst, &m).unwrap();
+        pages
+    }
+
+    fn totals(db: &dyn Db) -> Vec<(String, i64, String)> {
+        let m = backup::manifest(db).unwrap();
+        m.tables
+            .iter()
+            .map(|t| {
+                let (mut sum, mut after) = (backup::Checksum::default(), None);
+                loop {
+                    let s = backup::summary(db, &PageRequest { table: t.name.clone(), after }).unwrap();
+                    sum.merge(backup::Checksum::parse(s.count, &s.checksum).unwrap());
+                    after = s.next;
+                    if after.is_none() {
+                        break;
+                    }
+                }
+                (t.name.clone(), sum.rows, sum.hex())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_directory_copies_whole() {
+        use chrono::Utc;
+        use dumbslab_core::tenancy::{self, Limits, SlackInstall};
+        let (a, b) = (rusqlite::Connection::open_in_memory().unwrap(), rusqlite::Connection::open_in_memory().unwrap());
+        let (src, dst) = (Sqlite(&a), Sqlite(&b));
+        let limits = Limits { per_ip_per_day: 50, per_day: 50, max_workspaces: 50, free: ROOMY };
+        let now = Utc::now();
+        tenancy::directory_migrate(&src).unwrap();
+        for slug in ["acme", "beta", "held"] {
+            tenancy::reserve(&src, slug, "Name", "ip", now, limits).unwrap();
+        }
+        for slug in ["acme", "beta"] {
+            tenancy::activate(&src, slug, now).unwrap();
+        }
+        tenancy::move_address(&src, "acme", "wiki", now).unwrap();
+        tenancy::link_customer(&src, "cus_1", "acme", now).unwrap();
+        tenancy::record_subscription(&src, "cus_1", "sub_1", "active", now).unwrap();
+        tenancy::link_installation(&src, 42, "beta", true, now).unwrap();
+        tenancy::report_usage(&src, "acme", "pro", 120, 4096, now).unwrap();
+        let install = SlackInstall {
+            team_id: "T0123".into(),
+            bot_token: "v1.sealed-bot-token".into(),
+            token_fingerprint: "f".repeat(64),
+            bot_user_id: Some("U1".into()),
+            team_name: "Acme".into(),
+            scopes: "commands".into(),
+        };
+        tenancy::slack_install(&src, "acme", &install, 0, now).unwrap();
+
+        let names: Vec<(String, Kind)> = backup::directory_objects(&src).unwrap().into_iter().map(|o| (o.name, o.kind)).collect();
+        let want = [
+            ("directory", Kind::Directory),
+            ("ws:acme", Kind::Workspace),
+            ("ws:beta", Kind::Workspace),
+            ("ws:held", Kind::Workspace),
+            ("ws:wiki", Kind::Alias),
+        ];
+        assert_eq!(names, want.map(|(n, k)| (n.to_string(), k)));
+        assert_eq!(backup::manifest(&src).unwrap().kind, Kind::Directory);
+
+        // A fresh directory has its schema already; it holds no rows, so it qualifies.
+        tenancy::directory_migrate(&dst).unwrap();
+        // A workspace object takes no directory.
+        let m = backup::manifest(&src).unwrap();
+        assert_eq!(backup::begin(&dst, &[Kind::Workspace, Kind::Alias], &m).unwrap_err().status, 400);
+        copy_db(&src, &dst, &[Kind::Directory]);
+        assert_eq!(totals(&src), totals(&dst));
+        let list = |db: &dyn Db| serde_json::to_value(tenancy::list(db).unwrap()).unwrap();
+        assert_eq!(list(&dst), list(&src));
+        assert_eq!(tenancy::resolve(&dst, "wiki").unwrap(), Some(("acme".into(), vec!["wiki".into()])));
+        assert_eq!(tenancy::slack_token(&dst, "T0123", "acme").unwrap().unwrap().bot_token, "v1.sealed-bot-token");
+        assert!(tenancy::paying(&dst, "acme").unwrap());
+        assert_eq!(tenancy::installation_targets(&dst, 42).unwrap(), [("beta".to_string(), "beta".to_string())]);
+        // A directory with data refuses another copy.
+        assert_eq!(backup::begin(&dst, &[Kind::Directory], &m).unwrap_err().code, "not_empty");
+
+        // An alias object: just its pointer.
+        let (c, d) = (rusqlite::Connection::open_in_memory().unwrap(), rusqlite::Connection::open_in_memory().unwrap());
+        Sqlite(&c).execute_batch(tenancy::ALIAS_SCHEMA).unwrap();
+        Sqlite(&c).execute("INSERT INTO alias (home) VALUES ('acme')", &[]).unwrap();
+        copy_db(&Sqlite(&c), &Sqlite(&d), &[Kind::Workspace, Kind::Alias]);
+        assert_eq!(Sqlite(&d).one("SELECT home FROM alias", &[]).unwrap().unwrap().str("home"), "acme");
+    }
+
+    #[test]
+    fn pages_follow_composite_keys_and_rows_that_refer_to_later_rows() {
+        let schema = "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            INSERT INTO meta (key, value) VALUES ('schema_version', '7');
+            CREATE TABLE pairs (a TEXT NOT NULL, b INTEGER NOT NULL, v BLOB, r REAL, PRIMARY KEY (a, b)) WITHOUT ROWID;
+            CREATE TABLE nodes (id TEXT PRIMARY KEY, parent TEXT REFERENCES nodes(id), note TEXT);";
+        let open = || {
+            let c = rusqlite::Connection::open_in_memory().unwrap();
+            c.execute_batch("PRAGMA foreign_keys = ON").unwrap();
+            c.execute_batch(schema).unwrap();
+            c
+        };
+        let (a, b) = (open(), open());
+        let src = Sqlite(&a);
+        for i in 0..2_600i64 {
+            src.execute(
+                "INSERT INTO pairs (a, b, v, r) VALUES (?, ?, ?, ?)",
+                &[
+                    SqlValue::Text(format!("k{}", i % 7)),
+                    SqlValue::Integer(i),
+                    SqlValue::Blob(vec![(i % 256) as u8; (i % 5) as usize]),
+                    SqlValue::Real(i as f64 / 3.0),
+                ],
+            )
+            .unwrap();
+        }
+        // The first node is inserted first but points at the second.
+        src.execute_batch(
+            "INSERT INTO nodes (id, parent) VALUES ('n1', NULL), ('n2', NULL); UPDATE nodes SET parent = 'n2' WHERE id = 'n1';",
+        )
+        .unwrap();
+        let m = backup::manifest(&src).unwrap();
+        let pairs = m.tables.iter().find(|t| t.name == "pairs").unwrap();
+        assert_eq!(pairs.key, ["a", "b"]);
+        assert_eq!(pairs.columns, ["a", "b", "r", "v"], "no rowid in a WITHOUT ROWID table");
+        let nodes = m.tables.iter().find(|t| t.name == "nodes").unwrap();
+        assert_eq!(nodes.key, ["rowid"]);
+        // The target gets each run of pages in its own transaction, foreign keys enforced.
+        let dst = Sqlite(&b);
+        dst.execute_batch("DELETE FROM meta").unwrap();
+        dst.execute("INSERT INTO meta (key, value) VALUES ('schema_version', '7')", &[]).unwrap();
+        b.execute_batch("BEGIN").unwrap();
+        let pages = copy_db(&src, &dst, &[Kind::Workspace]);
+        b.execute_batch("COMMIT").unwrap();
+        assert!(pages >= 4, "2,600 rows take three pages, and nodes one: {pages}");
+        assert_eq!(totals(&src), totals(&dst));
+        let ordered = |db: &Sqlite| -> Vec<(String, i64)> {
+            db.query("SELECT a, b FROM pairs ORDER BY a, b", &[]).unwrap().iter().map(|r| (r.str("a"), r.i64("b"))).collect()
+        };
+        assert_eq!(ordered(&dst), ordered(&src));
     }
 }

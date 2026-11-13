@@ -18,7 +18,7 @@ There are two modes:
 
 - A Cloudflare account on the **Workers Paid** plan. Password hashing (Argon2) needs more than the free plan's 10 ms of CPU per request.
 - Rust with the `wasm32-unknown-unknown` target: `rustup target add wasm32-unknown-unknown`.
-- `worker-build`: `cargo install worker-build`.
+- `worker-build` for the `worker` crate's version (0.8): `cargo install worker-build@^0.8 --locked`. Version 0.9 refuses to build `worker` 0.8.
 - Wrangler 4.
 
 ## Hosted mode (multi-tenant)
@@ -128,7 +128,7 @@ With DumbSlab's Slack app set up (`SLACK_CLIENT_ID` in `[vars]`, and the `SLACK_
 
 ### Operator API
 
-Manage workspaces with `Authorization: Bearer $OPERATOR_TOKEN` on the root domain:
+Manage workspaces with `Authorization: Bearer $OPERATOR_TOKEN`. The operator API answers on the root domain and on any address of the Worker that isn't a workspace's, such as its `*.workers.dev` address, so a deployment that has no domain yet can be managed and restored. Workspace addresses never serve it.
 
 ```sh
 curl -H "Authorization: Bearer $OPERATOR_TOKEN" https://your-domain/api/operator/workspaces
@@ -196,6 +196,70 @@ The `dev` environment runs hosted mode on `localhost` with throwaway secrets: op
 
 - Admins can export a workspace as JSON with the `export_workspace` operation: `GET /api/v1/export`.
 - Durable Objects support point-in-time recovery for 30 days. See Cloudflare's [PITR API](https://developers.cloudflare.com/durable-objects/api/sqlite-storage-api/#pitr-point-in-time-recovery-api).
+- The operator can copy every object's data to another deployment, or to an encrypted file, with `dumbslab backup` (below). That's how DumbSlab moves to another Cloudflare account, and how to rebuild a deployment from scratch.
+
+### Operator backup and restore
+
+`dumbslab backup` copies every Durable Object's tables, row for row, from one deployment into the same-named objects of a fresh deployment of the same commit. It talks to both through the operator API, a page at a time (about 2 MB), and writes nothing to disk unless you ask for a file.
+
+```sh
+export FROM_OPERATOR_TOKEN=...   # the source's OPERATOR_TOKEN
+export TO_OPERATOR_TOKEN=...     # the target's
+cargo run --release -p dumbslab -- backup copy --from https://dumbslab.com --to https://dumbslab.<subdomain>.workers.dev
+```
+
+What it does, in order:
+
+1. **Lists the objects** from the source's directory: the `directory` object itself, each workspace's home object (`ws:<first address>`), and each address a workspace moved to (`ws:<address>`, which only points home). Addresses reserved but never set up hold nothing and are skipped.
+2. **Freezes the source**, directory first: no sign-ups, moves or writes from then on. Every request to a frozen workspace gets `503 moving` with `Retry-After`, reads included (reading a post records a view). Stripe retries its webhooks later; Slack commands and GitHub deliveries in the window fail. The source stays frozen; `dumbslab backup thaw --from <url>` reopens it.
+3. **Copies each object**: its manifest (tables in restore order, columns, row counts, schema version and a digest of the schema), then each table page by page in rowid or primary-key order. Blobs travel as base64 and each page carries a checksum the target checks.
+4. **Checks each object**: every table's row count and checksum on the target against a fresh read of the source, and the `AUTOINCREMENT` counters. Only then does the target's restore finish.
+
+It prints progress, then a table with one line per object: its tables, rows, a digest of each end, and the result. It exits non-zero if any object failed or differs.
+
+What the target allows:
+
+- **Only an object with no data.** A freshly migrated empty schema is fine; anything else is refused with `409 not_empty`, and the copy only compares it.
+- **Only the same schema.** Both ends must be at the same migration with the same tables, or the restore is refused with `409 schema_mismatch` and leaves nothing behind. Deploy the same commit on both. A source workspace first catches up with its code's migrations, as it would on its next request.
+- **Resuming.** Every page can be sent twice: rows already there stay. A copy that stops part-way resumes when you run the same command again; objects already copied are only checked. While an object's restore is unfinished it answers `503 restoring`. `dumbslab backup abort --to <url> --object <name>` wipes an unfinished restore to start it over; it refuses any other object.
+
+What's copied: every table, sessions and API tokens included, so people stay signed in. Connected apps' credentials, Slack bot tokens and other sealed secrets are copied as they are, encrypted with `CONNECTOR_KEY`, so the target needs the same key. The freeze and restore marks themselves are never copied, and neither is Cloudflare's key-value storage, which DumbSlab doesn't use. The full-text index is copied through its rows and rebuilt by SQLite.
+
+Other commands:
+
+| Command | Does |
+| --- | --- |
+| `backup copy ... --save FILE` | Also writes an encrypted backup file (AES-256-GCM, key from `BACKUP_PASSPHRASE` with Argon2id). Without `--to`, it only writes the file. The file is owner-only and never overwritten. |
+| `backup restore --file FILE --to <url>` | Restores such a file into a fresh deployment, checking each object against the rows the file holds. A file cut short leaves its last object unfinished. |
+| `backup verify --from <url> --to <url>` | Compares every object on two deployments, table by table. |
+| `backup freeze` / `backup thaw --from <url>` | Freezes or reopens a deployment's objects. |
+| `--object <name>` | Limits any command to that object (repeatable). |
+
+Either end can also be a native server's database file, which holds one workspace: `--from https://dumbslab.com --object ws:acme --to acme.db` copies one hosted workspace into a file `dumbslab serve` can run. A native server won't start on a database whose restore is unfinished.
+
+The routes behind it, all needing the operator token: `GET /api/operator/backup/objects`, `POST /api/operator/backup/{manifest,dump,summary,freeze,thaw}?object=<name>` and `POST /api/operator/restore/{begin,page,finish,abort}?object=<name>`. The logic lives in `crates/core/src/backup.rs`.
+
+## Moving to another Cloudflare account
+
+Durable Objects can't move between accounts, so the data is copied into a fresh deployment with `dumbslab backup copy`. Plan for a few minutes when every workspace answers `503 moving`, plus the time the domain takes to move, and tell people beforehand.
+
+1. **Workers Paid** on the new account.
+2. **Deploy the same commit there, on workers.dev only.** The checked-in routes need the domain, which is still on the old account, so deploy a copy of the config without them. Keep the Worker's name: its Durable Objects belong to it, and step 6 must deploy over the same Worker.
+
+   ```sh
+   cd crates/worker
+   perl -0pe 's/^routes = \[.*?^\]\n/workers_dev = true\n/ms' wrangler.toml > wrangler.move.toml
+   CLOUDFLARE_ACCOUNT_ID=<new account> npx wrangler deploy --config wrangler.move.toml
+   ```
+
+   The old deployment must run this commit too (merging to `main` deploys it), so both ends speak the same backup format and schema. `curl https://dumbslab.com/healthz` shows the old one's `git_sha`; the new one has no domain yet and answers only the operator API, where `curl -H "Authorization: Bearer $TO_OPERATOR_TOKEN" https://dumbslab.<subdomain>.workers.dev/api/operator/backup/objects` shows its `git_sha`. `backup copy` also says when they differ.
+3. **Secrets.** On the new Worker set the same `CONNECTOR_KEY` (sealed credentials need it) and fresh `SIGNUP_SECRET` and `OPERATOR_TOKEN`, each with `CLOUDFLARE_ACCOUNT_ID=<new account> npx wrangler secret put <NAME> --config wrangler.move.toml`. Set the other secrets with the values the old Worker uses, from wherever you keep them (Cloudflare never shows a secret again): Stripe, Slack, the GitHub App and the sign-in apps are registered to the domain, which doesn't change.
+4. **Freeze the old deployment.** `backup copy` does it first thing, directory then every workspace, and leaves it frozen. Nothing is disabled: workspaces disabled for abuse stay disabled, and nobody needs to re-enable anything on the new deployment.
+5. **Copy, then check.** Run the `backup copy` command above with `--from https://dumbslab.com --to https://dumbslab.<subdomain>.workers.dev`, and `--save backup.dslab` for a copy on disk if you want one. Every line of its table must read `copied, verified` (or `empty, skipped`). If one fails, run the same command again. `backup verify` repeats the check any time.
+6. **Move the domain, then attach the routes.** Remove the old Worker's routes and custom domains, move the `dumbslab.com` zone to the new account, and add the wildcard DNS record again (type `AAAA`, name `*`, content `100::`, proxied). Then deploy with the checked-in config, which attaches the routes: `CLOUDFLARE_ACCOUNT_ID=<new account> npx wrangler deploy`. Delete `wrangler.move.toml`.
+7. **Re-enable.** The freeze isn't copied, so the new deployment takes requests as soon as the routes attach. Check `curl https://dumbslab.com/healthz`, sign in to a workspace (existing sessions keep working), and list the workspaces with the operator API.
+8. **Keep the old deployment** frozen, unchanged, until the new one has run for a while. Then delete the old Worker, which deletes its Durable Objects.
+9. **Rolling back.** Until the domain moves, `dumbslab backup thaw --from https://dumbslab.com` reopens the old deployment as it was. After that, move the domain back and thaw. Either account can also restore any object to any point in the last 30 days with point-in-time recovery, which is the rollback for data itself.
 
 ## Optional Sentry error reporting
 

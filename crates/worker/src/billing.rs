@@ -137,7 +137,10 @@ async fn handle(env: &Env, event: &Value) -> Result<()> {
             };
             if let Some(customer) = customer {
                 console_warn!("stripe {kind} for customer {customer}");
-                directory(env, "/billing/risk", json!({ "customer": customer, "kind": kind })).await?;
+                let (status, _) = directory(env, "/billing/risk", json!({ "customer": customer, "kind": kind })).await?;
+                if status != 200 {
+                    return Err(Error::RustError(format!("noting a {kind} for {customer}: directory answered {status}")));
+                }
             }
             Ok(())
         }
