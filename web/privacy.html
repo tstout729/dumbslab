@@ -1,0 +1,243 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Privacy Policy · DumbSlab</title>
+<meta name="description" content="What hosted DumbSlab stores, what it reads from the apps you connect, who helps run it, and how to get your data out or deleted.">
+<!-- dumbslab.com's own policy. Running your own hosted copy? Replace this page with yours (see docs/cloudflare.md). -->
+<link rel="canonical" href="https://dumbslab.com/privacy">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#15161c" media="(prefers-color-scheme: dark)">
+<link rel="stylesheet" href="/styles.css">
+<link rel="stylesheet" href="/welcome.css">
+<script src="/theme-init.js"></script>
+</head>
+<body class="w-page">
+<a class="skip-link" href="#main">Skip to the policy</a>
+<header class="w-top">
+  <a class="w-brand" href="/" aria-label="DumbSlab home"><img src="/favicon.svg" alt="" width="28" height="28"><span>DumbSlab</span></a>
+  <nav class="w-legal-nav" aria-label="Legal">
+    <a href="/privacy" aria-current="page">Privacy</a>
+    <a href="/terms">Terms</a>
+  </nav>
+</header>
+
+<main id="main" class="w-legal w-wrap" tabindex="-1">
+  <h1>Privacy Policy</h1>
+  <p class="w-legal-updated">Last updated: November 13, 2026</p>
+
+  <div class="w-legal-summary">
+    <p><strong>The short version.</strong></p>
+    <ul>
+      <li>We store what your team puts in its workspace so we can show it to your team.</li>
+      <li>We don't sell your data, use it for advertising, or train AI models on it.</li>
+      <li>Apps you connect to search from DumbSlab are only read, with your own access. Their tokens are encrypted.</li>
+      <li>Admins can export the whole workspace at any time. Email us to have it deleted.</li>
+    </ul>
+  </div>
+
+  <nav class="w-legal-toc" aria-label="On this page">
+    <ol>
+      <li><a href="#who">Who we are</a></li>
+      <li><a href="#store">What we store</a></li>
+      <li><a href="#apps">Connected apps and integrations</a></li>
+      <li><a href="#google">Google user data</a></li>
+      <li><a href="#use">How we use data</a></li>
+      <li><a href="#processors">Companies that help us</a></li>
+      <li><a href="#retention">Keeping and deleting data</a></li>
+      <li><a href="#rights">Your choices and rights</a></li>
+      <li><a href="#security">Security</a></li>
+      <li><a href="#children">Children</a></li>
+      <li><a href="#changes">Changes to this policy</a></li>
+      <li><a href="#contact">Contact</a></li>
+    </ol>
+  </nav>
+
+  <section id="who" aria-labelledby="who-title">
+    <h2 id="who-title">Who we are</h2>
+    <p>DumbSlab runs the hosted team knowledge base at dumbslab.com and its workspace addresses, such as acme.dumbslab.com. This policy covers that hosted service. "We" and "us" mean DumbSlab.</p>
+    <p>Each workspace belongs to its admins. They decide who joins, what the workspace keeps and when it is deleted. We store and handle the workspace's content on their behalf.</p>
+    <p>DumbSlab is also open-source software. If you use a copy that someone else runs on their own server, they are responsible for your data there, and this policy doesn't apply.</p>
+    <p>Questions or requests: <a href="mailto:simplycoo+dumbslab@mail.grokbot.com">simplycoo+dumbslab@mail.grokbot.com</a>.</p>
+  </section>
+
+  <section id="store" aria-labelledby="store-title">
+    <h2 id="store-title">What we store</h2>
+    <p>Each workspace has its own separate database. It holds:</p>
+    <ul>
+      <li><strong>Workspace content.</strong> Posts and their earlier versions, comments, reactions, topics, uploaded files and images, and the search index built from them. Also who follows what, notifications, and which posts each person has viewed.</li>
+      <li><strong>Accounts.</strong> Each person's name, email address, handle, role, and optional bio and picture. Your password is stored only as an Argon2 hash; we never keep the password itself. If an admin turns on people sync, profiles also get job title, department, location, work phone, pronouns and manager from BambooHR.</li>
+      <li><strong>Single sign-on.</strong> If you sign in through Google, Microsoft, Slack, Okta or another identity provider, we keep the provider's ID for your account and the email address it gave.</li>
+      <li><strong>Sessions.</strong> Signing in sets one cookie, <code>dumbslab_session</code>, holding a random token. We store only a SHA-256 hash of that token, with your browser's user-agent string and when the session ends. Sessions last up to 30 days.</li>
+      <li><strong>API tokens.</strong> Personal access tokens, and the tokens AI tools get when you approve them, are stored only as SHA-256 hashes. A token is shown once, when it's made.</li>
+      <li><strong>Activity events.</strong> A feed of changes: who did what, to which post, topic or setting, and when. It doesn't copy comment text.</li>
+      <li><strong>Usage.</strong> The workspace's size and how many database rows it writes each hour, to apply plan limits.</li>
+      <li><strong>Sign-in protection.</strong> Counts of failed sign-ins, keyed by a hash of the email address and a hash of the network address, so we can slow down password guessing. They are cleared after a short window.</li>
+      <li><strong>Sign-up protection.</strong> To limit how many workspaces one visitor can create, the sign-up service keeps a keyed hash of the IP address that created each workspace, never the address itself.</li>
+      <li><strong>Billing.</strong> When Pro is on sale and a workspace subscribes, we keep its Stripe customer and subscription IDs and the subscription's status. Card details go to Stripe and never reach us.</li>
+    </ul>
+    <p>Your browser also keeps two small settings in local storage: your light or dark theme, and whether you hid the editor preview. We use no advertising cookies.</p>
+  </section>
+
+  <section id="apps" aria-labelledby="apps-title">
+    <h2 id="apps-title">Connected apps and integrations</h2>
+    <p>DumbSlab can work with other apps in a few ways. In each case, we never sell what we read, never use it for advertising, and never use it to train AI models.</p>
+
+    <h3>Apps you connect yourself</h3>
+    <p>Each person can connect their own account in another app to search it from DumbSlab or to preview its links. DumbSlab makes those requests with your access, so you see only what that app already lets you see. It only reads: it never creates, changes or deletes anything in these apps. Results are fetched when you ask and shown to you. They aren't saved in the workspace.</p>
+    <p>For each connection we keep your encrypted credential and a label, such as the email address of your Google account. For Jira, Confluence and Trello we keep only the site, not your name or email.</p>
+    <ul class="w-legal-apps">
+      <li><strong>Asana:</strong> tasks and projects in your workspaces.</li>
+      <li><strong>Box:</strong> files and folders you can open.</li>
+      <li><strong>ClickUp:</strong> tasks you link to.</li>
+      <li><strong>Confluence:</strong> pages and blog posts on one Atlassian site.</li>
+      <li><strong>Dropbox:</strong> file and folder names and details, including your team's space.</li>
+      <li><strong>Freshdesk:</strong> tickets you link to.</li>
+      <li><strong>GitHub:</strong> issues, pull requests and repositories you can see.</li>
+      <li><strong>GitLab:</strong> issues and merge requests you link to.</li>
+      <li><strong>Google Drive:</strong> files you can open, including shared drives. See <a href="#google">Google user data</a>.</li>
+      <li><strong>Guru:</strong> cards you can read.</li>
+      <li><strong>Jira:</strong> issues on one Atlassian site.</li>
+      <li><strong>Linear:</strong> issues you link to.</li>
+      <li><strong>monday.com:</strong> items you link to.</li>
+      <li><strong>Shortcut:</strong> stories you link to.</li>
+      <li><strong>Slack:</strong> messages you can see, through Slack's search.</li>
+      <li><strong>Todoist:</strong> tasks you link to.</li>
+      <li><strong>Trello:</strong> cards you link to.</li>
+      <li><strong>Wrike:</strong> tasks you link to.</li>
+      <li><strong>Zendesk:</strong> tickets and Help Center articles you can see.</li>
+    </ul>
+
+    <h3>Integrations admins set up for the workspace</h3>
+    <ul>
+      <li><strong>Docs sync from GitHub or GitLab.</strong> Reads the Markdown files and images in one repository folder and saves them as posts. Through DumbSlab's GitHub App it has read-only access to files, and each sync uses a one-hour token for one repository; we keep no GitHub token. GitLab offers only full API access for adding webhooks, so that's what you approve. DumbSlab uses it only to list your projects, read files, and add and remove its own push webhook on the project you pick.</li>
+      <li><strong>People sync from BambooHR.</strong> Reads job title, department, location, work phone, pronouns and manager for people already in the workspace, matched by work email. It never adds or removes anyone.</li>
+      <li><strong>Slack app.</strong> Lets people search DumbSlab and start drafts with <code>/dumbslab</code>, and shows previews of DumbSlab links pasted in Slack. If admins choose channels, DumbSlab also posts there when posts are published or updated. This is the one integration that writes to another app.</li>
+      <li><strong>Single sign-on.</strong> When you sign in through your identity provider, we receive your account ID, email address and name from it.</li>
+    </ul>
+
+    <h3>How credentials are protected</h3>
+    <p>Every credential for these apps and integrations is encrypted with AES-256-GCM, using a key derived from a server secret (<code>CONNECTOR_KEY</code>). Each one is bound to the person and app it belongs to. No part of DumbSlab ever shows a stored credential again.</p>
+    <p>Disconnecting an app deletes its stored credential right away. To also cancel DumbSlab's access on the app's side, revoke it in that app's settings. Removing DumbSlab's shared Slack app from Slack is done by a Slack admin in Slack.</p>
+  </section>
+
+  <section id="google" aria-labelledby="google-title">
+    <h2 id="google-title">Google user data</h2>
+    <p>DumbSlab's use and transfer to any other app of information received from Google APIs will adhere to the <a href="https://developers.google.com/terms/api-services-user-data-policy">Google API Services User Data Policy</a>, including the Limited Use requirements.</p>
+    <p>When you connect Google Drive, DumbSlab asks for read-only access to Drive (<code>drive.readonly</code>) and your email address. It uses them only so you can search your Drive from DumbSlab:</p>
+    <ul>
+      <li>When you search, Google runs the search and returns the matching files' names, types, links, last-changed times and owners' names. DumbSlab shows them to you and doesn't save them.</li>
+      <li>DumbSlab doesn't download or store the contents of your files.</li>
+      <li>We keep your Google account's email address to label the connection, and your encrypted token.</li>
+      <li>We don't transfer Google user data to anyone, except as needed to provide this feature, for security, to comply with the law, or as part of a merger or sale with your prior consent.</li>
+      <li>No person at DumbSlab reads it, unless you ask us to, it's needed for security, or the law requires it.</li>
+      <li>We never use it for advertising, never sell it, and never use it to create, train or improve AI or machine-learning models.</li>
+    </ul>
+    <p>You can disconnect Google Drive at any time, which deletes the stored token. You can also remove DumbSlab's access at <a href="https://myaccount.google.com/permissions">myaccount.google.com/permissions</a>.</p>
+  </section>
+
+  <section id="use" aria-labelledby="use-title">
+    <h2 id="use-title">How we use data</h2>
+    <ul>
+      <li>To run the service: show your workspace to the people in it, search it, and answer the AI tools and API clients you connect.</li>
+      <li>To keep it safe: limit requests and sign-in attempts, and stop abuse.</li>
+      <li>To find and fix problems, using the error reports and recordings described below.</li>
+      <li>To bill for Pro, and to answer your requests.</li>
+      <li>To comply with the law.</li>
+    </ul>
+    <p>We look at a workspace's content only when you ask us to help, when it's needed to investigate abuse or a security problem, or when the law requires it.</p>
+    <p>When you connect an AI tool (such as Claude, ChatGPT or Cursor) to your workspace, it reads what you allow it to. That tool's own privacy policy covers what it does with that data.</p>
+  </section>
+
+  <section id="processors" aria-labelledby="processors-title">
+    <h2 id="processors-title">Companies that help us</h2>
+    <ul>
+      <li><strong>Cloudflare</strong> hosts DumbSlab and stores all workspace data, uploads included. Its network carries every request and protects the service from attacks. It keeps short-lived request logs to run and protect the service.</li>
+      <li><strong>Stripe</strong> handles payments for Pro, once Pro is on sale.</li>
+      <li><strong>Sentry</strong> receives error reports.
+        <ul>
+          <li>From your browser, only on signed-in pages: the type of error, function names and line numbers, the page as a route template (like <code>/p/:id</code>), your user ID and your workspace's address. Error messages are replaced with "[redacted]", and no IP address is sent.</li>
+          <li>From our servers: only a failure category, the app version and a random ID. No user details, addresses or content.</li>
+        </ul>
+      </li>
+      <li><strong>Quill</strong> is a session-recording server we run ourselves (it's compatible with PostHog). It records how the app is used after you sign in to a workspace, so we can see where it breaks or confuses people.
+        <ul>
+          <li>All text and every input are masked. Post and comment bodies, the editor and search results are recorded as empty boxes.</li>
+          <li>Page addresses are cut down to route templates, like <code>/p/:id</code>, so titles, IDs and search words aren't recorded.</li>
+          <li>No canvas, console logs or network requests are recorded.</li>
+          <li>Nothing is recorded on the sign-up site, these policy pages, or the setup and sign-in pages.</li>
+          <li>Quill doesn't store IP addresses.</li>
+          <li>Each recording is linked to your user ID, name, email address and workspace address, so we can follow up on a problem. Signing out stops recording.</li>
+        </ul>
+      </li>
+      <li>The apps you connect receive the requests DumbSlab makes with your access. Their own privacy policies apply there.</li>
+    </ul>
+    <p>Cloudflare runs in many countries, and our other providers are in the United States. Your data may be stored and handled outside your country, including in the United States.</p>
+  </section>
+
+  <section id="retention" aria-labelledby="retention-title">
+    <h2 id="retention-title">Keeping and deleting data</h2>
+    <ul>
+      <li><strong>Workspace content</strong> stays until someone deletes it or the workspace is deleted.</li>
+      <li><strong>Export.</strong> Admins can download the whole workspace as JSON at any time, from Settings or with <code>GET /api/v1/export</code>.</li>
+      <li><strong>Deleting a workspace.</strong> An admin can email us to delete their workspace. We erase its database, uploads included, and free its addresses. A workspace with an active Pro subscription is cancelled first.</li>
+      <li><strong>Disconnecting an app</strong> deletes its stored credential right away.</li>
+      <li><strong>Sessions</strong> end after 30 days, or when you sign out.</li>
+      <li><strong>Accounts.</strong> Admins can deactivate people. To have your personal data removed from a workspace, ask its admins, or email us.</li>
+      <li><strong>Backups.</strong> Cloudflare can restore a workspace's storage to any point in the last 30 days. So deleted data can remain in that recovery window for up to 30 days before it's gone for good.</li>
+      <li><strong>Error reports and recordings</strong> are used only to find and fix problems.</li>
+    </ul>
+  </section>
+
+  <section id="rights" aria-labelledby="rights-title">
+    <h2 id="rights-title">Your choices and rights</h2>
+    <p>Depending on where you live, laws such as the GDPR, the UK GDPR and California's CCPA give you rights over your personal data. You can ask to see it, correct it, get a copy, have it deleted, or object to or limit how we use it.</p>
+    <p>Email <a href="mailto:simplycoo+dumbslab@mail.grokbot.com">simplycoo+dumbslab@mail.grokbot.com</a> with your request. We may need to confirm it's you. For data inside a workspace, we may work with that workspace's admins, since they control it. We won't treat you differently for using these rights.</p>
+    <p>We don't sell personal data, and we don't share it for cross-context behavioral advertising.</p>
+    <p>You can also complain to your local data protection authority.</p>
+  </section>
+
+  <section id="security" aria-labelledby="security-title">
+    <h2 id="security-title">Security</h2>
+    <ul>
+      <li>Every connection uses HTTPS, and browsers are told to always use it.</li>
+      <li>Passwords are hashed with Argon2. Sessions and API tokens are stored only as hashes.</li>
+      <li>Credentials for other apps are encrypted with AES-256-GCM.</li>
+      <li>Each workspace has its own database, and roles and private topics limit who sees what.</li>
+      <li>Requests and sign-in attempts are rate-limited.</li>
+    </ul>
+    <p>No system is perfectly secure. If a breach affects your personal data, we'll tell you as the law requires. To report a security problem, see <a href="https://github.com/tstout729/dumbslab/blob/main/SECURITY.md">SECURITY.md</a> or email us.</p>
+  </section>
+
+  <section id="children" aria-labelledby="children-title">
+    <h2 id="children-title">Children</h2>
+    <p>DumbSlab is made for teams at work. It isn't meant for anyone under 16, and we don't knowingly collect children's data. If you think a child has given us personal data, email us and we'll delete it.</p>
+  </section>
+
+  <section id="changes" aria-labelledby="changes-title">
+    <h2 id="changes-title">Changes to this policy</h2>
+    <p>When we change this policy, we'll update the date at the top. For changes that matter, we'll also post a notice on dumbslab.com before they take effect.</p>
+  </section>
+
+  <section id="contact" aria-labelledby="contact-title">
+    <h2 id="contact-title">Contact</h2>
+    <p>DumbSlab: <a href="mailto:simplycoo+dumbslab@mail.grokbot.com">simplycoo+dumbslab@mail.grokbot.com</a>.</p>
+  </section>
+</main>
+
+<footer class="w-foot w-wrap">
+  <p>DumbSlab is open source under MIT or Apache-2.0.</p>
+  <nav aria-label="Footer">
+    <a href="/">Sign up</a>
+    <a href="https://github.com/tstout729/dumbslab">GitHub</a>
+    <a href="/privacy">Privacy</a>
+    <a href="/terms">Terms</a>
+    <a href="mailto:simplycoo+dumbslab@mail.grokbot.com">Support</a>
+  </nav>
+</footer>
+</body>
+</html>

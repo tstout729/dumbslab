@@ -139,12 +139,20 @@ pub fn root_robots_txt(root: &str) -> String {
     format!("User-agent: *\nAllow: /\nDisallow: /api/\n\nSitemap: https://{root}/sitemap.xml\n")
 }
 
-/// The sign-up site's `/sitemap.xml`: it has one public page.
+/// The sign-up site's pages, by path, with the static file each is served from (`web/welcome.html`
+/// is served at `/welcome`). The privacy policy and terms are public URLs that apps such as Google
+/// and Slack ask for before people may sign in with them.
+const ROOT_PAGES: [(&str, &str); 3] = [("/", "/welcome"), ("/privacy", "/privacy"), ("/terms", "/terms")];
+
+/// The static page the sign-up site serves at `path`, as the path of its file without `.html`.
+pub fn root_page(path: &str) -> Option<&'static str> {
+    ROOT_PAGES.iter().find(|(p, _)| *p == path).map(|(_, file)| *file)
+}
+
+/// The sign-up site's `/sitemap.xml`: its public pages.
 pub fn root_sitemap_xml(root: &str) -> String {
-    format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
-         <urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">\n  <url><loc>https://{root}/</loc></url>\n</urlset>\n"
-    )
+    let urls: String = ROOT_PAGES.iter().map(|(path, _)| format!("  <url><loc>https://{root}{path}</loc></url>\n")).collect();
+    format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">\n{urls}</urlset>\n")
 }
 
 /// The sign-up site's `/llms.txt`: what DumbSlab is, and how an agent signs a person up and
@@ -987,7 +995,10 @@ mod tests {
         let robots = root_robots_txt("kb.test");
         assert!(robots.contains("Allow: /\n") && robots.contains("Disallow: /api/\n"), "{robots}");
         assert!(robots.ends_with("Sitemap: https://kb.test/sitemap.xml\n"), "{robots}");
-        assert!(root_sitemap_xml("kb.test").contains("<loc>https://kb.test/</loc>"));
+        let sitemap = root_sitemap_xml("kb.test");
+        for loc in ["https://kb.test/", "https://kb.test/privacy", "https://kb.test/terms"] {
+            assert!(sitemap.contains(&format!("<loc>{loc}</loc>")), "{sitemap}");
+        }
         let llms = root_llms_txt("kb.test");
         assert!(llms.starts_with("# DumbSlab\n\n> "), "llms.txt opens with a title and summary");
         for want in ["POST https://kb.test/api/signup", "https://<address>.kb.test/mcp", "{\"workspace_name\": \"Acme\""] {
@@ -1019,5 +1030,28 @@ mod tests {
         let body: serde_json::Value = serde_json::from_slice(&api.body).unwrap();
         assert_eq!(body["error"]["code"], "workspace_moved");
         assert_eq!(body["error"]["details"]["url"], "https://docs.x.test");
+    }
+
+    #[test]
+    fn the_sign_up_site_serves_its_privacy_policy_and_terms() {
+        assert_eq!(root_page("/"), Some("/welcome"));
+        assert_eq!(root_page("/privacy"), Some("/privacy"));
+        assert_eq!(root_page("/terms"), Some("/terms"));
+        for path in ["/privacy/", "/privacy.html", "/Terms", "/welcome", "/foo"] {
+            assert_eq!(root_page(path), None, "{path}");
+        }
+        // Each page is a static file in web/, which Cloudflare serves at its path without `.html`.
+        for (page, html) in [
+            ("/welcome", include_str!("../../../web/welcome.html")),
+            ("/privacy", include_str!("../../../web/privacy.html")),
+            ("/terms", include_str!("../../../web/terms.html")),
+        ] {
+            assert!(html.starts_with("<!doctype html>"), "{page}");
+            assert!(!html.contains("<script>") && !html.contains("<script type=\"module\">"), "{page}: no inline scripts");
+        }
+        for html in [include_str!("../../../web/privacy.html"), include_str!("../../../web/terms.html")] {
+            assert!(html.contains("Last updated: "), "the policies say when they last changed");
+            assert!(html.contains("mailto:simplycoo+dumbslab@mail.grokbot.com"), "and how to reach us");
+        }
     }
 }
