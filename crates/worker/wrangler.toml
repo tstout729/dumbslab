@@ -81,7 +81,12 @@ FREE_TOTAL_STORAGE_MB = "4096"
 # its secret with `npx wrangler secret put SSO_GOOGLE_CLIENT_SECRET` (or SSO_MICROSOFT_CLIENT_SECRET).
 # Slack's is the Slack app's SLACK_CLIENT_ID and SLACK_CLIENT_SECRET, which connected-app Slack uses
 # too. Empty turns a provider off.
-SSO_GOOGLE_CLIENT_ID = ""
+# DumbSlab's registered connected apps (client IDs are public; secrets are Worker secrets):
+GITHUB_CLIENT_ID = "Ov23liIgED3Qoj2ibTEg"
+GOOGLE_DRIVE_CLIENT_ID = "199798423369-nksu4okslidq6teb9p1e0i0gj6f45var.apps.googleusercontent.com"
+ATLASSIAN_CLIENT_ID = "1Rf6cMjPt978Li9CBAdijhSWBWrcR16w"
+TRELLO_CLIENT_ID = "sB0Jywr10XeKQIIISQK2RppadkR8FjVd"
+SSO_GOOGLE_CLIENT_ID = "972220925688-knk93cb3c4r86qlh21cfh4dvhrj99qog.apps.googleusercontent.com"
 SSO_MICROSOFT_CLIENT_ID = ""
 # DumbSlab's Slack app (docs/hosting/slack-app.md): the same SLACK_CLIENT_ID here and SLACK_CLIENT_SECRET
 # secret, with the SLACK_SIGNING_SECRET secret, also turn on Add to Slack and Slack search:
@@ -93,9 +98,9 @@ PRO_PRICE_LABEL = "$8 a month"
 # DumbSlab's GitHub App, so docs sync needs no token (docs/hosting/github-app.md). Empty turns it
 # off. Its client secret, private key and webhook secret are secrets: GITHUB_APP_CLIENT_SECRET,
 # GITHUB_APP_PRIVATE_KEY and GITHUB_APP_WEBHOOK_SECRET.
-GITHUB_APP_ID = ""
-GITHUB_APP_SLUG = ""
-GITHUB_APP_CLIENT_ID = ""
+GITHUB_APP_ID = "5750947"
+GITHUB_APP_SLUG = "dumbslab"
+GITHUB_APP_CLIENT_ID = "Iv23liYdv3vvSkBRRfbt"
 # Single-workspace mode only: public URL and Durable Object name.
 BASE_URL = ""
 WORKSPACE_NAME = "main"
