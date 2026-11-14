@@ -392,8 +392,13 @@ pub trait Connector: Sync {
 }
 
 /// A web link's host and path, before any query or fragment. Links with a user name (`@`) or a
-/// backslash are refused: browsers and simple parsers disagree about which host those name.
+/// backslash are refused: browsers and simple parsers disagree about which host those name. So
+/// are links with control characters: browsers delete tabs and line breaks before reading a link,
+/// so `…/7/.<tab>./8` opens item 8.
 fn host_and_path(url: &str) -> Option<(&str, &str)> {
+    if url.chars().any(|c| c.is_ascii_control()) {
+        return None;
+    }
     let rest = url.strip_prefix("https://").or_else(|| url.strip_prefix("http://"))?;
     let rest = rest.split(['?', '#']).next()?;
     let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
@@ -986,6 +991,7 @@ fn prune_attempts(db: &dyn Db, now: DateTime<Utc>) -> ApiResult<()> {
 /// carries only a code): only if it's still their latest sign-in with the app, so an older one
 /// that fails late can't cover up a newer one that worked. `reason` comes from [`public_reason`].
 fn remember_failure(db: &dyn Db, j: &ConnectJob, attempt: &str, reason: &str, now: DateTime<Utc>) -> ApiResult<()> {
+    // First, so a sign-in older than FAILURE_MINUTES can't record a reason.
     prune_attempts(db, now)?;
     db.execute(
         "UPDATE connect_attempts SET message = ?, created_at = ? WHERE user_id = ? AND provider = ? AND attempt = ?",
@@ -1921,11 +1927,15 @@ fn start_searching(j: &mut SearchJob, conns: Vec<Connection>, failed: Vec<AppRes
 fn connect_step(db: &dyn Db, cfg: &HostConfig, j: &mut ConnectJob, replies: Vec<HttpReply>, now: DateTime<Utc>) -> ApiResult<Step> {
     let connector = providers::get(j.provider).ok_or_else(|| ApiError::bad_request("unknown app"))?;
     let name = connector.info().name;
-    // A sign-in goes back to Settings with a code; the app's own words stay out of the link.
-    let fail = |j: &ConnectJob, code: SignInError, message: String| -> Step {
+    // A sign-in goes back to Settings with a code; the app's own words stay out of the link. Every
+    // failed sign-in deletes expired attempts, whether or not it keeps a reason.
+    let fail = |j: &ConnectJob, code: SignInError, message: String| -> ApiResult<Step> {
         match &j.back_to {
-            Some(base) => Step::Done(Finish::Redirect(settings_url(base, j.provider, Err(code)))),
-            None => Step::Done(Finish::Fail(ApiError::new(400, "connect_failed", message))),
+            Some(base) => {
+                prune_attempts(db, now)?;
+                Ok(Step::Done(Finish::Redirect(settings_url(base, j.provider, Err(code)))))
+            }
+            None => Ok(Step::Done(Finish::Fail(ApiError::new(400, "connect_failed", message)))),
         }
     };
     // The account the sign-in gave can't be used: Settings says why when the connector's message is
@@ -1937,19 +1947,19 @@ fn connect_step(db: &dyn Db, cfg: &HostConfig, j: &mut ConnectJob, replies: Vec<
         {
             remember_failure(db, j, attempt, &reason, now)?;
         }
-        Ok(fail(j, SignInError::Failed, message))
+        fail(j, SignInError::Failed, message)
     };
     match j.phase {
         ConnectPhase::Start => match &j.sign_in {
             Some(sign_in) => {
                 let Some(app) = oauth_app(cfg, j.provider) else {
-                    return Ok(fail(j, SignInError::Unavailable, format!("Signing in with {name} isn't set up on this server any more.")));
+                    return fail(j, SignInError::Unavailable, format!("Signing in with {name} isn't set up on this server any more."));
                 };
                 // On the site the sign-in started with, for apps that have one (the callback put
                 // it in the credential).
                 let token_url = match oauth_urls(connector, &j.cred) {
                     Ok((_, token_url)) => token_url,
-                    Err(e) => return Ok(fail(j, SignInError::Failed, e)),
+                    Err(e) => return fail(j, SignInError::Failed, e),
                 };
                 let mut form = vec![
                     ("grant_type".into(), "authorization_code".into()),
@@ -1980,7 +1990,7 @@ fn connect_step(db: &dyn Db, cfg: &HostConfig, j: &mut ConnectJob, replies: Vec<
                 }
                 // A refused exchange can quote the app's own answer (its `error_description`), so
                 // Settings shows only what the code means.
-                Err(e) => Ok(fail(j, SignInError::Failed, e)),
+                Err(e) => fail(j, SignInError::Failed, e),
             }
         }
         ConnectPhase::Profiling => match connector.read_profile(&j.cred, &replies) {
@@ -2165,9 +2175,14 @@ mod tests {
             "https://x.test/a/b/-/issues/7/%2e/8",
             "https://x.test/../a/b/-/issues/7",
             "https://x.test/a/b/-/issues/7/..",
+            // Browsers delete tabs and line breaks first, so these hold dot segments too.
+            "https://x.test/a/b/-/issues/7/.\t./8",
+            "https://x.test/a/b/-/issues/7/%2E\n%2E/8",
+            "https://x.test/a/b/-/issues/7/.\r./8",
         ] {
-            assert!(path_of(url).is_empty(), "{url}");
+            assert!(path_of(url).is_empty(), "{url:?}");
         }
+        assert_eq!(host_of("https://evil\t.test/x"), None, "nor does a host with a control character");
     }
 
     #[test]

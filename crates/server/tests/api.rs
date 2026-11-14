@@ -3583,6 +3583,10 @@ mod connected {
         assert!(jira(&admin)["sign_in_error"].is_null(), "a new sign-in clears the old reason");
         let reasons = || count(&h, "SELECT COUNT(*) FROM connect_attempts WHERE message IS NOT NULL");
         assert_eq!(reasons(), 0, "and old reasons are dropped");
+        // Mo's sign-in, and this one, expire while it's out at Atlassian: failing still deletes them,
+        // though it keeps no reason.
+        h.ok("POST", "/api/v1/connections", Some(json!({ "app": "jira" })), &mo);
+        age(20);
         let refused = |_: &HttpCall| HttpReply {
             status: 400,
             body: json!({ "error": "invalid_grant", "error_description": "Call 555-0100" }).to_string(),
@@ -3591,6 +3595,7 @@ mod connected {
         assert!(matches!(&finish, Finish::Redirect(u) if u.ends_with("connect_error=failed&app=jira")), "{finish:?}");
         let list = h.ok("GET", "/api/v1/connections", None, &admin);
         assert!(!list.to_string().contains("555-0100"), "{list}");
+        assert_eq!(kept(""), 0, "a failed sign-in deletes expired attempts, even when it keeps no reason");
 
         // Connecting the app clears the reason.
         fail();
