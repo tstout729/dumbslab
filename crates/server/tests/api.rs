@@ -1699,7 +1699,8 @@ fn embeds_pingboard_charts_and_otter_cards() {
     let frame = &html[start..start + html[start..].find('>').unwrap() + 1];
     assert!(
         frame.contains("title=\"Pingboard: ")
-            && frame.ends_with(" sandbox=\"allow-scripts allow-same-origin allow-popups allow-presentation\">"),
+            && frame.contains(" allow=\"fullscreen\" ")
+            && frame.ends_with(" sandbox=\"allow-scripts allow-same-origin allow-popups\">"),
         "{frame}"
     );
     assert_eq!(html.matches("<iframe ").count(), 1, "{html}");

@@ -197,6 +197,8 @@ fn seconds(t: &str) -> Option<u64> {
 
 /// Players and viewers: scripts, fullscreen, and popups that stay sandboxed.
 const PLAYER: &str = "allow-scripts allow-same-origin allow-popups allow-presentation";
+/// Read-only charts: scripts, and links that open in a new tab that stays sandboxed.
+const CHART: &str = "allow-scripts allow-same-origin allow-popups";
 /// Design tools: may also ask for their own cookies after a click, to show the viewer's access.
 const APP: &str = "allow-scripts allow-same-origin allow-popups allow-presentation allow-storage-access-by-user-activation";
 /// Google: signing in to see a private file needs forms and an unsandboxed sign-in popup.
@@ -597,7 +599,8 @@ fn pingboard(u: &Url) -> Option<Embed> {
     if !view.is_empty() {
         src = format!("{src}?{}", view.join("&"));
     }
-    frame("Pingboard", Shape::Document, PLAYER, src)
+    // An org chart only needs to draw and go fullscreen: no media, clipboard or presentation.
+    Some(Embed { provider: "Pingboard", src, shape: Shape::Document, sandbox: CHART, allow: "fullscreen", author: None, item: "" })
 }
 
 /// An Otter conversation: otter.ai/u/{id}. Otter's pages only let Outlook and Otter itself frame
@@ -1383,8 +1386,28 @@ mod tests {
                 "https://otter.ai/u/Ab3dE5gH7jK9mN1pQ_rS-tU2wX4/edit",
                 "https://otter.ai/pricing",
                 "https://otter.ai.evil.test/u/Ab3dE5gH7jK9mN1pQ_rS-tU2wX4",
+                // Encoded separators, dot segments and backslashes never reach the card's link.
+                "https://otter.ai/u/Ab3dE5gH7jK9mN1pQ_rS%2F..%2Fpricing",
+                "https://otter.ai/u/../u/Ab3dE5gH7jK9mN1pQ_rS-tU2wX4",
+                "https://otter.ai/u/Ab3dE5gH7jK9mN1pQ_rS-tU2wX4\\evil",
+                // 41 characters: one past the longest id.
+                "https://otter.ai/u/Ab3dE5gH7jK9mN1pQ_rS-tU2wX4Ab3dE5gH7jK9mN1pQ",
             ],
         );
+        // Case, fragments and the longest id all come out as the one canonical link.
+        let longest = "Ab3dE5gH7jK9mN1pQ_rS-tU2wX4Ab3dE5gH7jK9m";
+        assert_eq!(longest.len(), 40);
+        check(
+            &[
+                (&format!("https://OTTER.AI/u/{longest}#t=30"), &format!("https://otter.ai/u/{longest}")),
+                ("https://otter.ai/u/Ab3dE5gH7jK9mN1pQ_rS-tU2wX4#chat", "https://otter.ai/u/Ab3dE5gH7jK9mN1pQ_rS-tU2wX4"),
+            ],
+            &[],
+        );
+        // A link's own text is escaped in the card title.
+        let escaped = super::html(&talk, "https://otter.ai/u/Ab3dE5gH7jK9mN1pQ_rS-tU2wX4", Some("<b>sync</b> & \"notes\""));
+        assert!(!escaped.contains("<b>"), "{escaped}");
+        assert!(escaped.contains("&lt;b&gt;sync&lt;/b&gt; &amp; "), "{escaped}");
         let html = html(&talk, "https://otter.ai/u/Ab3dE5gH7jK9mN1pQ_rS-tU2wX4", None);
         assert!(!html.contains("<iframe"), "{html}");
         assert!(
@@ -1427,10 +1450,37 @@ mod tests {
                 "https://app.pingboard.com/org_chart",
                 "https://acme.pingboard.com/users/1234",
                 "https://pingboard.workleap.com.evil.test/s/Fk2mQ9vXr4Lp7TzW1nBc8d/org_chart",
+                // Encoded separators, dot segments and backslashes in the path.
+                "https://app.pingboard.com/s/Fk2mQ9vXr4Lp7TzW1nBc8d%2F..%2Fusers/org_chart",
+                "https://app.pingboard.com/s/../s/Fk2mQ9vXr4Lp7TzW1nBc8d/org_chart",
+                "https://app.pingboard.com/s/Fk2mQ9vXr4Lp7TzW1nBc8d/../org_chart",
+                "https://app.pingboard.com/s/Fk2mQ9vXr4Lp7TzW1nBc8d\\org_chart",
+                // 129 characters: one past the longest token.
+                &format!("https://app.pingboard.com/s/{}/org_chart", "a".repeat(129)),
             ],
         );
+        // Only digits survive in the view parameters, the first of a repeated key wins, and case,
+        // fragments and other parameters never reach the frame URL.
+        let longest = "a".repeat(128);
+        check(
+            &[
+                (
+                    &format!("https://app.pingboard.com/s/{token}/org_chart?filter_by=12&filter_by=34&center=%35%36"),
+                    &format!("{chart}?filter_by=12"),
+                ),
+                (&format!("https://app.pingboard.com/s/{token}/org_chart?filter_by=12%26center%3D3"), &chart),
+                (&format!("https://app.pingboard.com/s/{token}/org_chart?filter_by=1234567890123456"), &chart),
+                (&format!("https://APP.PingBoard.com/s/{token}/org_chart#people"), &chart),
+                (&format!("https://app.pingboard.com/s/{token}/org_chart?center=5#filter_by=6"), &format!("{chart}?center=5")),
+                (
+                    &format!("https://pingboard.workleap.com/s/{longest}/org_chart"),
+                    &format!("https://pingboard.workleap.com/s/{longest}/org_chart"),
+                ),
+            ],
+            &[],
+        );
         let e = from_url(&chart).unwrap();
-        assert_eq!((e.provider, e.shape, e.sandbox), ("Pingboard", Shape::Document, PLAYER));
+        assert_eq!((e.provider, e.shape, e.sandbox, e.allow), ("Pingboard", Shape::Document, CHART, "fullscreen"));
     }
 
     /// Whether `src` is on one of `origins`; `https://*.example.com` matches one subdomain.
@@ -1537,11 +1587,13 @@ mod tests {
             "https://www.canva.com/design/DAGhbGUMnnI/gZyl0pFu9hrdUYmKXUictg/view",
             "https://viewer.diagrams.net/#R7Vhtb9o",
             "https://app.mode.com/acme/reports/0d0d0bbe1e2e",
-            "https://app.pingboard.com/s/Fk2mQ9vXr4Lp7TzW1nBc8d/org_chart",
         ] {
             let sandbox = from_url(url).unwrap().sandbox;
             assert_eq!(sandbox, PLAYER, "{url}");
         }
+        // An org chart doesn't present, play media or write to the clipboard.
+        let chart = from_url("https://app.pingboard.com/s/Fk2mQ9vXr4Lp7TzW1nBc8d/org_chart").unwrap();
+        assert_eq!((chart.sandbox, chart.allow), ("allow-scripts allow-same-origin allow-popups", "fullscreen"));
         let video = html(&from_url("https://youtu.be/9pasx0ghADM").unwrap(), "https://youtu.be/9pasx0ghADM", None);
         assert!(video.contains(&format!("loading=\"lazy\" allow=\"{FEATURES}\" allowfullscreen referrerpolicy=")), "{video}");
     }
