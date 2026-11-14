@@ -24,6 +24,7 @@ pub use directory::Directory;
 pub use workspace::Workspace;
 
 use chrono::Utc;
+use dumbslab_core::assets;
 use dumbslab_core::http::{WORKSPACE_ROBOTS_TXT, is_core_path};
 use dumbslab_core::slack;
 use dumbslab_core::sync::github_app::{self, Routed};
@@ -99,7 +100,7 @@ async fn route(req: Request, env: Env, url: &Url) -> Result<Response> {
 
     if !multi {
         if !is_core_path(&path) {
-            return env.assets("ASSETS")?.fetch_request(req).await;
+            return asset(&env, &req, url.as_str()).await;
         }
         if let Some(limited) = rate_limited(&req, &env).await? {
             return Ok(limited);
@@ -117,7 +118,7 @@ async fn route(req: Request, env: Env, url: &Url) -> Result<Response> {
                 return text_response(WORKSPACE_ROBOTS_TXT.into(), "text/plain; charset=utf-8");
             }
             if !is_core_path(&path) {
-                return env.assets("ASSETS")?.fetch_request(req).await;
+                return asset(&env, &req, url.as_str()).await;
             }
             if let Some(limited) = rate_limited(&req, &env).await? {
                 return Ok(limited);
@@ -126,6 +127,35 @@ async fn route(req: Request, env: Env, url: &Url) -> Result<Response> {
         }
         _ => error_response(404, "no_workspace", &format!("There's no workspace at this address. Create one at https://{root}/")),
     }
+}
+
+/// A static file at `url`, for `req`. Its ETag gets this build's commit, so a deploy replaces every
+/// copy browsers hold; revalidations are answered here, since the assets compare only their own
+/// ETags (see `dumbslab_core::assets`).
+async fn asset(env: &Env, req: &Request, url: &str) -> Result<Response> {
+    let if_none_match = req.headers().get("if-none-match")?;
+    let headers = req.headers().clone();
+    for name in assets::CONDITIONAL_HEADERS {
+        headers.delete(name)?;
+    }
+    let mut init = RequestInit::new();
+    init.with_method(req.method()).with_headers(headers);
+    let resp = env.assets("ASSETS")?.fetch_request(Request::new_with_init(url, &init)?).await?;
+    let Some(etag) = resp.headers().get("etag")? else {
+        return Ok(resp);
+    };
+    let etag = assets::versioned_etag(&etag, dumbslab_core::GIT_SHA);
+    if resp.status_code() == 200 && if_none_match.is_some_and(|header| assets::none_match(&header, &etag)) {
+        let headers = Headers::new();
+        for (name, value) in resp.headers().entries().filter(|(name, _)| assets::kept_on_not_modified(name)) {
+            headers.set(&name, &value)?;
+        }
+        headers.set("etag", &etag)?;
+        return Ok(Response::empty()?.with_status(304).with_headers(headers));
+    }
+    let headers = resp.headers().clone();
+    headers.set("etag", &etag)?;
+    Ok(resp.with_headers(headers))
 }
 
 /// Refuses a request once its client network has sent too many this minute. Each request that
@@ -225,7 +255,7 @@ async fn root_site(req: Request, env: &Env, root: &str, path: &str) -> Result<Re
     {
         let mut url = req.url()?;
         url.set_path(page);
-        return env.assets("ASSETS")?.fetch_request(Request::new(url.as_str(), Method::Get)?).await;
+        return asset(env, &req, url.as_str()).await;
     }
     match (method, path) {
         (Method::Get, "/healthz") => {
@@ -264,7 +294,7 @@ async fn root_site(req: Request, env: &Env, root: &str, path: &str) -> Result<Re
         (Method::Post, "/api/stripe/webhook") => billing::webhook(req, env).await,
         // Static files the sign-up page uses.
         (Method::Get | Method::Head, p) if p.rsplit('/').next().is_some_and(|f| f.contains('.')) => {
-            env.assets("ASSETS")?.fetch_request(req).await
+            asset(env, &req, req.url()?.as_str()).await
         }
         (_, p) if is_core_path(p) => error_response(
             404,
