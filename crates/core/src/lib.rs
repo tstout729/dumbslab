@@ -10,6 +10,7 @@
 //! (`/api/v1/...`), the generic operations endpoint (`/api/v1/operations/{name}`), MCP (`/mcp`)
 //! and the CLI, so agents can do anything a person can do in the web app.
 
+pub mod assets;
 pub mod auth;
 pub mod backup;
 pub mod connect;

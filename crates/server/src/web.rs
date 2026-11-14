@@ -4,7 +4,11 @@
 use axum::body::Body;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
+use dumbslab_core::assets;
 use rust_embed::RustEmbed;
+
+/// Browsers check every file with the server before using their copy.
+const CACHE_CONTROL: &str = "no-cache";
 
 #[derive(RustEmbed)]
 #[folder = "../../web/"]
@@ -37,15 +41,22 @@ pub fn serve(path: &str, headers: &HeaderMap, csp: &str) -> Response {
             None => return Response::builder().status(StatusCode::NOT_FOUND).body(Body::from("web app not built")).unwrap_or_default(),
         },
     };
-    let etag = format!("\"{}\"", hex(&file.metadata.sha256_hash()[..12]));
-    if headers.get("if-none-match").and_then(|v| v.to_str().ok()) == Some(etag.as_str()) {
-        return Response::builder().status(StatusCode::NOT_MODIFIED).header("etag", etag).body(Body::empty()).unwrap_or_default();
+    // With the build's commit, like the Cloudflare host's, so each new build replaces every copy.
+    let etag = assets::versioned_etag(&hex(&file.metadata.sha256_hash()[..12]), dumbslab_core::GIT_SHA);
+    let if_none_match: Vec<&str> = headers.get_all("if-none-match").iter().filter_map(|v| v.to_str().ok()).collect();
+    if !if_none_match.is_empty() && assets::none_match(&if_none_match.join(","), &etag) {
+        return Response::builder()
+            .status(StatusCode::NOT_MODIFIED)
+            .header("etag", etag)
+            .header("cache-control", CACHE_CONTROL)
+            .body(Body::empty())
+            .unwrap_or_default();
     }
     let mime = mime_guess::from_path(&name).first_or_octet_stream();
     let mut b = Response::builder()
         .header("content-type", mime.as_ref())
         .header("etag", etag)
-        .header("cache-control", "no-cache")
+        .header("cache-control", CACHE_CONTROL)
         .header("x-content-type-options", "nosniff")
         .header("referrer-policy", "strict-origin-when-cross-origin");
     if name.ends_with(".html") {

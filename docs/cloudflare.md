@@ -27,7 +27,8 @@ The checked-in `crates/worker/wrangler.toml` deploys dumbslab.com in this mode. 
 
 1. Set `ROOT_DOMAIN` and the three `routes` to your domain. Also replace `https://dumbslab.com` in `web/welcome.html`: the sign-up page's canonical link, social tags and structured data name it. `web/privacy.html` and `web/terms.html` are dumbslab.com's own privacy policy and terms, served at `/privacy` and `/terms` on the root domain and on every workspace address: replace them with yours.
 2. Add a proxied wildcard DNS record so workspace subdomains reach the Worker: type `AAAA`, name `*`, content `100::`, proxied. Cloudflare's free Universal SSL covers one level of subdomains.
-3. Add the secrets and deploy:
+3. Add the zone's compression rule (see [Compression rule](#compression-rule) below).
+4. Add the secrets and deploy:
 
 ```sh
 cd crates/worker
@@ -45,6 +46,22 @@ How sign-up works:
 An address nobody has signed up for answers "no workspace here" and creates no storage. While someone types, the form asks `GET /api/signup/check?address=…` whether the address is free.
 
 For search engines and agents, the root domain serves `/robots.txt`, `/sitemap.xml` (the sign-up page, privacy policy and terms) and `/llms.txt`, built from `ROOT_DOMAIN`. The `llms.txt` explains how an agent can start a sign-up for a person. Every workspace subdomain answers `/robots.txt` with `Disallow: /`, so its sign-in pages stay out of search results.
+
+### Compression rule
+
+Every zone that serves DumbSlab needs a compression rule that leaves out Zstandard. Safari asks for Zstandard (`zstd`), and on dumbslab.com it cached `zstd` copies of `styles.css` and `app.js` that it couldn't read. Each revalidation then got `304 Not Modified`, so it kept the bad copies: the styles never applied, and the app stayed on "Loading". Chrome wasn't affected.
+
+- **Dashboard:** your zone › **Rules › Compression Rules** › create a rule for **All incoming requests**, with **Compression options: Custom** and the order **Brotli**, then **Gzip**.
+- **API**, with a token that has **Zone › Response Compression › Edit**. This replaces any compression rules the zone already has:
+
+```sh
+curl "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/rulesets/phases/http_response_compression/entrypoint" \
+  --request PUT --header "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+  --json '{"rules": [{"expression": "true", "action": "compress_response", "description": "Brotli or Gzip, never Zstandard (Safari)",
+    "action_parameters": {"algorithms": [{"name": "brotli"}, {"name": "gzip"}]}}]}'
+```
+
+The Worker also adds the deployed commit (the `git_sha` in `/healthz`) to every static file's ETag and answers revalidations itself, so each deploy gives every browser fresh copies, even of files that didn't change. A browser holding a bad copy recovers on its first visit after the next deploy.
 
 ### Changing a workspace's address
 
@@ -141,7 +158,7 @@ Any of a workspace's addresses works in these URLs. The list shows each workspac
 
 ## Single-workspace mode
 
-Set `MULTI_TENANT = "false"`. Point `routes` at your domain, set `BASE_URL` to its URL, and remove the wildcard route. Then:
+Set `MULTI_TENANT = "false"`. Point `routes` at your domain, set `BASE_URL` to its URL, remove the wildcard route, and add the zone's [compression rule](#compression-rule). Then:
 
 ```sh
 npx wrangler secret put SETUP_TOKEN   # any long random string; needed once to create the first admin
