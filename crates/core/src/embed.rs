@@ -23,6 +23,7 @@ pub const FRAME_ORIGINS: &[&str] = &[
     "https://app.ludus.one",
     "https://www.slideshare.net",
     "https://www.iorad.com",
+    "https://pingboard.workleap.com",
     "https://view.monday.com",
     "https://app.mode.com",
     "https://app.smartsheet.com",
@@ -61,7 +62,8 @@ pub fn media_src_directive() -> String {
 pub const PROVIDERS: &str = "YouTube, Vimeo, Loom, Wistia, Google Docs, Sheets, Slides, Forms and Drive, \
                              Word, Excel and PowerPoint (OneDrive or SharePoint embed links), Figma, Canva, Miro, Lucid, Draw.io, \
                              Gliffy, Airtable, Smartsheet, monday.com, Mode, Typeform, Jotform, CodePen, JSFiddle, iorad, Ludus, \
-                             SlideShare, Dropbox images and videos, and X posts (as a link card)";
+                             SlideShare, Pingboard org charts, Dropbox images and videos, and X posts and Otter conversations \
+                             (as link cards)";
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Embed {
@@ -77,6 +79,8 @@ pub struct Embed {
     pub allow: &'static str,
     /// For cards: who posted it, e.g. "@handle".
     pub author: Option<String>,
+    /// For cards: what the link is, e.g. "Post". Empty when there is no card.
+    pub item: &'static str,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -89,7 +93,8 @@ pub enum Shape {
     Image,
     /// A video file on one of [`MEDIA_ORIGINS`], played with `<video>`.
     VideoFile,
-    /// A link card with no frame, for posts that only embed with the provider's script.
+    /// A link card with no frame, for links the provider only embeds with its own script or won't
+    /// let other sites frame.
     Card,
 }
 
@@ -192,6 +197,8 @@ fn seconds(t: &str) -> Option<u64> {
 
 /// Players and viewers: scripts, fullscreen, and popups that stay sandboxed.
 const PLAYER: &str = "allow-scripts allow-same-origin allow-popups allow-presentation";
+/// Read-only charts: scripts, and links that open in a new tab that stays sandboxed.
+const CHART: &str = "allow-scripts allow-same-origin allow-popups";
 /// Design tools: may also ask for their own cookies after a click, to show the viewer's access.
 const APP: &str = "allow-scripts allow-same-origin allow-popups allow-presentation allow-storage-access-by-user-activation";
 /// Google: signing in to see a private file needs forms and an unsandboxed sign-in popup.
@@ -211,7 +218,7 @@ const CODE: &str = "allow-scripts allow-same-origin";
 const FEATURES: &str = "autoplay; clipboard-write; encrypted-media; fullscreen; picture-in-picture";
 
 fn frame(provider: &'static str, shape: Shape, sandbox: &'static str, src: String) -> Option<Embed> {
-    Some(Embed { provider, src, shape, sandbox, allow: FEATURES, author: None })
+    Some(Embed { provider, src, shape, sandbox, allow: FEATURES, author: None, item: "" })
 }
 
 fn video(provider: &'static str, src: String) -> Option<Embed> {
@@ -224,12 +231,17 @@ fn document(provider: &'static str, src: String) -> Option<Embed> {
 
 /// An image or video file: no frame, so no sandbox.
 fn inline(provider: &'static str, shape: Shape, src: String) -> Option<Embed> {
-    Some(Embed { provider, src, shape, sandbox: "", allow: "", author: None })
+    Some(Embed { provider, src, shape, sandbox: "", allow: "", author: None, item: "" })
 }
 
 /// A code playground's frame, with no extra features.
 fn code(provider: &'static str, src: String) -> Option<Embed> {
-    Some(Embed { provider, src, shape: Shape::Document, sandbox: CODE, allow: "", author: None })
+    Some(Embed { provider, src, shape: Shape::Document, sandbox: CODE, allow: "", author: None, item: "" })
+}
+
+/// A link card, e.g. a "Post" on X: no frame, so no sandbox.
+fn link_card(provider: &'static str, item: &'static str, src: String, author: Option<String>) -> Option<Embed> {
+    Some(Embed { provider, src, shape: Shape::Card, sandbox: "", allow: "", author, item })
 }
 
 /// The embed for a link, when it points at a provider that can be embedded.
@@ -333,6 +345,8 @@ pub fn from_url(url: &str) -> Option<Embed> {
             let slug = if seg(2).is_empty() { String::new() } else { format!("/{}", id(seg(2), 1, 200)?) };
             frame("iorad", Shape::Document, PLAYER, format!("https://www.iorad.com/player/{tutorial}{slug}?src=iframe&oembed=1"))
         }
+        "pingboard.workleap.com" | "app.pingboard.com" => pingboard(&u),
+        "otter.ai" => otter(&u),
         "view.monday.com" => {
             // A board view shared publicly: view.monday.com/{view}; adding /embed/ shows it alone.
             let view = if seg(0) == "embed" { seg(1) } else { seg(0) };
@@ -568,6 +582,34 @@ fn slideshare(u: &Url) -> Option<Embed> {
     video("SlideShare", format!("https://www.slideshare.net/slideshow/embed_code/{deck}"))
 }
 
+/// A Pingboard org chart shared with a link: pingboard.workleap.com/s/{token}/org_chart, where
+/// older app.pingboard.com links now redirect. Pingboard's own embed code frames the link
+/// (https://help.workleap.com/en/articles/10281432-org-chart-sharing-methods). A department's view
+/// adds `filter_by`, and a chart centered on a person adds `center`.
+fn pingboard(u: &Url) -> Option<Embed> {
+    let token = match u.segments.as_slice() {
+        ["s", token] | ["s", token, "org_chart"] => id(token, 16, 128)?,
+        _ => return None,
+    };
+    let view: Vec<String> = ["filter_by", "center"]
+        .into_iter()
+        .filter_map(|name| query_param(u.query, name).and_then(digits).map(|n| format!("{name}={n}")))
+        .collect();
+    let mut src = format!("https://pingboard.workleap.com/s/{token}/org_chart");
+    if !view.is_empty() {
+        src = format!("{src}?{}", view.join("&"));
+    }
+    // An org chart only needs to draw and go fullscreen: no media, clipboard or presentation.
+    Some(Embed { provider: "Pingboard", src, shape: Shape::Document, sandbox: CHART, allow: "fullscreen", author: None, item: "" })
+}
+
+/// An Otter conversation: otter.ai/u/{id}. Otter's pages only let Outlook and Otter itself frame
+/// them, so a conversation shows as a link card.
+fn otter(u: &Url) -> Option<Embed> {
+    let ["u", conversation] = u.segments.as_slice() else { return None };
+    link_card("Otter", "Conversation", format!("https://otter.ai/u/{}", id(conversation, 20, 40)?), None)
+}
+
 /// codepen.io/{user}/pen/{pen}, or /full/, /details/ or /embed/; a team's pens are under
 /// codepen.io/team/{team}/ (https://blog.codepen.io/documentation/embedded-pens/).
 fn codepen(u: &Url) -> Option<Embed> {
@@ -724,14 +766,7 @@ fn x_post(u: &Url) -> Option<Embed> {
         Some(h) => Some(h).filter(|h| (1..=15).contains(&h.len()) && h.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'))?,
         None => "i",
     };
-    Some(Embed {
-        provider: "X",
-        src: format!("https://x.com/{handle}/status/{post}"),
-        shape: Shape::Card,
-        sandbox: "",
-        allow: "",
-        author: (handle != "i").then(|| format!("@{handle}")),
-    })
+    link_card("X", "Post", format!("https://x.com/{handle}/status/{post}"), (handle != "i").then(|| format!("@{handle}")))
 }
 
 /// The trusted HTML for an embed. `href` is the link as written; `label` is its link text, if any.
@@ -778,9 +813,9 @@ pub fn html(embed: &Embed, href: &str, label: Option<&str>) -> String {
     )
 }
 
-/// A link card: who posted it, and where.
+/// A link card: what it is, who posted it, and where.
 fn card(embed: &Embed, label: Option<&str>) -> String {
-    let post = format!("Post on {}", embed.provider);
+    let post = format!("{} on {}", embed.item, embed.provider);
     let (title, meta) = match (label, embed.author.as_deref()) {
         (Some(l), Some(a)) => (l.to_string(), format!("{a} · {post}")),
         (Some(l), None) => (l.to_string(), post),
@@ -1335,6 +1370,119 @@ mod tests {
         assert!(labeled.contains(">Launch &lt;news&gt;</span><span class=\"embed-card-meta\">@XDevelopers · Post on X<"), "{labeled}");
     }
 
+    #[test]
+    fn otter_conversations_are_link_cards() {
+        let talk = from_url("https://otter.ai/u/Ab3dE5gH7jK9mN1pQ_rS-tU2wX4?utm_source=copy_url&tab=chat").unwrap();
+        assert_eq!(
+            (talk.provider, talk.src.as_str(), talk.shape, talk.sandbox, talk.author.as_deref()),
+            ("Otter", "https://otter.ai/u/Ab3dE5gH7jK9mN1pQ_rS-tU2wX4", Shape::Card, "", None)
+        );
+        check(
+            &[("https://www.otter.ai/u/-Zy8xW6vU4tS2rQ0pO9nM7lK5jI/", "https://otter.ai/u/-Zy8xW6vU4tS2rQ0pO9nM7lK5jI")],
+            &[
+                "https://otter.ai/u/",
+                "https://otter.ai/u/short",
+                "https://otter.ai/u/Ab3dE5gH7jK9mN1pQ_\"rS-tU2wX4",
+                "https://otter.ai/u/Ab3dE5gH7jK9mN1pQ_rS-tU2wX4/edit",
+                "https://otter.ai/pricing",
+                "https://otter.ai.evil.test/u/Ab3dE5gH7jK9mN1pQ_rS-tU2wX4",
+                // Encoded separators, dot segments and backslashes never reach the card's link.
+                "https://otter.ai/u/Ab3dE5gH7jK9mN1pQ_rS%2F..%2Fpricing",
+                "https://otter.ai/u/../u/Ab3dE5gH7jK9mN1pQ_rS-tU2wX4",
+                "https://otter.ai/u/Ab3dE5gH7jK9mN1pQ_rS-tU2wX4\\evil",
+                // 41 characters: one past the longest id.
+                "https://otter.ai/u/Ab3dE5gH7jK9mN1pQ_rS-tU2wX4Ab3dE5gH7jK9mN1pQ",
+            ],
+        );
+        // Case, fragments and the longest id all come out as the one canonical link.
+        let longest = "Ab3dE5gH7jK9mN1pQ_rS-tU2wX4Ab3dE5gH7jK9m";
+        assert_eq!(longest.len(), 40);
+        check(
+            &[
+                (&format!("https://OTTER.AI/u/{longest}#t=30"), &format!("https://otter.ai/u/{longest}")),
+                ("https://otter.ai/u/Ab3dE5gH7jK9mN1pQ_rS-tU2wX4#chat", "https://otter.ai/u/Ab3dE5gH7jK9mN1pQ_rS-tU2wX4"),
+            ],
+            &[],
+        );
+        // A link's own text is escaped in the card title.
+        let escaped = super::html(&talk, "https://otter.ai/u/Ab3dE5gH7jK9mN1pQ_rS-tU2wX4", Some("<b>sync</b> & \"notes\""));
+        assert!(!escaped.contains("<b>"), "{escaped}");
+        assert!(escaped.contains("&lt;b&gt;sync&lt;/b&gt; &amp; "), "{escaped}");
+        let html = html(&talk, "https://otter.ai/u/Ab3dE5gH7jK9mN1pQ_rS-tU2wX4", None);
+        assert!(!html.contains("<iframe"), "{html}");
+        assert!(
+            html.contains(
+                "<span class=\"embed-card-title\">Conversation on Otter</span>\
+                 <span class=\"embed-card-meta\">otter.ai/u/Ab3dE5gH7jK9mN1pQ_rS-tU2wX4</span>"
+            ),
+            "{html}"
+        );
+        let labeled = super::html(&talk, "https://otter.ai/u/Ab3dE5gH7jK9mN1pQ_rS-tU2wX4", Some("Weekly sync"));
+        assert!(labeled.contains(">Weekly sync</span><span class=\"embed-card-meta\">Conversation on Otter<"), "{labeled}");
+    }
+
+    #[test]
+    fn pingboard_org_charts() {
+        let token = "X7kQ2mPz9LwR4tYv8NcB3hJd6FsG1aUe5oKi0xWq7ZrT2yMn9pLb4cVg8jHf3sDa6eRu1iOw5tQk0mXz7NvB2_-q";
+        let chart = format!("https://pingboard.workleap.com/s/{token}/org_chart");
+        check(
+            &[
+                (&chart, &chart),
+                (&format!("https://app.pingboard.com/s/{token}/org_chart"), &chart),
+                (&format!("https://app.pingboard.com/s/{token}"), &chart),
+                (&format!("https://pingboard.workleap.com/s/{token}/org_chart?share_token={token}&utm_source=pingboard"), &chart),
+                (&format!("https://app.pingboard.com/s/{token}/org_chart?filter_by=1234567"), &format!("{chart}?filter_by=1234567")),
+                (
+                    &format!("https://app.pingboard.com/s/{token}/org_chart?center=7654321&filter_by=2468024"),
+                    &format!("{chart}?filter_by=2468024&center=7654321"),
+                ),
+                (&format!("https://app.pingboard.com/s/{token}/org_chart?filter_by=evil.test"), &chart),
+                (
+                    "https://app.pingboard.com/s/Fk2mQ9vXr4Lp7TzW1nBc8d/org_chart",
+                    "https://pingboard.workleap.com/s/Fk2mQ9vXr4Lp7TzW1nBc8d/org_chart",
+                ),
+            ],
+            &[
+                "https://app.pingboard.com/s/oembed.json?url=https%3A%2F%2Fapp.pingboard.com%2Fs%2FFk2mQ9vXr4Lp7TzW1nBc8d",
+                "https://app.pingboard.com/s/short/org_chart",
+                "https://app.pingboard.com/s/Fk2mQ9vXr4Lp7TzW1nBc8d/users/1",
+                "https://app.pingboard.com/s/Fk2mQ9vXr4L\"p7TzW1nBc8d/org_chart",
+                "https://app.pingboard.com/org_chart",
+                "https://acme.pingboard.com/users/1234",
+                "https://pingboard.workleap.com.evil.test/s/Fk2mQ9vXr4Lp7TzW1nBc8d/org_chart",
+                // Encoded separators, dot segments and backslashes in the path.
+                "https://app.pingboard.com/s/Fk2mQ9vXr4Lp7TzW1nBc8d%2F..%2Fusers/org_chart",
+                "https://app.pingboard.com/s/../s/Fk2mQ9vXr4Lp7TzW1nBc8d/org_chart",
+                "https://app.pingboard.com/s/Fk2mQ9vXr4Lp7TzW1nBc8d/../org_chart",
+                "https://app.pingboard.com/s/Fk2mQ9vXr4Lp7TzW1nBc8d\\org_chart",
+                // 129 characters: one past the longest token.
+                &format!("https://app.pingboard.com/s/{}/org_chart", "a".repeat(129)),
+            ],
+        );
+        // Only digits survive in the view parameters, the first of a repeated key wins, and case,
+        // fragments and other parameters never reach the frame URL.
+        let longest = "a".repeat(128);
+        check(
+            &[
+                (
+                    &format!("https://app.pingboard.com/s/{token}/org_chart?filter_by=12&filter_by=34&center=%35%36"),
+                    &format!("{chart}?filter_by=12"),
+                ),
+                (&format!("https://app.pingboard.com/s/{token}/org_chart?filter_by=12%26center%3D3"), &chart),
+                (&format!("https://app.pingboard.com/s/{token}/org_chart?filter_by=1234567890123456"), &chart),
+                (&format!("https://APP.PingBoard.com/s/{token}/org_chart#people"), &chart),
+                (&format!("https://app.pingboard.com/s/{token}/org_chart?center=5#filter_by=6"), &format!("{chart}?center=5")),
+                (
+                    &format!("https://pingboard.workleap.com/s/{longest}/org_chart"),
+                    &format!("https://pingboard.workleap.com/s/{longest}/org_chart"),
+                ),
+            ],
+            &[],
+        );
+        let e = from_url(&chart).unwrap();
+        assert_eq!((e.provider, e.shape, e.sandbox, e.allow), ("Pingboard", Shape::Document, CHART, "fullscreen"));
+    }
+
     /// Whether `src` is on one of `origins`; `https://*.example.com` matches one subdomain.
     fn on_origin(src: &str, origins: &[&str]) -> bool {
         origins.iter().any(|o| match o.strip_prefix("https://*.") {
@@ -1375,6 +1523,7 @@ mod tests {
             "https://app.ludus.one/3c5f8e07-4d86-4c0d-8356-a352f74b9c0a",
             "https://www.slideshare.net/slideshow/culture-code/17415022",
             "https://www.iorad.com/player/1622550/How-to-Embed-an-iorad-Tutorial",
+            "https://app.pingboard.com/s/Fk2mQ9vXr4Lp7TzW1nBc8d/org_chart",
             "https://view.monday.com/9424258790-ddec9d2cad0c8c255c08eac935803f29",
             "https://app.mode.com/acme/reports/0d0d0bbe1e2e",
             "https://app.smartsheet.com/b/publish?EQBCT=0123456789abcdef0123456789abcdef",
@@ -1398,6 +1547,7 @@ mod tests {
             "https://www.dropbox.com/scl/fi/abc123def456ghi789jkl/photo.png?rlkey=a1b2c3d4e5f6g7h8i9j0k1l2m",
             "https://www.dropbox.com/s/abc123def456ghi/demo.mp4",
             "https://x.com/jack/status/20",
+            "https://otter.ai/u/Ab3dE5gH7jK9mN1pQ_rS-tU2wX4",
         ];
         let mut framed = vec![];
         for url in links {
@@ -1413,7 +1563,7 @@ mod tests {
                 Shape::VideoFile => assert!(on_origin(s, MEDIA_ORIGINS), "{s}"),
                 // `img-src` allows any https: image.
                 Shape::Image => assert!(s.starts_with("https://"), "{s}"),
-                Shape::Card => assert!(s.starts_with("https://x.com/"), "{s}"),
+                Shape::Card => assert!(s.starts_with("https://x.com/") || s.starts_with("https://otter.ai/u/"), "{s}"),
             }
             if e.shape != Shape::Video && e.shape != Shape::Document {
                 assert!(e.sandbox.is_empty() && !html(&e, url, None).contains("<iframe"), "{url}");
@@ -1441,6 +1591,9 @@ mod tests {
             let sandbox = from_url(url).unwrap().sandbox;
             assert_eq!(sandbox, PLAYER, "{url}");
         }
+        // An org chart doesn't present, play media or write to the clipboard.
+        let chart = from_url("https://app.pingboard.com/s/Fk2mQ9vXr4Lp7TzW1nBc8d/org_chart").unwrap();
+        assert_eq!((chart.sandbox, chart.allow), ("allow-scripts allow-same-origin allow-popups", "fullscreen"));
         let video = html(&from_url("https://youtu.be/9pasx0ghADM").unwrap(), "https://youtu.be/9pasx0ghADM", None);
         assert!(video.contains(&format!("loading=\"lazy\" allow=\"{FEATURES}\" allowfullscreen referrerpolicy=")), "{video}");
     }
