@@ -27,7 +27,7 @@ The checked-in `crates/worker/wrangler.toml` deploys dumbslab.com in this mode. 
 
 1. Set `ROOT_DOMAIN` and the three `routes` to your domain. Also replace `https://dumbslab.com` in `web/welcome.html`: the sign-up page's canonical link, social tags and structured data name it. `web/privacy.html` and `web/terms.html` are dumbslab.com's own privacy policy and terms, served at `/privacy` and `/terms` on the root domain and on every workspace address: replace them with yours.
 2. Add a proxied wildcard DNS record so workspace subdomains reach the Worker: type `AAAA`, name `*`, content `100::`, proxied. Cloudflare's free Universal SSL covers one level of subdomains.
-3. Add the zone's compression rule (see [Compression rule](#compression-rule) below).
+3. Add the zone's [compression rule](#compression-rule).
 4. Add the secrets and deploy:
 
 ```sh
@@ -49,7 +49,7 @@ For search engines and agents, the root domain serves `/robots.txt`, `/sitemap.x
 
 ### Compression rule
 
-Every zone that serves DumbSlab needs a compression rule that leaves out Zstandard. Safari asks for Zstandard (`zstd`), and on dumbslab.com it cached `zstd` copies of `styles.css` and `app.js` that it couldn't read. Each revalidation then got `304 Not Modified`, so it kept the bad copies: the styles never applied, and the app stayed on "Loading". Chrome wasn't affected.
+Every zone that serves DumbSlab needs a compression rule that sends Brotli, then Gzip, and never Zstandard (`zstd`). Safari asks for Zstandard, and its broken copies of the app's files on dumbslab.com first appeared while the zone sent it. Brotli and Gzip work in every browser.
 
 - **Dashboard:** your zone › **Rules › Compression Rules** › create a rule for **All incoming requests**, with **Compression options: Custom** and the order **Brotli**, then **Gzip**.
 - **API**, with a token that has **Zone › Response Compression › Edit**. This replaces any compression rules the zone already has:
@@ -61,7 +61,9 @@ curl "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/rulesets/phases/http_r
     "action_parameters": {"algorithms": [{"name": "brotli"}, {"name": "gzip"}]}}]}'
 ```
 
-The Worker also adds the deployed commit (the `git_sha` in `/healthz`) to every static file's ETag and answers revalidations itself, so each deploy gives every browser fresh copies, even of files that didn't change. A browser holding a bad copy recovers on its first visit after the next deploy.
+### Why scripts and styles aren't cached
+
+The Worker sends the web app's scripts and stylesheets with `Cache-Control: no-store` and no `ETag` or `Last-Modified`, and asks the static assets for them without the browser's `If-None-Match` or `If-Modified-Since`. Browsers download them in full on every page load and never get a `304 Not Modified` for them. Safari can keep an empty, broken copy of a file in its memory cache and reuse it whenever the server answers `304`. On dumbslab.com every script and stylesheet then came back empty: the page had no styles and stayed on "Loading". HTML pages, images and other files are cached as usual. The native server does the same.
 
 ### Changing a workspace's address
 

@@ -8000,61 +8000,49 @@ fn healthz_reports_build_identity_without_auth() {
     assert!(sha == "unknown" || ((sha.len() == 40 || sha.len() == 64) && sha.bytes().all(|b| b.is_ascii_hexdigit())));
 }
 
-/// The web app's files carry the build's commit in their ETags, so each new build replaces every
-/// copy a browser holds, even of files that didn't change. A known copy revalidates with 304, also
-/// when a compressing proxy weakened its ETag.
+/// Browsers never revalidate the web app's scripts and stylesheets (Safari reuses a broken memory
+/// copy on a 304), so those come whole every time, with no ETag. Pages and images still revalidate.
 #[test]
-fn static_file_etags_change_with_each_build() {
+fn scripts_and_styles_are_never_revalidated() {
     use axum::http::{HeaderMap, HeaderValue, StatusCode};
-    let serve = |path: &str, if_none_match: &[&str]| {
+    let serve = |path: &str, if_none_match: Option<&str>| {
         let mut headers = HeaderMap::new();
-        for value in if_none_match {
-            headers.append("if-none-match", HeaderValue::from_str(value).unwrap());
+        if let Some(value) = if_none_match {
+            headers.insert("if-none-match", HeaderValue::from_str(value).unwrap());
         }
         let resp = dumbslab::web::serve(path, &headers, "default-src 'self'");
         let header = |name: &str| resp.headers().get(name).map(|v| v.to_str().unwrap().to_string());
-        let (status, etag, cache) = (resp.status(), header("etag"), header("cache-control"));
+        let (status, etag, cache, content_type) = (resp.status(), header("etag"), header("cache-control"), header("content-type"));
         let body = tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap()
             .block_on(axum::body::to_bytes(resp.into_body(), usize::MAX))
             .unwrap();
-        (status, etag.unwrap_or_default(), cache, body.len())
+        (status, etag, cache, content_type.unwrap_or_default(), body.len())
     };
 
-    let (status, etag, cache, size) = serve("/styles.css", &[]);
-    assert_eq!(status, StatusCode::OK);
-    assert!(size > 0);
-    assert_eq!(cache.as_deref(), Some("no-cache"));
-    let build = format!("-{}\"", dumbslab_core::GIT_SHA);
-    assert!(etag.starts_with('"') && etag.ends_with(&build), "{etag}");
-
-    // A copy from another build, or from before ETags named the build, comes again in full.
-    let content_only = etag.replace(&format!("-{}", dumbslab_core::GIT_SHA), "");
-    let other_build = etag.replace(dumbslab_core::GIT_SHA, "0000000000000000000000000000000000000000");
-    for stale in [content_only.clone(), format!("W/{content_only}"), other_build] {
-        let (status, again, _, size) = serve("/styles.css", &[stale.as_str()]);
-        assert_eq!((status, again.as_str()), (StatusCode::OK, etag.as_str()), "{stale}");
-        assert!(size > 0);
+    for path in ["/theme-init.js", "/app.js", "/styles.css", "/welcome.css"] {
+        let (status, etag, cache, content_type, size) = serve(path, None);
+        assert_eq!(status, StatusCode::OK, "{path}");
+        assert!(size > 0, "{path}");
+        assert!(dumbslab_core::assets::is_script_or_style(&content_type), "{path}: {content_type}");
+        assert_eq!((etag, cache.as_deref()), (None, Some("no-store")), "{path}");
+        // Whatever a browser sends to revalidate, it gets the whole file.
+        for sent in ["*", "W/\"anything\"", "\"anything\""] {
+            let (status, etag, cache, _, again) = serve(path, Some(sent));
+            assert_eq!((status, etag, cache.as_deref(), again), (StatusCode::OK, None, Some("no-store"), size), "{path} {sent}");
+        }
     }
 
-    // This build's copy, weak or strong, alone, in a list, on its own header line, or `*`: 304.
-    let weak = format!("W/{etag}");
-    let listed = format!("\"old\", {weak}");
-    for sent in [vec![etag.as_str()], vec![weak.as_str()], vec![listed.as_str()], vec!["\"old\"", etag.as_str()], vec!["*"]] {
-        let (status, again, cache, size) = serve("/styles.css", &sent);
-        assert_eq!(status, StatusCode::NOT_MODIFIED, "{sent:?}");
-        assert_eq!((again.as_str(), cache.as_deref(), size), (etag.as_str(), Some("no-cache"), 0), "{sent:?}");
+    // Pages and images keep their ETag and 304s, and the app's routes are index.html.
+    for path in ["/index.html", "/favicon.svg", "/p/123"] {
+        let (status, etag, cache, _, size) = serve(path, None);
+        assert_eq!((status, cache.as_deref()), (StatusCode::OK, Some("no-cache")), "{path}");
+        assert!(size > 0, "{path}");
+        let etag = etag.expect(path);
+        let (status, again, _, _, size) = serve(path, Some(&etag));
+        assert_eq!((status, again.as_deref(), size), (StatusCode::NOT_MODIFIED, Some(etag.as_str()), 0), "{path}");
     }
-    // Another file's ETag isn't this one's.
-    let (_, script, _, _) = serve("/app.js", &[]);
-    assert_ne!(script, etag);
-    assert_eq!(serve("/styles.css", &[script.as_str()]).0, StatusCode::OK);
-    // The app's routes are index.html, with its ETag.
-    let (_, index, _, _) = serve("/index.html", &[]);
-    assert!(index.ends_with(&build));
-    assert_eq!(serve("/p/123", &[]).1, index);
-    assert_eq!(serve("/p/123", &[index.as_str()]).0, StatusCode::NOT_MODIFIED);
 }
 
 // ---------------------------------------------------------------------------

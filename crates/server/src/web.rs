@@ -7,9 +7,6 @@ use axum::response::Response;
 use dumbslab_core::assets;
 use rust_embed::RustEmbed;
 
-/// Browsers check every file with the server before using their copy.
-const CACHE_CONTROL: &str = "no-cache";
-
 #[derive(RustEmbed)]
 #[folder = "../../web/"]
 #[exclude = "_headers"]
@@ -41,24 +38,21 @@ pub fn serve(path: &str, headers: &HeaderMap, csp: &str) -> Response {
             None => return Response::builder().status(StatusCode::NOT_FOUND).body(Body::from("web app not built")).unwrap_or_default(),
         },
     };
-    // With the build's commit, like the Cloudflare host's, so each new build replaces every copy.
-    let etag = assets::versioned_etag(&hex(&file.metadata.sha256_hash()[..12]), dumbslab_core::GIT_SHA);
-    let if_none_match: Vec<&str> = headers.get_all("if-none-match").iter().filter_map(|v| v.to_str().ok()).collect();
-    if !if_none_match.is_empty() && assets::none_match(&if_none_match.join(","), &etag) {
-        return Response::builder()
-            .status(StatusCode::NOT_MODIFIED)
-            .header("etag", etag)
-            .header("cache-control", CACHE_CONTROL)
-            .body(Body::empty())
-            .unwrap_or_default();
-    }
     let mime = mime_guess::from_path(&name).first_or_octet_stream();
     let mut b = Response::builder()
         .header("content-type", mime.as_ref())
-        .header("etag", etag)
-        .header("cache-control", CACHE_CONTROL)
         .header("x-content-type-options", "nosniff")
         .header("referrer-policy", "strict-origin-when-cross-origin");
+    if assets::is_script_or_style(mime.as_ref()) {
+        // Never revalidated, so no ETag and never a 304 (see `dumbslab_core::assets`).
+        b = b.header("cache-control", assets::NO_STORE);
+    } else {
+        let etag = format!("\"{}\"", hex(&file.metadata.sha256_hash()[..12]));
+        if headers.get("if-none-match").and_then(|v| v.to_str().ok()) == Some(etag.as_str()) {
+            return Response::builder().status(StatusCode::NOT_MODIFIED).header("etag", etag).body(Body::empty()).unwrap_or_default();
+        }
+        b = b.header("etag", etag).header("cache-control", "no-cache");
+    }
     if name.ends_with(".html") {
         b = b.header("content-security-policy", csp).header("x-frame-options", "DENY");
     }

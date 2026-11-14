@@ -100,7 +100,7 @@ async fn route(req: Request, env: Env, url: &Url) -> Result<Response> {
 
     if !multi {
         if !is_core_path(&path) {
-            return asset(&env, &req, url.as_str()).await;
+            return asset(&env, req, url).await;
         }
         if let Some(limited) = rate_limited(&req, &env).await? {
             return Ok(limited);
@@ -118,7 +118,7 @@ async fn route(req: Request, env: Env, url: &Url) -> Result<Response> {
                 return text_response(WORKSPACE_ROBOTS_TXT.into(), "text/plain; charset=utf-8");
             }
             if !is_core_path(&path) {
-                return asset(&env, &req, url.as_str()).await;
+                return asset(&env, req, url).await;
             }
             if let Some(limited) = rate_limited(&req, &env).await? {
                 return Ok(limited);
@@ -129,32 +129,32 @@ async fn route(req: Request, env: Env, url: &Url) -> Result<Response> {
     }
 }
 
-/// A static file at `url`, for `req`. Its ETag gets this build's commit, so a deploy replaces every
-/// copy browsers hold; revalidations are answered here, since the assets compare only their own
-/// ETags (see `dumbslab_core::assets`).
-async fn asset(env: &Env, req: &Request, url: &str) -> Result<Response> {
-    let if_none_match = req.headers().get("if-none-match")?;
-    let headers = req.headers().clone();
-    for name in assets::CONDITIONAL_HEADERS {
+/// A static file from the assets. Scripts and stylesheets are never revalidated (see
+/// `dumbslab_core::assets`): a request for one reaches the assets without its conditional headers,
+/// so they can't answer `304`, and goes out as `no-store` without validators. Other files pass
+/// through as the assets answer.
+async fn asset(env: &Env, req: Request, url: &Url) -> Result<Response> {
+    let resp = if assets::is_script_or_style_path(url.path()) {
+        let headers = req.headers().clone();
+        for name in assets::CONDITIONAL_HEADERS {
+            headers.delete(name)?;
+        }
+        let mut init = RequestInit::new();
+        // Like the browser's own request, which gets any redirect itself.
+        init.with_method(req.method()).with_headers(headers).with_redirect(RequestRedirect::Manual);
+        env.assets("ASSETS")?.fetch_request(Request::new_with_init(url.as_str(), &init)?).await?
+    } else {
+        env.assets("ASSETS")?.fetch_request(req).await?
+    };
+    if !assets::is_script_or_style(&resp.headers().get("content-type")?.unwrap_or_default()) {
+        return Ok(resp);
+    }
+    // Fetched responses have immutable headers; a copy can be changed.
+    let headers = resp.headers().clone();
+    for name in assets::VALIDATORS {
         headers.delete(name)?;
     }
-    let mut init = RequestInit::new();
-    init.with_method(req.method()).with_headers(headers);
-    let resp = env.assets("ASSETS")?.fetch_request(Request::new_with_init(url, &init)?).await?;
-    let Some(etag) = resp.headers().get("etag")? else {
-        return Ok(resp);
-    };
-    let etag = assets::versioned_etag(&etag, dumbslab_core::GIT_SHA);
-    if resp.status_code() == 200 && if_none_match.is_some_and(|header| assets::none_match(&header, &etag)) {
-        let headers = Headers::new();
-        for (name, value) in resp.headers().entries().filter(|(name, _)| assets::kept_on_not_modified(name)) {
-            headers.set(&name, &value)?;
-        }
-        headers.set("etag", &etag)?;
-        return Ok(Response::empty()?.with_status(304).with_headers(headers));
-    }
-    let headers = resp.headers().clone();
-    headers.set("etag", &etag)?;
+    headers.set("cache-control", assets::NO_STORE)?;
     Ok(resp.with_headers(headers))
 }
 
@@ -255,7 +255,7 @@ async fn root_site(req: Request, env: &Env, root: &str, path: &str) -> Result<Re
     {
         let mut url = req.url()?;
         url.set_path(page);
-        return asset(env, &req, url.as_str()).await;
+        return env.assets("ASSETS")?.fetch_request(Request::new(url.as_str(), Method::Get)?).await;
     }
     match (method, path) {
         (Method::Get, "/healthz") => {
@@ -294,7 +294,8 @@ async fn root_site(req: Request, env: &Env, root: &str, path: &str) -> Result<Re
         (Method::Post, "/api/stripe/webhook") => billing::webhook(req, env).await,
         // Static files the sign-up page uses.
         (Method::Get | Method::Head, p) if p.rsplit('/').next().is_some_and(|f| f.contains('.')) => {
-            asset(env, &req, req.url()?.as_str()).await
+            let url = req.url()?;
+            asset(env, req, &url).await
         }
         (_, p) if is_core_path(p) => error_response(
             404,
