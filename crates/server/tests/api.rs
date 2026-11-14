@@ -1681,6 +1681,45 @@ fn embeds_code_office_forms_files_and_posts() {
     assert!(!html.contains("<iframe src=\"https://1drv.ms/w/"), "{html}");
 }
 
+#[test]
+fn embeds_pingboard_charts_and_otter_cards() {
+    let h = H::new();
+    let (_, admin) = h.setup();
+    let (_, viewer) = h.user(&admin, "vic@acme.test", "Vic", "viewer");
+    let content = "https://app.pingboard.com/s/Fk2mQ9vXr4Lp7TzW1nBc8d/org_chart?filter_by=1234567&share_token=x\n\n\
+                   [Weekly sync](https://otter.ai/u/Ab3dE5gH7jK9mN1pQ_rS-tU2wX4?utm_source=copy_url)\n\n\
+                   https://otter.ai/u/-Zy8xW6vU4tS2rQ0pO9nM7lK5jI";
+    let post = h.ok("POST", "/api/v1/posts", Some(json!({ "title": "Org and notes", "content": content, "status": "published" })), &admin);
+    let got = h.ok("GET", &format!("/api/v1/posts/{}?format=html", post["id"].as_str().unwrap()), None, &viewer);
+    let html = got["html"].as_str().unwrap();
+
+    // The org chart frames Pingboard's live host, as a viewer with no forms or sandbox escape.
+    let src = "https://pingboard.workleap.com/s/Fk2mQ9vXr4Lp7TzW1nBc8d/org_chart?filter_by=1234567";
+    let start = html.find(&format!("<iframe src=\"{src}\"")).unwrap_or_else(|| panic!("no Pingboard frame: {html}"));
+    let frame = &html[start..start + html[start..].find('>').unwrap() + 1];
+    assert!(
+        frame.contains("title=\"Pingboard: ")
+            && frame.ends_with(" sandbox=\"allow-scripts allow-same-origin allow-popups allow-presentation\">"),
+        "{frame}"
+    );
+    assert_eq!(html.matches("<iframe ").count(), 1, "{html}");
+
+    // Otter won't be framed, so its conversations are cards, titled by the link text when there is one.
+    assert!(
+        html.contains(
+            "<figure class=\"embed embed-card\"><a href=\"https://otter.ai/u/Ab3dE5gH7jK9mN1pQ_rS-tU2wX4\" target=\"_blank\" rel=\"noopener noreferrer\">\
+             <span class=\"embed-card-title\">Weekly sync</span><span class=\"embed-card-meta\">Conversation on Otter</span></a></figure>"
+        ),
+        "{html}"
+    );
+    assert!(
+        html.contains(
+            "<span class=\"embed-card-title\">Conversation on Otter</span><span class=\"embed-card-meta\">otter.ai/u/-Zy8xW6vU4tS2rQ0pO9nM7lK5jI</span>"
+        ),
+        "{html}"
+    );
+}
+
 // Uploaded images and files.
 
 const PNG: &[u8] = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR not really an image";
