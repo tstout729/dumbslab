@@ -172,7 +172,12 @@ export function buildShell(root) {
   const footer = h('footer', { class: 'app-footer' },
     h('nav', { 'aria-label': 'Footer' },
       h('a', { href: 'https://github.com/tstout729/dumbslab/issues/new?template=bug_report.yml' }, 'Report a bug'),
-      h('a', { href: 'mailto:simplycoo+dumbslab@mail.grokbot.com' }, 'Support')));
+      h('a', { href: 'mailto:simplycoo+dumbslab@mail.grokbot.com' }, 'Support'),
+      // Hosted DumbSlab's policies. Only hosted workspaces have an address; a self-hosted
+      // server's operator has their own. Full page loads: they're static pages, not app views.
+      ...(state.settings && state.settings.address
+        ? [h('a', { href: '/privacy', 'data-native': true }, 'Privacy'), h('a', { href: '/terms', 'data-native': true }, 'Terms')]
+        : [])));
   root.replaceChildren(h('div', { class: 'app' }, sidebar, backdrop, h('div', { class: 'main-col' }, topbar, main, footer)));
 
   renderTopicTree(topicsBox);

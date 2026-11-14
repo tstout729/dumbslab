@@ -207,12 +207,15 @@ async fn send_to(
 /// The root domain: the sign-up site, sign-up API and operator API.
 async fn root_site(req: Request, env: &Env, root: &str, path: &str) -> Result<Response> {
     let method = req.method();
+    // The sign-up page, the privacy policy and the terms: static files.
+    if matches!(method, Method::Get | Method::Head)
+        && let Some(page) = tenancy::root_page(path)
+    {
+        let mut url = req.url()?;
+        url.set_path(page);
+        return env.assets("ASSETS")?.fetch_request(Request::new(url.as_str(), Method::Get)?).await;
+    }
     match (method, path) {
-        (Method::Get | Method::Head, "/") => {
-            let mut url = req.url()?;
-            url.set_path("/welcome");
-            env.assets("ASSETS")?.fetch_request(Request::new(url.as_str(), Method::Get)?).await
-        }
         (Method::Get, "/healthz") => {
             json_response(200, &json!({ "ok": true, "version": dumbslab_core::VERSION, "git_sha": dumbslab_core::GIT_SHA }))
         }
