@@ -38,12 +38,17 @@ pub fn serve(path: &str, headers: &HeaderMap, csp: &str) -> Response {
             None => return Response::builder().status(StatusCode::NOT_FOUND).body(Body::from("web app not built")).unwrap_or_default(),
         },
     };
-    let mime = mime_guess::from_path(&name).first_or_octet_stream();
+    // mime_guess doesn't know `.cjs`; serve it as JavaScript like `.js` and `.mjs`.
+    let mime = if name.ends_with(".cjs") {
+        "text/javascript".to_string()
+    } else {
+        mime_guess::from_path(&name).first_or_octet_stream().to_string()
+    };
     let mut b = Response::builder()
-        .header("content-type", mime.as_ref())
+        .header("content-type", mime.as_str())
         .header("x-content-type-options", "nosniff")
         .header("referrer-policy", "strict-origin-when-cross-origin");
-    if assets::is_script_or_style(mime.as_ref()) {
+    if assets::is_script_or_style(&mime) || assets::is_script_or_style_path(&name) {
         // Never revalidated, so no ETag and never a 304 (see `dumbslab_core::assets`).
         b = b.header("cache-control", assets::NO_STORE);
     } else {
