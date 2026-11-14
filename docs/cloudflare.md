@@ -234,7 +234,7 @@ Other commands:
 | `backup restore --file FILE --to <url>` | Restores such a file into a fresh deployment, checking each object against the rows the file holds. The file is read through first: one that's damaged, cut short, or missing any object it covers restores nothing and fails. |
 | `backup verify --from <url> --to <url>` | Compares every object on two deployments, table by table. |
 | `backup freeze` / `backup thaw --from <url>` | Freezes or reopens a deployment's objects. |
-| `--object <name>` | Limits any command to that object (repeatable). |
+| `--object <name>` | Limits any command to that object (repeatable). Freezing the directory settles its reserved addresses, so a copy or freeze that names `directory` must also name every reserved address's object (it says which), or leave out `--object`. |
 
 Either end can also be a native server's database file, which holds one workspace: `--from https://dumbslab.com --object ws:acme --to acme.db` copies one hosted workspace into a file `dumbslab serve` can run. A native server won't start on a database whose restore is unfinished.
 

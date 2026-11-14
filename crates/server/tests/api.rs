@@ -14494,6 +14494,70 @@ mod backups {
         assert!(sealed.to_string().contains("frozen"), "{sealed}");
     }
 
+    /// Round 4: freezing the directory settles its reserved addresses, so their objects must freeze
+    /// with it. The directory alone is refused before anything freezes; with its reserved home, a
+    /// sign-up that passed its check before the freeze can't commit after the repair looked, and a
+    /// later full copy finishes.
+    #[test]
+    fn the_directory_freezes_only_with_its_reserved_homes() {
+        use chrono::Utc;
+        use dumbslab_core::tenancy::{self, Limits, signup_token};
+        let (src_dir, dst_dir) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (src_root, dst_root) = (src_dir.path(), dst_dir.path());
+        {
+            let conn = rusqlite::Connection::open(src_root.join("directory.db")).unwrap();
+            let db = Sqlite(&conn);
+            tenancy::directory_migrate(&db).unwrap();
+            let limits = Limits { per_ip_per_day: 50, per_day: 50, max_workspaces: 50, free: ROOMY };
+            for slug in ["acme", "late"] {
+                tenancy::reserve(&db, slug, "Name", "ip", Utc::now(), limits).unwrap();
+            }
+            tenancy::activate(&db, "acme", Utc::now()).unwrap();
+        }
+        set_up(src_root, "ws:acme", "ada@acme.test");
+        let (from, to) = (Endpoint::folder(src_root).unwrap(), Endpoint::folder(dst_root).unwrap());
+        let frozen = |object: &str| run(from.call::<Manifest>("backup/manifest", object, &json!({}))).unwrap().frozen;
+
+        // The directory alone: refused, naming the reserved home, before anything freezes.
+        let only = |names: &[&str]| Options { objects: names.iter().map(|n| n.to_string()).collect(), freeze: true };
+        let err = run(tool::copy(&from, Some(&to), None, &only(&["directory"]))).unwrap_err();
+        assert!(format!("{err}").contains("--object ws:late"), "{err}");
+        assert!(!frozen("directory") && !frozen("ws:late"), "nothing was frozen");
+
+        // With its reserved home, the home freezes before the directory's repair reads it.
+        let outcomes = run(tool::copy(&from, Some(&to), None, &only(&["directory", "ws:late"]))).unwrap();
+        assert_eq!(statuses(&outcomes), [Status::Copied, Status::Empty], "{}", tool::table(&outcomes));
+        assert!(frozen("ws:late"));
+        // late's sign-up, whose directory check passed before the freeze, resumes now: the Worker
+        // creates the schema and runs the setup in one transaction. It's refused.
+        let conn = rusqlite::Connection::open(src_root.join("ws:late.db")).unwrap();
+        let db = Sqlite(&conn);
+        let cfg = HostConfig { signup_secret: Some("sekret".into()), workspace: Some("late".into()), ..Default::default() };
+        let token = signup_token("sekret", "late", Utc::now().timestamp() + 3600);
+        let body =
+            json!({ "setup_token": token, "workspace_name": "Late", "name": "Lee", "email": "lee@late.test", "password": "password123" });
+        let req = Request {
+            method: "POST".into(),
+            path: "/api/v1/auth/setup".into(),
+            headers: vec![("content-type".into(), "application/json".into()), ("x-dumbslab-client".into(), "web".into())],
+            body: serde_json::to_vec(&body).unwrap(),
+            origin: "https://late.kb.test".into(),
+            ..Default::default()
+        };
+        conn.execute_batch("BEGIN").unwrap();
+        dumbslab_core::migrate(&db).unwrap();
+        let outcome = dumbslab_core::handle(&db, &cfg, &req).unwrap();
+        assert_eq!((outcome.response.status, outcome.commit), (503, false));
+        conn.execute_batch("ROLLBACK").unwrap();
+        assert_eq!((entry(src_root, "late"), entry(dst_root, "late")), ("reserved".to_string(), "reserved".to_string()));
+
+        // A later full copy freezes the rest and finishes: nothing is stranded behind the sealed directory.
+        let all = run(tool::copy(&from, Some(&to), None, &Options { objects: vec![], freeze: true })).unwrap();
+        assert!(all.iter().all(|o| o.status.ok()), "{}", tool::table(&all));
+        let checked = run(tool::verify(&from, &to, &[])).unwrap();
+        assert!(checked.iter().all(|o| matches!(o.status, Status::Same | Status::Empty)), "{}", tool::table(&checked));
+    }
+
     /// Writes a backup file record by record, as a damaged or forged one might be.
     fn forge(path: &std::path::Path, passphrase: &str, records: &[Value]) {
         let (key, mut out) = FileKey::create(passphrase).unwrap();

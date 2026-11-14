@@ -579,6 +579,20 @@ pub async fn freeze(from: &Endpoint, only: &[String]) -> anyhow::Result<(Listing
         anyhow!("freezing {what}: {e}. Objects frozen so far stay frozen; `dumbslab backup thaw --from {}` reopens them", from.label())
     };
     let has_directory = first.objects.iter().any(|o| o.kind == Kind::Directory && (only.is_empty() || only.contains(&o.name)));
+    // Freezing the directory settles each reserved address (see `repair_directory`), which needs
+    // that address's object frozen too: otherwise a sign-up could still finish there unseen.
+    let unfrozen: Vec<&str> = first
+        .objects
+        .iter()
+        .filter(|o| o.kind == Kind::Workspace && o.status.as_deref() == Some("reserved") && !only.is_empty() && !only.contains(&o.name))
+        .map(|o| o.name.as_str())
+        .collect();
+    if has_directory && !unfrozen.is_empty() {
+        bail!(
+            "the directory freezes only with its reserved addresses' objects: add --object {}, or leave out --object to take everything. Nothing was frozen.",
+            unfrozen.join(" --object ")
+        );
+    }
     if has_directory {
         from.call::<Value>("backup/drain", backup::DIRECTORY_OBJECT, &json!({})).await.map_err(|e| stuck("the directory", e))?;
     }
@@ -606,12 +620,17 @@ pub async fn freeze(from: &Endpoint, only: &[String]) -> anyhow::Result<(Listing
 }
 
 /// Marks active, in the draining directory, each workspace whose entry says `reserved` though its
-/// (frozen) object holds a set-up workspace. Not disabled or deleted ones (their entries don't say
-/// `reserved`), nor reservations nobody set up (their objects hold no people).
+/// frozen object holds a set-up workspace. Not disabled or deleted ones (their entries don't say
+/// `reserved`), nor reservations nobody set up (their objects hold no people). Refuses when such an
+/// object isn't frozen: a sign-up could still finish there after this looked.
 async fn repair_directory(from: &Endpoint, listing: &Listing) -> Result<Vec<String>, CallError> {
     let mut stale = vec![];
     for o in listing.objects.iter().filter(|o| o.kind == Kind::Workspace && o.status.as_deref() == Some("reserved")) {
         let m: Manifest = from.call("backup/manifest", &o.name, &json!({})).await?;
+        if !m.frozen {
+            let why = format!("{} isn't frozen, so whether its sign-up finished can't be settled; freeze it with the directory", o.name);
+            return Err(api_error(ApiError::new(409, "not_frozen", why)));
+        }
         let set_up = m.kind == Kind::Workspace && !m.restoring && m.tables.iter().any(|t| t.name == "users" && t.rows > 0);
         if let (true, Some(home)) = (set_up, o.name.strip_prefix("ws:")) {
             stale.push(home.to_string());
