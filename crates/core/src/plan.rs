@@ -201,6 +201,10 @@ fn hour_of(now: DateTime<Utc>) -> i64 {
 
 /// Adds the rows a request wrote to the current hour, and forgets hours older than a day.
 pub fn record_writes(db: &dyn Db, now: DateTime<Utc>, rows: u64) -> ApiResult<()> {
+    // A workspace frozen for a copy records nothing more (see `backup::freeze`).
+    if crate::backup::lock(db)? != crate::backup::Lock::Open {
+        return Ok(());
+    }
     let hour = hour_of(now);
     db.execute(
         "INSERT INTO usage_hours (hour, rows_written) VALUES (?, ?)

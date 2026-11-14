@@ -128,6 +128,11 @@ pub fn transaction<T: 'static>(storage: &Storage, db: DoDb, f: impl FnOnce(&dyn 
 /// same limit the native server applies: uploads get room for a file).
 pub async fn read_body(req: &mut Request) -> Result<Option<Vec<u8>>> {
     let max_body = dumbslab_core::http::body_limit(req.url()?.path());
+    read_body_within(req, max_body).await
+}
+
+/// Reads the request body, or `None` when it is larger than `max_body`.
+pub async fn read_body_within(req: &mut Request, max_body: usize) -> Result<Option<Vec<u8>>> {
     let declared = req.headers().get("content-length")?.and_then(|v| v.parse::<usize>().ok());
     if declared.is_some_and(|n| n > max_body) {
         return Ok(None);
@@ -172,6 +177,16 @@ pub fn var_i64(env: &Env, name: &str, default: i64) -> i64 {
 
 pub fn flag(env: &Env, name: &str) -> bool {
     var(env, name).is_some_and(|v| v == "true")
+}
+
+/// Sends a request with a raw body to a Durable Object and returns its response as it is.
+pub async fn call_object_raw(env: &Env, binding: &str, name: &str, path: &str, body: Vec<u8>) -> Result<Response> {
+    let stub = env.durable_object(binding)?.id_from_name(name)?.get_stub()?;
+    let headers = Headers::new();
+    headers.set("content-type", "application/json")?;
+    let mut init = RequestInit::new();
+    init.with_method(Method::Post).with_headers(headers).with_body(Some(js_sys::Uint8Array::from(body.as_slice()).into()));
+    stub.fetch_with_request(Request::new_with_init(&format!("https://internal{path}"), &init)?).await
 }
 
 /// Sends a JSON request to a Durable Object and returns (status, body).

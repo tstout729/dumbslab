@@ -1536,7 +1536,14 @@ fn expiry(now: DateTime<Utc>, tokens: &TokenSet) -> Option<DateTime<Utc>> {
 /// [`Step::Fetch`] until it's [`Step::Done`]. Each call reads or writes the database, so hosts run
 /// it in its own transaction.
 pub fn step(db: &dyn Db, cfg: &HostConfig, job: &mut Job, replies: Vec<HttpReply>, now: DateTime<Utc>) -> ApiResult<Step> {
-    match job {
+    // A job that resumes after its workspace was frozen for a copy writes nothing more: the copy
+    // may already be checked. While the freeze drains, a step that only stores renewed credentials
+    // still commits: the app has spent the old refresh token (see `backup::drain`).
+    let lock = crate::backup::lock(db)?;
+    if let Some(e) = lock.refusal().filter(|_| lock != crate::backup::Lock::Draining) {
+        return Err(e);
+    }
+    let result = match job {
         Job::Search(j) => search_step(db, cfg, j, replies, now),
         Job::Preview(j) => preview_step(db, cfg, j, replies, now),
         Job::Connect(j) => connect_step(db, cfg, j, replies, now),
@@ -1547,6 +1554,10 @@ pub fn step(db: &dyn Db, cfg: &HostConfig, job: &mut Job, replies: Vec<HttpReply
         Job::GitHub(j) => crate::sync::github_app::install_step(db, cfg, j, replies, now),
         Job::GitHubCheck(j) => crate::sync::github_app::check_step(db, cfg, j, replies, now),
         Job::GitLab(j) => crate::sync::gitlab_app::step(db, cfg, j, replies, now),
+    };
+    match lock.refusal() {
+        Some(e) if result.is_ok() && !job.wrote_only_credentials() => Err(e),
+        _ => result,
     }
 }
 

@@ -12,6 +12,7 @@
 //! Requests to a workspace are limited per client network before they reach its object (the
 //! `REQUEST_LIMITER` binding), so a flood costs no Durable Object time.
 
+mod backup;
 mod billing;
 mod connect;
 mod directory;
@@ -28,7 +29,7 @@ use dumbslab_core::slack;
 use dumbslab_core::sync::github_app::{self, Routed};
 use dumbslab_core::sync::gitlab_app;
 use dumbslab_core::tenancy::{self, HostKind};
-use dumbslab_core::util::{secure_eq, sha256_hex};
+use dumbslab_core::util::sha256_hex;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use worker::*;
@@ -85,7 +86,18 @@ async fn route(req: Request, env: Env, url: &Url) -> Result<Response> {
         return error_response(404, "not_found", "not found");
     }
 
-    if !flag(&env, "MULTI_TENANT") {
+    // The operator API answers on the root domain and on any address that isn't a workspace's, such
+    // as the deployment's workers.dev address: a deployment being restored has no domain yet.
+    let multi = flag(&env, "MULTI_TENANT");
+    if path.starts_with("/api/operator/") {
+        let root = var(&env, "ROOT_DOMAIN").unwrap_or_default();
+        let workspace_host = multi && matches!(tenancy::host_kind(&host, &root), HostKind::Workspace(_));
+        if !workspace_host {
+            return operator(req, &env, &path).await;
+        }
+    }
+
+    if !multi {
         if !is_core_path(&path) {
             return env.assets("ASSETS")?.fetch_request(req).await;
         }
@@ -250,7 +262,6 @@ async fn root_site(req: Request, env: &Env, root: &str, path: &str) -> Result<Re
         (Method::Get, gitlab_app::CALLBACK_PATH) => connect::root_callback_redirect(&req.url()?, root, gitlab_app::CALLBACK_PATH),
         (Method::Post, "/hooks/github") => github_hook(req, env, root).await,
         (Method::Post, "/api/stripe/webhook") => billing::webhook(req, env).await,
-        (_, p) if p.starts_with("/api/operator/") => operator(req, env, p).await,
         // Static files the sign-up page uses.
         (Method::Get | Method::Head, p) if p.rsplit('/').next().is_some_and(|f| f.contains('.')) => {
             env.assets("ASSETS")?.fetch_request(req).await
@@ -453,20 +464,25 @@ async fn signup(mut req: Request, env: &Env, root: &str) -> Result<Response> {
     json_response(200, &json!({ "address": format!("{slug}.{root}"), "setup_url": setup_url }))
 }
 
-/// Operator API: `Authorization: Bearer $OPERATOR_TOKEN`.
+/// Operator API: `Authorization: Bearer $OPERATOR_TOKEN`, on the root domain or the deployment's
+/// own address (see [`route`]).
 ///
 /// - `GET  /api/operator/workspaces`: every workspace with its plan and usage, and the free plan's totals.
 /// - `POST /api/operator/workspaces/{address}/disable` (or `enable`, `delete`). Any of a
 ///   workspace's addresses works; `delete` frees all of them and its Slack workspace (Add to
 ///   Slack), and refuses while someone pays.
 /// - `POST /api/operator/workspaces/{address}/grant-pro` (or `revoke-pro`): Pro without paying.
+/// - `/api/operator/backup/...` and `/api/operator/restore/...`: copying every object's data to
+///   another deployment (see [`backup`]). Single-workspace deployments have only these.
 async fn operator(req: Request, env: &Env, path: &str) -> Result<Response> {
-    let Some(expected) = var(env, "OPERATOR_TOKEN") else {
-        return error_response(404, "not_found", "not found");
-    };
-    let provided = req.headers().get("authorization")?.and_then(|h| h.strip_prefix("Bearer ").map(str::to_string));
-    if !provided.is_some_and(|t| secure_eq(t.trim(), &expected)) {
-        return error_response(401, "unauthorized", "operator token required");
+    if let Err(e) = tenancy::operator_check(var(env, "OPERATOR_TOKEN").as_deref(), req.headers().get("authorization")?.as_deref()) {
+        return api_error_response(&e);
+    }
+    if path.starts_with("/api/operator/backup/") || path.starts_with("/api/operator/restore/") {
+        return backup::route(req, env, path).await;
+    }
+    if !flag(env, "MULTI_TENANT") {
+        return error_response(404, "not_found", "unknown operator route");
     }
     let rest = path.trim_start_matches("/api/operator/workspaces").trim_matches('/');
     if req.method() == Method::Get && rest.is_empty() {

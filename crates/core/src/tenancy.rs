@@ -189,6 +189,18 @@ Hosted workspaces are free at https://{root}/ with no credit card. Each workspac
     )
 }
 
+/// Checks the operator API's `Authorization: Bearer <token>` against the `OPERATOR_TOKEN` secret.
+/// Without that secret there's no operator API at all (404).
+pub fn operator_check(expected: Option<&str>, authorization: Option<&str>) -> ApiResult<()> {
+    let Some(expected) = expected.filter(|t| !t.is_empty()) else {
+        return Err(ApiError::not_found("not found"));
+    };
+    match authorization.and_then(|h| h.strip_prefix("Bearer ")) {
+        Some(t) if secure_eq(t.trim(), expected) => Ok(()),
+        _ => Err(ApiError::new(401, "unauthorized", "operator token required")),
+    }
+}
+
 /// A sign-up link token: `{expiry}.{HMAC(secret, "setup|{workspace}|{expiry}")}`.
 pub fn signup_token(secret: &str, workspace: &str, expires_unix: i64) -> String {
     format!("{expires_unix}.{}", hmac_sha256_hex(secret, &format!("setup|{workspace}|{expires_unix}")))
@@ -286,6 +298,10 @@ CREATE TABLE IF NOT EXISTS slack_homes (
   generation INTEGER NOT NULL DEFAULT 0
 );
 ";
+
+/// An address a workspace moved to keeps only this: the workspace's first address, whose object
+/// holds its data.
+pub const ALIAS_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS alias (home TEXT NOT NULL)";
 
 /// The most addresses one workspace can use, counting its first.
 pub const MAX_ADDRESSES: i64 = 5;
@@ -942,6 +958,9 @@ pub fn moved_response(method: &str, accept: &str, new_origin: &str, path_and_que
 /// Records a move after the host claimed the new address in its directory. Returns the webhook
 /// deliveries for the `workspace.address_changed` event.
 pub fn finish_move(db: &dyn Db, cfg: &HostConfig, mv: &AddressMove, new_origin: &str) -> ApiResult<Vec<Effect>> {
+    // Frozen for a copy while the move was claimed: the workspace stays where it is, and moving
+    // again on the new deployment finishes the job.
+    crate::backup::refuse_writes(db)?;
     crate::ops::admin::put_setting(db, "address", &mv.to)?;
     let mut ctx = Ctx { db, actor: mv.actor.clone(), now: Utc::now(), cfg, base_url: new_origin.to_string(), effects: vec![] };
     let summary = format!("moved the workspace from {} to {}", mv.from, mv.to);
@@ -1004,6 +1023,18 @@ mod tests {
         for want in ["POST https://kb.test/api/signup", "https://<address>.kb.test/mcp", "{\"workspace_name\": \"Acme\""] {
             assert!(llms.contains(want), "missing {want}");
         }
+    }
+
+    #[test]
+    fn operator_token() {
+        assert_eq!(operator_check(Some("s3cret"), Some("Bearer s3cret")).map_err(|e| e.status), Ok(()));
+        assert_eq!(operator_check(Some("s3cret"), Some("Bearer s3cret ")).map_err(|e| e.status), Ok(()));
+        for wrong in [None, Some("Bearer nope"), Some("s3cret"), Some("Basic s3cret"), Some("Bearer "), Some("Bearer s3cre")] {
+            assert_eq!(operator_check(Some("s3cret"), wrong).map_err(|e| e.status), Err(401), "{wrong:?}");
+        }
+        // No token configured: the operator API doesn't exist, whatever is sent.
+        assert_eq!(operator_check(None, Some("Bearer ")).map_err(|e| e.status), Err(404));
+        assert_eq!(operator_check(Some(""), Some("Bearer ")).map_err(|e| e.status), Err(404));
     }
 
     #[test]

@@ -11,6 +11,7 @@
 //! and the CLI, so agents can do anything a person can do in the web app.
 
 pub mod auth;
+pub mod backup;
 pub mod connect;
 pub mod db;
 pub mod embed;
@@ -225,8 +226,9 @@ pub struct Outcome {
 
 /// Records the result of a webhook delivery. Call it in its own transaction.
 pub fn record_webhook_result(db: &dyn Db, webhook_id: &str, status: Option<u16>, error: Option<&str>) -> ApiResult<()> {
-    // Slack channel messages have no webhook to record them on.
-    if webhook_id.starts_with("slack:") {
+    // Slack channel messages have no webhook to record them on, and a workspace frozen for a copy
+    // records nothing more (see `backup::freeze`).
+    if webhook_id.starts_with("slack:") || backup::lock(db)? != backup::Lock::Open {
         return Ok(());
     }
     db.execute(

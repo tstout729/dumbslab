@@ -16,6 +16,7 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use chrono::Utc;
+use dumbslab_core::backup::{self, Lock};
 use dumbslab_core::connect::{self, Finish, HttpCall, Job, Step};
 use dumbslab_core::db::{Db, DbExt};
 use dumbslab_core::plan::{self, Capacity, Plan, Subscription};
@@ -29,6 +30,28 @@ use crate::sql::{DoDb, api_error_response, call_object, error_response, flag, js
 
 /// Background jobs one request runs in a row, counting those they leave.
 const MAX_CHAINED_JOBS: usize = 6;
+
+/// How long a freeze waits for the jobs under way to end before it seals (see `backup::drain`).
+const DRAIN_SECS: u64 = 30;
+
+/// The jobs this object is running (in requests and after them), so a freeze can wait for them.
+type Jobs = Rc<Cell<usize>>;
+
+/// Counts one job as running until it's dropped.
+struct InFlight(Jobs);
+
+impl InFlight {
+    fn new(jobs: &Jobs) -> InFlight {
+        jobs.set(jobs.get() + 1);
+        InFlight(jobs.clone())
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.0.set(self.0.get().saturating_sub(1));
+    }
+}
 
 /// How often, at most, a busy workspace reports its usage to the directory.
 const REPORT_EVERY_SECS: i64 = 300;
@@ -63,6 +86,9 @@ pub struct Workspace {
     capacity: Rc<Cell<Capacity>>,
     /// When this workspace last reported its usage (Unix seconds).
     reported_at: Cell<i64>,
+    /// Whether it's frozen for a copy or being restored (see `backup::lock`), once read.
+    lock: Cell<Option<Lock>>,
+    jobs: Jobs,
 }
 
 fn rust_err(e: ApiError) -> worker::Error {
@@ -136,16 +162,89 @@ impl Workspace {
             return Ok(());
         }
         let storage = self.state.storage();
-        let failed = transaction(&storage, self.db(), |db| match dumbslab_core::migrate(db) {
-            Ok(()) => (None, true),
-            Err(e) => (Some(e.message), false),
+        // A frozen or half-restored object changes nothing, its schema included; it takes no
+        // requests until it's open again.
+        let ran = transaction(&storage, self.db(), |db| match backup::refuse_writes(db).and_then(|_| dumbslab_core::migrate(db)) {
+            Ok(()) => (Ok(true), true),
+            Err(e) if e.status == 503 => (Ok(false), false),
+            Err(e) => (Err(e.message), false),
         })?;
-        if let Some(message) = failed {
-            console_error!("migration failed: {message}");
-            return Err(worker::Error::RustError(message));
+        match ran {
+            Ok(migrated) => self.migrated.set(migrated),
+            Err(message) => {
+                console_error!("migration failed: {message}");
+                return Err(worker::Error::RustError(message));
+            }
         }
-        self.migrated.set(true);
         Ok(())
+    }
+
+    /// Whether this object takes requests: not while it's frozen for a copy or being restored.
+    fn lock(&self) -> Result<Lock> {
+        if let Some(lock) = self.lock.get() {
+            return Ok(lock);
+        }
+        let lock = backup::lock(&self.db()).map_err(rust_err)?;
+        self.lock.set(Some(lock));
+        Ok(lock)
+    }
+
+    /// An operator's backup or restore action (see `dumbslab_core::backup`), from the front Worker.
+    async fn backup(&self, path: &str, req: &mut Request) -> Result<Response> {
+        let action = backup::action(path).unwrap_or_default();
+        let Some(body) = read_body(req).await? else {
+            return error_response(413, "too_large", "request body too large");
+        };
+        // A workspace being copied first catches up with this code's schema, as on its next
+        // request: the copy goes to a deployment of the same code. (Not while restoring: the
+        // object is half written, and `stored` would remember a pointer before its row arrives.)
+        if path.starts_with("/_internal/backup/") && self.lock()? == Lock::Open && matches!(self.stored()?, Stored::Workspace) {
+            self.migrate()?;
+        }
+        if action == "freeze" {
+            return self.freeze().await;
+        }
+        match self.backup_step(action, body) {
+            Ok(v) => json_response(200, &v),
+            Err(e) => api_error_response(&e),
+        }
+    }
+
+    /// Runs one backup action in a transaction, then forgets what this object remembered about
+    /// what it takes and holds.
+    fn backup_step(&self, action: &'static str, body: Vec<u8>) -> ApiResult<Value> {
+        let storage = self.state.storage();
+        let result = transaction(&storage, self.db(), move |db| {
+            let r = backup::handle(db, action, &body, &[backup::Kind::Workspace, backup::Kind::Alias]);
+            let ok = r.is_ok();
+            (r, ok)
+        })
+        .unwrap_or_else(|e| Err(ApiError::internal(format!("the backup action failed: {e}"))));
+        self.lock.set(None);
+        *self.alias.borrow_mut() = None;
+        if action == "abort" {
+            self.migrated.set(false);
+        }
+        result
+    }
+
+    /// Freezes this object for a copy, in two phases (see `backup::drain`): it takes no requests or
+    /// new jobs from now on, and the jobs under way get up to [`DRAIN_SECS`] to end (a step that
+    /// stores renewed credentials still commits). Then it's sealed. The answer says how many jobs
+    /// were still running then; their later steps write nothing.
+    async fn freeze(&self) -> Result<Response> {
+        if let Err(e) = self.backup_step("drain", vec![]) {
+            return api_error_response(&e);
+        }
+        let deadline = Date::now().as_millis() + DRAIN_SECS * 1000;
+        while self.jobs.get() > 0 && Date::now().as_millis() < deadline {
+            Delay::from(std::time::Duration::from_millis(100)).await;
+        }
+        let parked = self.jobs.get();
+        match self.backup_step("seal", vec![]) {
+            Ok(_) => json_response(200, &json!({ "frozen": true, "parked": parked })),
+            Err(e) => api_error_response(&e),
+        }
     }
 
     fn disabled(&self) -> Result<bool> {
@@ -157,6 +256,13 @@ impl Workspace {
     /// Operator actions and address moves, reachable only from the front Worker and other objects
     /// (the Worker never forwards `/_internal`).
     async fn internal(&self, path: &str, req: &mut Request) -> Result<Response> {
+        if backup::action(path).is_some() {
+            return self.backup(path, req).await;
+        }
+        // A frozen object changes nothing until its copy is done; a restoring one isn't whole yet.
+        if let Some(e) = self.lock()?.refusal() {
+            return api_error_response(&e);
+        }
         match path {
             "/_internal/alias" => {
                 let home = req.json::<Value>().await.ok().and_then(|v| v["home"].as_str().map(str::to_string)).unwrap_or_default();
@@ -171,14 +277,16 @@ impl Workspace {
                 let storage = self.state.storage();
                 let pointer = home.clone();
                 let saved = transaction(&storage, self.db(), move |db| {
-                    let r = db
-                        .execute_batch("CREATE TABLE IF NOT EXISTS alias (home TEXT NOT NULL)")
+                    let r = backup::refuse_writes(db)
+                        .and_then(|_| db.execute_batch(tenancy::ALIAS_SCHEMA))
                         .and_then(|_| db.execute("DELETE FROM alias", &[]))
                         .and_then(|_| db.execute("INSERT INTO alias (home) VALUES (?)", &params![pointer]));
                     let ok = r.is_ok();
                     (r, ok)
                 })?;
-                saved.map_err(rust_err)?;
+                if let Err(e) = saved {
+                    return api_error_response(&e);
+                }
                 *self.alias.borrow_mut() = Some(home);
                 json_response(200, &json!({ "ok": true }))
             }
@@ -193,7 +301,10 @@ impl Workspace {
                 } else {
                     "DELETE FROM settings WHERE key = 'disabled'"
                 };
-                self.db().execute(sql, &[]).map_err(|e| worker::Error::RustError(e.message))?;
+                let db = self.db();
+                if let Err(e) = backup::refuse_writes(&db).and_then(|_| db.execute(sql, &[])) {
+                    return api_error_response(&e);
+                }
                 json_response(200, &json!({ "ok": true }))
             }
             // From the front Worker: Stripe reported a subscription, or the operator granted Pro.
@@ -217,11 +328,11 @@ impl Workspace {
                 };
                 let storage = self.state.storage();
                 let saved = transaction(&storage, self.db(), move |db| {
-                    let r = match (grant, &sub) {
+                    let r = backup::refuse_writes(db).and_then(|_| match (grant, &sub) {
                         (Some(g), _) => plan::set_grant(db, g).map(|_| true),
                         (None, Some(s)) => plan::apply_subscription(db, s),
                         (None, None) => Ok(false),
-                    };
+                    });
                     let ok = r.is_ok();
                     (r, ok)
                 })?;
@@ -305,8 +416,10 @@ impl Workspace {
     /// the webhooks its operations left. Its writes count against the plan step by step (see
     /// [`drive_job`]).
     async fn run_job(&self, job: Job, cfg: &HostConfig) -> Result<Finish> {
+        let running = InFlight::new(&self.jobs);
         let (finish, effects, written) = drive_job(&self.state, &self.env, job, cfg).await?;
-        deliver(&self.state, &self.env, cfg, effects);
+        drop(running);
+        deliver(&self.state, &self.env, &self.jobs, cfg, effects);
         if let Some(h) = cfg.hosting.as_ref().filter(|_| written > 0) {
             self.report_usage(&h.home, false);
         }
@@ -349,6 +462,8 @@ impl DurableObject for Workspace {
             setup_blocked: Cell::new(false),
             capacity: Rc::new(Cell::new(Capacity::default())),
             reported_at: Cell::new(0),
+            lock: Cell::new(None),
+            jobs: Rc::new(Cell::new(0)),
         }
     }
 
@@ -357,6 +472,11 @@ impl DurableObject for Workspace {
         let path = url.path().to_string();
         if path.starts_with("/_internal/") {
             return self.internal(&path, &mut req).await;
+        }
+        if let Some(e) = self.lock()?.refusal() {
+            let mut resp = api_error_response(&e)?;
+            resp.headers_mut().set("retry-after", "120")?;
+            return Ok(resp);
         }
         let method = req.method();
         let origin = match url.port() {
@@ -579,7 +699,7 @@ impl DurableObject for Workspace {
         }
 
         // The request's own webhooks, once each, and the jobs that run after the response.
-        deliver(&self.state, &self.env, &move_cfg, effects);
+        deliver(&self.state, &self.env, &self.jobs, &move_cfg, effects);
         to_response(response)
     }
 }
@@ -588,11 +708,14 @@ impl DurableObject for Workspace {
 /// within three seconds). Its steps are storage-checked and metered like any job's (see
 /// [`drive_job`]); the directory hears about them with this workspace's next report. The object's
 /// state outlives the request; the job holds its own handle to it.
-fn run_later(state: &State, env: &Env, job: Job, cfg: HostConfig) {
+fn run_later(state: &State, env: &Env, jobs: &Jobs, job: Job, cfg: HostConfig) {
     let raw: &JsValue = state.as_raw().as_ref();
     let own = State::from(raw.clone().unchecked_into::<worker::worker_sys::DurableObjectState>());
     let env = env.clone();
+    // Running until the last job it chains ends, so a freeze waits for it.
+    let running = InFlight::new(jobs);
     state.wait_until(async move {
+        let _running = running;
         // Jobs it leaves run after it, a few at most (a check of a GitHub App installation chains
         // one more when changes arrived while it ran); past that, the rest wait for their next
         // trigger.
@@ -627,12 +750,12 @@ fn run_later(state: &State, env: &Env, job: Job, cfg: HostConfig) {
 /// directory, and jobs to run afterwards (Slack's: channel messages that wait for the directory's
 /// token, forgetting a token Slack called dead; checks of GitHub App installations; GitLab webhook
 /// cleanups).
-fn deliver(state: &State, env: &Env, cfg: &HostConfig, effects: Vec<Effect>) {
+fn deliver(state: &State, env: &Env, jobs: &Jobs, cfg: &HostConfig, effects: Vec<Effect>) {
     let (later, effects): (Vec<Effect>, Vec<Effect>) = effects.into_iter().partition(|e| matches!(e, Effect::Background(_)));
     send_effects(state, env, cfg, effects);
     for effect in later {
         if let Effect::Background(job) = effect {
-            run_later(state, env, job, cfg.clone());
+            run_later(state, env, jobs, job, cfg.clone());
         }
     }
 }

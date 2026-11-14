@@ -27,6 +27,9 @@ pub fn body_limit(path: &str) -> usize {
     match path.trim_end_matches('/') {
         "/api/v1/files" | "/api/v1/operations/upload_file" | "/mcp" => MAX_UPLOAD_BODY,
         p if p.starts_with("/slack/") => crate::slack::MAX_BODY,
+        // An operator's restore page (see `backup`) on its way into an object. The front Worker
+        // checks the operator token before it reads one.
+        "/_internal/restore/page" => crate::backup::MAX_RESTORE_BODY,
         _ => MAX_BODY,
     }
 }
@@ -54,6 +57,11 @@ pub fn is_core_path(path: &str) -> bool {
 
 /// Handles a request. `None` means the path isn't ours (the host serves static files).
 pub fn handle(db: &dyn Db, cfg: &HostConfig, req: &Request) -> Option<Outcome> {
+    // A workspace frozen for a copy, or half restored, takes no requests: reads write too (views,
+    // sessions). Checked in the request's own transaction, so a freeze can't slip in between.
+    if let Err(e) = crate::backup::refuse_writes(db) {
+        return Some(Outcome { response: Response::error(&e).with_header("retry-after", "120"), commit: false, effects: vec![] });
+    }
     let path = req.path.as_str();
     let outcome = if path == "/healthz" {
         done(Response::json(200, &json!({ "ok": true, "version": crate::VERSION, "git_sha": crate::GIT_SHA })))

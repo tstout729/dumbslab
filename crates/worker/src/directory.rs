@@ -5,6 +5,7 @@
 use std::cell::Cell;
 
 use chrono::Utc;
+use dumbslab_core::backup::{self, Kind, Lock};
 use dumbslab_core::tenancy::{self, Limits};
 use dumbslab_core::{ApiError, ApiResult};
 use serde::Deserialize;
@@ -19,6 +20,8 @@ pub struct Directory {
     state: State,
     env: Env,
     migrated: Cell<bool>,
+    /// Whether it's frozen for a copy or being restored (see `backup::lock`), once read.
+    lock: Cell<Option<Lock>>,
 }
 
 #[derive(Deserialize)]
@@ -138,7 +141,7 @@ fn parse<T: for<'de> Deserialize<'de>>(body: &[u8]) -> ApiResult<T> {
 
 impl DurableObject for Directory {
     fn new(state: State, env: Env) -> Self {
-        Self { state, env, migrated: Cell::new(false) }
+        Self { state, env, migrated: Cell::new(false), lock: Cell::new(None) }
     }
 
     async fn fetch(&self, mut req: Request) -> Result<Response> {
@@ -150,6 +153,31 @@ impl DurableObject for Directory {
         }
         let path = req.path();
         let body = read_body(&mut req).await?.unwrap_or_default();
+        // An operator's backup or restore action (see `dumbslab_core::backup`).
+        let action = if path == "/_internal/backup/objects" { Some("objects") } else { backup::action(&path) };
+        if let Some(action) = action {
+            let result = self.run(move |db| backup::handle(db, action, &body, &[Kind::Directory]));
+            self.lock.set(None);
+            if action == "abort" {
+                self.migrated.set(false);
+            }
+            return respond(result.unwrap_or_else(|e| Err(ApiError::internal(format!("the backup action failed: {e}")))));
+        }
+        let lock = match self.lock.get() {
+            Some(lock) => lock,
+            None => {
+                let lock = backup::lock(&DoDb::new(self.state.storage().sql())).map_err(|e| Error::RustError(e.message))?;
+                self.lock.set(Some(lock));
+                lock
+            }
+        };
+        // Freezing for a copy, the directory still takes the operator's lookups and, until it's
+        // sealed, workspaces' activations; nothing else.
+        if !backup::directory_allows(lock, req.method().as_ref(), &path)
+            && let Some(e) = lock.refusal()
+        {
+            return api_error_response(&e);
+        }
         let limits = self.limits();
         let result = match (req.method(), path.as_str()) {
             (Method::Post, "/reserve") => {

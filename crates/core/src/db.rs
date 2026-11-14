@@ -93,6 +93,20 @@ impl Row {
         Row { columns, values }
     }
 
+    /// The column names, in the order the query selected them.
+    pub fn columns(&self) -> &Arc<Vec<String>> {
+        &self.columns
+    }
+
+    /// The values in the order the query selected them.
+    pub fn values(&self) -> &[SqlValue] {
+        &self.values
+    }
+
+    pub fn into_values(self) -> Vec<SqlValue> {
+        self.values
+    }
+
     pub fn get(&self, name: &str) -> &SqlValue {
         match self.columns.iter().position(|c| c == name) {
             Some(i) => &self.values[i],
