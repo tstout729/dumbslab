@@ -14373,8 +14373,8 @@ mod backups {
         assert!(tx(&half, |db| backup::summary(db, &PageRequest { table: "users".into(), after: None })).is_ok());
     }
 
-    /// S3: a workspace that says its sign-up finished while the directory drains is kept active;
-    /// and one the directory never heard from is marked active on the target by the copy.
+    /// S3: a workspace that says its sign-up finished while the directory drains is kept active,
+    /// and the copy carries it; once sealed, the directory takes no more.
     #[test]
     fn activations_around_the_freeze_end_active_on_the_target() {
         use chrono::Utc;
@@ -14404,18 +14404,94 @@ mod backups {
             db.one("SELECT status FROM workspaces WHERE slug = ?", &dumbslab_core::params![slug]).unwrap().unwrap().str("status")
         };
         assert_eq!((status(&dst, "acme"), status(&dst, "beta")), ("active".to_string(), "reserved".to_string()));
+    }
 
-        // beta's workspace was set up nonetheless: the copy notices and mends the target.
-        let set_up = H::new();
-        set_up.setup();
-        let listing: Vec<backup::ObjectRef> = backup::directory_objects(&src).unwrap();
-        let manifests = [("ws:beta".to_string(), manifest(&set_up)), ("ws:acme".to_string(), manifest(&set_up))].into_iter().collect();
-        assert_eq!(tool::stale_reservations(&listing, &manifests), ["beta"]);
-        let mended = backup::handle(&dst, "activate", br#"{"homes": ["beta"]}"#, &[Kind::Directory]).unwrap();
-        assert_eq!(mended["activated"], json!(["beta"]));
-        assert_eq!(status(&dst, "beta"), "active");
-        // Only a directory takes it.
-        assert_eq!(backup::handle(&dst, "activate", br#"{"homes": ["beta"]}"#, &[Kind::Workspace]).unwrap_err().status, 404);
+    /// A workspace object set up with its first admin, as a file in a folder deployment.
+    fn set_up(root: &std::path::Path, object: &str, email: &str) {
+        let store = Store::open(&root.join(format!("{object}.db"))).unwrap();
+        let cfg = HostConfig { setup_token: Some("SETUP".into()), ..Default::default() };
+        let body = json!({ "setup_token": "SETUP", "workspace_name": "W", "name": "Ada", "email": email, "password": "correct horse" });
+        let req = Request {
+            method: "POST".into(),
+            path: "/api/v1/auth/setup".into(),
+            headers: vec![("content-type".into(), "application/json".into()), ("x-dumbslab-client".into(), "web".into())],
+            body: serde_json::to_vec(&body).unwrap(),
+            origin: "https://kb.test".into(),
+            ..Default::default()
+        };
+        let status = store
+            .with_tx(|db| {
+                let o = dumbslab_core::handle(db, &cfg, &req).unwrap();
+                let commit = o.commit;
+                (o.response.status, commit)
+            })
+            .unwrap();
+        assert_eq!(status, 200);
+    }
+
+    fn entry(root: &std::path::Path, slug: &str) -> String {
+        let conn = rusqlite::Connection::open(root.join("directory.db")).unwrap();
+        conn.query_row("SELECT status FROM workspaces WHERE slug = ?", [slug], |r| r.get(0)).unwrap()
+    }
+
+    /// Round 3: a workspace set up but never activated is marked active on the source while its
+    /// directory drains, so the target, `verify` and a rerun all agree.
+    #[test]
+    fn a_stuck_reservation_is_mended_on_the_source_and_reruns_finish() {
+        use chrono::Utc;
+        use dumbslab_core::tenancy::{self, Limits};
+        let (src_dir, dst_dir) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (src_root, dst_root) = (src_dir.path(), dst_dir.path());
+        {
+            let conn = rusqlite::Connection::open(src_root.join("directory.db")).unwrap();
+            let db = Sqlite(&conn);
+            tenancy::directory_migrate(&db).unwrap();
+            let limits = Limits { per_ip_per_day: 50, per_day: 50, max_workspaces: 50, free: ROOMY };
+            for slug in ["acme", "stuck", "held", "broken", "off"] {
+                tenancy::reserve(&db, slug, "Name", "ip", Utc::now(), limits).unwrap();
+            }
+            for slug in ["acme", "broken"] {
+                tenancy::activate(&db, slug, Utc::now()).unwrap();
+            }
+            tenancy::set_status(&db, "off", "disabled").unwrap();
+        }
+        // stuck's sign-up finished but its activation never arrived; held was never set up; off
+        // was set up and disabled.
+        for object in ["ws:acme", "ws:stuck", "ws:broken", "ws:off"] {
+            set_up(src_root, object, &format!("ada@{}.test", &object[3..]));
+        }
+        let (from, to) = (Endpoint::folder(src_root).unwrap(), Endpoint::folder(dst_root).unwrap());
+        // On the target, ws:broken holds another source's unfinished restore: its copy fails.
+        let other: Manifest = run(from.call("backup/manifest", "ws:acme", &json!({}))).unwrap();
+        run(to.call::<backup::Begun>("restore/begin", "ws:broken", &json!({ "object": "ws:other", "manifest": other }))).unwrap();
+
+        let opts = Options { objects: vec![], freeze: true };
+        let outcomes = run(tool::copy(&from, Some(&to), None, &opts)).unwrap();
+        let by_name = |outcomes: &[tool::Outcome], name: &str| outcomes.iter().find(|o| o.object == name).unwrap().clone();
+        let directory = by_name(&outcomes, "directory");
+        assert_eq!(directory.status, Status::Copied, "{}", tool::table(&outcomes));
+        assert!(directory.note.as_deref().is_some_and(|n| n.contains("stuck")), "{:?}", directory.note);
+        assert!(matches!(&by_name(&outcomes, "ws:broken").status, Status::Failed(e) if e.contains("restore_conflict")));
+        // Mended on the source, before it was sealed and copied: both ends say active.
+        assert_eq!((entry(src_root, "stuck"), entry(dst_root, "stuck")), ("active".to_string(), "active".to_string()));
+        assert_eq!((entry(src_root, "held"), entry(src_root, "off")), ("reserved".to_string(), "disabled".to_string()));
+        assert_eq!(entry(dst_root, "off"), "disabled");
+        // verify finds nothing differing in what was copied.
+        let copied: Vec<String> = ["directory", "ws:acme", "ws:stuck", "ws:held", "ws:off"].map(String::from).to_vec();
+        let checked = run(tool::verify(&from, &to, &copied)).unwrap();
+        assert!(checked.iter().all(|o| matches!(o.status, Status::Same | Status::Empty)), "{}", tool::table(&checked));
+
+        // The operator wipes the conflicting restore and runs the same copy again: it finishes.
+        run(to.call::<Value>("restore/abort", "ws:broken", &json!({}))).unwrap();
+        let again = run(tool::copy(&from, Some(&to), None, &opts)).unwrap();
+        assert!(again.iter().all(|o| o.status.ok()), "{}", tool::table(&again));
+        assert_eq!(by_name(&again, "ws:broken").status, Status::Copied);
+        assert_eq!(by_name(&again, "directory").status, Status::AlreadyCopied);
+        let checked = run(tool::verify(&from, &to, &[])).unwrap();
+        assert!(checked.iter().all(|o| matches!(o.status, Status::Same | Status::Empty)), "{}", tool::table(&checked));
+        // A sealed directory takes no such change any more.
+        let sealed = run(from.call::<Value>("backup/activate", "directory", &json!({ "homes": ["held"] }))).unwrap_err();
+        assert!(sealed.to_string().contains("frozen"), "{sealed}");
     }
 
     /// Writes a backup file record by record, as a damaged or forged one might be.

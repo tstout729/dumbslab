@@ -3,7 +3,8 @@
 //! table. Rows stream from one end to the other a page at a time; nothing touches the disk unless
 //! an encrypted backup file is asked for.
 //!
-//! Either end can also be a native server's database file, which holds one workspace.
+//! Either end can also be a native server's database file, which holds one workspace, or a folder
+//! holding one SQLite file per object, laid out like a hosted deployment.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
@@ -13,12 +14,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, anyhow, bail};
-use dumbslab_core::backup::{self, Begun, Checksum, FileKey, Finished, Kind, Manifest, ObjectRef, Page, PageRequest, Restored, Summary};
+use dumbslab_core::backup::{
+    self, Begun, Checksum, FileKey, Finished, Kind, Manifest, ObjectRef, Page, PageRequest, Restored, Summary, Target,
+};
+use dumbslab_core::{ApiError, ApiResult, Db};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::store::Store;
+use crate::store::{Sqlite, Store};
 
 /// What a deployment says it holds (`GET /api/operator/backup/objects`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -64,6 +68,44 @@ pub enum Endpoint {
     Http { base: String, token: String, client: reqwest::Client },
     /// A native server's database: one workspace, listed as `name`.
     Local { store: Arc<Store>, name: String },
+    /// A hosted deployment kept as SQLite files in a folder, one per object (`directory.db`,
+    /// `ws:acme.db`, …), with the operator API's actions run on them directly. An object's file is
+    /// made, holding nothing, the first time it's named.
+    Folder { root: PathBuf, objects: Arc<std::sync::Mutex<BTreeMap<String, rusqlite::Connection>>> },
+}
+
+fn api_error(e: ApiError) -> CallError {
+    CallError::Api {
+        status: e.status,
+        code: e.code.to_string(),
+        message: e.message.clone(),
+        details: e.to_json()["error"]["details"].clone(),
+    }
+}
+
+/// Runs `f` on one object of a folder deployment, in a transaction. The directory's schema is
+/// made when it's first opened, as the hosted Directory object does on its first request.
+fn in_folder(
+    root: &Path,
+    objects: &std::sync::Mutex<BTreeMap<String, rusqlite::Connection>>,
+    object: &str,
+    f: impl FnOnce(&dyn Db) -> ApiResult<Value>,
+) -> Result<Value, CallError> {
+    let transport = |e: rusqlite::Error| CallError::Transport(e.to_string());
+    let mut open = objects.lock().unwrap_or_else(|e| e.into_inner());
+    if !open.contains_key(object) {
+        let conn = rusqlite::Connection::open(root.join(format!("{object}.db"))).map_err(transport)?;
+        conn.execute_batch("PRAGMA foreign_keys = ON").map_err(transport)?;
+        if object == backup::DIRECTORY_OBJECT {
+            dumbslab_core::tenancy::directory_migrate(&Sqlite(&conn)).map_err(api_error)?;
+        }
+        open.insert(object.to_string(), conn);
+    }
+    let conn = &open[object];
+    conn.execute_batch("BEGIN IMMEDIATE").map_err(transport)?;
+    let result = f(&Sqlite(conn));
+    conn.execute_batch(if result.is_ok() { "COMMIT" } else { "ROLLBACK" }).map_err(transport)?;
+    result.map_err(api_error)
 }
 
 /// Tries per call before giving up on an unreachable server (every call can safely run twice).
@@ -93,11 +135,18 @@ impl Endpoint {
         Endpoint::Local { store: Arc::new(store), name: name.to_string() }
     }
 
+    /// A folder deployment (see [`Endpoint::Folder`]), made if it doesn't exist.
+    pub fn folder(root: &Path) -> anyhow::Result<Endpoint> {
+        std::fs::create_dir_all(root).with_context(|| format!("creating {}", root.display()))?;
+        Ok(Endpoint::Folder { root: root.to_path_buf(), objects: Arc::default() })
+    }
+
     /// For messages: the URL or "a local database", never a token.
     pub fn label(&self) -> String {
         match self {
             Endpoint::Http { base, .. } => base.clone(),
             Endpoint::Local { .. } => "the local database".into(),
+            Endpoint::Folder { root, .. } => root.display().to_string(),
         }
     }
 
@@ -115,6 +164,18 @@ impl Endpoint {
                 multi_tenant: false,
                 objects: vec![ObjectRef { name: name.clone(), kind: Kind::Workspace, status: None, home: None }],
             }),
+            Endpoint::Folder { root, objects } => {
+                let listed =
+                    in_folder(root, objects, backup::DIRECTORY_OBJECT, |db| backup::handle(db, "objects", b"", &[Kind::Directory]))
+                        .map_err(|e| anyhow!("{}: {e}", self.label()))?;
+                Ok(Listing {
+                    format: backup::FORMAT,
+                    version: dumbslab_core::VERSION.into(),
+                    git_sha: dumbslab_core::GIT_SHA.into(),
+                    multi_tenant: true,
+                    objects: serde_json::from_value(listed["objects"].clone())?,
+                })
+            }
         }
     }
 
@@ -135,12 +196,16 @@ impl Endpoint {
                         (r, ok)
                     })
                     .map_err(|e| CallError::Transport(e.to_string()))?;
-                result.map_err(|e| CallError::Api {
-                    status: e.status,
-                    code: e.code.to_string(),
-                    message: e.message.clone(),
-                    details: e.to_json()["error"]["details"].clone(),
-                })?
+                result.map_err(api_error)?
+            }
+            Endpoint::Folder { root, objects } => {
+                let name = action.rsplit('/').next().unwrap_or_default();
+                let allowed: &[Kind] = match backup::target(object, true, "main") {
+                    Some(Target::Directory) => &[Kind::Directory],
+                    Some(Target::Workspace) => &[Kind::Workspace, Kind::Alias],
+                    None => return Err(api_error(ApiError::not_found(format!("an object named {object}")))),
+                };
+                in_folder(root, objects, object, |db| backup::handle(db, name, &body, allowed))?
             }
         };
         serde_json::from_value(reply).map_err(|e| CallError::Transport(format!("unexpected answer to {action}: {e}")))
@@ -494,9 +559,11 @@ async fn listing(end: &Endpoint) -> anyhow::Result<Listing> {
 
 /// Freezes the source: its directory starts draining first (no sign-ups, moves or new objects
 /// from then on, though workspaces can still say their sign-up finished), then every selected
-/// object freezes (each drains, waits for its jobs, and seals), then the directory seals. Returns
-/// the listing read once the directory was draining.
-pub async fn freeze(from: &Endpoint, only: &[String]) -> anyhow::Result<Listing> {
+/// object freezes (each drains, waits for its jobs, and seals). Then, before the directory seals,
+/// any workspace whose sign-up finished but whose entry still says `reserved` (its activation never
+/// arrived) is marked active there, on the source, so the copy and every later check see the same
+/// state. Returns the listing once sealed, and the workspaces it marked active.
+pub async fn freeze(from: &Endpoint, only: &[String]) -> anyhow::Result<(Listing, Vec<String>)> {
     if matches!(from, Endpoint::Local { .. }) {
         bail!("a local database can't be frozen: stop its server instead");
     }
@@ -522,11 +589,39 @@ pub async fn freeze(from: &Endpoint, only: &[String]) -> anyhow::Result<Listing>
             say(format!("{}: {n} job(s) were still running when it sealed; their later steps write nothing", o.name));
         }
     }
+    let mut repaired = vec![];
     if has_directory {
+        repaired = repair_directory(from, &listing).await.map_err(|e| stuck("the directory", e))?;
         from.call::<Value>("backup/seal", backup::DIRECTORY_OBJECT, &json!({})).await.map_err(|e| stuck("the directory", e))?;
     }
+    let listing = if has_directory { self::listing(from).await? } else { listing };
     say(format!("froze {} on {}", if only.is_empty() { "every object".to_string() } else { only.join(", ") }, from.label()));
-    Ok(listing)
+    if !repaired.is_empty() {
+        say(format!(
+            "marked {} active in the source's directory: its sign-up had finished, but the directory never heard",
+            repaired.join(", ")
+        ));
+    }
+    Ok((listing, repaired))
+}
+
+/// Marks active, in the draining directory, each workspace whose entry says `reserved` though its
+/// (frozen) object holds a set-up workspace. Not disabled or deleted ones (their entries don't say
+/// `reserved`), nor reservations nobody set up (their objects hold no people).
+async fn repair_directory(from: &Endpoint, listing: &Listing) -> Result<Vec<String>, CallError> {
+    let mut stale = vec![];
+    for o in listing.objects.iter().filter(|o| o.kind == Kind::Workspace && o.status.as_deref() == Some("reserved")) {
+        let m: Manifest = from.call("backup/manifest", &o.name, &json!({})).await?;
+        let set_up = m.kind == Kind::Workspace && !m.restoring && m.tables.iter().any(|t| t.name == "users" && t.rows > 0);
+        if let (true, Some(home)) = (set_up, o.name.strip_prefix("ws:")) {
+            stale.push(home.to_string());
+        }
+    }
+    if stale.is_empty() {
+        return Ok(vec![]);
+    }
+    let marked: Value = from.call("backup/activate", backup::DIRECTORY_OBJECT, &json!({ "homes": stale })).await?;
+    Ok(serde_json::from_value(marked["activated"].clone()).unwrap_or_default())
 }
 
 /// Lifts the freeze from every selected object, directory last.
@@ -633,40 +728,6 @@ async fn check_and_finish(
 
 const HALF_RESTORED: &str = "the source holds an unfinished restore (part of its rows): finish it or wipe it before copying it";
 
-/// The workspaces, by first address, whose directory entry says `reserved` though their object
-/// holds a set-up workspace: their sign-up finished, but the directory never heard.
-pub fn stale_reservations(objects: &[ObjectRef], manifests: &BTreeMap<String, Manifest>) -> Vec<String> {
-    objects
-        .iter()
-        .filter(|o| o.kind == Kind::Workspace && o.status.as_deref() == Some("reserved"))
-        .filter(|o| {
-            manifests.get(&o.name).is_some_and(|m| m.kind == Kind::Workspace && m.tables.iter().any(|t| t.name == "users" && t.rows > 0))
-        })
-        .filter_map(|o| o.name.strip_prefix("ws:").map(str::to_string))
-        .collect()
-}
-
-/// Marks such workspaces active in the target's directory, once it's copied, and notes it there.
-async fn reconcile(to: &Endpoint, objects: &[ObjectRef], manifests: &BTreeMap<String, Manifest>, outcomes: &mut [Outcome]) {
-    let stale = stale_reservations(objects, manifests);
-    if stale.is_empty() {
-        return;
-    }
-    let Some(directory) = outcomes.iter_mut().find(|o| o.kind == Kind::Directory && o.status.ok()) else {
-        say(format!("note: {} finished signing up but the directory still says reserved; copy the directory too", stale.join(", ")));
-        return;
-    };
-    match to.call::<Value>("restore/activate", backup::DIRECTORY_OBJECT, &json!({ "homes": stale })).await {
-        Ok(v) => {
-            let changed: Vec<String> = serde_json::from_value(v["activated"].clone()).unwrap_or_default();
-            if !changed.is_empty() {
-                directory.note = Some(format!("marked {} active: set up as the source froze", changed.join(", ")));
-            }
-        }
-        Err(e) => directory.status = Status::Failed(format!("couldn't mark {} active: {e}", stale.join(", "))),
-    }
-}
-
 /// How the target took an object.
 enum Taken {
     /// Restoring under this id.
@@ -704,13 +765,11 @@ async fn copy_object(
     to: Option<&Endpoint>,
     save: &mut Option<&mut BackupWriter>,
     object: &str,
-    manifests: &mut BTreeMap<String, Manifest>,
 ) -> anyhow::Result<Outcome> {
     let manifest: Manifest = from.call("backup/manifest", object, &json!({})).await.map_err(|e| anyhow!("{object}: {e}"))?;
     if manifest.restoring {
         return Ok(Outcome::new(object, manifest.kind, Status::Failed(HALF_RESTORED.into())));
     }
-    manifests.insert(object.to_string(), manifest.clone());
     if manifest.kind == Kind::Empty {
         if let Some(w) = save.as_deref_mut() {
             w.empty(object)?;
@@ -815,10 +874,11 @@ pub async fn copy(
             bail!("a local database holds one workspace: pick it with --object ws:<address>");
         }
     }
+    let mut repaired = vec![];
     if opts.freeze && matches!(from, Endpoint::Local { .. }) {
         say("a local database can't be frozen: stop its server before copying it");
     } else if opts.freeze {
-        source = freeze(from, &opts.objects).await?;
+        (source, repaired) = freeze(from, &opts.objects).await?;
     } else {
         say("not freezing the source: if it changes during the copy, the check says so, and an interrupted copy can't resume");
     }
@@ -828,17 +888,16 @@ pub async fn copy(
         w.listing(&source, &names)?;
     }
     let mut outcomes = vec![];
-    let mut manifests = BTreeMap::new();
     for o in &objects {
-        let outcome = match copy_object(from, to, &mut save, &o.name, &mut manifests).await {
+        let mut outcome = match copy_object(from, to, &mut save, &o.name).await {
             Ok(outcome) => outcome,
             Err(e) => Outcome::new(&o.name, o.kind, Status::Failed(e.to_string())),
         };
+        if o.kind == Kind::Directory && !repaired.is_empty() {
+            outcome.note = Some(format!("marked {} active on the source first: set up, but never activated", repaired.join(", ")));
+        }
         say(format!("{}: {}", o.name, status_text(&outcome.status)));
         outcomes.push(outcome);
-    }
-    if let Some(to) = to {
-        reconcile(to, &objects, &manifests, &mut outcomes).await;
     }
     Ok(outcomes)
 }
@@ -889,7 +948,6 @@ pub async fn restore_file(path: &Path, passphrase: &str, to: &Endpoint, only: &[
     let mut reader = BackupReader::open(path, passphrase)?;
     reader.next_record()?;
     let mut outcomes = vec![];
-    let mut manifests = BTreeMap::new();
     let mut current: Option<Restoring> = None;
     while let Some(record) = reader.next_record()? {
         let object = record["object"].as_str().unwrap_or_default().to_string();
@@ -898,7 +956,6 @@ pub async fn restore_file(path: &Path, passphrase: &str, to: &Endpoint, only: &[
             "empty" if wanted => outcomes.push(Outcome::new(&object, Kind::Empty, Status::Empty)),
             "manifest" if wanted => {
                 let manifest: Manifest = serde_json::from_value(record["manifest"].clone())?;
-                manifests.insert(object.clone(), manifest.clone());
                 let taken = begin(to, &object, &manifest).await;
                 current = Some(Restoring { name: object, manifest, taken, copied: Totals::new() });
             }
@@ -919,8 +976,6 @@ pub async fn restore_file(path: &Path, passphrase: &str, to: &Endpoint, only: &[
             _ => {}
         }
     }
-    let objects: Vec<ObjectRef> = contents.listing.objects.iter().filter(|o| only.is_empty() || only.contains(&o.name)).cloned().collect();
-    reconcile(to, &objects, &manifests, &mut outcomes).await;
     Ok(outcomes)
 }
 

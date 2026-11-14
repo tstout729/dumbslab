@@ -136,7 +136,7 @@ pub fn action(path: &str) -> Option<&'static str> {
         "restore/page",
         "restore/finish",
         "restore/abort",
-        "restore/activate",
+        "backup/activate",
     ];
     ACTIONS.iter().find(|a| **a == rest).map(|a| a.split_once('/').map_or(*a, |(_, name)| name))
 }
@@ -297,10 +297,13 @@ pub fn directory_allows(lock: Lock, method: &str, path: &str) -> bool {
 
 /// Marks as active the workspaces, by first address, whose directory entry still says `reserved`
 /// though their object holds a set-up workspace (its sign-up finished, but the directory never
-/// heard). A copy calls it on the target. Returns the ones it changed.
+/// heard). A copy calls it on the source while its directory drains, before it's sealed and
+/// exported, so both ends and every later check agree. Returns the ones it changed.
 pub fn activate(db: &dyn Db, homes: &[String]) -> ApiResult<Vec<String>> {
-    if lock(db)? == Lock::Restoring {
-        return Err(ApiError::new(409, "restoring", "Finish the directory's restore first."));
+    match lock(db)? {
+        Lock::Restoring => return Err(ApiError::new(409, "restoring", "Finish the directory's restore first.")),
+        Lock::Frozen => return Err(ApiError::new(409, "frozen", "The directory is sealed; mark workspaces active while it drains.")),
+        Lock::Open | Lock::Draining => {}
     }
     let mut changed = vec![];
     for home in homes {
