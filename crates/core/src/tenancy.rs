@@ -950,6 +950,9 @@ pub fn moved_response(method: &str, accept: &str, new_origin: &str, path_and_que
 /// Records a move after the host claimed the new address in its directory. Returns the webhook
 /// deliveries for the `workspace.address_changed` event.
 pub fn finish_move(db: &dyn Db, cfg: &HostConfig, mv: &AddressMove, new_origin: &str) -> ApiResult<Vec<Effect>> {
+    // Frozen for a copy while the move was claimed: the workspace stays where it is, and moving
+    // again on the new deployment finishes the job.
+    crate::backup::refuse_writes(db)?;
     crate::ops::admin::put_setting(db, "address", &mv.to)?;
     let mut ctx = Ctx { db, actor: mv.actor.clone(), now: Utc::now(), cfg, base_url: new_origin.to_string(), effects: vec![] };
     let summary = format!("moved the workspace from {} to {}", mv.from, mv.to);

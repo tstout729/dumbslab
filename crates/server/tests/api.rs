@@ -13871,8 +13871,8 @@ mod backups {
     use super::*;
     use dumbslab::backup::{self as tool, BackupReader, BackupWriter, Endpoint, Options, Status};
     use dumbslab::store::Sqlite;
-    use dumbslab_core::backup::{self, Kind, Lock, PageRequest};
-    use dumbslab_core::db::{Db, SqlValue};
+    use dumbslab_core::backup::{self, Cell, Checksum, FileKey, Kind, Lock, Manifest, PageRequest};
+    use dumbslab_core::db::{Db, Row, SqlValue};
 
     fn run<T>(f: impl std::future::Future<Output = T>) -> T {
         tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(f)
@@ -13904,6 +13904,14 @@ mod backups {
     fn same(a: &H, b: &H) {
         let checked = run(tool::verify(&end(a), &end(b), &[])).unwrap();
         assert_eq!(statuses(&checked), [Status::Same], "{}", tool::table(&checked));
+    }
+
+    fn manifest(h: &H) -> Manifest {
+        tx(h, |db| backup::manifest(db)).unwrap()
+    }
+
+    fn page(h: &H, table: &str) -> backup::Page {
+        tx(h, |db| backup::dump(db, &PageRequest { table: table.into(), after: None })).unwrap()
     }
 
     /// A workspace with something in every kind of table that matters: people, sessions, tokens,
@@ -13946,7 +13954,7 @@ mod backups {
         let (src, cookie, admin, bytes, path) = populated();
         let mut dst = H::new();
         super::connected::with_key(&mut dst);
-        let before = tx(&src, |db| backup::manifest(db)).unwrap();
+        let before = manifest(&src);
         assert!(before.tables.iter().any(|t| t.name == "search_index" && t.virtual_table && t.rows > 0));
         assert!(before.tables.iter().all(|t| !t.name.starts_with("search_index_")), "the index's own storage isn't copied");
         assert!(before.sequences.iter().any(|q| q.name == "search_docs"));
@@ -13957,8 +13965,7 @@ mod backups {
         assert_eq!(statuses(&outcomes), [Status::Copied], "{}", tool::table(&outcomes));
         assert_eq!(outcomes[0].source, outcomes[0].target);
         same(&src, &dst);
-        let after = tx(&dst, |db| backup::manifest(db)).unwrap();
-        assert_eq!(after.sequences, before.sequences);
+        assert_eq!(manifest(&dst).sequences, before.sequences);
         assert_eq!(tx(&dst, |db| backup::lock(db)).unwrap(), Lock::Open);
 
         // The same session cookie and API token work on the copy, and so do passwords.
@@ -13981,13 +13988,69 @@ mod backups {
         assert_eq!(super::connected::filled(&r, finish)["preview"]["reference"], "acme/api #7");
 
         // New rows continue after the source's counters, never reusing an id.
-        let top = |h: &H| count(h, "SELECT seq FROM sqlite_sequence WHERE name = 'search_docs'");
-        let seq = top(&dst);
+        let seq = count(&dst, "SELECT seq FROM sqlite_sequence WHERE name = 'search_docs'");
         dst.ok("POST", "/api/v1/posts", Some(json!({ "title": "After the move", "content": "y", "status": "published" })), &admin);
         assert!(count(&dst, "SELECT MAX(id) FROM search_docs") > seq);
         // Copying again changes nothing: it only checks.
         let again = run(tool::copy(&end(&src), Some(&end(&dst)), None, &Options::default())).unwrap();
         assert!(matches!(&again[0].status, Status::Differs(t) if t.contains(&"posts".to_string())), "the target moved on: {again:?}");
+    }
+
+    /// S1: a freeze stops every later write, including a job that resumes after an outside call.
+    #[test]
+    fn freezing_stops_every_later_write_even_a_job_mid_flight() {
+        use dumbslab_core::connect::{self, Step};
+        let mut h = H::new();
+        super::connected::with_key(&mut h);
+        let (_, admin) = h.setup();
+        let hook = h.ok("POST", "/api/v1/webhooks", Some(json!({ "url": "https://hooks.test/in", "events": ["post.*"] })), &admin);
+        let hook_id = hook["id"]
+            .as_str()
+            .map(str::to_string)
+            .unwrap_or_else(|| h.store.with_tx(|db| (db.one("SELECT id FROM webhooks", &[]).unwrap().unwrap().str("id"), true)).unwrap());
+        // Connecting GitHub: the first step asks GitHub who the token belongs to, and the job waits.
+        let r = h.call("POST", "/api/v1/connections", Some(json!({ "app": "github", "fields": { "token": "ghp_secret_token" } })), &admin);
+        let mut job = super::connected::job_of(&r);
+        let calls = match tx(&h, |db| connect::step(db, &h.cfg, &mut job, vec![], chrono::Utc::now())).unwrap() {
+            Step::Fetch(calls) => calls,
+            other => panic!("expected the job to call GitHub, got {other:?}"),
+        };
+        // The operator freezes the workspace while the job waits on GitHub.
+        assert!(tx(&h, |db| backup::freeze(db)).unwrap());
+        let writes = |h: &H| count(h, "SELECT COUNT(*) FROM activity") + count(h, "SELECT COUNT(*) FROM usage_hours");
+        let before = writes(&h);
+        // GitHub answers; the job's next step would save the connection. It's refused.
+        let replies = calls.iter().map(super::connected::github).collect();
+        let refused = tx(&h, |db| connect::step(db, &h.cfg, &mut job, replies, chrono::Utc::now())).unwrap_err();
+        assert_eq!((refused.status, refused.code), (503, "moving"));
+        assert_eq!(count(&h, "SELECT COUNT(*) FROM connections"), 0);
+        // Every request, reads included, is refused in its own transaction.
+        let r = h.call("GET", "/api/v1/posts", None, &admin);
+        assert_eq!((r.status, r.header("retry-after")), (503, Some("120")), "{}", r.body);
+        assert_eq!(h.call("POST", "/api/v1/posts", Some(json!({ "title": "Late", "status": "published" })), &admin).status, 503);
+        // A webhook delivery that finishes later records nothing, and neither does metering.
+        tx(&h, |db| dumbslab_core::record_webhook_result(db, &hook_id, Some(200), None)).unwrap();
+        assert_eq!(count(&h, "SELECT COUNT(*) FROM webhooks WHERE last_status IS NOT NULL"), 0);
+        tx(&h, |db| dumbslab_core::plan::record_writes(db, chrono::Utc::now(), 7)).unwrap();
+        // An address move that was claimed before the freeze doesn't finish.
+        let actor = dumbslab_core::auth::Actor {
+            user_id: "u".into(),
+            name: "Ada".into(),
+            handle: "ada".into(),
+            email: "ada@acme.test".into(),
+            role: dumbslab_core::auth::Role::Admin,
+            scopes: dumbslab_core::auth::Scopes::for_role(dumbslab_core::auth::Role::Admin),
+            via: dumbslab_core::auth::Via::Cli,
+            token_id: None,
+            session_hash: None,
+        };
+        let mv = dumbslab_core::AddressMove { from: "acme".into(), to: "docs".into(), actor };
+        let refused = tx(&h, |db| dumbslab_core::tenancy::finish_move(db, &h.cfg, &mv, "https://docs.kb.test")).unwrap_err();
+        assert_eq!(refused.status, 503);
+        assert_eq!(writes(&h), before, "nothing was written after the freeze");
+        // Thawed, the workspace works again.
+        tx(&h, |db| backup::thaw(db)).unwrap();
+        assert_eq!(h.call("GET", "/api/v1/posts", None, &admin).status, 200);
     }
 
     #[test]
@@ -14000,60 +14063,85 @@ mod backups {
         assert!(matches!(&outcomes[0].status, Status::Differs(_)), "{outcomes:?}");
         assert_eq!(dst.ok("GET", "/api/v1/auth/state", None, &theirs)["user"]["email"], "ada@acme.test");
         assert_eq!(count(&dst, "SELECT COUNT(*) FROM users"), 1);
-        let manifest = tx(&src, |db| backup::manifest(db)).unwrap();
-        let refused = tx(&dst, |db| backup::begin(db, &[Kind::Workspace], &manifest)).unwrap_err();
+        let m = manifest(&src);
+        let refused = tx(&dst, |db| backup::begin(db, &[Kind::Workspace], "main", &m)).unwrap_err();
         assert_eq!((refused.status, refused.code), (409, "not_empty"));
 
         // Another schema version, or other tables, are refused and leave nothing behind.
         let empty = H::new();
-        for change in [
-            (&|m: &mut backup::Manifest| m.schema_version = Some(3)) as &dyn Fn(&mut backup::Manifest),
-            &|m| m.schema = "0".repeat(64),
-            &|m| m.format = 99,
-        ] {
-            let mut m = manifest.clone();
-            change(&mut m);
-            let e = tx(&empty, |db| backup::begin(db, &[Kind::Workspace], &m)).unwrap_err();
+        for change in
+            [(&|m: &mut Manifest| m.schema_version = Some(3)) as &dyn Fn(&mut Manifest), &|m| m.schema = "0".repeat(64), &|m| m.format = 99]
+        {
+            let mut bad = m.clone();
+            change(&mut bad);
+            let e = tx(&empty, |db| backup::begin(db, &[Kind::Workspace], "main", &bad)).unwrap_err();
             assert!(matches!(e.code, "schema_mismatch" | "bad_request"), "{}", e.message);
             assert_eq!(tx(&empty, |db| backup::lock(db)).unwrap(), Lock::Open);
         }
-        // A workspace object takes no directory, and pages need a restore under way.
-        let mut dir = manifest.clone();
+        // A workspace object takes no directory, and pages need the restore they name.
+        let mut dir = m.clone();
         dir.kind = Kind::Directory;
-        assert_eq!(tx(&empty, |db| backup::begin(db, &[Kind::Workspace, Kind::Alias], &dir)).unwrap_err().status, 400);
-        let page = tx(&src, |db| backup::dump(db, &PageRequest { table: "users".into(), after: None })).unwrap();
-        assert_eq!(tx(&empty, |db| backup::restore(db, &page)).unwrap_err().code, "not_restoring");
+        assert_eq!(tx(&empty, |db| backup::begin(db, &[Kind::Workspace, Kind::Alias], "main", &dir)).unwrap_err().status, 400);
+        assert_eq!(tx(&empty, |db| backup::restore(db, "nope", &page(&src, "users"))).unwrap_err().code, "not_restoring");
         assert_eq!(count(&empty, "SELECT COUNT(*) FROM users"), 0);
+    }
+
+    /// S8: a restore resumes only from the same source object and snapshot.
+    #[test]
+    fn a_restore_resumes_only_from_the_same_source_snapshot() {
+        let (a, ..) = populated();
+        let (b, ..) = populated();
+        tx(&a, |db| backup::freeze(db).map(|_| ())).unwrap();
+        let dst = H::new();
+        let ma = manifest(&a);
+        let id = tx(&dst, |db| backup::begin(db, &[Kind::Workspace], "ws:acme", &ma)).unwrap().restore_id;
+        tx(&dst, |db| backup::restore(db, &id, &page(&a, "users"))).unwrap();
+        // Another workspace with the same schema can't start here, nor the same one under another name.
+        let mb = manifest(&b);
+        assert_eq!(tx(&dst, |db| backup::begin(db, &[Kind::Workspace], "ws:acme", &mb)).unwrap_err().code, "restore_conflict");
+        assert_eq!(tx(&dst, |db| backup::begin(db, &[Kind::Workspace], "ws:beta", &ma)).unwrap_err().code, "restore_conflict");
+        // A page or a finish naming another restore is refused.
+        assert_eq!(tx(&dst, |db| backup::restore(db, "another", &page(&b, "posts"))).unwrap_err().code, "restore_conflict");
+        assert_eq!(tx(&dst, |db| backup::finish(db, "another", &ma)).unwrap_err().code, "restore_conflict");
+        // The same frozen snapshot resumes, under the same id.
+        let again = tx(&dst, |db| backup::begin(db, &[Kind::Workspace], "ws:acme", &manifest(&a))).unwrap();
+        assert!(again.resumed && again.restore_id == id);
+        // An unfrozen source has a new snapshot each time: its restore can't be resumed.
+        let (m1, m2) = (manifest(&b), manifest(&b));
+        assert_ne!(m1.snapshot, m2.snapshot);
+        assert_eq!(count(&dst, "SELECT COUNT(*) FROM posts"), 0, "nothing of b's was written");
     }
 
     #[test]
     fn a_restore_cut_short_resumes_and_pages_can_be_sent_twice() {
         let (src, cookie, ..) = populated();
+        // Resuming needs the source's snapshot to stay put: frozen.
+        tx(&src, |db| backup::freeze(db).map(|_| ())).unwrap();
         let dst = H::new();
-        let manifest = tx(&src, |db| backup::manifest(db)).unwrap();
-        assert!(!tx(&dst, |db| backup::begin(db, &[Kind::Workspace], &manifest)).unwrap().resumed);
-        // The first page of each table arrives, some twice (a retried request); then the
-        // connection drops.
+        let m = manifest(&src);
+        let begun = tx(&dst, |db| backup::begin(db, &[Kind::Workspace], "main", &m)).unwrap();
+        assert!(!begun.resumed);
+        // The first page of each table arrives twice (a retried request); then the connection drops.
         let mut chunk_pages = 0;
-        for t in &manifest.tables {
-            let page = tx(&src, |db| backup::dump(db, &PageRequest { table: t.name.clone(), after: None })).unwrap();
+        for t in &m.tables {
+            let p = page(&src, &t.name);
             for _ in 0..2 {
-                assert_eq!(tx(&dst, |db| backup::restore(db, &page)).unwrap().rows, page.count);
+                assert_eq!(tx(&dst, |db| backup::restore(db, &begun.restore_id, &p)).unwrap().rows, p.count);
             }
             if t.name == "file_chunks" {
-                assert!(page.next.is_some(), "a 2.5 MB file takes more than one page");
+                assert!(p.next.is_some(), "a 2.5 MB file takes more than one page");
                 chunk_pages += 1;
             }
         }
         assert_eq!(chunk_pages, 1);
         // A damaged page is refused whole.
-        let mut page = tx(&src, |db| backup::dump(db, &PageRequest { table: "posts".into(), after: None })).unwrap();
-        page.rows[0][1] = backup::Cell::Text("tampered".into());
-        assert_eq!(tx(&dst, |db| backup::restore(db, &page)).unwrap_err().status, 400);
+        let mut damaged = page(&src, "posts");
+        damaged.rows[0][1] = Cell::Text("tampered".into());
+        assert_eq!(tx(&dst, |db| backup::restore(db, &begun.restore_id, &damaged)).unwrap_err().status, 400);
         // Unfinished, the restore can't be finished and the object refuses requests.
-        assert_eq!(tx(&dst, |db| backup::finish(db, &manifest)).unwrap_err().code, "verify_failed");
+        assert_eq!(tx(&dst, |db| backup::finish(db, &begun.restore_id, &m)).unwrap_err().code, "verify_failed");
         assert_eq!(tx(&dst, |db| backup::lock(db)).unwrap(), Lock::Restoring);
-        assert_eq!(Lock::Restoring.refusal().unwrap().status, 503);
+        assert_eq!(dst.call("GET", "/api/v1/auth/state", None, &cookie).status, 503);
 
         // Running the copy again picks up where it stopped.
         let outcomes = copy(&src, &dst);
@@ -14061,25 +14149,64 @@ mod backups {
         same(&src, &dst);
         assert_eq!(dst.ok("GET", "/api/v1/auth/state", None, &cookie)["user"]["email"], "ada@acme.test");
         // Finishing twice changes nothing.
-        assert!(tx(&dst, |db| backup::finish(db, &manifest)).unwrap().already_finished);
+        assert!(tx(&dst, |db| backup::finish(db, &begun.restore_id, &m)).unwrap().already_finished);
     }
 
     #[test]
     fn an_unfinished_restore_can_be_wiped_and_started_over() {
         let (src, ..) = populated();
         let dst = H::new();
-        let manifest = tx(&src, |db| backup::manifest(db)).unwrap();
-        tx(&dst, |db| backup::begin(db, &[Kind::Workspace], &manifest)).unwrap();
-        let page = tx(&src, |db| backup::dump(db, &PageRequest { table: "users".into(), after: None })).unwrap();
-        tx(&dst, |db| backup::restore(db, &page)).unwrap();
+        let m = manifest(&src);
+        let id = tx(&dst, |db| backup::begin(db, &[Kind::Workspace], "main", &m)).unwrap().restore_id;
+        tx(&dst, |db| backup::restore(db, &id, &page(&src, "users"))).unwrap();
         tx(&dst, |db| backup::abort(db)).unwrap();
         assert_eq!(count(&dst, "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"), 0);
         // Only an unfinished restore can be wiped.
         assert_eq!(tx(&src, |db| backup::abort(db)).unwrap_err().code, "not_restoring");
         assert!(count(&src, "SELECT COUNT(*) FROM users") > 0);
-        let outcomes = copy(&src, &dst);
-        assert_eq!(statuses(&outcomes), [Status::Copied]);
+        assert_eq!(statuses(&copy(&src, &dst)), [Status::Copied]);
         same(&src, &dst);
+    }
+
+    /// S7: a target with the same rows but other counters (or schema) doesn't pass as copied.
+    #[test]
+    fn an_existing_target_passes_only_with_the_same_counters() {
+        let (src, ..) = populated();
+        let dst = H::new();
+        assert_eq!(statuses(&copy(&src, &dst)), [Status::Copied]);
+        assert_eq!(statuses(&copy(&src, &dst)), [Status::AlreadyCopied]);
+        dst.store
+            .with_tx(|db| (db.execute("UPDATE sqlite_sequence SET seq = seq + 5 WHERE name = 'search_docs'", &[]), true))
+            .unwrap()
+            .unwrap();
+        assert_eq!(statuses(&copy(&src, &dst)), [Status::Differs(vec!["sqlite_sequence".into()])]);
+        let checked = run(tool::verify(&end(&src), &end(&dst), &[])).unwrap();
+        assert_eq!(statuses(&checked), [Status::Differs(vec!["sqlite_sequence".into()])]);
+    }
+
+    /// S6: a page whose rows refer to rows in a later page restores, foreign keys enforced.
+    #[test]
+    fn rows_that_refer_to_a_later_page_restore() {
+        let h = H::new();
+        let (_, admin) = h.setup();
+        let ids: Vec<String> = (0..1001)
+            .map(|i| {
+                h.ok("POST", "/api/v1/topics", Some(json!({ "name": format!("Topic {i:04}") })), &admin)["id"].as_str().unwrap().to_string()
+            })
+            .collect();
+        // The first topic moves under the last: page one refers to page two.
+        h.ok("PATCH", &format!("/api/v1/topics/{}", ids[0]), Some(json!({ "parent_id": ids[1000] })), &admin);
+        assert!(page(&h, "topics").next.is_some(), "the topics take two pages");
+        let dst = H::new();
+        let outcomes = copy(&h, &dst);
+        assert_eq!(statuses(&outcomes), [Status::Copied], "{}", tool::table(&outcomes));
+        same(&h, &dst);
+        let parent = dst
+            .store
+            .with_tx(|db| (db.one("SELECT parent_id FROM topics WHERE id = ?", &dumbslab_core::params![ids[0].clone()]), true))
+            .unwrap();
+        assert_eq!(parent.unwrap().unwrap().str("parent_id"), ids[1000]);
+        assert_eq!(count(&dst, "SELECT COUNT(*) FROM pragma_foreign_key_check"), 0);
     }
 
     #[test]
@@ -14088,7 +14215,9 @@ mod backups {
         assert!(tx(&src, |db| backup::freeze(db)).unwrap());
         assert_eq!(tx(&src, |db| backup::lock(db)).unwrap(), Lock::Frozen);
         assert_eq!(Lock::Frozen.refusal().unwrap().code, "moving");
-        assert!(tx(&src, |db| backup::manifest(db)).unwrap().frozen);
+        let m = manifest(&src);
+        assert!(m.frozen);
+        assert_eq!(manifest(&src).snapshot, m.snapshot, "a frozen object keeps its snapshot");
         let dst = H::new();
         assert_eq!(statuses(&copy(&src, &dst)), [Status::Copied]);
         assert_eq!(tx(&dst, |db| backup::lock(db)).unwrap(), Lock::Open, "the target takes requests");
@@ -14100,16 +14229,37 @@ mod backups {
         assert_eq!(backup::manifest(&Sqlite(&conn)).unwrap().kind, Kind::Empty);
     }
 
+    /// Writes a backup file record by record, as a damaged or forged one might be.
+    fn forge(path: &std::path::Path, passphrase: &str, records: &[Value]) {
+        let (key, mut out) = FileKey::create(passphrase).unwrap();
+        for (i, r) in records.iter().enumerate() {
+            let sealed = key.seal(i as u64, &serde_json::to_vec(r).unwrap()).unwrap();
+            out.extend((sealed.len() as u32).to_be_bytes());
+            out.extend(sealed);
+        }
+        std::fs::write(path, out).unwrap();
+    }
+
+    fn records(path: &std::path::Path, passphrase: &str) -> Vec<Value> {
+        let mut reader = BackupReader::open(path, passphrase).unwrap();
+        let mut out = vec![];
+        while let Some(r) = reader.next_record().unwrap() {
+            out.push(r);
+        }
+        out
+    }
+
     #[test]
-    fn an_encrypted_backup_file_restores_and_refuses_a_wrong_passphrase_or_a_cut() {
+    fn an_encrypted_backup_file_restores_and_refuses_a_wrong_passphrase() {
         let (src, cookie, ..) = populated();
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("dumbslab.backup");
-        let mut writer = BackupWriter::create(&file, "correct horse battery staple").unwrap();
+        let pass = "correct horse battery staple";
+        let mut writer = BackupWriter::create(&file, pass).unwrap();
         let saved = run(tool::copy(&end(&src), None, Some(&mut writer), &Options::default())).unwrap();
         writer.finish().unwrap();
         assert_eq!(statuses(&saved), [Status::Saved]);
-        assert!(BackupWriter::create(&file, "correct horse battery staple").is_err(), "never overwritten");
+        assert!(BackupWriter::create(&file, pass).is_err(), "never overwritten");
         let raw = std::fs::read(&file).unwrap();
         assert!(!raw.windows(15).any(|w| w == b"Zebracorn deplo"), "nothing readable in the file");
         #[cfg(unix)]
@@ -14117,36 +14267,80 @@ mod backups {
             use std::os::unix::fs::PermissionsExt;
             assert_eq!(std::fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600);
         }
-
         let dst = H::new();
-        let mut reader = BackupReader::open(&file, "correct horse battery staple").unwrap();
-        let restored = run(tool::restore_file(&mut reader, &end(&dst), &[])).unwrap();
+        let restored = run(tool::restore_file(&file, pass, &end(&dst), &[])).unwrap();
         assert_eq!(statuses(&restored), [Status::Copied], "{}", tool::table(&restored));
         same(&src, &dst);
         assert_eq!(dst.ok("GET", "/api/v1/auth/state", None, &cookie)["user"]["email"], "ada@acme.test");
+        assert!(run(tool::restore_file(&file, "battery staple horse correct", &end(&H::new()), &[])).is_err());
+    }
 
-        let mut wrong = BackupReader::open(&file, "battery staple horse correct").unwrap();
-        assert!(wrong.next_record().is_err());
-        // Cut short, the last object isn't finished: it stays an unfinished restore.
+    /// S3 and S4: a file that's cut short, or that lacks an object its listing covers, restores
+    /// nothing; and the writer never finishes such a file.
+    #[test]
+    fn an_incomplete_backup_file_restores_nothing() {
+        let (src, ..) = populated();
+        let dir = tempfile::tempdir().unwrap();
+        let pass = "correct horse battery staple";
+        let file = dir.path().join("whole.backup");
+        let mut writer = BackupWriter::create(&file, pass).unwrap();
+        run(tool::copy(&end(&src), None, Some(&mut writer), &Options::default())).unwrap();
+        writer.finish().unwrap();
+        let whole = records(&file, pass);
+        let end_record = |objects: &[&str], n: usize| json!({ "type": "end", "records": n, "objects": objects });
+        let untouched = |dst: &H| {
+            assert_eq!(tx(dst, |db| backup::lock(db)).unwrap(), Lock::Open);
+            assert_eq!(count(dst, "SELECT COUNT(*) FROM users"), 0);
+        };
+
+        // Cut short right after its listing.
         let cut = dir.path().join("cut.backup");
-        std::fs::write(&cut, &raw[..raw.len() - 100]).unwrap();
+        forge(&cut, pass, &whole[..1]);
         let dst = H::new();
-        let mut reader = BackupReader::open(&cut, "correct horse battery staple").unwrap();
-        let restored = run(tool::restore_file(&mut reader, &end(&dst), &[])).unwrap();
-        assert!(matches!(&restored[0].status, Status::Failed(_)), "{restored:?}");
-        assert_eq!(tx(&dst, |db| backup::lock(db)).unwrap(), Lock::Restoring);
+        assert!(run(tool::restore_file(&cut, pass, &end(&dst), &[])).is_err());
+        untouched(&dst);
+        // Cut short in the middle of an object.
+        forge(&cut, pass, &whole[..whole.len() / 2]);
+        assert!(run(tool::restore_file(&cut, pass, &end(&dst), &[])).is_err());
+        untouched(&dst);
+
+        // The listing covers two objects; only one is in the file, whatever its end record says.
+        let mut listing = whole[0].clone();
+        listing["objects"] = json!(["main", "ws:beta"]);
+        let mut lacking: Vec<Value> = std::iter::once(listing).chain(whole[1..].iter().cloned()).collect();
+        for objects in [vec!["main"], vec!["main", "ws:beta"]] {
+            let n = lacking.len();
+            lacking.push(end_record(&objects, n));
+            let forged = dir.path().join("lacking.backup");
+            forge(&forged, pass, &lacking);
+            let err = run(tool::restore_file(&forged, pass, &end(&dst), &[])).unwrap_err();
+            assert!(format!("{err:#}").contains("ws:beta") || format!("{err:#}").contains("end record"), "{err:#}");
+            untouched(&dst);
+            lacking.pop();
+        }
+
+        // The writer removes a file that lacks an object rather than finish it.
+        let partial = dir.path().join("partial.backup");
+        let mut writer = BackupWriter::create(&partial, pass).unwrap();
+        let listing: tool::Listing = serde_json::from_value(whole[0]["listing"].clone()).unwrap();
+        writer.listing(&listing, &["main".into(), "ws:beta".into()]).unwrap();
+        writer.empty("ws:beta").unwrap();
+        let err = writer.finish().unwrap_err();
+        assert!(format!("{err}").contains("main"), "{err}");
+        assert!(!partial.exists());
     }
 
     /// Copies a database into another with the core alone, page by page.
     fn copy_db(src: &dyn Db, dst: &dyn Db, allowed: &[Kind]) -> usize {
         let m = backup::manifest(src).unwrap();
-        backup::begin(dst, allowed, &m).unwrap();
+        let id = backup::begin(dst, allowed, "main", &m).unwrap().restore_id;
         let mut pages = 0;
         for t in &m.tables {
             let mut after = None;
             loop {
                 let page = backup::dump(src, &PageRequest { table: t.name.clone(), after }).unwrap();
-                backup::restore(dst, &page).unwrap();
+                assert!(serde_json::to_vec(&page).unwrap().len() <= backup::MAX_PAGE_JSON, "a page of {} is too big", t.name);
+                backup::restore(dst, &id, &page).unwrap();
                 pages += 1;
                 after = page.next;
                 if after.is_none() {
@@ -14154,7 +14348,7 @@ mod backups {
                 }
             }
         }
-        backup::finish(dst, &m).unwrap();
+        backup::finish(dst, &id, &m).unwrap();
         pages
     }
 
@@ -14163,10 +14357,10 @@ mod backups {
         m.tables
             .iter()
             .map(|t| {
-                let (mut sum, mut after) = (backup::Checksum::default(), None);
+                let (mut sum, mut after) = (Checksum::default(), None);
                 loop {
                     let s = backup::summary(db, &PageRequest { table: t.name.clone(), after }).unwrap();
-                    sum.merge(backup::Checksum::parse(s.count, &s.checksum).unwrap());
+                    sum.merge(Checksum::parse(s.count, &s.checksum).unwrap());
                     after = s.next;
                     if after.is_none() {
                         break;
@@ -14175,6 +14369,105 @@ mod backups {
                 (t.name.clone(), sum.rows, sum.hex())
             })
             .collect()
+    }
+
+    /// A database as the Worker sees it through JavaScript numbers (worker 0.8.7): integers become
+    /// doubles, which round past 2^53, and any double that is a safe integer comes back as one.
+    struct Js<'a>(&'a dyn Db);
+
+    fn js(v: &SqlValue) -> SqlValue {
+        let number =
+            |f: f64| if f.fract() == 0.0 && f.abs() <= 9_007_199_254_740_991.0 { SqlValue::Integer(f as i64) } else { SqlValue::Real(f) };
+        match v {
+            SqlValue::Integer(i) => number(*i as f64),
+            SqlValue::Real(f) => number(*f),
+            other => other.clone(),
+        }
+    }
+
+    impl Db for Js<'_> {
+        fn query(&self, sql: &str, params: &[SqlValue]) -> dumbslab_core::ApiResult<Vec<Row>> {
+            let params: Vec<SqlValue> = params.iter().map(js).collect();
+            let rows = self.0.query(sql, &params)?;
+            Ok(rows.iter().map(|r| Row::new(r.columns().clone(), r.values().iter().map(js).collect())).collect())
+        }
+        fn execute(&self, sql: &str, params: &[SqlValue]) -> dumbslab_core::ApiResult<u64> {
+            let params: Vec<SqlValue> = params.iter().map(js).collect();
+            self.0.execute(sql, &params)
+        }
+        fn execute_batch(&self, sql: &str) -> dumbslab_core::ApiResult<()> {
+            self.0.execute_batch(sql)
+        }
+    }
+
+    fn raw_db(schema: &str) -> rusqlite::Connection {
+        let c = rusqlite::Connection::open_in_memory().unwrap();
+        c.execute_batch("PRAGMA foreign_keys = ON").unwrap();
+        c.execute_batch(schema).unwrap();
+        c
+    }
+
+    /// S2: integers past 2^53 (keys included), integral reals and typeless columns keep their exact
+    /// values and types through a JavaScript host, and the checksum tells 2^53 + 1 from 2^53.
+    #[test]
+    fn values_cross_a_javascript_host_exactly() {
+        let schema = "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            INSERT INTO meta (key, value) VALUES ('schema_version', '7');
+            CREATE TABLE nums (id INTEGER PRIMARY KEY, n INTEGER, r REAL, anything);";
+        let (a, b) = (raw_db(schema), raw_db(schema));
+        let first = 9_007_199_254_740_993i64; // 2^53 + 1: a double can't hold it.
+        for i in 0..2_500i64 {
+            let anything = match i % 4 {
+                0 => SqlValue::Integer(first + i),
+                1 => SqlValue::Real(3.0),
+                2 => SqlValue::Text("9007199254740993".into()),
+                _ => SqlValue::Integer(i64::MIN + i),
+            };
+            Sqlite(&a)
+                .execute(
+                    "INSERT INTO nums (id, n, r, anything) VALUES (?, ?, ?, ?)",
+                    &[
+                        SqlValue::Integer(first + i),
+                        SqlValue::Integer(i64::MAX - i),
+                        SqlValue::Real(if i % 2 == 0 { 3.0 } else { 0.1 }),
+                        anything,
+                    ],
+                )
+                .unwrap();
+        }
+        let pages = copy_db(&Js(&Sqlite(&a)), &Js(&Sqlite(&b)), &[Kind::Workspace]);
+        assert!(pages >= 4, "{pages} pages");
+        let exact = |c: &rusqlite::Connection| -> Vec<(i64, i64, f64, String, String)> {
+            let mut stmt =
+                c.prepare("SELECT id, n, r, CAST(anything AS TEXT), typeof(anything) || '/' || typeof(r) FROM nums ORDER BY id").unwrap();
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))).unwrap().map(|r| r.unwrap()).collect()
+        };
+        assert_eq!(exact(&b), exact(&a));
+        assert_eq!(exact(&b).len(), 2_500);
+        assert_eq!(totals(&Js(&Sqlite(&a))), totals(&Sqlite(&a)), "checksums cover the exact values");
+        // One value off by one, which a double can't tell apart, fails the check.
+        b.execute_batch(&format!("UPDATE nums SET n = n - 1 WHERE id = {first}")).unwrap();
+        assert_ne!(totals(&Js(&Sqlite(&a))), totals(&Js(&Sqlite(&b))));
+    }
+
+    /// S5: pages stay under their byte bound however big the text, NULs included.
+    #[test]
+    fn pages_stay_small_with_big_text_and_nuls() {
+        let schema = "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            INSERT INTO meta (key, value) VALUES ('schema_version', '7');
+            CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT);";
+        let (a, b) = (raw_db(schema), raw_db(schema));
+        for i in 0..24i64 {
+            // `length()` of the first kind is 0 (it stops at a NUL); as JSON each NUL takes six bytes.
+            let body = if i % 2 == 0 { format!("\0{}", "\0".repeat(600_000)) } else { "é".repeat(300_000) };
+            Sqlite(&a).execute("INSERT INTO notes (id, body) VALUES (?, ?)", &[SqlValue::Integer(i), SqlValue::Text(body)]).unwrap();
+        }
+        // Every page stays under the bound (`copy_db` checks): 14 MB of row data takes at least eight.
+        let pages = copy_db(&Sqlite(&a), &Sqlite(&b), &[Kind::Workspace]);
+        assert!(pages > 8, "{pages} pages");
+        assert_eq!(totals(&Sqlite(&b)), totals(&Sqlite(&a)));
+        let nuls: i64 = b.query_row("SELECT SUM(length(CAST(body AS BLOB))) FROM notes", [], |r| r.get(0)).unwrap();
+        assert_eq!(nuls, 12 * 600_001 + 12 * 600_000);
     }
 
     #[test]
@@ -14222,7 +14515,7 @@ mod backups {
         tenancy::directory_migrate(&dst).unwrap();
         // A workspace object takes no directory.
         let m = backup::manifest(&src).unwrap();
-        assert_eq!(backup::begin(&dst, &[Kind::Workspace, Kind::Alias], &m).unwrap_err().status, 400);
+        assert_eq!(backup::begin(&dst, &[Kind::Workspace, Kind::Alias], "directory", &m).unwrap_err().status, 400);
         copy_db(&src, &dst, &[Kind::Directory]);
         assert_eq!(totals(&src), totals(&dst));
         let list = |db: &dyn Db| serde_json::to_value(tenancy::list(db).unwrap()).unwrap();
@@ -14232,7 +14525,7 @@ mod backups {
         assert!(tenancy::paying(&dst, "acme").unwrap());
         assert_eq!(tenancy::installation_targets(&dst, 42).unwrap(), [("beta".to_string(), "beta".to_string())]);
         // A directory with data refuses another copy.
-        assert_eq!(backup::begin(&dst, &[Kind::Directory], &m).unwrap_err().code, "not_empty");
+        assert_eq!(backup::begin(&dst, &[Kind::Directory], "directory", &m).unwrap_err().code, "not_empty");
 
         // An alias object: just its pointer.
         let (c, d) = (rusqlite::Connection::open_in_memory().unwrap(), rusqlite::Connection::open_in_memory().unwrap());
@@ -14243,18 +14536,12 @@ mod backups {
     }
 
     #[test]
-    fn pages_follow_composite_keys_and_rows_that_refer_to_later_rows() {
+    fn pages_follow_composite_keys() {
         let schema = "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
             INSERT INTO meta (key, value) VALUES ('schema_version', '7');
             CREATE TABLE pairs (a TEXT NOT NULL, b INTEGER NOT NULL, v BLOB, r REAL, PRIMARY KEY (a, b)) WITHOUT ROWID;
             CREATE TABLE nodes (id TEXT PRIMARY KEY, parent TEXT REFERENCES nodes(id), note TEXT);";
-        let open = || {
-            let c = rusqlite::Connection::open_in_memory().unwrap();
-            c.execute_batch("PRAGMA foreign_keys = ON").unwrap();
-            c.execute_batch(schema).unwrap();
-            c
-        };
-        let (a, b) = (open(), open());
+        let (a, b) = (raw_db(schema), raw_db(schema));
         let src = Sqlite(&a);
         for i in 0..2_600i64 {
             src.execute(
@@ -14277,20 +14564,14 @@ mod backups {
         let pairs = m.tables.iter().find(|t| t.name == "pairs").unwrap();
         assert_eq!(pairs.key, ["a", "b"]);
         assert_eq!(pairs.columns, ["a", "b", "r", "v"], "no rowid in a WITHOUT ROWID table");
-        let nodes = m.tables.iter().find(|t| t.name == "nodes").unwrap();
-        assert_eq!(nodes.key, ["rowid"]);
-        // The target gets each run of pages in its own transaction, foreign keys enforced.
-        let dst = Sqlite(&b);
-        dst.execute_batch("DELETE FROM meta").unwrap();
-        dst.execute("INSERT INTO meta (key, value) VALUES ('schema_version', '7')", &[]).unwrap();
-        b.execute_batch("BEGIN").unwrap();
-        let pages = copy_db(&src, &dst, &[Kind::Workspace]);
-        b.execute_batch("COMMIT").unwrap();
+        assert_eq!(m.tables.iter().find(|t| t.name == "nodes").unwrap().key, ["rowid"]);
+        let pages = copy_db(&src, &Js(&Sqlite(&b)), &[Kind::Workspace]);
         assert!(pages >= 4, "2,600 rows take three pages, and nodes one: {pages}");
-        assert_eq!(totals(&src), totals(&dst));
+        assert_eq!(totals(&src), totals(&Sqlite(&b)));
         let ordered = |db: &Sqlite| -> Vec<(String, i64)> {
             db.query("SELECT a, b FROM pairs ORDER BY a, b", &[]).unwrap().iter().map(|r| (r.str("a"), r.i64("b"))).collect()
         };
-        assert_eq!(ordered(&dst), ordered(&src));
+        assert_eq!(ordered(&Sqlite(&b)), ordered(&src));
+        assert_eq!(Sqlite(&b).one("SELECT parent FROM nodes WHERE id = 'n1'", &[]).unwrap().unwrap().str("parent"), "n2");
     }
 }

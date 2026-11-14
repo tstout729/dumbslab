@@ -5,10 +5,10 @@
 //!
 //! Either end can also be a native server's database file, which holds one workspace.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -194,11 +194,18 @@ where
 // Encrypted backup files
 
 /// Writes an encrypted backup file: a header, then sealed records (see [`FileKey`]), each a JSON
-/// value: the listing, then each object's manifest and pages, then an end record.
+/// value: the listing and the objects it covers, then for each object either its manifest, pages
+/// and `object_end`, or `empty`; then an end record naming every object. [`BackupWriter::finish`]
+/// writes the end record only once every object is in the file. A file left unfinished (an error,
+/// a missing object) is removed: it could never be restored.
 pub struct BackupWriter {
-    file: BufWriter<File>,
+    file: Option<BufWriter<File>>,
+    path: PathBuf,
     key: FileKey,
     index: u64,
+    /// The objects the listing covers, and those whose records are all written.
+    expected: BTreeSet<String>,
+    done: BTreeSet<String>,
 }
 
 impl BackupWriter {
@@ -210,26 +217,79 @@ impl BackupWriter {
         #[cfg(unix)]
         std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
         let file = options.open(path).with_context(|| format!("creating {}", path.display()))?;
-        let mut file = BufWriter::new(file);
-        file.write_all(&header)?;
-        Ok(BackupWriter { file, key, index: 0 })
+        let mut writer = BackupWriter {
+            file: Some(BufWriter::new(file)),
+            path: path.to_path_buf(),
+            key,
+            index: 0,
+            expected: BTreeSet::new(),
+            done: BTreeSet::new(),
+        };
+        writer.file.as_mut().map(|f| f.write_all(&header)).transpose()?;
+        Ok(writer)
     }
 
-    pub fn record(&mut self, value: &Value) -> anyhow::Result<()> {
+    fn record(&mut self, value: &Value) -> anyhow::Result<()> {
         let sealed = self.key.seal(self.index, &serde_json::to_vec(value)?).map_err(|e| anyhow!(e.message))?;
-        self.file.write_all(&(sealed.len() as u32).to_be_bytes())?;
-        self.file.write_all(&sealed)?;
+        let file = self.file.as_mut().ok_or_else(|| anyhow!("the backup file is closed"))?;
+        file.write_all(&(sealed.len() as u32).to_be_bytes())?;
+        file.write_all(&sealed)?;
         self.index += 1;
         Ok(())
     }
 
-    /// Writes the end record, without which the file reads as cut short.
-    pub fn finish(mut self) -> anyhow::Result<()> {
-        let records = self.index;
-        self.record(&json!({ "type": "end", "records": records }))?;
-        self.file.flush()?;
-        self.file.get_ref().sync_all()?;
+    /// The first record: what the source listed, and the objects this file covers.
+    pub fn listing(&mut self, listing: &Listing, objects: &[String]) -> anyhow::Result<()> {
+        self.expected = objects.iter().cloned().collect();
+        self.record(&json!({ "type": "listing", "listing": listing, "objects": objects }))
+    }
+
+    pub fn manifest(&mut self, object: &str, manifest: &Manifest) -> anyhow::Result<()> {
+        self.record(&json!({ "type": "manifest", "object": object, "manifest": manifest }))
+    }
+
+    pub fn page(&mut self, object: &str, page: &Page) -> anyhow::Result<()> {
+        self.record(&json!({ "type": "page", "object": object, "page": page }))
+    }
+
+    /// Every page of `object` is in the file.
+    pub fn object_done(&mut self, object: &str) -> anyhow::Result<()> {
+        self.record(&json!({ "type": "object_end", "object": object }))?;
+        self.done.insert(object.to_string());
         Ok(())
+    }
+
+    /// `object` holds nothing.
+    pub fn empty(&mut self, object: &str) -> anyhow::Result<()> {
+        self.record(&json!({ "type": "empty", "object": object }))?;
+        self.done.insert(object.to_string());
+        Ok(())
+    }
+
+    /// Writes the end record once every object the listing covers is in the file; otherwise
+    /// removes the file and says which objects it lacks.
+    pub fn finish(mut self) -> anyhow::Result<()> {
+        let missing: Vec<&String> = self.expected.difference(&self.done).collect();
+        if !missing.is_empty() {
+            let names: Vec<&str> = missing.iter().map(|s| s.as_str()).collect();
+            bail!("the backup file was removed: it lacks {}", names.join(", "));
+        }
+        let records = self.index;
+        let objects: Vec<&String> = self.done.iter().collect();
+        self.record(&json!({ "type": "end", "records": records, "objects": objects }))?;
+        let mut file = self.file.take().ok_or_else(|| anyhow!("the backup file is closed"))?;
+        file.flush()?;
+        file.get_ref().sync_all()?;
+        Ok(())
+    }
+}
+
+impl Drop for BackupWriter {
+    fn drop(&mut self) {
+        // Not finished: incomplete, so of no use.
+        if self.file.take().is_some() {
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -238,7 +298,8 @@ pub struct BackupReader {
     file: BufReader<File>,
     key: FileKey,
     index: u64,
-    ended: bool,
+    /// The objects the end record names, once it's read.
+    ended: Option<Vec<String>>,
 }
 
 /// The largest record a backup file may hold.
@@ -250,12 +311,12 @@ impl BackupReader {
         let mut header = vec![0u8; backup::FILE_HEADER_LEN];
         file.read_exact(&mut header).context("this isn't a DumbSlab backup file")?;
         let key = FileKey::open_header(passphrase, &header).map_err(|e| anyhow!(e.message))?;
-        Ok(BackupReader { file, key, index: 0, ended: false })
+        Ok(BackupReader { file, key, index: 0, ended: None })
     }
 
     /// The next record, or `None` after the end record.
     pub fn next_record(&mut self) -> anyhow::Result<Option<Value>> {
-        if self.ended {
+        if self.ended.is_some() {
             return Ok(None);
         }
         let mut len = [0u8; 4];
@@ -273,11 +334,64 @@ impl BackupReader {
             if value["records"].as_u64() != Some(self.index - 1) {
                 bail!("the backup file is damaged");
             }
-            self.ended = true;
+            self.ended = Some(serde_json::from_value(value["objects"].clone()).context("the backup file's end record names no objects")?);
             return Ok(None);
         }
         Ok(Some(value))
     }
+}
+
+/// What a backup file holds once read through and checked: every record opens, the end record is
+/// there, and every object the listing covers is in it whole (or recorded as empty).
+pub struct Contents {
+    pub listing: Listing,
+    pub objects: Vec<String>,
+}
+
+/// Reads a backup file through and refuses it unless it's whole (see [`Contents`]).
+pub fn check_file(path: &Path, passphrase: &str) -> anyhow::Result<Contents> {
+    let mut reader = BackupReader::open(path, passphrase)?;
+    let first = reader.next_record()?.ok_or_else(|| anyhow!("the backup file holds nothing"))?;
+    if first["type"] != "listing" {
+        bail!("the backup file doesn't start with its listing");
+    }
+    let listing: Listing = serde_json::from_value(first["listing"].clone()).context("the backup file's listing can't be read")?;
+    let objects: Vec<String> = serde_json::from_value(first["objects"].clone()).context("the backup file names no objects")?;
+    let covered: BTreeSet<&String> = objects.iter().collect();
+    let mut done = BTreeSet::new();
+    let mut open: Option<String> = None;
+    while let Some(record) = reader.next_record()? {
+        let object = record["object"].as_str().unwrap_or_default().to_string();
+        let kind = record["type"].as_str().unwrap_or_default();
+        let fresh = covered.contains(&object) && !done.contains(&object);
+        match kind {
+            "manifest" | "empty" if open.is_none() && fresh => {
+                if kind == "manifest" {
+                    open = Some(object);
+                } else {
+                    done.insert(object);
+                }
+            }
+            "page" if open.as_ref() == Some(&object) => {}
+            "object_end" if open.as_ref() == Some(&object) => {
+                open = None;
+                done.insert(object);
+            }
+            _ => bail!("the backup file is damaged: a {kind} record for {object} is out of place"),
+        }
+    }
+    let missing: Vec<&str> = objects.iter().filter(|o| !done.contains(*o)).map(|o| o.as_str()).collect();
+    if !missing.is_empty() {
+        bail!("the backup file lacks {}", missing.join(", "));
+    }
+    let mut ended = reader.ended.clone().unwrap_or_default();
+    ended.sort();
+    let mut expected = objects.clone();
+    expected.sort();
+    if ended != expected {
+        bail!("the backup file's end record doesn't match its listing");
+    }
+    Ok(Contents { listing, objects })
 }
 
 // ---------------------------------------------------------------------------
@@ -441,13 +555,33 @@ fn as_copied(manifest: &Manifest, copied: &Totals) -> Manifest {
     m
 }
 
-/// Checks the target against `expected` and finishes its restore when they match.
+/// What the target's own manifest says that differs from the source's, besides rows: its kind,
+/// schema and schema version, and its `AUTOINCREMENT` counters.
+fn manifest_differences(source: &Manifest, target: &Manifest) -> Vec<String> {
+    let mut out = vec![];
+    if target.kind != source.kind {
+        out.push(format!("the target holds a {}", target.kind.as_str()));
+    } else if target.schema != source.schema {
+        out.push("schema".into());
+    }
+    if target.schema_version != source.schema_version {
+        out.push("schema_version".into());
+    }
+    if target.sequences != source.sequences {
+        out.push("sqlite_sequence".into());
+    }
+    out
+}
+
+/// Checks the target against `expected` and, when `restore_id` names its unfinished restore,
+/// finishes it once they match. A target that already held data passes only when its manifest
+/// matches the source's too.
 async fn check_and_finish(
     to: &Endpoint,
     object: &str,
     manifest: &Manifest,
     expected: &Totals,
-    restoring: bool,
+    restore_id: Option<&str>,
 ) -> Result<Outcome, CallError> {
     let mut outcome = Outcome::new(object, manifest.kind, Status::Copied);
     outcome.tables = manifest.tables.len();
@@ -460,18 +594,50 @@ async fn check_and_finish(
         outcome.status = Status::Differs(differ);
         return Ok(outcome);
     }
-    if !restoring {
-        outcome.status = Status::AlreadyCopied;
-        return Ok(outcome);
-    }
-    let finished: Finished = to.call("restore/finish", object, &json!({ "manifest": as_copied(manifest, expected) })).await?;
-    let after: Manifest = to.call("backup/manifest", object, &json!({})).await?;
-    if after.sequences != manifest.sequences {
-        outcome.status = Status::Differs(vec!["sqlite_sequence".into()]);
-    } else if finished.already_finished {
-        outcome.status = Status::AlreadyCopied;
-    }
+    let already = match restore_id {
+        None => true,
+        Some(restore_id) => {
+            let request = json!({ "restore_id": restore_id, "manifest": as_copied(manifest, expected) });
+            to.call::<Finished>("restore/finish", object, &request).await?.already_finished
+        }
+    };
+    let theirs: Manifest = to.call("backup/manifest", object, &json!({})).await?;
+    let differ = manifest_differences(manifest, &theirs);
+    outcome.status = match (differ.is_empty(), already) {
+        (false, _) => Status::Differs(differ),
+        (true, true) => Status::AlreadyCopied,
+        (true, false) => Status::Copied,
+    };
     Ok(outcome)
+}
+
+/// How the target took an object.
+enum Taken {
+    /// Restoring under this id.
+    Restoring(String),
+    /// It already holds data: only check it.
+    Existing,
+    Refused(String),
+}
+
+async fn begin(to: &Endpoint, object: &str, manifest: &Manifest) -> Taken {
+    match to.call::<Begun>("restore/begin", object, &json!({ "object": object, "manifest": manifest })).await {
+        Ok(b) => {
+            if b.resumed {
+                say(format!("{object}: resuming an unfinished restore of the same snapshot"));
+            }
+            Taken::Restoring(b.restore_id)
+        }
+        Err(e) if e.code() == Some("not_empty") => Taken::Existing,
+        Err(e) => Taken::Refused(e.to_string()),
+    }
+}
+
+async fn write_page(to: &Endpoint, object: &str, restore_id: &str, page: &Page) -> anyhow::Result<()> {
+    to.call::<Restored>("restore/page", object, &json!({ "restore_id": restore_id, "page": page }))
+        .await
+        .map(|_| ())
+        .map_err(|e| anyhow!("{object}: writing {}: {e}", page.table))
 }
 
 /// Copies one object: its manifest, then every table page by page, to the target (when there is
@@ -485,32 +651,25 @@ async fn copy_object(
 ) -> anyhow::Result<Outcome> {
     let manifest: Manifest = from.call("backup/manifest", object, &json!({})).await.map_err(|e| anyhow!("{object}: {e}"))?;
     if manifest.kind == Kind::Empty {
+        if let Some(w) = save.as_deref_mut() {
+            w.empty(object)?;
+        }
         return Ok(Outcome::new(object, Kind::Empty, Status::Empty));
     }
     if let Some(w) = save.as_deref_mut() {
-        w.record(&json!({ "type": "manifest", "object": object, "manifest": manifest }))?;
+        w.manifest(object, &manifest)?;
     }
-    // `Some(true)`: restoring into the target; `Some(false)`: it already holds this object's data.
     // A target that refuses the object still leaves the backup file whole.
-    let mut refused = None;
-    let restoring = match to {
+    let taken = match to {
         None => None,
-        Some(to) => match to.call::<Begun>("restore/begin", object, &json!({ "manifest": manifest })).await {
-            Ok(b) => {
-                if b.resumed {
-                    say(format!("{object}: resuming an unfinished restore"));
-                }
-                Some(true)
-            }
-            Err(e) if e.code() == Some("not_empty") => Some(false),
-            Err(e) => {
-                refused = Some(e.to_string());
-                None
-            }
-        },
+        Some(to) => Some(begin(to, object, &manifest).await),
+    };
+    let restore_id = match &taken {
+        Some(Taken::Restoring(id)) => Some(id.clone()),
+        _ => None,
     };
     let mut copied = Totals::new();
-    if restoring == Some(true) || save.is_some() {
+    if restore_id.is_some() || save.is_some() {
         for t in &manifest.tables {
             let mut sum = Checksum::default();
             let mut after = None;
@@ -521,10 +680,10 @@ async fn copy_object(
                     .map_err(|e| anyhow!("{object}: reading {}: {e}", t.name))?;
                 sum.merge(Checksum::parse(page.count, &page.checksum).map_err(|e| anyhow!(e.message))?);
                 if let Some(w) = save.as_deref_mut() {
-                    w.record(&json!({ "type": "page", "object": object, "page": page }))?;
+                    w.page(object, &page)?;
                 }
-                if let (Some(to), Some(true)) = (to, restoring) {
-                    to.call::<Restored>("restore/page", object, &page).await.map_err(|e| anyhow!("{object}: writing {}: {e}", t.name))?;
+                if let (Some(to), Some(id)) = (to, &restore_id) {
+                    write_page(to, object, id, &page).await?;
                 }
                 after = page.next;
                 if after.is_none() {
@@ -536,37 +695,40 @@ async fn copy_object(
             }
             copied.insert(t.name.clone(), sum);
         }
-        // Without this, a restore from the file treats the object as cut short.
         if let Some(w) = save.as_deref_mut() {
-            w.record(&json!({ "type": "object_end", "object": object }))?;
+            w.object_done(object)?;
         }
     }
-    if let Some(why) = refused {
-        let mut outcome = Outcome::new(object, manifest.kind, Status::Failed(why));
-        outcome.tables = manifest.tables.len();
-        return Ok(outcome);
-    }
-    let Some(to) = to else {
-        let mut outcome = Outcome::new(object, manifest.kind, Status::Saved);
-        outcome.tables = manifest.tables.len();
-        outcome.rows = copied.values().map(|c| c.rows).sum();
-        outcome.source = Some(digest(&copied));
-        return Ok(outcome);
+    let to = match (to, taken) {
+        (None, _) => {
+            let mut outcome = Outcome::new(object, manifest.kind, Status::Saved);
+            outcome.tables = manifest.tables.len();
+            outcome.rows = copied.values().map(|c| c.rows).sum();
+            outcome.source = Some(digest(&copied));
+            return Ok(outcome);
+        }
+        (Some(_), Some(Taken::Refused(why))) => {
+            let mut outcome = Outcome::new(object, manifest.kind, Status::Failed(why));
+            outcome.tables = manifest.tables.len();
+            return Ok(outcome);
+        }
+        (Some(to), _) => to,
     };
     // What the source holds now: when it's frozen, exactly what was copied.
     let source = totals(from, object, &manifest).await.map_err(|e| anyhow!("{object}: {e}"))?;
-    if restoring == Some(true) && source != copied {
+    if restore_id.is_some() && source != copied {
         let mut outcome = Outcome::new(object, manifest.kind, Status::Differs(differing(&source, &copied)));
         outcome.source = Some(digest(&source));
         outcome.tables = manifest.tables.len();
         say(format!("{object}: the source changed while it was copied; freeze it and copy again"));
         return Ok(outcome);
     }
-    check_and_finish(to, object, &manifest, &source, restoring == Some(true)).await.map_err(|e| anyhow!("{object}: {e}"))
+    check_and_finish(to, object, &manifest, &source, restore_id.as_deref()).await.map_err(|e| anyhow!("{object}: {e}"))
 }
 
 /// Copies every selected object from `from` to `to` and/or an encrypted backup file, then checks
-/// each one. An object that fails doesn't stop the others; run it again to resume.
+/// each one. An object that fails doesn't stop the others; run it again to resume. The backup
+/// file, if any, still needs [`BackupWriter::finish`], which refuses a file missing an object.
 pub async fn copy(
     from: &Endpoint,
     to: Option<&Endpoint>,
@@ -597,11 +759,12 @@ pub async fn copy(
     } else if opts.freeze {
         source = freeze(from, &opts.objects).await?;
     } else {
-        say("not freezing the source: if it changes during the copy, the check says so");
+        say("not freezing the source: if it changes during the copy, the check says so, and an interrupted copy can't resume");
     }
     let objects = select(&source, &opts.objects)?;
     if let Some(w) = save.as_deref_mut() {
-        w.record(&json!({ "type": "listing", "listing": source }))?;
+        let names: Vec<String> = objects.iter().map(|o| o.name.clone()).collect();
+        w.listing(&source, &names)?;
     }
     let mut outcomes = vec![];
     for o in &objects {
@@ -619,98 +782,75 @@ pub async fn copy(
 struct Restoring {
     name: String,
     manifest: Manifest,
-    /// `Some(true)`: the target takes its pages; `Some(false)`: it already holds its data;
-    /// `None`: it refused the object.
-    restoring: Option<bool>,
+    taken: Taken,
     /// The rows the file held for it.
     copied: Totals,
-    /// The file held all of it (its end record came).
-    complete: bool,
 }
 
 async fn close(to: &Endpoint, r: Restoring) -> Outcome {
     let failed = |why: String| Outcome::new(&r.name, r.manifest.kind, Status::Failed(why));
-    let outcome = match r.restoring {
-        _ if !r.complete => failed("the backup file holds only part of it".into()),
-        None => failed("the target refused it".into()),
-        Some(restoring) => {
-            let mut expected = r.copied.clone();
-            for t in &r.manifest.tables {
-                expected.entry(t.name.clone()).or_default();
-            }
-            check_and_finish(to, &r.name, &r.manifest, &expected, restoring).await.unwrap_or_else(|e| failed(e.to_string()))
+    let restore_id = match &r.taken {
+        Taken::Refused(why) => {
+            let outcome = failed(why.clone());
+            say(format!("{}: {}", r.name, status_text(&outcome.status)));
+            return outcome;
         }
+        Taken::Restoring(id) => Some(id.as_str()),
+        Taken::Existing => None,
     };
+    let mut expected = r.copied.clone();
+    for t in &r.manifest.tables {
+        expected.entry(t.name.clone()).or_default();
+    }
+    let outcome = check_and_finish(to, &r.name, &r.manifest, &expected, restore_id).await.unwrap_or_else(|e| failed(e.to_string()));
     say(format!("{}: {}", r.name, status_text(&outcome.status)));
     outcome
 }
 
 /// Restores an encrypted backup file into `to`, object by object, checking each against the rows
-/// the file holds.
-pub async fn restore_file(reader: &mut BackupReader, to: &Endpoint, only: &[String]) -> anyhow::Result<Vec<Outcome>> {
-    let target = listing(to).await?;
-    let first = reader.next_record()?.unwrap_or_default();
-    let source: Listing = serde_json::from_value(first["listing"].clone()).context("the backup file doesn't start with its listing")?;
-    if source.git_sha != target.git_sha {
-        say(format!("note: the backup is from {} and {} runs {}", source.git_sha, to.label(), target.git_sha));
+/// the file holds. The file is read through and checked first (see [`check_file`]): one that's
+/// damaged, cut short or missing an object restores nothing.
+pub async fn restore_file(path: &Path, passphrase: &str, to: &Endpoint, only: &[String]) -> anyhow::Result<Vec<Outcome>> {
+    let contents = check_file(path, passphrase)?;
+    for name in only {
+        if !contents.objects.contains(name) {
+            bail!("the backup holds no object named {name}");
+        }
     }
-    select(&source, only)?;
+    let target = listing(to).await?;
+    if contents.listing.git_sha != target.git_sha {
+        say(format!("note: the backup is from {} and {} runs {}", contents.listing.git_sha, to.label(), target.git_sha));
+    }
+    let mut reader = BackupReader::open(path, passphrase)?;
+    reader.next_record()?;
     let mut outcomes = vec![];
     let mut current: Option<Restoring> = None;
-    loop {
-        let record = match reader.next_record() {
-            Ok(Some(r)) => r,
-            Ok(None) => break,
-            Err(e) => {
-                if let Some(mut r) = current.take() {
-                    r.complete = false;
-                    outcomes.push(close(to, r).await);
-                }
-                say(format!("{e:#}"));
-                break;
-            }
-        };
+    while let Some(record) = reader.next_record()? {
         let object = record["object"].as_str().unwrap_or_default().to_string();
+        let wanted = only.is_empty() || only.contains(&object);
         match record["type"].as_str().unwrap_or_default() {
-            "manifest" => {
-                if let Some(r) = current.take() {
-                    outcomes.push(close(to, r).await);
-                }
-                if !only.is_empty() && !only.contains(&object) {
-                    continue;
-                }
+            "empty" if wanted => outcomes.push(Outcome::new(&object, Kind::Empty, Status::Empty)),
+            "manifest" if wanted => {
                 let manifest: Manifest = serde_json::from_value(record["manifest"].clone())?;
-                let restoring = match to.call::<Begun>("restore/begin", &object, &json!({ "manifest": manifest })).await {
-                    Ok(_) => Some(true),
-                    Err(e) if e.code() == Some("not_empty") => Some(false),
-                    Err(e) => {
-                        say(format!("{object}: {e}"));
-                        None
-                    }
-                };
-                current = Some(Restoring { name: object, manifest, restoring, copied: Totals::new(), complete: false });
+                let taken = begin(to, &object, &manifest).await;
+                current = Some(Restoring { name: object, manifest, taken, copied: Totals::new() });
             }
             "page" => {
                 let Some(r) = current.as_mut().filter(|r| r.name == object) else { continue };
                 let page: Page = serde_json::from_value(record["page"].clone())?;
                 let sum = Checksum::parse(page.count, &page.checksum).map_err(|e| anyhow!(e.message))?;
                 r.copied.entry(page.table.clone()).or_default().merge(sum);
-                if r.restoring == Some(true) {
-                    to.call::<Restored>("restore/page", &object, &page)
-                        .await
-                        .map_err(|e| anyhow!("{object}: writing {}: {e}", page.table))?;
+                if let Taken::Restoring(id) = &r.taken {
+                    write_page(to, &object, id, &page).await?;
                 }
             }
             "object_end" => {
-                if let Some(r) = current.as_mut().filter(|r| r.name == object) {
-                    r.complete = true;
+                if let Some(r) = current.take_if(|r| r.name == object) {
+                    outcomes.push(close(to, r).await);
                 }
             }
-            _ => bail!("the backup file holds a record this tool doesn't know"),
+            _ => {}
         }
-    }
-    if let Some(r) = current.take() {
-        outcomes.push(close(to, r).await);
     }
     Ok(outcomes)
 }
@@ -729,7 +869,7 @@ pub async fn verify(from: &Endpoint, to: &Endpoint, only: &[String]) -> anyhow::
             let mut outcome = Outcome::new(&o.name, manifest.kind, Status::Same);
             outcome.tables = manifest.tables.len();
             if theirs.kind != manifest.kind || theirs.schema != manifest.schema {
-                outcome.status = Status::Differs(vec![format!("the target holds a {}", theirs.kind.as_str())]);
+                outcome.status = Status::Differs(manifest_differences(&manifest, &theirs));
                 return Ok(outcome);
             }
             let (a, b) = (totals(from, &o.name, &manifest).await?, totals(to, &o.name, &manifest).await?);
@@ -737,9 +877,7 @@ pub async fn verify(from: &Endpoint, to: &Endpoint, only: &[String]) -> anyhow::
             outcome.source = Some(digest(&a));
             outcome.target = Some(digest(&b));
             let mut differ = differing(&a, &b);
-            if theirs.sequences != manifest.sequences {
-                differ.push("sqlite_sequence".into());
-            }
+            differ.extend(manifest_differences(&manifest, &theirs));
             if !differ.is_empty() {
                 outcome.status = Status::Differs(differ);
             }

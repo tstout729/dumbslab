@@ -93,6 +93,11 @@ impl Row {
         Row { columns, values }
     }
 
+    /// The column names, in the order the query selected them.
+    pub fn columns(&self) -> &Arc<Vec<String>> {
+        &self.columns
+    }
+
     /// The values in the order the query selected them.
     pub fn values(&self) -> &[SqlValue] {
         &self.values

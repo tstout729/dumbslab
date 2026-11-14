@@ -1536,6 +1536,9 @@ fn expiry(now: DateTime<Utc>, tokens: &TokenSet) -> Option<DateTime<Utc>> {
 /// [`Step::Fetch`] until it's [`Step::Done`]. Each call reads or writes the database, so hosts run
 /// it in its own transaction.
 pub fn step(db: &dyn Db, cfg: &HostConfig, job: &mut Job, replies: Vec<HttpReply>, now: DateTime<Utc>) -> ApiResult<Step> {
+    // A job that resumes after its workspace was frozen for a copy writes nothing more: the copy
+    // may already be checked (see `backup::freeze`).
+    crate::backup::refuse_writes(db)?;
     match job {
         Job::Search(j) => search_step(db, cfg, j, replies, now),
         Job::Preview(j) => preview_step(db, cfg, j, replies, now),

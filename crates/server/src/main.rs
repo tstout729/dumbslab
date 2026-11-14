@@ -308,15 +308,15 @@ async fn backup_command(command: BackupCommand) -> anyhow::Result<()> {
             let mut writer = save.as_deref().map(|p| backup::BackupWriter::create(p, &passphrase()?)).transpose()?;
             let opts = backup::Options { objects, freeze: !no_freeze };
             let outcomes = backup::copy(&source, target.as_ref(), writer.as_mut(), &opts).await?;
-            if let Some(w) = writer {
-                w.finish()?;
-            }
-            backup_report(&outcomes)
+            // An incomplete file is removed: it could never be restored.
+            let saved = writer.map(|w| w.finish()).transpose();
+            let report = backup_report(&outcomes);
+            saved?;
+            report
         }
         BackupCommand::Restore { file, to, objects } => {
             let target = backup_end(&to, "TO_OPERATOR_TOKEN", false, &objects)?;
-            let mut reader = backup::BackupReader::open(&file, &passphrase()?)?;
-            let outcomes = backup::restore_file(&mut reader, &target, &objects).await?;
+            let outcomes = backup::restore_file(&file, &passphrase()?, &target, &objects).await?;
             backup_report(&outcomes)
         }
         BackupCommand::Verify { from, to, objects } => {

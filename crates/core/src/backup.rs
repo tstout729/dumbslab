@@ -11,11 +11,18 @@
 //! - [`begin`] prepares an object that holds no data: it creates the schema, refuses a source whose
 //!   schema differs, and marks the restore as under way.
 //! - [`restore`] writes a page. Rows already there are left alone, so a page sent twice changes
-//!   nothing, and a restore that stopped part-way resumes by beginning again.
+//!   nothing, and a restore that stopped part-way resumes by beginning again with the same source
+//!   snapshot. A row that refers to one not restored yet waits for it (see [`restore`]).
 //! - [`summary`] counts and checksums a table page by page, so both ends can be compared.
 //! - [`finish`] checks the row counts, sets the `AUTOINCREMENT` counters and ends the restore.
-//! - [`freeze`] stops an object's changes for the copy window: hosts refuse its requests while
-//!   [`lock`] says so. Neither the freeze nor the restore mark is ever copied.
+//! - [`freeze`] stops an object's changes for the copy window. Every write checks [`refuse_writes`]
+//!   in its own transaction (requests, job steps, webhook results, metering), so nothing lands
+//!   after a freeze. Neither the freeze nor the restore mark is ever copied.
+//!
+//! Values cross hosts exactly. A JavaScript host (the Worker) turns SQLite integers into floats,
+//! which round past 2^53, and reports integral reals as integers. So every value is read as its
+//! SQLite type plus a value, integers as decimal text ([`exact`]), and written back through a cast
+//! ([`bind`]); checksums cover those exact values.
 //!
 //! Sealed secrets (connected apps' credentials, Slack tokens) are copied as they are, so the
 //! target needs the same `CONNECTOR_KEY`. Sessions are copied too: people stay signed in.
@@ -40,6 +47,9 @@ pub const FORMAT: u32 = 1;
 pub const PAGE_BYTES: i64 = 2 * 1024 * 1024;
 /// The most rows in one page.
 pub const PAGE_ROWS: i64 = 1000;
+/// The most a page may take as JSON. A page over it is read again with fewer rows (text full of
+/// characters JSON escapes can grow sixfold).
+pub const MAX_PAGE_JSON: usize = 8 * 1024 * 1024;
 /// A summary page reads about this much row data.
 pub const SUMMARY_BYTES: i64 = 8 * 1024 * 1024;
 pub const SUMMARY_ROWS: i64 = 10_000;
@@ -54,6 +64,8 @@ pub const DIRECTORY_OBJECT: &str = "directory";
 const OWN_PREFIX: &str = "_dumbslab_";
 const FROZEN_TABLE: &str = "_dumbslab_frozen";
 const RESTORE_TABLE: &str = "_dumbslab_restore";
+/// References a restore set aside until the rows they name arrive (see [`restore`]).
+const REFS_TABLE: &str = "_dumbslab_restore_refs";
 /// The tables SQLite keeps for a virtual table's own storage, by suffix (FTS5, FTS3/4, R*Tree).
 /// The virtual table itself is copied through its columns instead.
 const SHADOW_SUFFIXES: &[&str] = &["data", "idx", "content", "docsize", "config", "segments", "segdir", "stat", "node", "rowid", "parent"];
@@ -188,17 +200,38 @@ pub fn lock(db: &dyn Db) -> ApiResult<Lock> {
     })
 }
 
-/// Freezes the object until [`thaw`]. An object with no tables holds nothing to freeze and stays
-/// without storage. Whether it's frozen now.
+/// Refuses a write while the object is frozen for a copy or half restored. Hosts run it inside the
+/// same transaction as the write it guards, so nothing can freeze the object in between.
+pub fn refuse_writes(db: &dyn Db) -> ApiResult<()> {
+    match lock(db)?.refusal() {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
+/// Freezes the object until [`thaw`], under a new snapshot id that every manifest reports until
+/// then (a restore resumes only from the same snapshot). An object with no tables holds nothing to
+/// freeze and stays without storage. Whether it's frozen now.
 pub fn freeze(db: &dyn Db) -> ApiResult<bool> {
     if kind_of(&schema(db)?.tables)? == Kind::Empty {
         return Ok(false);
     }
-    db.execute_batch(&format!("CREATE TABLE IF NOT EXISTS {FROZEN_TABLE} (frozen_at TEXT NOT NULL)"))?;
-    if db.one(&format!("SELECT frozen_at FROM {FROZEN_TABLE}"), &[])?.is_none() {
-        db.execute(&format!("INSERT INTO {FROZEN_TABLE} (frozen_at) VALUES (?)"), &params![crate::util::ts(chrono::Utc::now())])?;
+    db.execute_batch(&format!("CREATE TABLE IF NOT EXISTS {FROZEN_TABLE} (frozen_at TEXT NOT NULL, snapshot TEXT NOT NULL)"))?;
+    if snapshot(db)?.is_none() {
+        db.execute(
+            &format!("INSERT INTO {FROZEN_TABLE} (frozen_at, snapshot) VALUES (?, ?)"),
+            &params![crate::util::ts(chrono::Utc::now()), hex::encode(crate::util::random_bytes::<16>())],
+        )?;
     }
     Ok(true)
+}
+
+/// The frozen object's snapshot id.
+fn snapshot(db: &dyn Db) -> ApiResult<Option<String>> {
+    if !has_table(db, FROZEN_TABLE)? {
+        return Ok(None);
+    }
+    Ok(db.one(&format!("SELECT snapshot FROM {FROZEN_TABLE}"), &[])?.map(|r| r.str("snapshot")))
 }
 
 pub fn thaw(db: &dyn Db) -> ApiResult<()> {
@@ -242,6 +275,60 @@ impl Cell {
             Cell::Blob { blob } => SqlValue::Blob(STANDARD.decode(blob).map_err(|_| ApiError::bad_request("a blob isn't valid base64"))?),
         })
     }
+}
+
+/// Selects a column so its value crosses any host exactly: its SQLite type, then the value, with
+/// integers as decimal text. Two result columns; [`from_exact`] rebuilds the value.
+fn exact(column: &str) -> String {
+    let c = col(column);
+    format!("typeof({c}), CASE WHEN typeof({c}) = 'integer' THEN CAST({c} AS TEXT) ELSE {c} END")
+}
+
+/// The value a pair of columns from [`exact`] stands for.
+fn from_exact(kind: &SqlValue, value: &SqlValue) -> ApiResult<SqlValue> {
+    let changed = || ApiError::internal("a value came back from the database as another type");
+    let SqlValue::Text(kind) = kind else { return Err(changed()) };
+    Ok(match (kind.as_str(), value) {
+        ("null", _) => SqlValue::Null,
+        ("integer", SqlValue::Text(t)) => SqlValue::Integer(t.parse().map_err(|_| changed())?),
+        ("real", SqlValue::Real(f)) => SqlValue::Real(*f),
+        // A JavaScript host reports an integral real as an integer; it came from a double, so it's exact.
+        ("real", SqlValue::Integer(i)) => SqlValue::Real(*i as f64),
+        ("text", SqlValue::Text(t)) => SqlValue::Text(t.clone()),
+        ("blob", SqlValue::Blob(b)) => SqlValue::Blob(b.clone()),
+        _ => return Err(changed()),
+    })
+}
+
+/// Rebuilds a row selected with [`exact`] for each column.
+fn exact_row(values: &[SqlValue]) -> ApiResult<Vec<SqlValue>> {
+    values.chunks(2).map(|pair| from_exact(&pair[0], pair.get(1).unwrap_or(&SqlValue::Null))).collect()
+}
+
+/// The placeholder that stores `v` exactly from any host, pushing its parameter: integers go as
+/// decimal text and reals as reals, each cast back by SQLite.
+fn bind(v: &SqlValue, params: &mut Vec<SqlValue>) -> &'static str {
+    match v {
+        SqlValue::Null => "NULL",
+        SqlValue::Integer(i) => {
+            params.push(SqlValue::Text(i.to_string()));
+            "CAST(? AS INTEGER)"
+        }
+        SqlValue::Real(f) => {
+            params.push(SqlValue::Real(*f));
+            "CAST(? AS REAL)"
+        }
+        SqlValue::Text(_) | SqlValue::Blob(_) => {
+            params.push(v.clone());
+            "?"
+        }
+    }
+}
+
+/// `a` or `(a, b)`.
+fn tuple<S: AsRef<str>>(items: &[S]) -> String {
+    let items: Vec<&str> = items.iter().map(|i| i.as_ref()).collect();
+    if items.len() == 1 { items[0].to_string() } else { format!("({})", items.join(", ")) }
 }
 
 /// Rows and an order-independent checksum of them: the sum of each row's SHA-256 (its first 128
@@ -323,8 +410,20 @@ pub struct Table {
 struct Schema {
     /// In restore order, with `rows` unset.
     tables: Vec<Table>,
+    /// Each table's single-column foreign keys, in the order of `tables`.
+    refs: Vec<Vec<Ref>>,
     /// SHA-256 over every table's name and columns (name, type, NOT NULL, primary key), by name.
     fingerprint: String,
+}
+
+/// A column that refers to a row of a table (perhaps its own).
+#[derive(Debug, Clone)]
+struct Ref {
+    column: String,
+    table: String,
+    /// The referred table's column; `None` for its primary key.
+    to: Option<String>,
+    nullable: bool,
 }
 
 fn ident(name: &str) -> String {
@@ -353,7 +452,7 @@ fn schema(db: &dyn Db) -> ApiResult<Schema> {
                 .any(|v| name.strip_prefix(v).and_then(|r| r.strip_prefix('_')).is_some_and(|suffix| SHADOW_SUFFIXES.contains(&suffix)))
     };
     let mut tables = vec![];
-    let mut parents: Vec<Vec<String>> = vec![];
+    let mut parents: Vec<Vec<Ref>> = vec![];
     let mut lines = vec![];
     for (name, sql) in all.iter().filter(|(n, _)| !skipped(n)) {
         let virtual_table = is_virtual(sql);
@@ -380,7 +479,17 @@ fn schema(db: &dyn Db) -> ApiResult<Schema> {
         let refs = if virtual_table {
             vec![]
         } else {
-            db.query(&format!("PRAGMA foreign_key_list({})", ident(name)), &[])?.iter().map(|r| r.str("table")).collect()
+            let list = db.query(&format!("PRAGMA foreign_key_list({})", ident(name)), &[])?;
+            let parts = |id: i64| list.iter().filter(|r| r.i64("id") == id).count();
+            list.iter()
+                .filter(|r| parts(r.i64("id")) == 1)
+                .map(|r| Ref {
+                    column: r.str("from"),
+                    table: r.str("table"),
+                    to: r.opt_str("to").filter(|t| !t.is_empty()),
+                    nullable: cols.iter().find(|c| c.0 == r.str("from")).is_none_or(|c| c.2 == 0),
+                })
+                .collect()
         };
         let described: Vec<String> = cols.iter().map(|(n, t, nn, pk)| format!("{n}:{t}:{nn}:{pk}")).collect();
         lines.push(format!("{name}|{virtual_table}|{without_rowid}|{}", described.join(";")));
@@ -388,11 +497,15 @@ fn schema(db: &dyn Db) -> ApiResult<Schema> {
         parents.push(refs);
     }
     let fingerprint = hex::encode(Sha256::digest(lines.join("\n").as_bytes()));
-    Ok(Schema { tables: restore_order(tables, parents), fingerprint })
+    let names: Vec<Vec<String>> = parents.iter().map(|p| p.iter().map(|r| r.table.clone()).collect()).collect();
+    let ordered = restore_order(tables.clone(), names);
+    let refs = ordered.iter().map(|t| parents[tables.iter().position(|u| u.name == t.name).unwrap_or(0)].clone()).collect();
+    Ok(Schema { tables: ordered, refs, fingerprint })
 }
 
 /// Orders tables so each comes after the tables it refers to (by name otherwise). A cycle is
-/// broken by name; rows within one page may refer to each other in any order.
+/// broken by name; references a table makes to itself or to a later table wait for their rows
+/// (see [`restore`]).
 fn restore_order(tables: Vec<Table>, parents: Vec<Vec<String>>) -> Vec<Table> {
     let names: BTreeSet<String> = tables.iter().map(|t| t.name.clone()).collect();
     let mut waiting: Vec<(Table, BTreeSet<String>)> = tables
@@ -465,6 +578,9 @@ pub struct Manifest {
     pub sequences: Vec<Sequence>,
     /// Whether the object was frozen (see [`freeze`]), so its data won't change during the copy.
     pub frozen: bool,
+    /// The frozen object's snapshot id (see [`freeze`]), or a new one each time when it isn't
+    /// frozen: a restore resumes only from the same snapshot.
+    pub snapshot: String,
 }
 
 pub fn manifest(db: &dyn Db) -> ApiResult<Manifest> {
@@ -475,11 +591,13 @@ pub fn manifest(db: &dyn Db) -> ApiResult<Manifest> {
     }
     let names: BTreeSet<&str> = s.tables.iter().map(|t| t.name.as_str()).collect();
     let sequences = if has_table(db, "sqlite_sequence")? {
-        db.query("SELECT name, seq FROM sqlite_sequence ORDER BY name", &[])?
-            .iter()
-            .map(|r| Sequence { name: r.str("name"), seq: r.i64("seq") })
-            .filter(|q| names.contains(q.name.as_str()))
-            .collect()
+        let mut out = vec![];
+        for r in db.query("SELECT name, CAST(seq AS TEXT) AS seq FROM sqlite_sequence ORDER BY name", &[])? {
+            let seq = r.str("seq").parse().map_err(|_| ApiError::internal("an AUTOINCREMENT counter isn't a number"))?;
+            out.push(Sequence { name: r.str("name"), seq });
+        }
+        out.retain(|q| names.contains(q.name.as_str()));
+        out
     } else {
         vec![]
     };
@@ -491,6 +609,10 @@ pub fn manifest(db: &dyn Db) -> ApiResult<Manifest> {
         tables: s.tables,
         sequences,
         frozen: lock(db)? == Lock::Frozen,
+        snapshot: match snapshot(db)? {
+            Some(s) => s,
+            None => hex::encode(crate::util::random_bytes::<16>()),
+        },
     })
 }
 
@@ -535,26 +657,33 @@ fn find_table(s: &Schema, name: &str) -> ApiResult<Table> {
 type Scanned = (Vec<Vec<SqlValue>>, Option<Vec<Cell>>);
 
 /// Reads the rows after `after` in key order, up to about `max_bytes` (at least one row) and
-/// `max_rows`.
+/// `max_rows`. Sizes are bytes: `length()` of text counts characters, and stops at a NUL.
 fn scan(db: &dyn Db, t: &Table, after: Option<&[Cell]>, max_bytes: i64, max_rows: i64) -> ApiResult<Scanned> {
     let key: Vec<String> = t.key.iter().map(|k| col(k)).collect();
-    let tuple = |items: &[String]| if items.len() == 1 { items[0].clone() } else { format!("({})", items.join(", ")) };
-    let marks: Vec<String> = t.key.iter().map(|_| "?".to_string()).collect();
-    let (from, mut params) = match after {
-        None => ("1 = 1".to_string(), vec![]),
+    let mut params = vec![];
+    let from = match after {
+        None => "1 = 1".to_string(),
         Some(a) if a.len() == t.key.len() => {
-            (format!("{} > {}", tuple(&key), tuple(&marks)), a.iter().map(Cell::to_value).collect::<ApiResult<Vec<_>>>()?)
+            let values = a.iter().map(Cell::to_value).collect::<ApiResult<Vec<_>>>()?;
+            let marks: Vec<&str> = values.iter().map(|v| bind(v, &mut params)).collect();
+            format!("{} > {}", tuple(&key), tuple(&marks))
         }
         Some(_) => return Err(ApiError::bad_request(format!("`after` must hold {} value(s): {}", t.key.len(), t.key.join(", ")))),
     };
-    let sizes: Vec<String> = t.columns.iter().filter(|c| *c != "rowid").map(|c| format!("COALESCE(length({}), 0)", ident(c))).collect();
+    let sizes: Vec<String> =
+        t.columns.iter().filter(|c| *c != "rowid").map(|c| format!("COALESCE(length(CAST({} AS BLOB)), 0)", ident(c))).collect();
     let size = if sizes.is_empty() { "0".to_string() } else { sizes.join(" + ") };
     let table = ident(&t.name);
     let order = key.join(", ");
+    let key_exact: Vec<String> = t.key.iter().map(|k| exact(k)).collect();
     let mut candidate_params = params.clone();
     candidate_params.push(SqlValue::Integer(max_rows + 1));
     let candidates = db.query(
-        &format!("SELECT {order}, {size} + {} AS backup_bytes FROM {table} WHERE {from} ORDER BY {order} LIMIT ?", 16 * t.columns.len()),
+        &format!(
+            "SELECT {}, {size} + {} AS backup_bytes FROM {table} WHERE {from} ORDER BY {order} LIMIT ?",
+            key_exact.join(", "),
+            16 * t.columns.len()
+        ),
         &candidate_params,
     )?;
     let (mut taken, mut bytes) = (0usize, 0i64);
@@ -569,34 +698,51 @@ fn scan(db: &dyn Db, t: &Table, after: Option<&[Cell]>, max_bytes: i64, max_rows
     if taken == 0 {
         return Ok((vec![], None));
     }
-    let last: Vec<SqlValue> = candidates[taken - 1].values()[..t.key.len()].to_vec();
+    let last = exact_row(&candidates[taken - 1].values()[..2 * t.key.len()])?;
     let more = taken < candidates.len();
-    params.extend(last.iter().cloned());
-    let columns: Vec<String> = t.columns.iter().map(|c| col(c)).collect();
+    let last_marks: Vec<&str> = last.iter().map(|v| bind(v, &mut params)).collect();
+    let columns: Vec<String> = t.columns.iter().map(|c| exact(c)).collect();
     let rows = db.query(
-        &format!("SELECT {} FROM {table} WHERE {from} AND {} <= {} ORDER BY {order}", columns.join(", "), tuple(&key), tuple(&marks)),
+        &format!("SELECT {} FROM {table} WHERE {from} AND {} <= {} ORDER BY {order}", columns.join(", "), tuple(&key), tuple(&last_marks)),
         &params,
     )?;
+    let rows = rows.iter().map(|r| exact_row(r.values())).collect::<ApiResult<Vec<_>>>()?;
     let next = more.then(|| last.iter().map(Cell::from).collect());
-    Ok((rows.into_iter().map(|r| r.into_values()).collect(), next))
+    Ok((rows, next))
 }
 
-/// Reads one page of a table.
+/// Reads one page of a table: at most [`PAGE_ROWS`], about [`PAGE_BYTES`] of row data, and at most
+/// [`MAX_PAGE_JSON`] as JSON (a single larger row goes alone).
 pub fn dump(db: &dyn Db, req: &PageRequest) -> ApiResult<Page> {
     let t = find_table(&schema(db)?, &req.table)?;
-    let (rows, next) = scan(db, &t, req.after.as_deref(), PAGE_BYTES, PAGE_ROWS)?;
-    let mut sum = Checksum::default();
-    for r in &rows {
-        sum.add_row(r);
+    let mut max_rows = PAGE_ROWS;
+    loop {
+        let (rows, next) = scan(db, &t, req.after.as_deref(), PAGE_BYTES, max_rows)?;
+        let mut sum = Checksum::default();
+        for r in &rows {
+            sum.add_row(r);
+        }
+        let page = Page {
+            table: t.name.clone(),
+            columns: t.columns.clone(),
+            rows: rows.iter().map(|r| r.iter().map(Cell::from).collect()).collect(),
+            count: sum.rows,
+            checksum: sum.hex(),
+            next,
+        };
+        let size = serde_json::to_vec(&page).map_err(|e| ApiError::internal(e.to_string()))?.len();
+        if size <= MAX_PAGE_JSON {
+            return Ok(page);
+        }
+        if page.rows.len() <= 1 {
+            // Room for the restore request around it.
+            if size + 4096 <= MAX_RESTORE_BODY {
+                return Ok(page);
+            }
+            return Err(ApiError::internal(format!("a row of {} takes {size} bytes as JSON, more than a restore takes", t.name)));
+        }
+        max_rows = (page.rows.len() / 2) as i64;
     }
-    Ok(Page {
-        table: t.name,
-        columns: t.columns,
-        rows: rows.iter().map(|r| r.iter().map(Cell::from).collect()).collect(),
-        count: sum.rows,
-        checksum: sum.hex(),
-        next,
-    })
 }
 
 /// Counts and checksums one page of a table, for comparing both ends.
@@ -613,11 +759,12 @@ pub fn summary(db: &dyn Db, req: &PageRequest) -> ApiResult<Summary> {
 // ---------------------------------------------------------------------------
 // Restoring
 
-/// Names a restore: the source's kind and schema. Beginning again with the same one resumes it.
-fn restore_id(m: &Manifest) -> String {
-    let tables: Vec<(&str, &[String])> = m.tables.iter().map(|t| (t.name.as_str(), t.columns.as_slice())).collect();
-    let described = json!({ "format": m.format, "kind": m.kind, "schema_version": m.schema_version, "schema": m.schema, "tables": tables });
-    hex::encode(Sha256::digest(described.to_string().as_bytes()))
+/// Names a restore: the source object, and a digest of its whole manifest, snapshot id included.
+/// Beginning again with the same source snapshot resumes it; anything else conflicts.
+fn restore_id(object: &str, m: &Manifest) -> ApiResult<String> {
+    let manifest = serde_json::to_string(m).map_err(|e| ApiError::internal(e.to_string()))?;
+    let described = json!({ "object": object, "manifest": hex::encode(Sha256::digest(manifest.as_bytes())) });
+    Ok(hex::encode(Sha256::digest(described.to_string().as_bytes())))
 }
 
 fn restoring(db: &dyn Db) -> ApiResult<Option<String>> {
@@ -628,7 +775,20 @@ fn restoring(db: &dyn Db) -> ApiResult<Option<String>> {
 }
 
 fn other_restore() -> ApiError {
-    ApiError::new(409, "restore_conflict", "A restore from another source is under way here. Abort it first (restore/abort).")
+    ApiError::new(
+        409,
+        "restore_conflict",
+        "A restore of another object or snapshot is under way here. Copy from the same frozen source to resume it, or wipe it first (restore/abort).",
+    )
+}
+
+/// The restore under way must be `restore_id`.
+fn same_restore(db: &dyn Db, restore_id: &str) -> ApiResult<()> {
+    match restoring(db)? {
+        None => Err(ApiError::new(409, "not_restoring", "No restore is under way here. Begin one first (restore/begin).")),
+        Some(id) if id == restore_id => Ok(()),
+        Some(_) => Err(other_restore()),
+    }
 }
 
 /// Whether the object holds data of its own: a row in any table but `meta`, which a new
@@ -653,15 +813,26 @@ fn create_schema(db: &dyn Db, kind: Kind) -> ApiResult<()> {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Begun {
-    /// An unfinished restore from the same source was already under way; pages already written stay.
+    /// An unfinished restore from the same source snapshot was already under way; pages already
+    /// written stay.
     pub resumed: bool,
+    /// Every page and the finish must name it.
+    pub restore_id: String,
 }
 
-/// Starts restoring `source` into this object. Only an object that holds no data qualifies (a new
-/// schema without rows is fine), or one whose restore from the same source stopped part-way.
-/// `allowed`: what this kind of object can hold. Refuses a source whose schema version or tables
-/// differ from this code's.
-pub fn begin(db: &dyn Db, allowed: &[Kind], source: &Manifest) -> ApiResult<Begun> {
+/// What [`begin`] takes: the source object's name and manifest.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BeginRequest {
+    pub object: String,
+    pub manifest: Manifest,
+}
+
+/// Starts restoring `source` (the object named `object` on the source) into this object. Only an
+/// object that holds no data qualifies (a new schema without rows is fine), or one whose restore
+/// from the same source snapshot stopped part-way. `allowed`: what this kind of object can hold.
+/// Refuses a source whose schema version or tables differ from this code's.
+pub fn begin(db: &dyn Db, allowed: &[Kind], object: &str, source: &Manifest) -> ApiResult<Begun> {
     if source.format != FORMAT {
         return Err(ApiError::bad_request(format!("this server reads backup format {FORMAT}, not {}", source.format)));
     }
@@ -671,9 +842,9 @@ pub fn begin(db: &dyn Db, allowed: &[Kind], source: &Manifest) -> ApiResult<Begu
     if !allowed.contains(&source.kind) {
         return Err(ApiError::bad_request(format!("a {} can't be restored into this object", source.kind.as_str())));
     }
-    let id = restore_id(source);
+    let id = restore_id(object, source)?;
     match restoring(db)? {
-        Some(current) if current == id => return Ok(Begun { resumed: true }),
+        Some(current) if current == id => return Ok(Begun { resumed: true, restore_id: id }),
         Some(_) => return Err(other_restore()),
         None => {}
     }
@@ -702,12 +873,15 @@ pub fn begin(db: &dyn Db, allowed: &[Kind], source: &Manifest) -> ApiResult<Begu
             "target": { "schema_version": version, "schema": s.fingerprint },
         })));
     }
-    db.execute_batch(&format!("CREATE TABLE {RESTORE_TABLE} (restore_id TEXT NOT NULL, started_at TEXT NOT NULL)"))?;
+    db.execute_batch(&format!(
+        "CREATE TABLE {RESTORE_TABLE} (restore_id TEXT NOT NULL, started_at TEXT NOT NULL);
+         CREATE TABLE {REFS_TABLE} (tbl TEXT NOT NULL, row_key TEXT NOT NULL, col TEXT NOT NULL, value TEXT NOT NULL)"
+    ))?;
     db.execute(
         &format!("INSERT INTO {RESTORE_TABLE} (restore_id, started_at) VALUES (?, ?)"),
-        &params![id, crate::util::ts(chrono::Utc::now())],
+        &params![id.clone(), crate::util::ts(chrono::Utc::now())],
     )?;
-    Ok(Begun { resumed: false })
+    Ok(Begun { resumed: false, restore_id: id })
 }
 
 fn not_empty() -> ApiError {
@@ -719,13 +893,68 @@ pub struct Restored {
     pub rows: i64,
 }
 
-/// Writes one page into an object whose restore has begun. Rows already there stay as they are,
-/// so the same page can be sent again safely.
-pub fn restore(db: &dyn Db, page: &Page) -> ApiResult<Restored> {
-    if restoring(db)?.is_none() {
-        return Err(ApiError::new(409, "not_restoring", "No restore is under way here. Begin one first (restore/begin)."));
+/// A page to write, under the restore [`begin`] started.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RestoreRequest {
+    pub restore_id: String,
+    pub page: Page,
+}
+
+/// Whether the row `value` names exists in `table` (by `to`, or its primary key).
+fn exists(db: &dyn Db, s: &Schema, r: &Ref, value: &SqlValue) -> ApiResult<bool> {
+    let column = match &r.to {
+        Some(c) => col(c),
+        None => match s.tables.iter().find(|t| t.name == r.table).map(|t| t.key.clone()) {
+            Some(k) if k.len() == 1 => col(&k[0]),
+            // An unknown table or key: the database's own check decides.
+            _ => return Ok(true),
+        },
+    };
+    let mut params = vec![];
+    let mark = bind(value, &mut params);
+    Ok(db.one(&format!("SELECT 1 AS found FROM {} WHERE {column} = {mark} LIMIT 1", ident(&r.table)), &params)?.is_some())
+}
+
+/// Sets the references a restore set aside wherever the rows they name have arrived.
+fn settle_refs(db: &dyn Db, s: &Schema) -> ApiResult<()> {
+    let waiting = db.query(&format!("SELECT rowid AS id, tbl, row_key, col, value FROM {REFS_TABLE}"), &[])?;
+    for w in waiting {
+        let bad = || ApiError::internal("a set-aside reference can't be read");
+        let (tbl, column) = (w.str("tbl"), w.str("col"));
+        let value = serde_json::from_str::<Cell>(&w.str("value")).map_err(|_| bad())?.to_value()?;
+        let key: Vec<Cell> = serde_json::from_str(&w.str("row_key")).map_err(|_| bad())?;
+        let Some(i) = s.tables.iter().position(|t| t.name == tbl) else { continue };
+        let Some(r) = s.refs[i].iter().find(|r| r.column == column) else { continue };
+        if !exists(db, s, r, &value)? {
+            continue;
+        }
+        let t = &s.tables[i];
+        let mut params = vec![];
+        let set = bind(&value, &mut params);
+        let keys = key.iter().map(Cell::to_value).collect::<ApiResult<Vec<_>>>()?;
+        let marks: Vec<&str> = keys.iter().map(|v| bind(v, &mut params)).collect();
+        let names: Vec<String> = t.key.iter().map(|k| col(k)).collect();
+        db.execute(
+            &format!("UPDATE {} SET {} = {set} WHERE {} = {}", ident(&t.name), ident(&column), tuple(&names), tuple(&marks)),
+            &params,
+        )?;
+        db.execute(&format!("DELETE FROM {REFS_TABLE} WHERE rowid = ?"), &params![w.i64("id")])?;
     }
-    let t = find_table(&schema(db)?, &page.table)?;
+    Ok(())
+}
+
+/// Writes one page into an object whose restore `restore_id` has begun. Rows already there stay as
+/// they are, so the same page can be sent again safely. A row may refer to one that comes later, in
+/// its own table (a topic moved under a newer one) or a table restored after it: that reference is
+/// stored empty and set once the row it names arrives, so no page waits for another.
+pub fn restore(db: &dyn Db, restore_id: &str, page: &Page) -> ApiResult<Restored> {
+    same_restore(db, restore_id)?;
+    let s = schema(db)?;
+    let Some(i) = s.tables.iter().position(|t| t.name == page.table) else {
+        return Err(ApiError::not_found(format!("a table named {}", page.table)));
+    };
+    let t = &s.tables[i];
     if page.columns != t.columns {
         return Err(ApiError::new(409, "schema_mismatch", format!("table {} has other columns here", t.name)));
     }
@@ -742,21 +971,49 @@ pub fn restore(db: &dyn Db, page: &Page) -> ApiResult<Restored> {
     if Checksum::parse(page.count, &page.checksum)? != sum {
         return Err(ApiError::bad_request("the page doesn't match its checksum; it was damaged on the way. Send it again."));
     }
-    // A table's rows may refer to rows later in the same page (a topic moved under a newer one).
-    db.execute_batch("PRAGMA defer_foreign_keys = ON")?;
-    let columns: Vec<String> = t.columns.iter().map(|c| col(c)).collect();
-    let marks: Vec<&str> = t.columns.iter().map(|_| "?").collect();
+    db.execute_batch(&format!("PRAGMA defer_foreign_keys = ON; CREATE TABLE IF NOT EXISTS {REFS_TABLE} (tbl TEXT NOT NULL, row_key TEXT NOT NULL, col TEXT NOT NULL, value TEXT NOT NULL)"))?;
+    // References that can name a row not restored yet: to its own table, or one restored later.
+    let later: Vec<(usize, &Ref)> = s.refs[i]
+        .iter()
+        .filter(|r| r.nullable && s.tables.iter().position(|u| u.name == r.table).is_some_and(|p| p >= i))
+        .filter_map(|r| t.columns.iter().position(|c| *c == r.column).map(|c| (c, r)))
+        .collect();
+    let key_at: Vec<usize> = t.key.iter().filter_map(|k| t.columns.iter().position(|c| c == k)).collect();
     let table = ident(&t.name);
-    let insert = format!("INSERT INTO {table} ({}) VALUES ({})", columns.join(", "), marks.join(", "));
-    for values in &rows {
-        if t.virtual_table {
+    let columns: Vec<String> = t.columns.iter().map(|c| col(c)).collect();
+    for original in &rows {
+        let mut values = original.clone();
+        let mut set_aside = vec![];
+        for (c, r) in &later {
+            if values[*c] != SqlValue::Null && !exists(db, &s, r, &values[*c])? {
+                set_aside.push((r.column.clone(), std::mem::replace(&mut values[*c], SqlValue::Null)));
+            }
+        }
+        let mut params = vec![];
+        let marks: Vec<&str> = values.iter().map(|v| bind(v, &mut params)).collect();
+        let insert = format!("INSERT INTO {table} ({}) VALUES ({})", columns.join(", "), marks.join(", "));
+        let inserted = if t.virtual_table {
             // Virtual tables take no ON CONFLICT clause; their rows refer to nothing.
-            db.execute(&format!("DELETE FROM {table} WHERE rowid = ?"), &values[..1])?;
-            db.execute(&insert, values)?;
+            let mut key = vec![];
+            let mark = bind(&values[0], &mut key);
+            db.execute(&format!("DELETE FROM {table} WHERE rowid = {mark}"), &key)?;
+            db.execute(&insert, &params)?
         } else {
-            db.execute(&format!("{insert} ON CONFLICT DO NOTHING"), values)?;
+            db.execute(&format!("{insert} ON CONFLICT DO NOTHING"), &params)?
+        };
+        if inserted == 1 && !set_aside.is_empty() {
+            let key: Vec<Cell> = key_at.iter().map(|k| Cell::from(&original[*k])).collect();
+            let key = serde_json::to_string(&key).map_err(|e| ApiError::internal(e.to_string()))?;
+            for (column, value) in set_aside {
+                let value = serde_json::to_string(&Cell::from(&value)).map_err(|e| ApiError::internal(e.to_string()))?;
+                db.execute(
+                    &format!("INSERT INTO {REFS_TABLE} (tbl, row_key, col, value) VALUES (?, ?, ?, ?)"),
+                    &params![t.name.clone(), key.clone(), column, value],
+                )?;
+            }
         }
     }
+    settle_refs(db, &s)?;
     Ok(Restored { rows: rows.len() as i64 })
 }
 
@@ -768,19 +1025,21 @@ pub struct Finished {
     pub already_finished: bool,
 }
 
+/// What [`finish`] takes: the restore it ends, and the source's manifest with the rows copied.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ManifestRequest {
+pub struct FinishRequest {
+    pub restore_id: String,
     pub manifest: Manifest,
 }
 
-/// Ends a restore once every table holds as many rows as the source's manifest says: sets the
-/// `AUTOINCREMENT` counters and lifts the restore mark, so the object takes requests. Compare the
-/// checksums (see [`summary`]) before finishing. Finishing again changes nothing.
-pub fn finish(db: &dyn Db, source: &Manifest) -> ApiResult<Finished> {
-    let id = restore_id(source);
+/// Ends the restore `restore_id` once every table holds as many rows as `source` says and every
+/// set-aside reference is set: sets the `AUTOINCREMENT` counters and lifts the restore mark, so the
+/// object takes requests. Compare the checksums (see [`summary`]) before finishing. Finishing
+/// again changes nothing.
+pub fn finish(db: &dyn Db, restore_id: &str, source: &Manifest) -> ApiResult<Finished> {
     let current = restoring(db)?;
-    if current.as_ref().is_some_and(|c| *c != id) {
+    if current.as_ref().is_some_and(|c| c != restore_id) {
         return Err(other_restore());
     }
     let s = schema(db)?;
@@ -803,12 +1062,22 @@ pub fn finish(db: &dyn Db, source: &Manifest) -> ApiResult<Finished> {
     if current.is_none() {
         return Ok(Finished { tables: source.tables.len(), rows, already_finished: true });
     }
-    for q in &source.sequences {
-        if db.execute("UPDATE sqlite_sequence SET seq = ? WHERE name = ?", &params![q.seq, q.name.clone()])? == 0 {
-            db.execute("INSERT INTO sqlite_sequence (name, seq) VALUES (?, ?)", &params![q.name.clone(), q.seq])?;
+    if has_table(db, REFS_TABLE)? {
+        let waiting = db.query(&format!("SELECT tbl, col, COUNT(*) AS n FROM {REFS_TABLE} GROUP BY tbl, col"), &[])?;
+        if !waiting.is_empty() {
+            let refs: Vec<Value> =
+                waiting.iter().map(|r| json!({ "table": r.str("tbl"), "column": r.str("col"), "rows": r.i64("n") })).collect();
+            return Err(ApiError::new(409, "verify_failed", "Some rows refer to rows the source didn't send.")
+                .with_details(json!({ "references": refs })));
         }
     }
-    db.execute_batch(&format!("DROP TABLE {RESTORE_TABLE}"))?;
+    for q in &source.sequences {
+        let seq = SqlValue::Text(q.seq.to_string());
+        if db.execute("UPDATE sqlite_sequence SET seq = CAST(? AS INTEGER) WHERE name = ?", &[seq.clone(), q.name.clone().into()])? == 0 {
+            db.execute("INSERT INTO sqlite_sequence (name, seq) VALUES (?, CAST(? AS INTEGER))", &[q.name.clone().into(), seq])?;
+        }
+    }
+    db.execute_batch(&format!("DROP TABLE {RESTORE_TABLE}; DROP TABLE IF EXISTS {REFS_TABLE}"))?;
     Ok(Finished { tables: source.tables.len(), rows, already_finished: false })
 }
 
@@ -825,7 +1094,9 @@ pub fn abort(db: &dyn Db) -> ApiResult<()> {
     if has_table(db, "sqlite_sequence")? {
         db.execute("DELETE FROM sqlite_sequence", &[])?;
     }
-    db.execute_batch(&format!("DROP TABLE IF EXISTS {RESTORE_TABLE}; DROP TABLE IF EXISTS {FROZEN_TABLE}"))
+    db.execute_batch(&format!(
+        "DROP TABLE IF EXISTS {RESTORE_TABLE}; DROP TABLE IF EXISTS {REFS_TABLE}; DROP TABLE IF EXISTS {FROZEN_TABLE}"
+    ))
 }
 
 /// Runs a backup or restore action (see [`action`]) on an object's database. `allowed`: what this
@@ -849,9 +1120,18 @@ pub fn handle(db: &dyn Db, action: &str, body: &[u8], allowed: &[Kind]) -> ApiRe
         "summary" => out(summary(db, &input::<PageRequest>(body)?)),
         "freeze" => Ok(json!({ "frozen": freeze(db)? })),
         "thaw" => thaw(db).map(|_| json!({ "frozen": false })),
-        "begin" => out(begin(db, allowed, &input::<ManifestRequest>(body)?.manifest)),
-        "page" => out(restore(db, &input::<Page>(body)?)),
-        "finish" => out(finish(db, &input::<ManifestRequest>(body)?.manifest)),
+        "begin" => {
+            let r = input::<BeginRequest>(body)?;
+            out(begin(db, allowed, &r.object, &r.manifest))
+        }
+        "page" => {
+            let r = input::<RestoreRequest>(body)?;
+            out(restore(db, &r.restore_id, &r.page))
+        }
+        "finish" => {
+            let r = input::<FinishRequest>(body)?;
+            out(finish(db, &r.restore_id, &r.manifest))
+        }
         "abort" => abort(db).map(|_| json!({ "ok": true })),
         _ => Err(ApiError::not_found("a backup action by that name")),
     }

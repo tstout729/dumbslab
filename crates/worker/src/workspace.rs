@@ -139,15 +139,20 @@ impl Workspace {
             return Ok(());
         }
         let storage = self.state.storage();
-        let failed = transaction(&storage, self.db(), |db| match dumbslab_core::migrate(db) {
-            Ok(()) => (None, true),
-            Err(e) => (Some(e.message), false),
+        // A frozen or half-restored object changes nothing, its schema included; it takes no
+        // requests until it's open again.
+        let ran = transaction(&storage, self.db(), |db| match backup::refuse_writes(db).and_then(|_| dumbslab_core::migrate(db)) {
+            Ok(()) => (Ok(true), true),
+            Err(e) if e.status == 503 => (Ok(false), false),
+            Err(e) => (Err(e.message), false),
         })?;
-        if let Some(message) = failed {
-            console_error!("migration failed: {message}");
-            return Err(worker::Error::RustError(message));
+        match ran {
+            Ok(migrated) => self.migrated.set(migrated),
+            Err(message) => {
+                console_error!("migration failed: {message}");
+                return Err(worker::Error::RustError(message));
+            }
         }
-        self.migrated.set(true);
         Ok(())
     }
 
@@ -170,7 +175,7 @@ impl Workspace {
         // A workspace being copied first catches up with this code's schema, as on its next
         // request: the copy goes to a deployment of the same code. (Not while restoring: the
         // object is half written, and `stored` would remember a pointer before its row arrives.)
-        if path.starts_with("/_internal/backup/") && matches!(self.stored()?, Stored::Workspace) {
+        if path.starts_with("/_internal/backup/") && self.lock()? == Lock::Open && matches!(self.stored()?, Stored::Workspace) {
             self.migrate()?;
         }
         let storage = self.state.storage();
@@ -222,14 +227,16 @@ impl Workspace {
                 let storage = self.state.storage();
                 let pointer = home.clone();
                 let saved = transaction(&storage, self.db(), move |db| {
-                    let r = db
-                        .execute_batch(tenancy::ALIAS_SCHEMA)
+                    let r = backup::refuse_writes(db)
+                        .and_then(|_| db.execute_batch(tenancy::ALIAS_SCHEMA))
                         .and_then(|_| db.execute("DELETE FROM alias", &[]))
                         .and_then(|_| db.execute("INSERT INTO alias (home) VALUES (?)", &params![pointer]));
                     let ok = r.is_ok();
                     (r, ok)
                 })?;
-                saved.map_err(rust_err)?;
+                if let Err(e) = saved {
+                    return api_error_response(&e);
+                }
                 *self.alias.borrow_mut() = Some(home);
                 json_response(200, &json!({ "ok": true }))
             }
@@ -244,7 +251,10 @@ impl Workspace {
                 } else {
                     "DELETE FROM settings WHERE key = 'disabled'"
                 };
-                self.db().execute(sql, &[]).map_err(|e| worker::Error::RustError(e.message))?;
+                let db = self.db();
+                if let Err(e) = backup::refuse_writes(&db).and_then(|_| db.execute(sql, &[])) {
+                    return api_error_response(&e);
+                }
                 json_response(200, &json!({ "ok": true }))
             }
             // From the front Worker: Stripe reported a subscription, or the operator granted Pro.
@@ -268,11 +278,11 @@ impl Workspace {
                 };
                 let storage = self.state.storage();
                 let saved = transaction(&storage, self.db(), move |db| {
-                    let r = match (grant, &sub) {
+                    let r = backup::refuse_writes(db).and_then(|_| match (grant, &sub) {
                         (Some(g), _) => plan::set_grant(db, g).map(|_| true),
                         (None, Some(s)) => plan::apply_subscription(db, s),
                         (None, None) => Ok(false),
-                    };
+                    });
                     let ok = r.is_ok();
                     (r, ok)
                 })?;

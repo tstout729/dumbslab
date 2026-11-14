@@ -211,9 +211,9 @@ cargo run --release -p dumbslab -- backup copy --from https://dumbslab.com --to 
 What it does, in order:
 
 1. **Lists the objects** from the source's directory: the `directory` object itself, each workspace's home object (`ws:<first address>`), and each address a workspace moved to (`ws:<address>`, which only points home). Addresses reserved but never set up hold nothing and are skipped.
-2. **Freezes the source**, directory first: no sign-ups, moves or writes from then on. Every request to a frozen workspace gets `503 moving` with `Retry-After`, reads included (reading a post records a view). Stripe retries its webhooks later; Slack commands and GitHub deliveries in the window fail. The source stays frozen; `dumbslab backup thaw --from <url>` reopens it.
-3. **Copies each object**: its manifest (tables in restore order, columns, row counts, schema version and a digest of the schema), then each table page by page in rowid or primary-key order. Blobs travel as base64 and each page carries a checksum the target checks.
-4. **Checks each object**: every table's row count and checksum on the target against a fresh read of the source, and the `AUTOINCREMENT` counters. Only then does the target's restore finish.
+2. **Freezes the source**, directory first: no sign-ups, moves or writes from then on. Every request to a frozen workspace gets `503 moving` with `Retry-After`, reads included (reading a post records a view). Work already under way stops too: every write checks the freeze in its own transaction, so a sync whose outside call returns later, a webhook result or a usage count writes nothing once the object is frozen. Stripe retries its webhooks later; Slack commands and GitHub deliveries in the window fail. The source stays frozen; `dumbslab backup thaw --from <url>` reopens it.
+3. **Copies each object**: its manifest (tables in restore order, columns, row counts, schema version, a digest of the schema and the freeze's snapshot id), then each table page by page in rowid or primary-key order. Values keep their exact SQLite types: integers travel as decimal text through the Worker (JavaScript numbers round past 2^53), and blobs as base64. A page holds about 2 MB of row data and at most 8 MB as JSON, and carries a checksum the target checks.
+4. **Checks each object**: every table's row count and checksum on the target against a fresh read of the source, then the target's own manifest (schema, schema version and `AUTOINCREMENT` counters). Only then does the target's restore finish.
 
 It prints progress, then a table with one line per object: its tables, rows, a digest of each end, and the result. It exits non-zero if any object failed or differs.
 
@@ -221,7 +221,8 @@ What the target allows:
 
 - **Only an object with no data.** A freshly migrated empty schema is fine; anything else is refused with `409 not_empty`, and the copy only compares it.
 - **Only the same schema.** Both ends must be at the same migration with the same tables, or the restore is refused with `409 schema_mismatch` and leaves nothing behind. Deploy the same commit on both. A source workspace first catches up with its code's migrations, as it would on its next request.
-- **Resuming.** Every page can be sent twice: rows already there stay. A copy that stops part-way resumes when you run the same command again; objects already copied are only checked. While an object's restore is unfinished it answers `503 restoring`. `dumbslab backup abort --to <url> --object <name>` wipes an unfinished restore to start it over; it refuses any other object.
+- **Rows in any order.** A row that refers to one not restored yet (a topic moved under a newer one, in a later page) is written with that reference empty, and the reference is set as soon as the row it names arrives. A restore can't finish while any is still waiting.
+- **Resuming, from the same snapshot only.** Every page can be sent twice: rows already there stay. A restore is named by the source object, its manifest and the freeze's snapshot id; every page and the finish must name it. A copy that stops part-way resumes when you run the same command again while the source stays frozen; objects already copied are only checked. Anything else (another object, another workspace with the same schema, or the source thawed and frozen again) is refused with `409 restore_conflict`. A copy with `--no-freeze` can't resume. While an object's restore is unfinished it answers `503 restoring`. `dumbslab backup abort --to <url> --object <name>` wipes an unfinished restore to start it over; it refuses any other object.
 
 What's copied: every table, sessions and API tokens included, so people stay signed in. Connected apps' credentials, Slack bot tokens and other sealed secrets are copied as they are, encrypted with `CONNECTOR_KEY`, so the target needs the same key. The freeze and restore marks themselves are never copied, and neither is Cloudflare's key-value storage, which DumbSlab doesn't use. The full-text index is copied through its rows and rebuilt by SQLite.
 
@@ -229,8 +230,8 @@ Other commands:
 
 | Command | Does |
 | --- | --- |
-| `backup copy ... --save FILE` | Also writes an encrypted backup file (AES-256-GCM, key from `BACKUP_PASSPHRASE` with Argon2id). Without `--to`, it only writes the file. The file is owner-only and never overwritten. |
-| `backup restore --file FILE --to <url>` | Restores such a file into a fresh deployment, checking each object against the rows the file holds. A file cut short leaves its last object unfinished. |
+| `backup copy ... --save FILE` | Also writes an encrypted backup file (AES-256-GCM, key from `BACKUP_PASSPHRASE` with Argon2id). Without `--to`, it only writes the file. The file is owner-only and never overwritten. It names every object it covers and records each one as complete or empty; if any object can't be read whole, the file is removed rather than left looking finished. |
+| `backup restore --file FILE --to <url>` | Restores such a file into a fresh deployment, checking each object against the rows the file holds. The file is read through first: one that's damaged, cut short, or missing any object it covers restores nothing and fails. |
 | `backup verify --from <url> --to <url>` | Compares every object on two deployments, table by table. |
 | `backup freeze` / `backup thaw --from <url>` | Freezes or reopens a deployment's objects. |
 | `--object <name>` | Limits any command to that object (repeatable). |
