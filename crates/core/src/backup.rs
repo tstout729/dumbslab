@@ -15,9 +15,14 @@
 //!   snapshot. A row that refers to one not restored yet waits for it (see [`restore`]).
 //! - [`summary`] counts and checksums a table page by page, so both ends can be compared.
 //! - [`finish`] checks the row counts, sets the `AUTOINCREMENT` counters and ends the restore.
-//! - [`freeze`] stops an object's changes for the copy window. Every write checks [`refuse_writes`]
-//!   in its own transaction (requests, job steps, webhook results, metering), so nothing lands
-//!   after a freeze. Neither the freeze nor the restore mark is ever copied.
+//! - Freezing stops an object's changes for the copy window, in two phases. [`drain`] refuses
+//!   requests, new jobs and every write except a job step that only stores renewed credentials (an
+//!   app has spent the old refresh token by then); the host waits for jobs under way to end, then
+//!   [`seal`] refuses everything and names the snapshot. Every write checks [`refuse_writes`] in its
+//!   own transaction (requests, job steps, webhook results, metering), so nothing else lands. An
+//!   object holding no data is frozen too, so a sign-up that was under way can't finish. Neither the
+//!   freeze nor the restore mark is ever copied, and an object whose restore is unfinished can't be
+//!   frozen or copied.
 //!
 //! Values cross hosts exactly. A JavaScript host (the Worker) turns SQLite integers into floats,
 //! which round past 2^53, and reports integral reals as integers. So every value is read as its
@@ -123,12 +128,15 @@ pub fn action(path: &str) -> Option<&'static str> {
         "backup/manifest",
         "backup/dump",
         "backup/summary",
+        "backup/drain",
+        "backup/seal",
         "backup/freeze",
         "backup/thaw",
         "restore/begin",
         "restore/page",
         "restore/finish",
         "restore/abort",
+        "restore/activate",
     ];
     ACTIONS.iter().find(|a| **a == rest).map(|a| a.split_once('/').map_or(*a, |(_, name)| name))
 }
@@ -168,7 +176,10 @@ pub fn directory_objects(db: &dyn Db) -> ApiResult<Vec<ObjectRef>> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Lock {
     Open,
-    /// Frozen for a copy: its data must not change until the copy is checked.
+    /// Freezing for a copy (see [`drain`]): no requests or new jobs; a job step that only stores
+    /// renewed credentials still commits.
+    Draining,
+    /// Frozen for a copy (see [`seal`]): its data must not change until the copy is checked.
     Frozen,
     /// A restore into it hasn't finished: it holds part of its data.
     Restoring,
@@ -179,7 +190,7 @@ impl Lock {
     pub fn refusal(self) -> Option<ApiError> {
         match self {
             Lock::Open => None,
-            Lock::Frozen => {
+            Lock::Draining | Lock::Frozen => {
                 Some(ApiError::new(503, "moving", "DumbSlab is moving to new servers. It's paused for a few minutes; try again shortly."))
             }
             Lock::Restoring => Some(ApiError::new(503, "restoring", "This workspace is being restored. Try again in a few minutes.")),
@@ -187,21 +198,23 @@ impl Lock {
     }
 }
 
-/// Whether the object is frozen or holds an unfinished restore. Reading `sqlite_master` writes nothing.
+/// Whether the object is freezing, frozen or holds an unfinished restore. Writes nothing.
 pub fn lock(db: &dyn Db) -> ApiResult<Lock> {
     let rows = db.query("SELECT name FROM sqlite_master WHERE type = 'table' AND name IN (?, ?)", &params![FROZEN_TABLE, RESTORE_TABLE])?;
     let has = |t: &str| rows.iter().any(|r| r.str("name") == t);
-    Ok(if has(RESTORE_TABLE) {
-        Lock::Restoring
-    } else if has(FROZEN_TABLE) {
-        Lock::Frozen
-    } else {
-        Lock::Open
-    })
+    if has(RESTORE_TABLE) {
+        return Ok(Lock::Restoring);
+    }
+    if !has(FROZEN_TABLE) {
+        return Ok(Lock::Open);
+    }
+    let sealed = db.one(&format!("SELECT phase FROM {FROZEN_TABLE}"), &[])?.is_none_or(|r| r.str("phase") == "sealed");
+    Ok(if sealed { Lock::Frozen } else { Lock::Draining })
 }
 
-/// Refuses a write while the object is frozen for a copy or half restored. Hosts run it inside the
-/// same transaction as the write it guards, so nothing can freeze the object in between.
+/// Refuses a write while the object is freezing or frozen for a copy, or half restored. Hosts run
+/// it inside the same transaction as the write it guards, so nothing can freeze the object in
+/// between.
 pub fn refuse_writes(db: &dyn Db) -> ApiResult<()> {
     match lock(db)?.refusal() {
         Some(e) => Err(e),
@@ -209,33 +222,95 @@ pub fn refuse_writes(db: &dyn Db) -> ApiResult<()> {
     }
 }
 
-/// Freezes the object until [`thaw`], under a new snapshot id that every manifest reports until
-/// then (a restore resumes only from the same snapshot). An object with no tables holds nothing to
-/// freeze and stays without storage. Whether it's frozen now.
-pub fn freeze(db: &dyn Db) -> ApiResult<bool> {
-    if kind_of(&schema(db)?.tables)? == Kind::Empty {
-        return Ok(false);
-    }
-    db.execute_batch(&format!("CREATE TABLE IF NOT EXISTS {FROZEN_TABLE} (frozen_at TEXT NOT NULL, snapshot TEXT NOT NULL)"))?;
-    if snapshot(db)?.is_none() {
-        db.execute(
-            &format!("INSERT INTO {FROZEN_TABLE} (frozen_at, snapshot) VALUES (?, ?)"),
-            &params![crate::util::ts(chrono::Utc::now()), hex::encode(crate::util::random_bytes::<16>())],
-        )?;
-    }
-    Ok(true)
+fn unfinished_restore() -> ApiError {
+    ApiError::new(
+        409,
+        "restoring",
+        "This object holds an unfinished restore: part of its rows. Finish the restore or wipe it (restore/abort) before copying it anywhere.",
+    )
 }
 
-/// The frozen object's snapshot id.
+/// The first phase of freezing an object for a copy: it takes no requests or new jobs from now on,
+/// and of the jobs under way only a step that stores renewed credentials still commits. The host
+/// waits for those jobs, then calls [`seal`]. An object with no data is frozen too, so a sign-up
+/// or address move that was under way can't finish on it; copies still find it empty. Refuses an
+/// object whose restore is unfinished.
+pub fn drain(db: &dyn Db) -> ApiResult<Lock> {
+    match lock(db)? {
+        Lock::Restoring => Err(unfinished_restore()),
+        Lock::Open => {
+            db.execute_batch(&format!(
+                "CREATE TABLE IF NOT EXISTS {FROZEN_TABLE} (frozen_at TEXT NOT NULL, phase TEXT NOT NULL, snapshot TEXT)"
+            ))?;
+            db.execute(
+                &format!("INSERT INTO {FROZEN_TABLE} (frozen_at, phase) VALUES (?, 'draining')"),
+                &params![crate::util::ts(chrono::Utc::now())],
+            )?;
+            Ok(Lock::Draining)
+        }
+        other => Ok(other),
+    }
+}
+
+/// The second phase: the object refuses everything until [`thaw`], under a new snapshot id that
+/// every manifest reports until then (a restore resumes only from the same snapshot).
+pub fn seal(db: &dyn Db) -> ApiResult<()> {
+    if drain(db)? == Lock::Draining {
+        db.execute(
+            &format!("UPDATE {FROZEN_TABLE} SET phase = 'sealed', snapshot = ?"),
+            &params![hex::encode(crate::util::random_bytes::<16>())],
+        )?;
+    }
+    Ok(())
+}
+
+/// Freezes an object that runs no jobs (the directory, a native database): [`drain`], then [`seal`].
+pub fn freeze(db: &dyn Db) -> ApiResult<()> {
+    drain(db)?;
+    seal(db)
+}
+
+/// The sealed object's snapshot id.
 fn snapshot(db: &dyn Db) -> ApiResult<Option<String>> {
-    if !has_table(db, FROZEN_TABLE)? {
+    if lock(db)? != Lock::Frozen {
         return Ok(None);
     }
-    Ok(db.one(&format!("SELECT snapshot FROM {FROZEN_TABLE}"), &[])?.map(|r| r.str("snapshot")))
+    Ok(db.one(&format!("SELECT snapshot FROM {FROZEN_TABLE}"), &[])?.and_then(|r| r.opt_str("snapshot")))
 }
 
 pub fn thaw(db: &dyn Db) -> ApiResult<()> {
     db.execute_batch(&format!("DROP TABLE IF EXISTS {FROZEN_TABLE}"))
+}
+
+/// What the directory takes while it freezes for a copy: while draining, the operator's lookups
+/// and workspaces' activations (a sign-up that finished just before its workspace froze still
+/// tells the directory, so the copy holds it as active); once sealed, only the lookups.
+pub fn directory_allows(lock: Lock, method: &str, path: &str) -> bool {
+    let lookup = matches!((method, path), ("GET", "/list") | ("POST", "/resolve"));
+    match lock {
+        Lock::Open => true,
+        Lock::Draining => lookup || (method, path) == ("POST", "/activate"),
+        Lock::Frozen => lookup,
+        Lock::Restoring => false,
+    }
+}
+
+/// Marks as active the workspaces, by first address, whose directory entry still says `reserved`
+/// though their object holds a set-up workspace (its sign-up finished, but the directory never
+/// heard). A copy calls it on the target. Returns the ones it changed.
+pub fn activate(db: &dyn Db, homes: &[String]) -> ApiResult<Vec<String>> {
+    if lock(db)? == Lock::Restoring {
+        return Err(ApiError::new(409, "restoring", "Finish the directory's restore first."));
+    }
+    let mut changed = vec![];
+    for home in homes {
+        let reserved = db.one("SELECT slug FROM workspaces WHERE slug = ? AND status = 'reserved'", &params![home.clone()])?.is_some();
+        if reserved {
+            crate::tenancy::activate(db, home, chrono::Utc::now())?;
+            changed.push(home.clone());
+        }
+    }
+    Ok(changed)
 }
 
 // ---------------------------------------------------------------------------
@@ -578,9 +653,13 @@ pub struct Manifest {
     pub sequences: Vec<Sequence>,
     /// Whether the object was frozen (see [`freeze`]), so its data won't change during the copy.
     pub frozen: bool,
-    /// The frozen object's snapshot id (see [`freeze`]), or a new one each time when it isn't
+    /// The frozen object's snapshot id (see [`seal`]), or a new one each time when it isn't
     /// frozen: a restore resumes only from the same snapshot.
     pub snapshot: String,
+    /// The object holds an unfinished restore (part of its rows): it can be inspected, but not
+    /// frozen or copied.
+    #[serde(default)]
+    pub restoring: bool,
 }
 
 pub fn manifest(db: &dyn Db) -> ApiResult<Manifest> {
@@ -609,6 +688,7 @@ pub fn manifest(db: &dyn Db) -> ApiResult<Manifest> {
         tables: s.tables,
         sequences,
         frozen: lock(db)? == Lock::Frozen,
+        restoring: lock(db)? == Lock::Restoring,
         snapshot: match snapshot(db)? {
             Some(s) => s,
             None => hex::encode(crate::util::random_bytes::<16>()),
@@ -714,6 +794,11 @@ fn scan(db: &dyn Db, t: &Table, after: Option<&[Cell]>, max_bytes: i64, max_rows
 /// Reads one page of a table: at most [`PAGE_ROWS`], about [`PAGE_BYTES`] of row data, and at most
 /// [`MAX_PAGE_JSON`] as JSON (a single larger row goes alone).
 pub fn dump(db: &dyn Db, req: &PageRequest) -> ApiResult<Page> {
+    // A half-restored object holds part of its rows, and references set aside until theirs
+    // arrive: a copy of it would make those gaps permanent.
+    if lock(db)? == Lock::Restoring {
+        return Err(unfinished_restore());
+    }
     let t = find_table(&schema(db)?, &req.table)?;
     let mut max_rows = PAGE_ROWS;
     loop {
@@ -1118,7 +1203,20 @@ pub fn handle(db: &dyn Db, action: &str, body: &[u8], allowed: &[Kind]) -> ApiRe
         "manifest" => out(manifest(db)),
         "dump" => out(dump(db, &input::<PageRequest>(body)?)),
         "summary" => out(summary(db, &input::<PageRequest>(body)?)),
-        "freeze" => Ok(json!({ "frozen": freeze(db)? })),
+        "drain" => drain(db).map(|_| json!({ "frozen": false, "draining": true })),
+        "seal" => seal(db).map(|_| json!({ "frozen": true })),
+        "freeze" => freeze(db).map(|_| json!({ "frozen": true })),
+        "activate" => {
+            if !allowed.contains(&Kind::Directory) {
+                return Err(ApiError::not_found("a directory here"));
+            }
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Homes {
+                homes: Vec<String>,
+            }
+            Ok(json!({ "activated": activate(db, &input::<Homes>(body)?.homes)? }))
+        }
         "thaw" => thaw(db).map(|_| json!({ "frozen": false })),
         "begin" => {
             let r = input::<BeginRequest>(body)?;

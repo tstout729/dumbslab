@@ -3539,6 +3539,87 @@ mod connected {
         assert_eq!(stored("zendesk"), ("zd-at-3".to_string(), "zd-rt-3".to_string()));
     }
 
+    /// S2 of the backup review: a refresh answer that arrives while a copy's freeze drains is saved
+    /// (the app has spent the old refresh token), and the copy carries the renewed tokens.
+    #[test]
+    fn refreshed_tokens_are_kept_while_a_copy_drains() {
+        use dumbslab::backup as tool;
+        use dumbslab_core::backup;
+        let mut h = H::new();
+        let (admin, _) = h.setup();
+        with_key(&mut h);
+        h.cfg.connectors.apps.insert("zendesk".into(), OAuthApp { client_id: "zdg-dumbslab".into(), client_secret: "zsecret".into() });
+        let user_id = h.ok("GET", "/api/v1/me", None, &admin)["user"]["id"].as_str().unwrap().to_string();
+        let soon = dumbslab_core::util::ts(chrono::Utc::now() + chrono::Duration::minutes(1));
+        let cred = connect::Credential {
+            token: "zd-at-1".into(),
+            refresh_token: Some("zd-rt-1".into()),
+            fields: [("subdomain".to_string(), "acme".to_string())].into(),
+        };
+        h.store
+            .with_tx(|db| {
+                let sealed = connect::seal("connector-key", &user_id, "zendesk", &cred).unwrap();
+                let settings = json!({ "host": "acme.zendesk.com", "user_id": 7 }).to_string();
+                let r = db.execute(
+                    "INSERT INTO connections (user_id, provider, account, settings, secret, expires_at, created_at, updated_at) VALUES (?, 'zendesk', 'ada (acme.zendesk.com)', ?, ?, ?, ?, ?)",
+                    &dumbslab_core::params![user_id.clone(), settings, sealed, soon.clone(), soon.clone(), soon.clone()],
+                );
+                (r, true)
+            })
+            .unwrap()
+            .unwrap();
+        let stored = |h: &H| {
+            let secret = h
+                .store
+                .with_tx(|db| {
+                    (db.one("SELECT secret FROM connections WHERE provider = 'zendesk'", &[]).unwrap().unwrap().str("secret"), true)
+                })
+                .unwrap();
+            let cred = connect::open("connector-key", &user_id, "zendesk", &secret).unwrap();
+            (cred.token, cred.refresh_token.unwrap_or_default())
+        };
+        // A preview asks Zendesk for new tokens first, and waits for the answer.
+        let link = urlencoding::encode("https://acme.zendesk.com/agent/tickets/12");
+        let r = h.call("GET", &format!("/api/v1/connections/preview?url={link}"), None, &admin);
+        let mut job = job_of(&r);
+        let refresh = fetches(step(&h, &mut job, vec![]));
+        assert_eq!(refresh[0].url, "https://acme.zendesk.com/oauth/tokens");
+        // The copy's freeze starts draining. Zendesk answers, having spent zd-rt-1.
+        h.store.with_tx(|db| (backup::drain(db), true)).unwrap().unwrap();
+        let in_worker = |h: &H, job: &mut Job, replies: Vec<HttpReply>| {
+            h.store
+                .with_tx(|db| {
+                    let (step, _) = connect::guarded_step(db, &h.cfg, job, replies, chrono::Utc::now(), |_| None);
+                    let ok = step.is_ok();
+                    (step, ok)
+                })
+                .unwrap()
+        };
+        let renewed = ok(json!({ "access_token": "zd-at-2", "refresh_token": "zd-rt-2", "token_type": "bearer", "expires_in": 28800 }));
+        let next = match in_worker(&h, &mut job, vec![renewed]) {
+            Ok(Step::Fetch(calls)) => calls,
+            other => panic!("the renewed tokens are kept: {other:?}"),
+        };
+        assert_eq!(stored(&h), ("zd-at-2".to_string(), "zd-rt-2".to_string()));
+        // Nothing else lands: the preview's next step, or a new request.
+        let refused = in_worker(&h, &mut job, next.iter().map(zendesk).collect()).unwrap_err();
+        assert_eq!(refused.code, "moving");
+        assert_eq!(h.call("GET", "/api/v1/connections", None, &admin).status, 503);
+        // Sealed, then copied: the target holds the renewed tokens, not the spent ones.
+        h.store.with_tx(|db| (backup::seal(db), true)).unwrap().unwrap();
+        let mut dst = H::new();
+        with_key(&mut dst);
+        let end = |h: &H| tool::Endpoint::local(dumbslab::store::Store::open(&h._dir.path().join("t.db")).unwrap(), "main");
+        let outcomes = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(tool::copy(&end(&h), Some(&end(&dst)), None, &tool::Options::default()))
+            .unwrap();
+        assert_eq!(outcomes[0].status, tool::Status::Copied, "{}", tool::table(&outcomes));
+        assert_eq!(stored(&dst), ("zd-at-2".to_string(), "zd-rt-2".to_string()));
+    }
+
     #[test]
     fn expired_tokens_are_refreshed_first() {
         let mut h = H::new();
@@ -14016,7 +14097,7 @@ mod backups {
             other => panic!("expected the job to call GitHub, got {other:?}"),
         };
         // The operator freezes the workspace while the job waits on GitHub.
-        assert!(tx(&h, |db| backup::freeze(db)).unwrap());
+        tx(&h, |db| backup::freeze(db)).unwrap();
         let writes = |h: &H| count(h, "SELECT COUNT(*) FROM activity") + count(h, "SELECT COUNT(*) FROM usage_hours");
         let before = writes(&h);
         // GitHub answers; the job's next step would save the connection. It's refused.
@@ -14091,7 +14172,7 @@ mod backups {
     fn a_restore_resumes_only_from_the_same_source_snapshot() {
         let (a, ..) = populated();
         let (b, ..) = populated();
-        tx(&a, |db| backup::freeze(db).map(|_| ())).unwrap();
+        tx(&a, |db| backup::freeze(db)).unwrap();
         let dst = H::new();
         let ma = manifest(&a);
         let id = tx(&dst, |db| backup::begin(db, &[Kind::Workspace], "ws:acme", &ma)).unwrap().restore_id;
@@ -14116,7 +14197,7 @@ mod backups {
     fn a_restore_cut_short_resumes_and_pages_can_be_sent_twice() {
         let (src, cookie, ..) = populated();
         // Resuming needs the source's snapshot to stay put: frozen.
-        tx(&src, |db| backup::freeze(db).map(|_| ())).unwrap();
+        tx(&src, |db| backup::freeze(db)).unwrap();
         let dst = H::new();
         let m = manifest(&src);
         let begun = tx(&dst, |db| backup::begin(db, &[Kind::Workspace], "main", &m)).unwrap();
@@ -14212,7 +14293,7 @@ mod backups {
     #[test]
     fn frozen_objects_refuse_requests_and_the_freeze_stays_behind() {
         let (src, ..) = populated();
-        assert!(tx(&src, |db| backup::freeze(db)).unwrap());
+        tx(&src, |db| backup::freeze(db)).unwrap();
         assert_eq!(tx(&src, |db| backup::lock(db)).unwrap(), Lock::Frozen);
         assert_eq!(Lock::Frozen.refusal().unwrap().code, "moving");
         let m = manifest(&src);
@@ -14223,10 +14304,118 @@ mod backups {
         assert_eq!(tx(&dst, |db| backup::lock(db)).unwrap(), Lock::Open, "the target takes requests");
         tx(&src, |db| backup::thaw(db)).unwrap();
         assert_eq!(tx(&src, |db| backup::lock(db)).unwrap(), Lock::Open);
-        // An object with no tables has nothing to freeze, and gets no storage for it.
+    }
+
+    /// S1: an address nobody set up freezes too (copies still find it empty), so a sign-up whose
+    /// directory check passed just before the freeze can't finish after it.
+    #[test]
+    fn a_sign_up_under_way_when_its_empty_object_freezes_is_refused() {
+        use dumbslab_core::tenancy::signup_token;
         let conn = rusqlite::Connection::open_in_memory().unwrap();
-        assert!(!backup::freeze(&Sqlite(&conn)).unwrap());
-        assert_eq!(backup::manifest(&Sqlite(&conn)).unwrap().kind, Kind::Empty);
+        let db = Sqlite(&conn);
+        // The sign-up's directory check passed; meanwhile the operator freezes the object.
+        backup::freeze(&db).unwrap();
+        assert_eq!(backup::lock(&db).unwrap(), Lock::Frozen);
+        let m = backup::manifest(&db).unwrap();
+        assert_eq!((m.kind, m.tables.len()), (Kind::Empty, 0), "a copy still finds it empty");
+        // The sign-up resumes: the Worker creates the schema and runs the setup in one transaction.
+        let cfg = HostConfig {
+            base_url: Some("https://held.kb.test".into()),
+            signup_secret: Some("sekret".into()),
+            workspace: Some("held".into()),
+            ..Default::default()
+        };
+        let token = signup_token("sekret", "held", chrono::Utc::now().timestamp() + 3600);
+        let body =
+            json!({ "setup_token": token, "workspace_name": "Held", "name": "Ada", "email": "ada@held.test", "password": "password123" });
+        let req = Request {
+            method: "POST".into(),
+            path: "/api/v1/auth/setup".into(),
+            headers: vec![("content-type".into(), "application/json".into()), ("x-dumbslab-client".into(), "web".into())],
+            body: serde_json::to_vec(&body).unwrap(),
+            origin: "https://held.kb.test".into(),
+            ..Default::default()
+        };
+        conn.execute_batch("BEGIN").unwrap();
+        dumbslab_core::migrate(&db).unwrap();
+        let outcome = dumbslab_core::handle(&db, &cfg, &req).unwrap();
+        assert_eq!((outcome.response.status, outcome.commit), (503, false));
+        conn.execute_batch("ROLLBACK").unwrap();
+        assert!(db.one("SELECT name FROM sqlite_master WHERE name IN ('meta', 'users')", &[]).unwrap().is_none(), "no workspace was made");
+        // Nor can a workspace's move point the address anywhere.
+        assert_eq!(backup::refuse_writes(&db).unwrap_err().code, "moving");
+    }
+
+    /// S4: a half-restored object holds part of its rows: it can be inspected, not frozen or copied.
+    #[test]
+    fn a_half_restored_object_cant_be_frozen_or_copied() {
+        let (src, ..) = populated();
+        let half = H::new();
+        let m = manifest(&src);
+        let id = tx(&half, |db| backup::begin(db, &[Kind::Workspace], "main", &m)).unwrap().restore_id;
+        tx(&half, |db| backup::restore(db, &id, &page(&src, "users"))).unwrap();
+        assert!(manifest(&half).restoring, "the manifest says so");
+        for refused in [
+            tx(&half, |db| backup::drain(db).map(|_| ())).unwrap_err(),
+            tx(&half, |db| backup::freeze(db)).unwrap_err(),
+            tx(&half, |db| backup::dump(db, &PageRequest { table: "users".into(), after: None }).map(|_| ())).unwrap_err(),
+        ] {
+            assert_eq!((refused.status, refused.code), (409, "restoring"));
+        }
+        // A copy from it, even without freezing, refuses it.
+        let onward = H::new();
+        let outcomes = copy(&half, &onward);
+        assert!(matches!(&outcomes[0].status, Status::Failed(why) if why.contains("unfinished restore")), "{outcomes:?}");
+        assert_eq!(count(&onward, "SELECT COUNT(*) FROM users"), 0);
+        let checked = run(tool::verify(&end(&half), &end(&onward), &[])).unwrap();
+        assert!(matches!(&checked[0].status, Status::Failed(_)), "{checked:?}");
+        // Its target-side checks still work: a summary of what has arrived.
+        assert!(tx(&half, |db| backup::summary(db, &PageRequest { table: "users".into(), after: None })).is_ok());
+    }
+
+    /// S3: a workspace that says its sign-up finished while the directory drains is kept active;
+    /// and one the directory never heard from is marked active on the target by the copy.
+    #[test]
+    fn activations_around_the_freeze_end_active_on_the_target() {
+        use chrono::Utc;
+        use dumbslab_core::tenancy::{self, Limits};
+        let limits = Limits { per_ip_per_day: 50, per_day: 50, max_workspaces: 50, free: ROOMY };
+        let (a, b) = (rusqlite::Connection::open_in_memory().unwrap(), rusqlite::Connection::open_in_memory().unwrap());
+        let (src, dst) = (Sqlite(&a), Sqlite(&b));
+        tenancy::directory_migrate(&src).unwrap();
+        tenancy::directory_migrate(&dst).unwrap();
+        for slug in ["acme", "beta"] {
+            tenancy::reserve(&src, slug, "Name", "ip", Utc::now(), limits).unwrap();
+        }
+        // The copy starts: the directory drains. acme's sign-up committed just before its workspace
+        // froze, and its activation arrives now: the directory still takes it.
+        backup::drain(&src).unwrap();
+        let lock = backup::lock(&src).unwrap();
+        assert_eq!(lock, Lock::Draining);
+        assert!(backup::directory_allows(lock, "POST", "/activate"));
+        assert!(!backup::directory_allows(lock, "POST", "/reserve") && !backup::directory_allows(lock, "POST", "/usage"));
+        assert!(backup::directory_allows(lock, "GET", "/list"));
+        tenancy::activate(&src, "acme", Utc::now()).unwrap();
+        // Then the directory seals: nothing more lands, beta's late activation included.
+        backup::seal(&src).unwrap();
+        assert!(!backup::directory_allows(backup::lock(&src).unwrap(), "POST", "/activate"));
+        copy_db(&src, &dst, &[Kind::Directory]);
+        let status = |db: &dyn Db, slug: &str| {
+            db.one("SELECT status FROM workspaces WHERE slug = ?", &dumbslab_core::params![slug]).unwrap().unwrap().str("status")
+        };
+        assert_eq!((status(&dst, "acme"), status(&dst, "beta")), ("active".to_string(), "reserved".to_string()));
+
+        // beta's workspace was set up nonetheless: the copy notices and mends the target.
+        let set_up = H::new();
+        set_up.setup();
+        let listing: Vec<backup::ObjectRef> = backup::directory_objects(&src).unwrap();
+        let manifests = [("ws:beta".to_string(), manifest(&set_up)), ("ws:acme".to_string(), manifest(&set_up))].into_iter().collect();
+        assert_eq!(tool::stale_reservations(&listing, &manifests), ["beta"]);
+        let mended = backup::handle(&dst, "activate", br#"{"homes": ["beta"]}"#, &[Kind::Directory]).unwrap();
+        assert_eq!(mended["activated"], json!(["beta"]));
+        assert_eq!(status(&dst, "beta"), "active");
+        // Only a directory takes it.
+        assert_eq!(backup::handle(&dst, "activate", br#"{"homes": ["beta"]}"#, &[Kind::Workspace]).unwrap_err().status, 404);
     }
 
     /// Writes a backup file record by record, as a damaged or forged one might be.

@@ -171,9 +171,11 @@ impl DurableObject for Directory {
                 lock
             }
         };
-        // Frozen for a copy, the directory changes nothing; the operator can still look things up.
-        let lookup = matches!((req.method(), path.as_str()), (Method::Get, "/list") | (Method::Post, "/resolve"));
-        if let Some(e) = lock.refusal().filter(|_| !(lock == Lock::Frozen && lookup)) {
+        // Freezing for a copy, the directory still takes the operator's lookups and, until it's
+        // sealed, workspaces' activations; nothing else.
+        if !backup::directory_allows(lock, req.method().as_ref(), &path)
+            && let Some(e) = lock.refusal()
+        {
             return api_error_response(&e);
         }
         let limits = self.limits();

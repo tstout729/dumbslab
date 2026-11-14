@@ -432,11 +432,13 @@ pub struct Outcome {
     pub source: Option<String>,
     pub target: Option<String>,
     pub status: Status,
+    /// What else the copy did to it (the directory: workspaces it marked active).
+    pub note: Option<String>,
 }
 
 impl Outcome {
     fn new(object: &str, kind: Kind, status: Status) -> Outcome {
-        Outcome { object: object.into(), kind, tables: 0, rows: 0, source: None, target: None, status }
+        Outcome { object: object.into(), kind, tables: 0, rows: 0, source: None, target: None, status, note: None }
     }
 }
 
@@ -490,20 +492,38 @@ async fn listing(end: &Endpoint) -> anyhow::Result<Listing> {
     Ok(l)
 }
 
-/// Freezes the source's directory first (no sign-ups, moves or new objects from then on), then
-/// every selected object. Returns the listing read once the directory was frozen.
+/// Freezes the source: its directory starts draining first (no sign-ups, moves or new objects
+/// from then on, though workspaces can still say their sign-up finished), then every selected
+/// object freezes (each drains, waits for its jobs, and seals), then the directory seals. Returns
+/// the listing read once the directory was draining.
 pub async fn freeze(from: &Endpoint, only: &[String]) -> anyhow::Result<Listing> {
     if matches!(from, Endpoint::Local { .. }) {
         bail!("a local database can't be frozen: stop its server instead");
     }
     let first = listing(from).await?;
+    // An object holding an unfinished restore can't be copied: say so before freezing anything.
+    for o in select(&first, only)? {
+        let m: Manifest = from.call("backup/manifest", &o.name, &json!({})).await.map_err(|e| anyhow!("{}: {e}", o.name))?;
+        if m.restoring {
+            bail!("{}: {HALF_RESTORED}. Nothing was frozen.", o.name);
+        }
+    }
+    let stuck = |what: &str, e: CallError| {
+        anyhow!("freezing {what}: {e}. Objects frozen so far stay frozen; `dumbslab backup thaw --from {}` reopens them", from.label())
+    };
     let has_directory = first.objects.iter().any(|o| o.kind == Kind::Directory && (only.is_empty() || only.contains(&o.name)));
     if has_directory {
-        from.call::<Value>("backup/freeze", backup::DIRECTORY_OBJECT, &json!({})).await?;
+        from.call::<Value>("backup/drain", backup::DIRECTORY_OBJECT, &json!({})).await.map_err(|e| stuck("the directory", e))?;
     }
     let listing = if has_directory { self::listing(from).await? } else { first };
     for o in select(&listing, only)?.iter().filter(|o| o.kind != Kind::Directory) {
-        from.call::<Value>("backup/freeze", &o.name, &json!({})).await.map_err(|e| anyhow!("freezing {}: {e}", o.name))?;
+        let frozen: Value = from.call("backup/freeze", &o.name, &json!({})).await.map_err(|e| stuck(&o.name, e))?;
+        if let Some(n) = frozen["parked"].as_u64().filter(|n| *n > 0) {
+            say(format!("{}: {n} job(s) were still running when it sealed; their later steps write nothing", o.name));
+        }
+    }
+    if has_directory {
+        from.call::<Value>("backup/seal", backup::DIRECTORY_OBJECT, &json!({})).await.map_err(|e| stuck("the directory", e))?;
     }
     say(format!("froze {} on {}", if only.is_empty() { "every object".to_string() } else { only.join(", ") }, from.label()));
     Ok(listing)
@@ -611,6 +631,42 @@ async fn check_and_finish(
     Ok(outcome)
 }
 
+const HALF_RESTORED: &str = "the source holds an unfinished restore (part of its rows): finish it or wipe it before copying it";
+
+/// The workspaces, by first address, whose directory entry says `reserved` though their object
+/// holds a set-up workspace: their sign-up finished, but the directory never heard.
+pub fn stale_reservations(objects: &[ObjectRef], manifests: &BTreeMap<String, Manifest>) -> Vec<String> {
+    objects
+        .iter()
+        .filter(|o| o.kind == Kind::Workspace && o.status.as_deref() == Some("reserved"))
+        .filter(|o| {
+            manifests.get(&o.name).is_some_and(|m| m.kind == Kind::Workspace && m.tables.iter().any(|t| t.name == "users" && t.rows > 0))
+        })
+        .filter_map(|o| o.name.strip_prefix("ws:").map(str::to_string))
+        .collect()
+}
+
+/// Marks such workspaces active in the target's directory, once it's copied, and notes it there.
+async fn reconcile(to: &Endpoint, objects: &[ObjectRef], manifests: &BTreeMap<String, Manifest>, outcomes: &mut [Outcome]) {
+    let stale = stale_reservations(objects, manifests);
+    if stale.is_empty() {
+        return;
+    }
+    let Some(directory) = outcomes.iter_mut().find(|o| o.kind == Kind::Directory && o.status.ok()) else {
+        say(format!("note: {} finished signing up but the directory still says reserved; copy the directory too", stale.join(", ")));
+        return;
+    };
+    match to.call::<Value>("restore/activate", backup::DIRECTORY_OBJECT, &json!({ "homes": stale })).await {
+        Ok(v) => {
+            let changed: Vec<String> = serde_json::from_value(v["activated"].clone()).unwrap_or_default();
+            if !changed.is_empty() {
+                directory.note = Some(format!("marked {} active: set up as the source froze", changed.join(", ")));
+            }
+        }
+        Err(e) => directory.status = Status::Failed(format!("couldn't mark {} active: {e}", stale.join(", "))),
+    }
+}
+
 /// How the target took an object.
 enum Taken {
     /// Restoring under this id.
@@ -648,8 +704,13 @@ async fn copy_object(
     to: Option<&Endpoint>,
     save: &mut Option<&mut BackupWriter>,
     object: &str,
+    manifests: &mut BTreeMap<String, Manifest>,
 ) -> anyhow::Result<Outcome> {
     let manifest: Manifest = from.call("backup/manifest", object, &json!({})).await.map_err(|e| anyhow!("{object}: {e}"))?;
+    if manifest.restoring {
+        return Ok(Outcome::new(object, manifest.kind, Status::Failed(HALF_RESTORED.into())));
+    }
+    manifests.insert(object.to_string(), manifest.clone());
     if manifest.kind == Kind::Empty {
         if let Some(w) = save.as_deref_mut() {
             w.empty(object)?;
@@ -767,13 +828,17 @@ pub async fn copy(
         w.listing(&source, &names)?;
     }
     let mut outcomes = vec![];
+    let mut manifests = BTreeMap::new();
     for o in &objects {
-        let outcome = match copy_object(from, to, &mut save, &o.name).await {
+        let outcome = match copy_object(from, to, &mut save, &o.name, &mut manifests).await {
             Ok(outcome) => outcome,
             Err(e) => Outcome::new(&o.name, o.kind, Status::Failed(e.to_string())),
         };
         say(format!("{}: {}", o.name, status_text(&outcome.status)));
         outcomes.push(outcome);
+    }
+    if let Some(to) = to {
+        reconcile(to, &objects, &manifests, &mut outcomes).await;
     }
     Ok(outcomes)
 }
@@ -824,6 +889,7 @@ pub async fn restore_file(path: &Path, passphrase: &str, to: &Endpoint, only: &[
     let mut reader = BackupReader::open(path, passphrase)?;
     reader.next_record()?;
     let mut outcomes = vec![];
+    let mut manifests = BTreeMap::new();
     let mut current: Option<Restoring> = None;
     while let Some(record) = reader.next_record()? {
         let object = record["object"].as_str().unwrap_or_default().to_string();
@@ -832,6 +898,7 @@ pub async fn restore_file(path: &Path, passphrase: &str, to: &Endpoint, only: &[
             "empty" if wanted => outcomes.push(Outcome::new(&object, Kind::Empty, Status::Empty)),
             "manifest" if wanted => {
                 let manifest: Manifest = serde_json::from_value(record["manifest"].clone())?;
+                manifests.insert(object.clone(), manifest.clone());
                 let taken = begin(to, &object, &manifest).await;
                 current = Some(Restoring { name: object, manifest, taken, copied: Totals::new() });
             }
@@ -852,6 +919,8 @@ pub async fn restore_file(path: &Path, passphrase: &str, to: &Endpoint, only: &[
             _ => {}
         }
     }
+    let objects: Vec<ObjectRef> = contents.listing.objects.iter().filter(|o| only.is_empty() || only.contains(&o.name)).cloned().collect();
+    reconcile(to, &objects, &manifests, &mut outcomes).await;
     Ok(outcomes)
 }
 
@@ -862,8 +931,11 @@ pub async fn verify(from: &Endpoint, to: &Endpoint, only: &[String]) -> anyhow::
     for o in select(&source, only)? {
         let outcome = async {
             let manifest: Manifest = from.call("backup/manifest", &o.name, &json!({})).await?;
+            if manifest.restoring {
+                return Ok::<_, CallError>(Outcome::new(&o.name, manifest.kind, Status::Failed(HALF_RESTORED.into())));
+            }
             if manifest.kind == Kind::Empty {
-                return Ok::<_, CallError>(Outcome::new(&o.name, Kind::Empty, Status::Empty));
+                return Ok(Outcome::new(&o.name, Kind::Empty, Status::Empty));
             }
             let theirs: Manifest = to.call("backup/manifest", &o.name, &json!({})).await?;
             let mut outcome = Outcome::new(&o.name, manifest.kind, Status::Same);
@@ -914,7 +986,10 @@ pub fn table(outcomes: &[Outcome]) -> String {
                 o.rows.to_string(),
                 o.source.clone().unwrap_or_else(|| "-".into()),
                 o.target.clone().unwrap_or_else(|| "-".into()),
-                status_text(&o.status),
+                match &o.note {
+                    Some(note) => format!("{} ({note})", status_text(&o.status)),
+                    None => status_text(&o.status),
+                },
             ]
         })
         .collect();
