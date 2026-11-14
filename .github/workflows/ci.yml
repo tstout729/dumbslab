@@ -21,7 +21,7 @@ jobs:
       # The importer tests read zips with DecompressionStream('deflate-raw'), new in Node 20.12.
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 26
       - run: cargo fmt --all --check
       - run: cargo clippy -p dumbslab-core -p dumbslab --all-targets -- -D warnings
       - run: cargo clippy -p dumbslab-worker --target wasm32-unknown-unknown -- -D warnings
