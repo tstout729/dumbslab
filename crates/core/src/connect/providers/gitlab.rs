@@ -1,7 +1,14 @@
 //! GitLab: previews of linked issues and merge requests, on gitlab.com or a self-managed GitLab.
 //! People connect with a personal access token (read_api), or sign in to gitlab.com.
 //!
+//! GitLab now sends people to work items: `/-/issues/<iid>` redirects to `/-/work_items/<iid>`,
+//! and new issues open there. A project's issues, tasks, incidents and other project work items
+//! share its numbers and its REST issues API, so both links preview the same item, read from
+//! `/projects/:id/issues/:iid`; its `issue_type` says which kind it is. Group work items (epics, at
+//! `/groups/<group>/-/work_items/<iid>`) have no REST issue, so those links get no preview.
+//!
 //! Docs: https://docs.gitlab.com/api/issues/#retrieve-a-single-project-issue,
+//! https://docs.gitlab.com/user/work_items/,
 //! https://docs.gitlab.com/api/merge_requests/#retrieve-a-single-merge-request,
 //! https://docs.gitlab.com/api/rest/authentication/, https://docs.gitlab.com/api/oauth2/,
 //! https://docs.gitlab.com/user/profile/personal_access_tokens/
@@ -9,8 +16,8 @@
 use serde_json::{Value, json};
 
 use crate::connect::{
-    Account, Connector, Credential, Detail, Field, Hit, HttpCall, HttpReply, OAuthSpec, Preview, ProviderInfo, host_of, http_error, opt,
-    path_of, s,
+    Account, Connector, Credential, Detail, Field, Hit, HttpCall, HttpReply, OAuthSpec, Preview, ProviderInfo, excerpt, host_of,
+    http_error, opt, path_of, s,
 };
 
 pub struct GitLab;
@@ -20,7 +27,7 @@ const DEFAULT_HOST: &str = "gitlab.com";
 static INFO: ProviderInfo = ProviderInfo {
     id: "gitlab",
     name: "GitLab",
-    about: "Preview linked issues and merge requests, on gitlab.com or your own GitLab.",
+    about: "Preview linked issues, tasks and merge requests, on gitlab.com or your own GitLab.",
     search: false,
     preview: true,
     // Signing in works for gitlab.com only; a self-managed GitLab connects with a token.
@@ -112,6 +119,20 @@ fn split(target: &str) -> (&str, bool, &str) {
     (&target[..i], target[i..].starts_with('!'), target.get(i + 1..).unwrap_or_default())
 }
 
+/// What kind of project work item an issue answer is, from its `issue_type` (`issue`, `task`,
+/// `incident`, `test_case`, `objective`, `key_result`…): the preview's kind, and the name to show
+/// when it isn't a plain issue.
+fn work_item_type(issue: &Value) -> (&'static str, Option<String>) {
+    let t = issue["issue_type"].as_str().unwrap_or_default();
+    if t.is_empty() || t == "issue" {
+        return ("issue", None);
+    }
+    let words = excerpt(&t.replace('_', " "), 40);
+    let mut chars = words.chars();
+    let shown = chars.next().map(|c| c.to_uppercase().chain(chars).collect());
+    (if t == "task" { "task" } else { "issue" }, shown)
+}
+
 fn handles(users: &Value) -> String {
     users.as_array().into_iter().flatten().filter_map(|u| u["username"].as_str()).map(|u| format!("@{u}")).collect::<Vec<_>>().join(", ")
 }
@@ -157,8 +178,9 @@ impl Connector for GitLab {
         Ok(vec![])
     }
 
-    /// `https://gitlab.com/acme/tools/api/-/issues/12` → `acme/tools/api#12`, and
-    /// `…/-/merge_requests/34` → `acme/tools/api!34`. Only links to the account's own GitLab.
+    /// `https://gitlab.com/acme/tools/api/-/issues/12` and `…/-/work_items/12` → `acme/tools/api#12`
+    /// (the same item; see the module docs), and `…/-/merge_requests/34` → `acme/tools/api!34`. Only
+    /// links to the account's own GitLab, and only to a project's items: `/groups/…` is a group's.
     fn preview_target(&self, account: &Account, url: &str) -> Option<String> {
         let host = host_for(account)?;
         if host_of(url)? != host.strip_prefix("www.").unwrap_or(host) {
@@ -168,13 +190,15 @@ impl Connector for GitLab {
         let dash = path.iter().position(|p| p == "-")?;
         let (project, rest) = path.split_at(dash);
         let sep = match rest.get(1)?.as_str() {
-            "issues" => '#',
+            "issues" | "work_items" => '#',
             "merge_requests" => '!',
             _ => return None,
         };
         let iid = rest.get(2)?.parse::<u64>().ok()?;
-        // A namespace and a project at least; GitLab nests groups up to 20 deep.
-        let ok = (2..=21).contains(&project.len()) && project.iter().all(|p| valid_segment(p));
+        // A namespace and a project at least; GitLab nests groups up to 20 deep. GitLab reserves
+        // `groups` as a top-level name: links under it are a group's (epics), never a project's.
+        let ok =
+            (2..=21).contains(&project.len()) && !project[0].eq_ignore_ascii_case("groups") && project.iter().all(|p| valid_segment(p));
         ok.then(|| format!("{}{sep}{iid}", project.join("/")))
     }
 
@@ -190,7 +214,10 @@ impl Connector for GitLab {
         let r = replies.first().cloned().unwrap_or_default();
         if !r.ok() {
             return Err(match r.status {
-                404 => format!("GitLab has no such {}, or the connected account can't see it.", if mr { "merge request" } else { "issue" }),
+                404 => format!(
+                    "GitLab has no such {}, or the connected account can't see it.",
+                    if mr { "merge request" } else { "issue or work item in that project" }
+                ),
                 _ => http_error("GitLab", &r),
             });
         }
@@ -202,7 +229,11 @@ impl Connector for GitLab {
         };
         let labels: Vec<String> =
             i["labels"].as_array().into_iter().flatten().filter_map(|l| l.as_str().or(l["name"].as_str())).map(str::to_string).collect();
+        let (kind, type_name) = if mr { ("merge_request", None) } else { work_item_type(&i) };
         let mut details = vec![];
+        if let Some(t) = type_name {
+            details.push(Detail { label: "Type".into(), value: t });
+        }
         if !labels.is_empty() {
             details.push(Detail { label: "Labels".into(), value: labels.join(", ") });
         }
@@ -220,12 +251,12 @@ impl Connector for GitLab {
         }
         let sep = if mr { '!' } else { '#' };
         let host = host_for(account).unwrap_or(DEFAULT_HOST);
-        let kind = if mr { "merge_requests" } else { "issues" };
+        let path = if mr { "merge_requests" } else { "issues" };
         Ok(Preview {
             provider: "gitlab".into(),
-            kind: if mr { "merge_request" } else { "issue" }.into(),
+            kind: kind.into(),
             title: s(&i["title"]),
-            url: opt(&i["web_url"]).unwrap_or_else(|| format!("https://{host}/{project}/-/{kind}/{iid}")),
+            url: opt(&i["web_url"]).unwrap_or_else(|| format!("https://{host}/{project}/-/{path}/{iid}")),
             reference: opt(&i["references"]["full"]).unwrap_or_else(|| format!("{project}{sep}{iid}")),
             status: Some(state).filter(|s| !s.is_empty()),
             assignee: Some(handles(&i["assignees"])).filter(|a| !a.is_empty()),
@@ -328,6 +359,77 @@ mod tests {
         ] {
             assert_eq!(GitLab.preview_target(account, no), None, "{no}");
         }
+    }
+
+    #[test]
+    fn work_item_links_are_the_same_items_as_issue_links() {
+        let com = on("gitlab.com");
+        for (link, issue) in [
+            ("https://gitlab.com/acme/api/-/work_items/12", "https://gitlab.com/acme/api/-/issues/12"),
+            ("https://gitlab.com/acme/tools/api/-/work_items/7?show=x#note_1", "https://gitlab.com/acme/tools/api/-/issues/7"),
+        ] {
+            assert!(GitLab.preview_target(&com, link).is_some(), "{link}");
+            assert_eq!(GitLab.preview_target(&com, link), GitLab.preview_target(&com, issue), "{link}");
+        }
+        assert_eq!(GitLab.preview_target(&com, "https://gitlab.com/a/b/c/d/-/work_items/3").as_deref(), Some("a/b/c/d#3"));
+        let own = on("gitlab.example.com");
+        assert_eq!(GitLab.preview_target(&own, "https://gitlab.example.com/a/b/-/work_items/5").as_deref(), Some("a/b#5"));
+        // Nobody connected: still GitLab's, so the person can be asked to connect it.
+        assert!(GitLab.recognizes("https://gitlab.com/acme/api/-/work_items/12"));
+        // Group work items (epics) aren't a project's issues: no preview, rather than a wrong one.
+        for (account, no) in [
+            (&com, "https://gitlab.com/groups/acme/-/work_items/5"),
+            (&com, "https://gitlab.com/groups/acme/platform/-/work_items/5"),
+            (&com, "https://gitlab.com/Groups/acme/-/work_items/5"),
+            (&com, "https://gitlab.com/groups/acme/-/epics/5"),
+            (&com, "https://gitlab.com/groups/acme/-/issues/5"),
+            (&own, "https://gitlab.example.com/groups/a/-/work_items/5"),
+            (&com, "https://gitlab.com/acme/-/work_items/3"),
+            (&com, "https://gitlab.com/acme/api/-/work_items"),
+            (&com, "https://gitlab.com/acme/api/-/work_items/new"),
+            (&com, "https://gitlab.com/acme/api/work_items/3"),
+            (&own, "https://gitlab.com/acme/api/-/work_items/3"),
+        ] {
+            assert_eq!(GitLab.preview_target(account, no), None, "{no}");
+        }
+        // A project whose name only starts like the reserved one is a project.
+        assert_eq!(GitLab.preview_target(&com, "https://gitlab.com/groupsoft/api/-/work_items/2").as_deref(), Some("groupsoft/api#2"));
+    }
+
+    #[test]
+    fn previews_tasks_and_other_work_items_by_their_type() {
+        let cred = Credential { token: "t".into(), ..Default::default() };
+        let com = on("gitlab.com");
+        let target = GitLab.preview_target(&com, "https://gitlab.com/acme/api/-/work_items/9").unwrap();
+        // The REST issues API reads every project work item by its number.
+        assert_eq!(GitLab.preview(&cred, &com, &target)[0].url, "https://gitlab.com/api/v4/projects/acme%2Fapi/issues/9");
+
+        let task = json!({ "title": "Write the runbook", "state": "opened", "issue_type": "task", "type": "TASK",
+            "web_url": "https://gitlab.com/acme/api/-/work_items/9", "references": { "full": "acme/api#9" },
+            "assignees": [{ "username": "bo" }], "author": { "username": "ada" } });
+        let p = GitLab.read_preview(&com, &target, &[reply(200, task)]).unwrap();
+        assert_eq!((p.kind.as_str(), p.status.as_deref(), p.reference.as_str()), ("task", Some("open"), "acme/api#9"));
+        assert_eq!(p.url, "https://gitlab.com/acme/api/-/work_items/9");
+        assert_eq!((p.details[0].label.as_str(), p.details[0].value.as_str()), ("Type", "Task"));
+
+        for (issue_type, shown) in
+            [("incident", "Incident"), ("test_case", "Test case"), ("key_result", "Key result"), ("objective", "Objective")]
+        {
+            let item = json!({ "title": "x", "state": "closed", "issue_type": issue_type });
+            let p = GitLab.read_preview(&com, &target, &[reply(200, item)]).unwrap();
+            assert_eq!(
+                (p.kind.as_str(), p.details[0].value.as_str(), p.status.as_deref()),
+                ("issue", shown, Some("closed")),
+                "{issue_type}"
+            );
+        }
+        // A plain issue says nothing about its type.
+        let issue = json!({ "title": "x", "state": "opened", "issue_type": "issue", "type": "ISSUE" });
+        let p = GitLab.read_preview(&com, &target, &[reply(200, issue)]).unwrap();
+        assert_eq!((p.kind.as_str(), p.details.len()), ("issue", 0));
+        // A work item the issues API can't read fails as plainly as a missing issue.
+        let missing = GitLab.read_preview(&com, &target, &[reply(404, json!({ "message": "404 Not found" }))]).unwrap_err();
+        assert_eq!(missing, "GitLab has no such issue or work item in that project, or the connected account can't see it.");
     }
 
     #[test]

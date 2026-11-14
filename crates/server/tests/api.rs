@@ -3454,6 +3454,161 @@ mod connected {
         assert!(error(step(&h, &mut job, vec![])).contains("isn't connected any more"));
     }
 
+    #[test]
+    fn gitlab_previews_work_item_links() {
+        let mut h = H::new();
+        let (admin, _) = h.setup();
+        let (_, mo) = h.user(&admin, "mo@acme.test", "Mo", "member");
+        with_key(&mut h);
+        // gitlab.com: a task in a nested group, and an issue, each where GitLab links it now.
+        let gitlab = |c: &HttpCall| -> HttpReply {
+            match c.url.as_str() {
+                "https://gitlab.com/api/v4/user" => ok(json!({ "username": "ada" })),
+                "https://gitlab.com/api/v4/projects/acme%2Fplatform%2Fapi/issues/41" => ok(
+                    json!({ "title": "Write the runbook", "state": "opened", "issue_type": "task", "type": "TASK", "author": { "username": "bo" },
+                    "web_url": "https://gitlab.com/acme/platform/api/-/work_items/41", "references": { "full": "acme/platform/api#41" } }),
+                ),
+                "https://gitlab.com/api/v4/projects/acme%2Fapi/issues/7" => {
+                    ok(json!({ "title": "Login loops", "state": "opened", "issue_type": "issue", "type": "ISSUE",
+                    "web_url": "https://gitlab.com/acme/api/-/work_items/7", "references": { "full": "acme/api#7" } }))
+                }
+                _ => HttpReply { status: 404, body: json!({ "message": "404 Not found" }).to_string() },
+            }
+        };
+        let r = h.call("POST", "/api/v1/connections", Some(json!({ "app": "gitlab", "fields": { "token": "glpat-ada" } })), &admin);
+        let (finish, _) = drive(&h, job_of(&r), &gitlab);
+        assert_eq!(filled(&r, finish)["connection"]["account"], "@ada");
+        let preview =
+            |url: &str, auth: &Auth| h.call("GET", &format!("/api/v1/connections/preview?url={}", urlencoding::encode(url)), None, auth);
+
+        // The link a new issue opens at previews that issue, read from GitLab's REST issues API...
+        let r = preview("https://gitlab.com/acme/api/-/work_items/7", &admin);
+        let (finish, sent) = drive(&h, job_of(&r), &gitlab);
+        assert_eq!(sent[0].url, "https://gitlab.com/api/v4/projects/acme%2Fapi/issues/7");
+        assert!(sent[0].headers.contains(&("authorization".into(), "Bearer glpat-ada".into())));
+        let p = filled(&r, finish)["preview"].clone();
+        assert_eq!(
+            (p["kind"].as_str(), p["reference"].as_str(), p["title"].as_str()),
+            (Some("issue"), Some("acme/api#7"), Some("Login loops"))
+        );
+        assert_eq!(p["url"], "https://gitlab.com/acme/api/-/work_items/7");
+        // ...the same one its /-/issues/ link reads.
+        let (_, again) = drive(&h, job_of(&preview("https://gitlab.com/acme/api/-/issues/7", &admin)), &gitlab);
+        assert_eq!(again[0].url, sent[0].url);
+
+        // A task says it's one.
+        let r = preview("https://gitlab.com/acme/platform/api/-/work_items/41#note_3", &admin);
+        let (finish, _) = drive(&h, job_of(&r), &gitlab);
+        let p = filled(&r, finish)["preview"].clone();
+        assert_eq!((p["kind"].as_str(), p["author"].as_str()), (Some("task"), Some("@bo")));
+        assert_eq!(p["details"][0], json!({ "label": "Type", "value": "Task" }));
+
+        // A work item the issues API doesn't have: a plain error, not a wrong preview.
+        let r = preview("https://gitlab.com/acme/api/-/work_items/99", &admin);
+        let (finish, _) = drive(&h, job_of(&r), &gitlab);
+        let v = filled(&r, finish);
+        assert!(v["preview"].is_null() && v["error"].as_str().unwrap().contains("can't see it"), "{v}");
+        // A group's work items (epics) have no REST issue: no preview, and nothing is fetched.
+        for url in ["https://gitlab.com/groups/acme/-/work_items/5", "https://gitlab.com/groups/acme/platform/-/work_items/5"] {
+            let r = preview(url, &admin);
+            assert!(r.effects.is_empty() && r.body["app"].is_null(), "{url}: {}", r.body);
+        }
+        // Someone without GitLab connected is told which app the link is.
+        let r = preview("https://gitlab.com/acme/api/-/work_items/7", &mo);
+        assert!(r.effects.is_empty());
+        assert_eq!((r.body["app"].as_str(), r.body["connected"].as_bool()), (Some("gitlab"), Some(false)));
+    }
+
+    #[test]
+    fn a_failed_sign_in_says_why_in_settings() {
+        let mut h = H::new();
+        let (admin, admin_token) = h.setup();
+        let (_, mo) = h.user(&admin, "mo@acme.test", "Mo", "member");
+        with_key(&mut h);
+        h.cfg.connectors.apps.insert("jira".into(), OAuthApp { client_id: "atl".into(), client_secret: "atl-secret".into() });
+        let jira = |auth: &Auth| {
+            let list = h.ok("GET", "/api/v1/connections", None, auth);
+            list["apps"].as_array().unwrap().iter().find(|a| a["id"] == "jira").unwrap().clone()
+        };
+        let start = || {
+            let url =
+                h.ok("POST", "/api/v1/connections", Some(json!({ "app": "jira" })), &admin)["authorize_url"].as_str().unwrap().to_string();
+            query_of(&url)["state"].clone()
+        };
+        let back =
+            |state: &str| h.call("GET", &format!("/connect/callback?code=the-code&state={}", urlencoding::encode(state)), None, &admin);
+        // Atlassian signs the person in, but to no site that has Jira.
+        let no_site = |c: &HttpCall| if c.url.ends_with("/oauth/token/accessible-resources") { ok(json!([])) } else { atlassian(c) };
+        let fail = || {
+            let (finish, _) = drive(&h, job_of(&back(&start())), &no_site);
+            finish
+        };
+        let reason = "Atlassian didn't give access to a site with Jira. Connect again and choose a site that has Jira.";
+
+        // The link back to Settings still carries only a code...
+        let finish = fail();
+        assert!(
+            matches!(&finish, Finish::Redirect(u) if u == "https://kb.test/settings/connections?connect_error=failed&app=jira"),
+            "{finish:?}"
+        );
+        // ...and Settings reads why from the person's own list of apps, as agents can.
+        let j = jira(&admin);
+        assert_eq!((j["sign_in_error"]["message"].as_str(), j["connected"].is_null()), (Some(reason), true), "{j}");
+        assert!(j["sign_in_error"]["failed_at"].is_string());
+        let call = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": { "name": "list_connections", "arguments": {} } });
+        let apps = h.mcp(&admin_token, "", call).body["result"]["structuredContent"]["apps"].clone();
+        assert!(apps.as_array().unwrap().iter().any(|a| a["id"] == "jira" && a["sign_in_error"]["message"] == reason), "{apps}");
+        // Nobody else sees it.
+        assert!(jira(&mo)["sign_in_error"].is_null());
+        // It's for right after: a quarter of an hour later it's gone.
+        let old = dumbslab_core::util::ts(chrono::Utc::now() - chrono::Duration::minutes(20));
+        h.store
+            .with_tx(|db| (db.execute("UPDATE connect_failures SET created_at = ?", &dumbslab_core::params![old]), true))
+            .unwrap()
+            .unwrap();
+        assert!(jira(&admin)["sign_in_error"].is_null());
+
+        // Signing in again starts fresh. A refused code shows only what the code means: the app's
+        // own description stays out of Settings, as it stays out of the link.
+        fail();
+        let state = start();
+        assert!(jira(&admin)["sign_in_error"].is_null(), "a new sign-in clears the old reason");
+        assert_eq!(count(&h, "SELECT COUNT(*) FROM connect_failures"), 0, "and old reasons are dropped");
+        let refused = |_: &HttpCall| HttpReply {
+            status: 400,
+            body: json!({ "error": "invalid_grant", "error_description": "Call 555-0100" }).to_string(),
+        };
+        let (finish, _) = drive(&h, job_of(&back(&state)), &refused);
+        assert!(matches!(&finish, Finish::Redirect(u) if u.ends_with("connect_error=failed&app=jira")), "{finish:?}");
+        let list = h.ok("GET", "/api/v1/connections", None, &admin);
+        assert!(!list.to_string().contains("555-0100"), "{list}");
+
+        // Connecting the app clears the reason.
+        fail();
+        let fields = json!({ "app": "jira", "fields": { "site": "acme.atlassian.net", "email": "ada@acme.com", "token": "atl-token" } });
+        let r = h.call("POST", "/api/v1/connections", Some(fields), &admin);
+        let (finish, _) = drive(&h, job_of(&r), &atlassian);
+        assert_eq!(filled(&r, finish)["connection"]["account"], "acme.atlassian.net");
+        let j = jira(&admin);
+        assert!(j["sign_in_error"].is_null() && j["connected"].is_object(), "{j}");
+
+        // A token that doesn't work is answered right away; nothing is kept.
+        h.ok("DELETE", "/api/v1/connections/jira", None, &admin);
+        let fields = json!({ "app": "jira", "fields": { "site": "acme.atlassian.net", "email": "ada@acme.com", "token": "wrong" } });
+        let r = h.call("POST", "/api/v1/connections", Some(fields), &admin);
+        let (finish, _) = drive(&h, job_of(&r), &|_: &HttpCall| HttpReply { status: 401, body: "{}".into() });
+        assert!(matches!(finish, Finish::Fail(ref e) if e.message.contains("rejected")), "{finish:?}");
+        assert_eq!(count(&h, "SELECT COUNT(*) FROM connect_failures"), 0);
+
+        // On a full workspace the step that would keep the reason is refused and rolled back; the
+        // person still lands on Settings with the code (the callback's own redirect).
+        let mut job = job_of(&back(&start()));
+        let exchange = fetches(step(&h, &mut job, vec![]));
+        let profile = fetches(step(&h, &mut job, exchange.iter().map(no_site).collect()));
+        assert!(step_on_a_full_workspace(&h, &mut job, profile.iter().map(no_site).collect()).is_err());
+        assert_eq!(count(&h, "SELECT COUNT(*) FROM connect_failures"), 0);
+    }
+
     /// One step under a guard that refuses every step, as the Worker does on a full workspace.
     fn step_on_a_full_workspace(h: &H, job: &mut Job, replies: Vec<HttpReply>) -> dumbslab_core::ApiResult<Step> {
         let full = || Some(dumbslab_core::ApiError::new(507, "workspace_full", "The workspace is full."));

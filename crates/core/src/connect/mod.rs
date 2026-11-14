@@ -37,6 +37,10 @@ pub const FETCH_TIMEOUT_SECS: u64 = 8;
 pub const MAX_STEPS: usize = 5;
 /// How long a sign-in with another app may take.
 const SIGN_IN_MINUTES: i64 = 15;
+/// How long Settings may show why a sign-in didn't work (see [`remember_failure`]).
+const FAILURE_MINUTES: i64 = 15;
+/// The most characters of that reason kept.
+const FAILURE_CHARS: usize = 300;
 /// Tokens this close to expiring are refreshed before use.
 const REFRESH_MARGIN_SECS: i64 = 300;
 
@@ -668,6 +672,7 @@ fn save(db: &dyn Db, cfg: &HostConfig, j: &ConnectJob, account: &Account, now: D
            expires_at = excluded.expires_at, refreshing_until = NULL, updated_at = excluded.updated_at",
         &params![j.user_id.clone(), j.provider, account.label.clone(), account.settings.to_string(), secret, j.expires_at.map(ts), ts(now), ts(now)],
     )?;
+    forget_failure(db, &j.user_id, j.provider)?;
     Ok(())
 }
 
@@ -842,6 +847,9 @@ pub fn start_sign_in(
     }
     let (authorize_url, _) = oauth_urls(connector, &cred).map_err(ApiError::bad_request)?;
     db.execute("DELETE FROM connect_requests WHERE created_at < ?", &params![ts(now - Duration::minutes(SIGN_IN_MINUTES))])?;
+    // Why the last try didn't work no longer applies: this one gets its own outcome.
+    db.execute("DELETE FROM connect_failures WHERE created_at < ?", &params![ts(now - Duration::minutes(FAILURE_MINUTES))])?;
+    forget_failure(db, user_id, info.id)?;
     let random = crate::util::new_secret("");
     let state = match &cfg.workspace {
         Some(address) => format!("{address}.{random}"),
@@ -875,7 +883,9 @@ pub fn start_sign_in(
 }
 
 /// Why connecting by signing in didn't work. Only these codes go in the link back to Settings,
-/// never text: anyone can make a link to Settings, and the page shows what the code means.
+/// never text: anyone can make a link to Settings, and the page shows what the code means. When
+/// DumbSlab can say more about a [`SignInError::Failed`] (the account it got can't be used), it
+/// keeps that for the person instead (see [`remember_failure`]).
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum SignInError {
     /// The sign-in link was used already, or never existed.
@@ -913,6 +923,43 @@ fn settings_url(base_url: &str, provider: &str, outcome: Result<(), SignInError>
         Err(e) if provider.is_empty() => format!("{base_url}/settings/connections?connect_error={}", e.code()),
         Err(e) => format!("{base_url}/settings/connections?connect_error={}&app={app}", e.code()),
     }
+}
+
+/// Why a person's last sign-in with an app didn't work, as list_connections shows it.
+#[derive(Clone, Debug, PartialEq, Serialize, JsonSchema)]
+pub struct SignInFailure {
+    /// What went wrong and what to do, e.g. "Atlassian didn't give access to a site with Jira.
+    /// Connect again and choose a site that has Jira." Plain text.
+    pub message: String,
+    pub failed_at: String,
+}
+
+/// Keeps why `user_id`'s sign-in with `provider` didn't work, for Settings to show once the app
+/// sends them back (the link carries only a code). Only for the person who signed in, only for
+/// [`FAILURE_MINUTES`], at most [`FAILURE_CHARS`] characters. `message` is the connector's own
+/// sentence about the account it got, the one a token connection is answered with (a few quote the
+/// app's short error message, as previews do); never an app's raw answer, a token or a secret.
+fn remember_failure(db: &dyn Db, user_id: &str, provider: &str, message: &str, now: DateTime<Utc>) -> ApiResult<()> {
+    db.execute(
+        "INSERT INTO connect_failures (user_id, provider, message, created_at) VALUES (?, ?, ?, ?)
+         ON CONFLICT(user_id, provider) DO UPDATE SET message = excluded.message, created_at = excluded.created_at",
+        &params![user_id, provider, excerpt(message, FAILURE_CHARS), ts(now)],
+    )?;
+    Ok(())
+}
+
+fn forget_failure(db: &dyn Db, user_id: &str, provider: &str) -> ApiResult<()> {
+    db.execute("DELETE FROM connect_failures WHERE user_id = ? AND provider = ?", &params![user_id, provider])?;
+    Ok(())
+}
+
+/// Why `user_id`'s recent sign-ins didn't work, by app (see [`remember_failure`]).
+pub fn sign_in_failures(db: &dyn Db, user_id: &str, now: DateTime<Utc>) -> ApiResult<BTreeMap<String, SignInFailure>> {
+    let rows = db.query(
+        "SELECT provider, message, created_at FROM connect_failures WHERE user_id = ? AND created_at > ?",
+        &params![user_id, ts(now - Duration::minutes(FAILURE_MINUTES))],
+    )?;
+    Ok(rows.iter().map(|r| (r.str("provider"), SignInFailure { message: r.str("message"), failed_at: r.str("created_at") })).collect())
 }
 
 /// `GET /connect/callback`: an app sent the person back after they signed in. The signed-in
@@ -1797,6 +1844,14 @@ fn connect_step(db: &dyn Db, cfg: &HostConfig, j: &mut ConnectJob, replies: Vec<
             None => Step::Done(Finish::Fail(ApiError::new(400, "connect_failed", message))),
         }
     };
+    // The account (or site) the sign-in gave can't be used: Settings says why, in the connector's
+    // own words, which a token connection gets as its error.
+    let unusable = |j: &ConnectJob, message: String| -> ApiResult<Step> {
+        if j.back_to.is_some() {
+            remember_failure(db, &j.user_id, j.provider, &message, now)?;
+        }
+        Ok(fail(j, SignInError::Failed, message))
+    };
     match j.phase {
         ConnectPhase::Start => match &j.sign_in {
             Some(sign_in) => {
@@ -1807,7 +1862,7 @@ fn connect_step(db: &dyn Db, cfg: &HostConfig, j: &mut ConnectJob, replies: Vec<
                 // it in the credential).
                 let token_url = match oauth_urls(connector, &j.cred) {
                     Ok((_, token_url)) => token_url,
-                    Err(e) => return Ok(fail(j, SignInError::Failed, e)),
+                    Err(e) => return unusable(j, e),
                 };
                 let mut form = vec![
                     ("grant_type".into(), "authorization_code".into()),
@@ -1836,6 +1891,8 @@ fn connect_step(db: &dyn Db, cfg: &HostConfig, j: &mut ConnectJob, replies: Vec<
                     j.phase = ConnectPhase::Profiling;
                     Ok(Step::Fetch(connector.profile(&j.cred)))
                 }
+                // A refused exchange can quote the app's own answer (its `error_description`), so
+                // Settings shows only what the code means.
                 Err(e) => Ok(fail(j, SignInError::Failed, e)),
             }
         }
@@ -1856,7 +1913,7 @@ fn connect_step(db: &dyn Db, cfg: &HostConfig, j: &mut ConnectJob, replies: Vec<
                     }
                 }
             }
-            Err(e) => Ok(fail(j, SignInError::Failed, e)),
+            Err(e) => unusable(j, e),
         },
     }
 }

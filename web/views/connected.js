@@ -157,7 +157,8 @@ export function attachPreviews(root) {
 // Settings › Connected apps
 
 // What the codes in `?connect_error=` mean. The link carries only a code, never a message:
-// anyone can make a link to this page.
+// anyone can make a link to this page. For `failed`, the server may know why (the account the app
+// gave can't be used): list_connections says so in the app's `sign_in_error`, shown as text.
 const connectErrors = {
   expired_link: () => 'That sign-in link is no longer valid. Start connecting again.',
   wrong_person: () => 'Sign in to DumbSlab as the person who started connecting, then try again.',
@@ -169,7 +170,10 @@ const connectErrors = {
 };
 
 function connectError(code, app) {
-  return Object.hasOwn(connectErrors, code) ? connectErrors[code](app) : 'Connecting didn’t work. Try again.';
+  const reason = code === 'failed' && app && app.sign_in_error && app.sign_in_error.message;
+  if (reason) return reason;
+  const name = app ? app.name : 'the app';
+  return Object.hasOwn(connectErrors, code) ? connectErrors[code](name) : 'Connecting didn’t work. Try again.';
 }
 
 export async function connectionsSection() {
@@ -183,7 +187,7 @@ export async function connectionsSection() {
   if (query.get('connect_error')) {
     const app = list.apps.find((a) => a.id === query.get('app'));
     notes.push(h('p', { class: 'callout callout-warn', role: 'alert' }, icon('alert', { size: 15 }),
-      h('span', null, connectError(query.get('connect_error'), app ? app.name : 'the app'))));
+      h('span', null, connectError(query.get('connect_error'), app))));
   }
   if (!list.enabled) {
     return h('section', { class: 'panel' }, emptyState({ iconName: 'plug', title: 'Connected apps aren’t set up here',

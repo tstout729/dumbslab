@@ -203,8 +203,10 @@ pub const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0013_add_to_slack.sql"),
     // Docs sync through DumbSlab's GitHub and GitLab apps.
     include_str!("migrations/0014_docs_sync_apps.sql"),
-    // What docs sync through DumbSlab's GitLab app adds. Listed last.
+    // What docs sync through DumbSlab's GitLab app adds.
     include_str!("migrations/0015_docs_sync_gitlab.sql"),
+    // Why a sign-in with a connected app didn't work, for Settings. Listed last.
+    include_str!("migrations/0016_connect_failures.sql"),
 ];
 
 /// Brings the schema up to date. Safe to call on every start.
