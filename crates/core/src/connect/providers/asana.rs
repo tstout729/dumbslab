@@ -119,6 +119,10 @@ fn project_hit(p: &Value, workspace: &str) -> Hit {
     }
 }
 
+/// Why an account can't be used, in fixed words (see [`Connector::public_reasons`]).
+const NO_NAME: &str = "Asana didn't say whose account that is.";
+const NO_WORKSPACE: &str = "That Asana account isn't in any workspace.";
+
 impl Connector for Asana {
     fn info(&self) -> &'static ProviderInfo {
         &INFO
@@ -137,7 +141,7 @@ impl Connector for Asana {
             });
         }
         let me = &r.json()["data"];
-        let label = opt(&me["email"]).or_else(|| opt(&me["name"])).ok_or("Asana didn't say whose account that is.")?;
+        let label = opt(&me["email"]).or_else(|| opt(&me["name"])).ok_or(NO_NAME)?;
         let spaces: Vec<Value> = me["workspaces"]
             .as_array()
             .into_iter()
@@ -147,9 +151,13 @@ impl Connector for Asana {
             .map(|w| json!({ "gid": s(&w["gid"]), "name": s(&w["name"]) }))
             .collect();
         if spaces.is_empty() {
-            return Err("That Asana account isn't in any workspace.".into());
+            return Err(NO_WORKSPACE.into());
         }
         Ok(Account { label, settings: json!({ "workspaces": spaces }) })
+    }
+
+    fn public_reasons(&self, _cred: &Credential) -> Vec<String> {
+        vec![NO_NAME.into(), NO_WORKSPACE.into()]
     }
 
     /// For each workspace: its tasks, then its projects.

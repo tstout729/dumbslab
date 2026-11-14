@@ -157,6 +157,12 @@ pub fn profile_calls(product: &str, me_path: &str, cred: &Credential) -> Vec<Htt
     vec![HttpCall::get(format!("{GATEWAY}/oauth/token/accessible-resources")).bearer(&cred.token).header("accept", "application/json")]
 }
 
+/// Why a sign-in to `name` (Jira or Confluence) can't be used: Atlassian gave no site that has it.
+/// Fixed words, so Settings may show it after the sign-in (see [`Connector::public_reasons`]).
+pub fn no_site(name: &str) -> String {
+    format!("Atlassian didn't give access to a site with {name}. Connect again and choose a site that has {name}.")
+}
+
 /// Reads the answers to [`profile_calls`]. Atlassian lists each site once per product, so `scope`
 /// (one only this product has) picks the product's sites. The account is labeled with its site
 /// only: nothing personal is kept (see the module docs).
@@ -194,7 +200,7 @@ pub fn read_account(name: &str, scope: &str, cred: &Credential, replies: &[HttpR
     // Atlassian lists sites in no particular order; pick the same one every time.
     sites.sort();
     let Some((host, cloud_id)) = sites.into_iter().next() else {
-        return Err(format!("Atlassian didn't give access to a site with {name}. Connect again and choose a site that has {name}."));
+        return Err(no_site(name));
     };
     Ok(Account { label: host.clone(), settings: json!({ "site": host, "cloud_id": cloud_id }) })
 }
@@ -282,6 +288,10 @@ impl Connector for Jira {
 
     fn read_profile(&self, cred: &Credential, replies: &[HttpReply]) -> Result<Account, String> {
         read_account("Jira", "read:jira-work", cred, replies)
+    }
+
+    fn public_reasons(&self, _cred: &Credential) -> Vec<String> {
+        vec![no_site("Jira")]
     }
 
     /// Jira has no relevance order, so the most recently updated come first.

@@ -397,6 +397,26 @@ mod tests {
     }
 
     #[test]
+    fn dot_segments_never_pick_another_item() {
+        // A browser resolves `.` and `..` (also as %2e), so these open item 8 (or another project's)
+        // while the segments before them name item 7: no preview, rather than the wrong one.
+        let com = on("gitlab.com");
+        for kind in ["issues", "merge_requests", "work_items"] {
+            for tail in ["/../../work_items/8", "/%2e%2e/%2E%2E/issues/8", "/.%2e/8", "/%2E./8", "/./../8", "/%2e/../8", "/.."] {
+                let url = format!("https://gitlab.com/acme/api/-/{kind}/7{tail}");
+                assert_eq!(GitLab.preview_target(&com, &url), None, "{url}");
+                assert!(!GitLab.recognizes(&url), "{url}");
+            }
+            let url = format!("https://gitlab.com/acme/other/../api/-/{kind}/7");
+            assert_eq!(GitLab.preview_target(&com, &url), None, "{url}");
+            let url = format!("https://gitlab.com/acme/%2e%2e/api/-/{kind}/7");
+            assert_eq!(GitLab.preview_target(&com, &url), None, "{url}");
+        }
+        // Without dot segments, what follows the number doesn't change the item.
+        assert_eq!(GitLab.preview_target(&com, "https://gitlab.com/acme/api/-/merge_requests/7/diffs").as_deref(), Some("acme/api!7"));
+    }
+
+    #[test]
     fn previews_tasks_and_other_work_items_by_their_type() {
         let cred = Credential { token: "t".into(), ..Default::default() };
         let com = on("gitlab.com");

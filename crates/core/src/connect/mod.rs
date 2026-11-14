@@ -37,9 +37,10 @@ pub const FETCH_TIMEOUT_SECS: u64 = 8;
 pub const MAX_STEPS: usize = 5;
 /// How long a sign-in with another app may take.
 const SIGN_IN_MINUTES: i64 = 15;
-/// How long Settings may show why a sign-in didn't work (see [`remember_failure`]).
+/// How long Settings may show why a sign-in didn't work, and how long a sign-in under way may still
+/// record that (see [`remember_failure`]).
 const FAILURE_MINUTES: i64 = 15;
-/// The most characters of that reason kept.
+/// The most characters of that reason kept, `…` included.
 const FAILURE_CHARS: usize = 300;
 /// Tokens this close to expiring are refreshed before use.
 const REFRESH_MARGIN_SECS: i64 = 300;
@@ -329,6 +330,14 @@ pub trait Connector: Sync {
     /// Reads the answers to [`Connector::profile`]. An error explains what's wrong, for the person.
     fn read_profile(&self, cred: &Credential, replies: &[HttpReply]) -> Result<Account, String>;
 
+    /// The sentences [`Connector::read_profile`] can fail with for a sign-in that hold nothing from
+    /// the app's answers: fixed words, with at most the app's name or the site the credential
+    /// keeps. After a sign-in, Settings may show one of these (see [`public_reason`]); any other
+    /// error could quote the app, so it isn't kept. Apps that keep none get the default.
+    fn public_reasons(&self, _cred: &Credential) -> Vec<String> {
+        vec![]
+    }
+
     /// Requests that search the app for `q`.
     fn search(&self, cred: &Credential, account: &Account, q: &str, limit: usize) -> Vec<HttpCall>;
 
@@ -399,10 +408,22 @@ pub fn host_of(url: &str) -> Option<String> {
 
 /// A URL's path segments, as written (still percent-encoded), without the query or fragment.
 /// Apps' recognizers accept only the characters their ids use, so a segment can't smuggle a `/`
-/// or `?` into the request built from it.
+/// or `?` into the request built from it. A path with a `.` or `..` segment, also percent-encoded
+/// (`%2e`, `.%2E`…), has none: browsers resolve those, so `…/issues/7/../8` opens item 8 while its
+/// segments name 7.
 pub fn path_of(url: &str) -> Vec<String> {
     let path = host_and_path(url).map(|(_, p)| p).unwrap_or_default();
-    path.split('/').filter(|s| !s.is_empty()).map(str::to_string).collect()
+    let segments: Vec<String> = path.split('/').filter(|s| !s.is_empty()).map(str::to_string).collect();
+    if segments.iter().any(|s| is_dot_segment(s)) {
+        return vec![];
+    }
+    segments
+}
+
+/// `.` or `..`, as browsers read path segments: `%2e` is a dot too.
+fn is_dot_segment(segment: &str) -> bool {
+    let dots = segment.to_ascii_lowercase().replace("%2e", ".");
+    dots == "." || dots == ".."
 }
 
 /// Reads a standard OAuth token answer.
@@ -672,7 +693,7 @@ fn save(db: &dyn Db, cfg: &HostConfig, j: &ConnectJob, account: &Account, now: D
            expires_at = excluded.expires_at, refreshing_until = NULL, updated_at = excluded.updated_at",
         &params![j.user_id.clone(), j.provider, account.label.clone(), account.settings.to_string(), secret, j.expires_at.map(ts), ts(now), ts(now)],
     )?;
-    forget_failure(db, &j.user_id, j.provider)?;
+    connected_now(db, j, now)?;
     Ok(())
 }
 
@@ -847,14 +868,14 @@ pub fn start_sign_in(
     }
     let (authorize_url, _) = oauth_urls(connector, &cred).map_err(ApiError::bad_request)?;
     db.execute("DELETE FROM connect_requests WHERE created_at < ?", &params![ts(now - Duration::minutes(SIGN_IN_MINUTES))])?;
-    // Why the last try didn't work no longer applies: this one gets its own outcome.
-    db.execute("DELETE FROM connect_failures WHERE created_at < ?", &params![ts(now - Duration::minutes(FAILURE_MINUTES))])?;
-    forget_failure(db, user_id, info.id)?;
     let random = crate::util::new_secret("");
     let state = match &cfg.workspace {
         Some(address) => format!("{address}.{random}"),
         None => random,
     };
+    // This sign-in is the person's latest with the app: why an earlier one failed no longer
+    // applies, and only this one may say why it failed.
+    start_attempt(db, user_id, info.id, &sha256_hex(&state), now)?;
     let verifier = spec.pkce.then(|| crate::util::new_secret("") + &crate::util::new_secret(""));
     let pending = Pending { verifier: verifier.clone(), site: spec.site.map(|f| cred.field(f.key).to_string()) };
     db.execute(
@@ -929,34 +950,85 @@ fn settings_url(base_url: &str, provider: &str, outcome: Result<(), SignInError>
 #[derive(Clone, Debug, PartialEq, Serialize, JsonSchema)]
 pub struct SignInFailure {
     /// What went wrong and what to do, e.g. "Atlassian didn't give access to a site with Jira.
-    /// Connect again and choose a site that has Jira." Plain text.
+    /// Connect again and choose a site that has Jira." Plain text, one of DumbSlab's own fixed
+    /// sentences: nothing the app sent back.
     pub message: String,
+    /// When the sign-in failed: UTC, RFC 3339 with milliseconds, e.g. `2026-11-14T20:06:04.061Z`.
     pub failed_at: String,
 }
 
-/// Keeps why `user_id`'s sign-in with `provider` didn't work, for Settings to show once the app
-/// sends them back (the link carries only a code). Only for the person who signed in, only for
-/// [`FAILURE_MINUTES`], at most [`FAILURE_CHARS`] characters. `message` is the connector's own
-/// sentence about the account it got, the one a token connection is answered with (a few quote the
-/// app's short error message, as previews do); never an app's raw answer, a token or a secret.
-fn remember_failure(db: &dyn Db, user_id: &str, provider: &str, message: &str, now: DateTime<Utc>) -> ApiResult<()> {
+// A person's latest sign-in with each app, in `connect_attempts`, so that only it may record why it
+// failed. Rows are kept a short while: Settings never shows one older than FAILURE_MINUTES, and
+// [`prune_attempts`] deletes those whenever someone in the workspace starts a sign-in, connects an
+// app, or a sign-in fails. So until then a few expired rows may remain, and a backup may copy
+// them. They hold only an OAuth state's hash and a sentence from [`public_reason`].
+
+/// Records that `attempt` (the hash of a sign-in's OAuth `state`) is now `user_id`'s latest sign-in
+/// with `provider`, replacing any earlier one and why it failed.
+fn start_attempt(db: &dyn Db, user_id: &str, provider: &str, attempt: &str, now: DateTime<Utc>) -> ApiResult<()> {
+    prune_attempts(db, now)?;
     db.execute(
-        "INSERT INTO connect_failures (user_id, provider, message, created_at) VALUES (?, ?, ?, ?)
-         ON CONFLICT(user_id, provider) DO UPDATE SET message = excluded.message, created_at = excluded.created_at",
-        &params![user_id, provider, excerpt(message, FAILURE_CHARS), ts(now)],
+        "INSERT INTO connect_attempts (user_id, provider, attempt, message, created_at) VALUES (?, ?, ?, NULL, ?)
+         ON CONFLICT(user_id, provider) DO UPDATE SET attempt = excluded.attempt, message = NULL, created_at = excluded.created_at",
+        &params![user_id, provider, attempt, ts(now)],
     )?;
     Ok(())
 }
 
-fn forget_failure(db: &dyn Db, user_id: &str, provider: &str) -> ApiResult<()> {
-    db.execute("DELETE FROM connect_failures WHERE user_id = ? AND provider = ?", &params![user_id, provider])?;
+/// Deletes attempts older than [`FAILURE_MINUTES`]: sign-ins that can't finish any more, and
+/// reasons Settings no longer shows.
+fn prune_attempts(db: &dyn Db, now: DateTime<Utc>) -> ApiResult<()> {
+    db.execute("DELETE FROM connect_attempts WHERE created_at < ?", &params![ts(now - Duration::minutes(FAILURE_MINUTES))])?;
     Ok(())
+}
+
+/// Keeps why a sign-in failed, for Settings to show once the app sends the person back (the link
+/// carries only a code): only if it's still their latest sign-in with the app, so an older one
+/// that fails late can't cover up a newer one that worked. `reason` comes from [`public_reason`].
+fn remember_failure(db: &dyn Db, j: &ConnectJob, attempt: &str, reason: &str, now: DateTime<Utc>) -> ApiResult<()> {
+    prune_attempts(db, now)?;
+    db.execute(
+        "UPDATE connect_attempts SET message = ?, created_at = ? WHERE user_id = ? AND provider = ? AND attempt = ?",
+        &params![failure_text(reason), ts(now), j.user_id.clone(), j.provider, attempt],
+    )?;
+    Ok(())
+}
+
+/// At most [`FAILURE_CHARS`] characters, `…` included.
+fn failure_text(reason: &str) -> String {
+    let whole = excerpt(reason, FAILURE_CHARS);
+    if whole.chars().count() <= FAILURE_CHARS { whole } else { excerpt(reason, FAILURE_CHARS - 1) }
+}
+
+/// The app is connected now: a sign-in that started earlier can no longer say it failed, and an
+/// earlier failure no longer applies. A sign-in started later than the one that just connected
+/// may still record its own failure.
+fn connected_now(db: &dyn Db, j: &ConnectJob, now: DateTime<Utc>) -> ApiResult<()> {
+    prune_attempts(db, now)?;
+    match &j.attempt {
+        Some(attempt) => db.execute(
+            "DELETE FROM connect_attempts WHERE user_id = ? AND provider = ? AND (attempt = ? OR message IS NOT NULL)",
+            &params![j.user_id.clone(), j.provider, attempt.clone()],
+        )?,
+        None => db.execute("DELETE FROM connect_attempts WHERE user_id = ? AND provider = ?", &params![j.user_id.clone(), j.provider])?,
+    };
+    Ok(())
+}
+
+/// What a failed sign-in may keep for Settings: `message`, but only when it's one of the sentences
+/// that hold nothing from the app's answers: the usual HTTP statuses' ([`http_error`], for one of
+/// `replies`) or the app's own [`Connector::public_reasons`]. Any other message could quote the app
+/// (an error it sent back, which might even hold a token), so Settings keeps to the code's message.
+fn public_reason(connector: &dyn Connector, cred: &Credential, message: &str, replies: &[HttpReply]) -> Option<String> {
+    let name = connector.info().name;
+    let statuses = replies.iter().filter(|r| !r.ok()).any(|r| http_error(name, r) == message);
+    (statuses || connector.public_reasons(cred).iter().any(|r| r == message)).then(|| message.to_string())
 }
 
 /// Why `user_id`'s recent sign-ins didn't work, by app (see [`remember_failure`]).
 pub fn sign_in_failures(db: &dyn Db, user_id: &str, now: DateTime<Utc>) -> ApiResult<BTreeMap<String, SignInFailure>> {
     let rows = db.query(
-        "SELECT provider, message, created_at FROM connect_failures WHERE user_id = ? AND created_at > ?",
+        "SELECT provider, message, created_at FROM connect_attempts WHERE user_id = ? AND message IS NOT NULL AND created_at > ?",
         &params![user_id, ts(now - Duration::minutes(FAILURE_MINUTES))],
     )?;
     Ok(rows.iter().map(|r| (r.str("provider"), SignInFailure { message: r.str("message"), failed_at: r.str("created_at") })).collect())
@@ -1028,6 +1100,7 @@ pub fn callback(db: &dyn Db, cfg: &HostConfig, req: &Request) -> crate::Outcome 
             expires_at: None,
             phase: ConnectPhase::Start,
             back_to: Some(base.clone()),
+            attempt: Some(sha256_hex(&state)),
         });
         let mut out = redirect(settings_url(&base, &provider, Err(SignInError::Failed)));
         out.effects.push(crate::Effect::Connect(job));
@@ -1370,6 +1443,8 @@ pub struct ConnectJob {
     phase: ConnectPhase,
     /// Where to send the browser at the end (sign-ins); `None` fills the operation's answer.
     pub back_to: Option<String>,
+    /// For sign-ins: which one this is (the hash of its OAuth `state`; see [`start_attempt`]).
+    attempt: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1382,7 +1457,16 @@ enum ConnectPhase {
 impl ConnectJob {
     /// Connecting with a personal token.
     pub fn with_token(user_id: &str, provider: &'static str, cred: Credential) -> ConnectJob {
-        ConnectJob { user_id: user_id.into(), provider, sign_in: None, cred, expires_at: None, phase: ConnectPhase::Start, back_to: None }
+        ConnectJob {
+            user_id: user_id.into(),
+            provider,
+            sign_in: None,
+            cred,
+            expires_at: None,
+            phase: ConnectPhase::Start,
+            back_to: None,
+            attempt: None,
+        }
     }
 }
 
@@ -1844,11 +1928,14 @@ fn connect_step(db: &dyn Db, cfg: &HostConfig, j: &mut ConnectJob, replies: Vec<
             None => Step::Done(Finish::Fail(ApiError::new(400, "connect_failed", message))),
         }
     };
-    // The account (or site) the sign-in gave can't be used: Settings says why, in the connector's
-    // own words, which a token connection gets as its error.
-    let unusable = |j: &ConnectJob, message: String| -> ApiResult<Step> {
-        if j.back_to.is_some() {
-            remember_failure(db, &j.user_id, j.provider, &message, now)?;
+    // The account the sign-in gave can't be used: Settings says why when the connector's message is
+    // one that holds nothing from the app's answers (see `public_reason`). A token connection gets
+    // the message itself, as its error.
+    let unusable = |j: &ConnectJob, message: String, replies: &[HttpReply]| -> ApiResult<Step> {
+        if let (Some(_), Some(attempt)) = (&j.back_to, &j.attempt)
+            && let Some(reason) = public_reason(connector, &j.cred, &message, replies)
+        {
+            remember_failure(db, j, attempt, &reason, now)?;
         }
         Ok(fail(j, SignInError::Failed, message))
     };
@@ -1862,7 +1949,7 @@ fn connect_step(db: &dyn Db, cfg: &HostConfig, j: &mut ConnectJob, replies: Vec<
                 // it in the credential).
                 let token_url = match oauth_urls(connector, &j.cred) {
                     Ok((_, token_url)) => token_url,
-                    Err(e) => return unusable(j, e),
+                    Err(e) => return Ok(fail(j, SignInError::Failed, e)),
                 };
                 let mut form = vec![
                     ("grant_type".into(), "authorization_code".into()),
@@ -1913,7 +2000,7 @@ fn connect_step(db: &dyn Db, cfg: &HostConfig, j: &mut ConnectJob, replies: Vec<
                     }
                 }
             }
-            Err(e) => unusable(j, e),
+            Err(e) => unusable(j, e, &replies),
         },
     }
 }
@@ -2061,5 +2148,58 @@ mod tests {
     fn excerpts() {
         assert_eq!(excerpt("  a \n b  ", 10), "a b");
         assert_eq!(excerpt("one two three four", 9), "one two…");
+    }
+
+    #[test]
+    fn paths_with_dot_segments_name_nothing() {
+        assert_eq!(path_of("https://x.test/a/b/-/issues/7?x=1#y"), ["a", "b", "-", "issues", "7"]);
+        assert_eq!(path_of("https://x.test/a/.../b..c/.x"), ["a", "...", "b..c", ".x"], "only `.` and `..` are dot segments");
+        // Browsers resolve these, so the page opened isn't the one the segments name.
+        for url in [
+            "https://x.test/a/b/-/issues/7/../8",
+            "https://x.test/a/b/-/issues/7/./8",
+            "https://x.test/a/b/-/issues/7/%2e%2e/8",
+            "https://x.test/a/b/-/issues/7/%2E%2E/8",
+            "https://x.test/a/b/-/issues/7/.%2e/8",
+            "https://x.test/a/b/-/issues/7/%2E./8",
+            "https://x.test/a/b/-/issues/7/%2e/8",
+            "https://x.test/../a/b/-/issues/7",
+            "https://x.test/a/b/-/issues/7/..",
+        ] {
+            assert!(path_of(url).is_empty(), "{url}");
+        }
+    }
+
+    #[test]
+    fn kept_reasons_are_fixed_words_only() {
+        let jira = &providers::jira::Jira;
+        let none = Credential::default();
+        let no_site = providers::jira::no_site("Jira");
+        assert_eq!(public_reason(jira, &none, &no_site, &[]), Some(no_site.clone()));
+        // The usual statuses, for a reply that had one.
+        let down = HttpReply { status: 503, body: "{\"token\":\"Bearer abc\"}".into() };
+        let said = http_error("Jira", &down);
+        assert_eq!(public_reason(jira, &none, &said, std::slice::from_ref(&down)), Some(said.clone()));
+        assert_eq!(public_reason(jira, &none, &said, &[]), None, "no such reply");
+        // Anything else may quote the app, a token even.
+        let monday = &providers::monday::Monday;
+        assert_eq!(public_reason(monday, &none, "monday.com refused: Bearer eyJsecret rejected", &[]), None);
+        assert_eq!(public_reason(jira, &none, &format!("{no_site} Bearer abc"), &[]), None);
+        // Zendesk's keep the site the credential keeps, and name nobody.
+        let zendesk = &providers::zendesk::Zendesk;
+        let acme = Credential { fields: [("subdomain".to_string(), "acme".to_string())].into(), ..Default::default() };
+        let reasons = zendesk.public_reasons(&acme);
+        assert!(reasons.iter().any(|r| r == "acme.zendesk.com didn't recognize the sign-in. Try connecting again."), "{reasons:?}");
+        assert!(reasons.iter().all(|r| !r.contains('@')));
+    }
+
+    #[test]
+    fn kept_reasons_fit_the_cap() {
+        let exact = "x".repeat(FAILURE_CHARS);
+        assert_eq!(failure_text(&exact), exact, "a reason that fits stays whole");
+        for long in ["y".repeat(FAILURE_CHARS + 1), "word ".repeat(200), "z".repeat(5000)] {
+            let kept = failure_text(&long);
+            assert!(kept.chars().count() <= FAILURE_CHARS && kept.ends_with('…'), "{} chars", kept.chars().count());
+        }
     }
 }

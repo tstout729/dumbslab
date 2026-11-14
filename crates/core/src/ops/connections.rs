@@ -65,10 +65,10 @@ pub struct AppInfo {
     pub token_help: Option<String>,
     /// Your connection, if you made one.
     pub connected: Option<ConnectedAccount>,
-    /// Why your last sign-in with this app didn't work, when DumbSlab can say and it was in the
-    /// last few minutes: the account the app gave can't be used, for example. The link back to
-    /// Settings carries only a code (`connect_error=failed`); this is the reason. Signing in again
-    /// or connecting the app clears it.
+    /// Why your last sign-in with this app didn't work, when DumbSlab can say in its own fixed
+    /// words and it was in the last 15 minutes: the account the app gave can't be used, for
+    /// example. The link back to Settings carries only a code (`connect_error=failed`); this is the
+    /// reason. Signing in again or connecting the app clears it.
     pub sign_in_error: Option<SignInFailure>,
 }
 

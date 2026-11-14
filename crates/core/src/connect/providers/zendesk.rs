@@ -197,6 +197,19 @@ fn article_hit(a: &Value) -> Hit {
     }
 }
 
+/// Why a sign-in at `host` can't be used, in fixed words and the site the credential keeps (see
+/// [`Connector::public_reasons`]).
+fn sign_in_refused(host: &str) -> String {
+    format!("{host} didn't accept the sign-in. Try connecting again.")
+}
+
+fn sign_in_unknown(host: &str) -> String {
+    format!("{host} didn't recognize the sign-in. Try connecting again.")
+}
+
+/// Names nobody: the account's email and name are Zendesk's to say, so they stay out.
+const END_USER_SIGN_IN: &str = "That Zendesk account is an end user. Only agents and admins can search tickets, so sign in as an agent.";
+
 impl Connector for Zendesk {
     fn info(&self) -> &'static ProviderInfo {
         &INFO
@@ -217,7 +230,7 @@ impl Connector for Zendesk {
         let r = replies.first().cloned().unwrap_or_default();
         if !r.ok() {
             return Err(match (r.status, &email) {
-                (401, None) => format!("{host} didn't accept the sign-in. Try connecting again."),
+                (401, None) => sign_in_refused(&host),
                 (401, Some(_)) => format!("{host} rejected that email and API token. Check both, and that the token is still active."),
                 (404, _) => format!("There's no Zendesk at {host}. Check the subdomain."),
                 _ => http_error("Zendesk", &r),
@@ -227,15 +240,25 @@ impl Connector for Zendesk {
         // Without credentials Zendesk answers with an anonymous user, who has no ID.
         let Some(id) = user["id"].as_i64() else {
             return Err(match email {
-                None => format!("{host} didn't recognize the sign-in. Try connecting again."),
+                None => sign_in_unknown(&host),
                 Some(_) => format!("{host} didn't recognize that email and API token."),
             });
         };
+        let signing_in = email.is_none();
         let shown = opt(&user["email"]).or(email).or_else(|| opt(&user["name"])).unwrap_or_else(|| format!("User {id}"));
         if user["role"] == "end-user" {
-            return Err(format!("{shown} is an end user in Zendesk. Only agents and admins can search tickets, so connect as an agent."));
+            return Err(match signing_in {
+                true => END_USER_SIGN_IN.into(),
+                false => format!("{shown} is an end user in Zendesk. Only agents and admins can search tickets, so connect as an agent."),
+            });
         }
         Ok(Account { label: format!("{shown} ({host})"), settings: json!({ "host": host, "user_id": id }) })
+    }
+
+    fn public_reasons(&self, cred: &Credential) -> Vec<String> {
+        let Ok(sub) = subdomain(cred.field("subdomain")) else { return vec![] };
+        let host = format!("{sub}.zendesk.com");
+        vec![sign_in_refused(&host), sign_in_unknown(&host), END_USER_SIGN_IN.into()]
     }
 
     fn search(&self, cred: &Credential, account: &Account, q: &str, limit: usize) -> Vec<HttpCall> {

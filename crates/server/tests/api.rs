@@ -3560,20 +3560,29 @@ mod connected {
         assert!(apps.as_array().unwrap().iter().any(|a| a["id"] == "jira" && a["sign_in_error"]["message"] == reason), "{apps}");
         // Nobody else sees it.
         assert!(jira(&mo)["sign_in_error"].is_null());
-        // It's for right after: a quarter of an hour later it's gone.
-        let old = dumbslab_core::util::ts(chrono::Utc::now() - chrono::Duration::minutes(20));
-        h.store
-            .with_tx(|db| (db.execute("UPDATE connect_failures SET created_at = ?", &dumbslab_core::params![old]), true))
-            .unwrap()
-            .unwrap();
+        // It's for right after: a quarter of an hour later it's gone...
+        let age = |minutes: i64| {
+            let old = dumbslab_core::util::ts(chrono::Utc::now() - chrono::Duration::minutes(minutes));
+            h.store
+                .with_tx(|db| (db.execute("UPDATE connect_attempts SET created_at = ?", &dumbslab_core::params![old]), true))
+                .unwrap()
+                .unwrap();
+        };
+        age(20);
         assert!(jira(&admin)["sign_in_error"].is_null());
+        // ...and the row goes the next time anyone in the workspace starts a sign-in.
+        let kept = |filter: &str| count(&h, &format!("SELECT COUNT(*) FROM connect_attempts {filter}"));
+        assert_eq!(kept("WHERE message IS NOT NULL"), 1, "expired and hidden, but still there");
+        h.ok("POST", "/api/v1/connections", Some(json!({ "app": "jira" })), &mo);
+        assert_eq!((kept("WHERE message IS NOT NULL"), kept("")), (0, 1), "only Mo's new sign-in is left");
 
         // Signing in again starts fresh. A refused code shows only what the code means: the app's
         // own description stays out of Settings, as it stays out of the link.
         fail();
         let state = start();
         assert!(jira(&admin)["sign_in_error"].is_null(), "a new sign-in clears the old reason");
-        assert_eq!(count(&h, "SELECT COUNT(*) FROM connect_failures"), 0, "and old reasons are dropped");
+        let reasons = || count(&h, "SELECT COUNT(*) FROM connect_attempts WHERE message IS NOT NULL");
+        assert_eq!(reasons(), 0, "and old reasons are dropped");
         let refused = |_: &HttpCall| HttpReply {
             status: 400,
             body: json!({ "error": "invalid_grant", "error_description": "Call 555-0100" }).to_string(),
@@ -3598,7 +3607,7 @@ mod connected {
         let r = h.call("POST", "/api/v1/connections", Some(fields), &admin);
         let (finish, _) = drive(&h, job_of(&r), &|_: &HttpCall| HttpReply { status: 401, body: "{}".into() });
         assert!(matches!(finish, Finish::Fail(ref e) if e.message.contains("rejected")), "{finish:?}");
-        assert_eq!(count(&h, "SELECT COUNT(*) FROM connect_failures"), 0);
+        assert_eq!(reasons(), 0);
 
         // On a full workspace the step that would keep the reason is refused and rolled back; the
         // person still lands on Settings with the code (the callback's own redirect).
@@ -3606,7 +3615,142 @@ mod connected {
         let exchange = fetches(step(&h, &mut job, vec![]));
         let profile = fetches(step(&h, &mut job, exchange.iter().map(no_site).collect()));
         assert!(step_on_a_full_workspace(&h, &mut job, profile.iter().map(no_site).collect()).is_err());
-        assert_eq!(count(&h, "SELECT COUNT(*) FROM connect_failures"), 0);
+        assert_eq!(reasons(), 0);
+    }
+
+    #[test]
+    fn a_sign_in_keeps_no_words_from_the_apps_answer() {
+        let mut h = H::new();
+        let (admin, admin_token) = h.setup();
+        with_key(&mut h);
+        for app in ["monday", "linear", "slack"] {
+            h.cfg.connectors.apps.insert(app.into(), OAuthApp { client_id: format!("{app}-id"), client_secret: format!("{app}-secret") });
+        }
+        // Signs in to `app`; its token endpoint works, and its account check answers `profile`.
+        let sign_in = |app: &str, profile: HttpReply| {
+            let url =
+                h.ok("POST", "/api/v1/connections", Some(json!({ "app": app })), &admin)["authorize_url"].as_str().unwrap().to_string();
+            let state = query_of(&url)["state"].clone();
+            let r = h.call("GET", &format!("/connect/callback?code=the-code&state={}", urlencoding::encode(&state)), None, &admin);
+            let answer = |c: &HttpCall| {
+                if c.url.contains("oauth") {
+                    ok(json!({ "ok": true, "access_token": "at-1", "token_type": "bearer",
+                        "authed_user": { "access_token": "xoxp-1", "token_type": "user" } }))
+                } else {
+                    profile.clone()
+                }
+            };
+            let (finish, _) = drive(&h, job_of(&r), &answer);
+            assert!(matches!(&finish, Finish::Redirect(u) if u.ends_with(&format!("connect_error=failed&app={app}"))), "{app}: {finish:?}");
+        };
+        let shown = |app: &str| {
+            let list = h.ok("GET", "/api/v1/connections", None, &admin);
+            list["apps"].as_array().unwrap().iter().find(|a| a["id"] == app).unwrap()["sign_in_error"]["message"]
+                .as_str()
+                .map(str::to_string)
+        };
+
+        // Each of these apps' errors can quote what the app said: here, a credential it echoed back.
+        let secret = "Bearer eyJhbGciOiJIUzI1NiJ9.c2VjcmV0.sig";
+        let quoting = [
+            ("monday", json!({ "errors": [{ "message": format!("{secret} rejected") }] })),
+            (
+                "linear",
+                json!({ "errors": [{ "message": "x", "extensions": { "code": "INTERNAL", "userPresentableMessage": format!("{secret} rejected") } }] }),
+            ),
+            ("slack", json!({ "ok": false, "error": format!("{secret} rejected") })),
+        ];
+        for (app, body) in quoting {
+            sign_in(app, ok(body));
+            assert_eq!(shown(app), None, "{app}");
+        }
+        // None of it is stored, or answered over REST or MCP.
+        assert_eq!(count(&h, "SELECT COUNT(*) FROM connect_attempts WHERE message IS NOT NULL"), 0);
+        assert_eq!(count(&h, "SELECT COUNT(*) FROM connect_attempts WHERE message LIKE '%eyJ%' OR attempt LIKE '%eyJ%'"), 0);
+        let list = h.ok("GET", "/api/v1/connections", None, &admin).to_string();
+        let call = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": { "name": "list_connections", "arguments": {} } });
+        let via_mcp = h.mcp(&admin_token, "", call).body.to_string();
+        assert!(!list.contains("eyJ") && !via_mcp.contains("eyJ"), "{list} {via_mcp}");
+
+        // DumbSlab's own fixed sentences are kept: what a status means, and an app's own.
+        sign_in("slack", HttpReply { status: 503, body: json!({ "error": secret }).to_string() });
+        assert_eq!(shown("slack").as_deref(), Some("Slack had an error (HTTP 503). Try again later."));
+        sign_in("slack", ok(json!({ "ok": false, "error": "invalid_auth" })));
+        assert_eq!(shown("slack").as_deref(), Some("Slack rejected the saved credentials. Reconnect Slack in Settings › Connected apps."));
+    }
+
+    #[test]
+    fn an_older_sign_in_cannot_cover_up_a_newer_one() {
+        let mut h = H::new();
+        let (admin, _) = h.setup();
+        with_key(&mut h);
+        h.cfg.connectors.apps.insert("jira".into(), OAuthApp { client_id: "atl".into(), client_secret: "atl-secret".into() });
+        let jira = || {
+            let list = h.ok("GET", "/api/v1/connections", None, &admin);
+            list["apps"].as_array().unwrap().iter().find(|a| a["id"] == "jira").unwrap().clone()
+        };
+        let reason = || jira()["sign_in_error"]["message"].as_str().map(str::to_string);
+        // A sign-in, from its start to the callback's job.
+        let begin = || {
+            let url =
+                h.ok("POST", "/api/v1/connections", Some(json!({ "app": "jira" })), &admin)["authorize_url"].as_str().unwrap().to_string();
+            let state = query_of(&url)["state"].clone();
+            job_of(&h.call("GET", &format!("/connect/callback?code=the-code&state={}", urlencoding::encode(&state)), None, &admin))
+        };
+        // Runs a sign-in's job until its account check waits for Atlassian, then later answers it.
+        let until_check = |job: &mut Job| {
+            let exchange = fetches(step(&h, job, vec![]));
+            fetches(step(&h, job, exchange.iter().map(atlassian).collect()))
+        };
+        let answer = |job: &mut Job, calls: &[HttpCall], with: &dyn Fn(&HttpCall) -> HttpReply| match step(
+            &h,
+            job,
+            calls.iter().map(with).collect(),
+        ) {
+            Step::Done(Finish::Redirect(to)) => to,
+            other => panic!("expected a redirect, got {other:?}"),
+        };
+        let no_site = |c: &HttpCall| if c.url.ends_with("/oauth/token/accessible-resources") { ok(json!([])) } else { atlassian(c) };
+        let down = |_: &HttpCall| HttpReply { status: 503, body: "{}".into() };
+        let no_site_reason = "Atlassian didn't give access to a site with Jira. Connect again and choose a site that has Jira.";
+
+        // Sign-in A waits on Atlassian; sign-in B starts later and works; then A's check fails.
+        let mut a = begin();
+        let a_check = until_check(&mut a);
+        let (b, _) = drive(&h, begin(), &atlassian);
+        assert!(matches!(&b, Finish::Redirect(u) if u.ends_with("connected=jira")), "{b:?}");
+        assert!(answer(&mut a, &a_check, &no_site).ends_with("connect_error=failed&app=jira"));
+        assert_eq!(reason(), None, "A started before the sign-in that worked");
+        assert!(jira()["connected"].is_object());
+
+        // A token connection made while a sign-in waits is newer too.
+        h.ok("DELETE", "/api/v1/connections/jira", None, &admin);
+        let mut a = begin();
+        let a_check = until_check(&mut a);
+        let fields = json!({ "app": "jira", "fields": { "site": "acme.atlassian.net", "email": "ada@acme.com", "token": "atl-token" } });
+        let r = h.call("POST", "/api/v1/connections", Some(fields), &admin);
+        drive(&h, job_of(&r), &atlassian);
+        answer(&mut a, &a_check, &no_site);
+        assert_eq!(reason(), None);
+
+        // A newer sign-in still says why it failed after an older one worked.
+        h.ok("DELETE", "/api/v1/connections/jira", None, &admin);
+        let mut a = begin();
+        let a_check = until_check(&mut a);
+        let mut b = begin();
+        let b_check = until_check(&mut b);
+        assert!(answer(&mut a, &a_check, &atlassian).ends_with("connected=jira"));
+        answer(&mut b, &b_check, &no_site);
+        assert_eq!(reason().as_deref(), Some(no_site_reason), "B is the latest");
+
+        // And an older sign-in failing late doesn't replace the newer one's reason.
+        h.ok("DELETE", "/api/v1/connections/jira", None, &admin);
+        let mut a = begin();
+        let a_check = until_check(&mut a);
+        let (b, _) = drive(&h, begin(), &no_site);
+        assert!(matches!(&b, Finish::Redirect(u) if u.ends_with("connect_error=failed&app=jira")), "{b:?}");
+        answer(&mut a, &a_check, &down);
+        assert_eq!(reason().as_deref(), Some(no_site_reason));
     }
 
     /// One step under a guard that refuses every step, as the Worker does on a full workspace.
