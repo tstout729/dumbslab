@@ -47,6 +47,8 @@ The redirect (callback) URL to register is:
 
 The person who started signing in must be the one who comes back, signed in to the workspace, within 15 minutes; each sign-in link works once.
 
+When a sign-in doesn't work, the link back to Settings carries only a code (`connect_error=failed&app=jira`), never text: anyone can make such a link. When DumbSlab can say why in its own fixed words, Settings shows that reason, read from `list_connections` (the app's `sign_in_error`): for example that Atlassian gave access to no site with Jira, that a Zendesk account is an end user, or what an HTTP status means. A message that could quote the app's answer (an error it sent back) is never kept, nor are tokens or secrets; Settings then says only what the code means, as it does when the app refuses the sign-in itself. Only the person who signed in sees the reason, for 15 minutes, and only from their latest sign-in with that app: an older one that fails late can't cover up a newer one that worked. Signing in again or connecting the app clears it. Expired rows are deleted the next time someone in the workspace starts or fails a sign-in or connects an app.
+
 Some apps live on each company's own address. For those (Zendesk), Settings asks for it first, like `acme` for acme.zendesk.com, and signing in happens there (`connect_app` takes it as `site`). The server checks it strictly, keeps it with the sign-in rather than in the link, and seals it with the token, so the token only ever goes back to that address.
 
 ## The apps
@@ -63,7 +65,7 @@ Some apps live on each company's own address. For those (Zendesk), Settings asks
 | Box | `BOX` | files and folders | | | OAuth app |
 | Dropbox | `DROPBOX` | files and folders | | | app with PKCE |
 | Guru | `GURU` | cards | cards | email and user token | |
-| GitLab | `GITLAB` | | issues, merge requests | personal access token (and the server's URL for self-managed GitLab) | gitlab.com OAuth app |
+| GitLab | `GITLAB` | | issues, tasks and other project work items (`/-/issues/` and `/-/work_items/` links), merge requests | personal access token (and the server's URL for self-managed GitLab) | gitlab.com OAuth app |
 | Linear | `LINEAR` | | issues | personal API key | OAuth app |
 | Freshdesk | `FRESHDESK` | | tickets | domain and API key | |
 | Shortcut | `SHORTCUT` | | stories | API token | |
@@ -79,5 +81,5 @@ Things worth knowing before you register apps:
 - **Slack**'s terms allow distributing an app commercially only through the Slack Marketplace, so hosted DumbSlab's shared Slack app needs a listing. A self-hosted server's own Slack app counts as internal. Message search uses `search.messages`, which works for any app. Use the same Slack app for **Add to Slack** ([docs/hosting/slack-app.md](hosting/slack-app.md)): its manifest has every redirect URL and scope both need.
 - **Zendesk** is retiring API tokens: no new ones since October 27, 2026, and existing ones stop working on April 30, 2027. A service for many companies, like hosted DumbSlab, needs a *global* OAuth client, which Zendesk approves. With one, people type their subdomain and sign in on their own Zendesk (scope `read`, PKCE). Access tokens last 8 hours and refresh tokens 90 days, renewed on each refresh, so a connection unused for 90 days must be connected again. A self-hosted server connecting its own company's Zendesk may use a normal OAuth client from that account, or existing tokens.
 - **Atlassian**: one app in Atlassian's developer console serves Jira and Confluence (`ATLASSIAN_CLIENT_ID`). Add the Jira and Confluence APIs. Connections keep only the site, never anyone's account ID, email or name, so DumbSlab has no personal data to report to Atlassian (or to Trello). When the two share an app, each sign-in asks for both products' scopes: Atlassian keeps one grant per person and app, and a new consent replaces the old one's scopes. Trello can't share it: its OAuth 2.0 clients are made at trello.com/apps/admin.
-- **GitLab**: docs sync's Connect GitLab uses the same app, with the `api` scope and a second redirect URI, `<root>/sync/gitlab/callback` (see [hosting/gitlab-app.md](hosting/gitlab-app.md)). Connected apps keep asking for `read_api` only.
+- **GitLab**: docs sync's Connect GitLab uses the same app, with the `api` scope and a second redirect URI, `<root>/sync/gitlab/callback` (see [hosting/gitlab-app.md](hosting/gitlab-app.md)). Connected apps keep asking for `read_api` only. GitLab links issues as work items now (`/-/work_items/<iid>`); a project's issues, tasks, incidents and other work items share its numbers, so both kinds of link preview the same item through the REST issues API. A group's work items (epics, under `/groups/…`) have no REST issue and get no preview.
 - **Asana**'s OAuth app should ask only for `users:read`, `workspaces:read`, `workspaces.typeahead:read`, `tasks:read` and `projects:read`.

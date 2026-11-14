@@ -9,7 +9,8 @@ use serde::{Deserialize, Serialize};
 
 use super::{DONE, Done, NoInput};
 use crate::connect::{
-    self, ConnectJob, ConnectedAccount, ConnectedResults, Credential, Deferred, Field, Job, LinkPreview, PreviewJob, SearchJob, providers,
+    self, ConnectJob, ConnectedAccount, ConnectedResults, Credential, Deferred, Field, Job, LinkPreview, PreviewJob, SearchJob,
+    SignInFailure, providers,
 };
 use crate::db::DbExt;
 use crate::error::{ApiError, ApiResult};
@@ -20,7 +21,7 @@ pub fn ops() -> Vec<Op> {
     vec![
         op("connections", "list_connections", "GET", "/connections", Access::Read, list_connections)
             .title("Connected apps")
-            .desc("The apps you can connect (GitHub, Google Drive…) and which you have. For each: whether this server lets you sign in to it (`sign_in`), what to fill in first for apps on your company's own address (`sign_in_field`, e.g. Zendesk's subdomain), and the fields for connecting with a personal token instead (`token_fields`). Everyone connects their own accounts; nobody else can use them.")
+            .desc("The apps you can connect (GitHub, Google Drive…) and which you have. For each: whether this server lets you sign in to it (`sign_in`), what to fill in first for apps on your company's own address (`sign_in_field`, e.g. Zendesk's subdomain), and the fields for connecting with a personal token instead (`token_fields`). After a sign-in that didn't work, `sign_in_error` says why for a few minutes. Everyone connects their own accounts; nobody else can use them.")
             .build(),
         op("connections", "connect_app", "POST", "/connections", Access::Write, connect_app)
             .title("Connect an app")
@@ -64,6 +65,11 @@ pub struct AppInfo {
     pub token_help: Option<String>,
     /// Your connection, if you made one.
     pub connected: Option<ConnectedAccount>,
+    /// Why your last sign-in with this app didn't work, when DumbSlab can say in its own fixed
+    /// words and it was in the last 15 minutes: the account the app gave can't be used, for
+    /// example. The link back to Settings carries only a code (`connect_error=failed`); this is the
+    /// reason. Signing in again or connecting the app clears it.
+    pub sign_in_error: Option<SignInFailure>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -76,6 +82,7 @@ pub struct ConnectionList {
 fn list_connections(ctx: &mut Ctx, _: NoInput) -> ApiResult<ConnectionList> {
     let enabled = connect::enabled(ctx.cfg);
     let mine = if enabled { connect::connections(ctx.db, ctx.cfg, &ctx.actor.user_id)? } else { vec![] };
+    let mut failures = if enabled { connect::sign_in_failures(ctx.db, &ctx.actor.user_id, Utc::now())? } else { BTreeMap::new() };
     let apps = providers::ALL
         .iter()
         .map(|c| {
@@ -97,6 +104,7 @@ fn list_connections(ctx: &mut Ctx, _: NoInput) -> ApiResult<ConnectionList> {
                     account: m.account.label.clone(),
                     connected_at: m.connected_at.clone(),
                 }),
+                sign_in_error: failures.remove(info.id),
             }
         })
         .collect();

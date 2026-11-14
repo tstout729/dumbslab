@@ -75,6 +75,10 @@ impl Connector for Confluence {
         jira::read_account("Confluence", "search:confluence", cred, replies)
     }
 
+    fn public_reasons(&self, _cred: &Credential) -> Vec<String> {
+        vec![jira::no_site("Confluence")]
+    }
+
     /// Best matches first, as Confluence ranks them.
     fn search(&self, cred: &Credential, account: &Account, q: &str, limit: usize) -> Vec<HttpCall> {
         let words = jira::search_words(q);

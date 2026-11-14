@@ -58,16 +58,21 @@ fn failure(reply: &HttpReply) -> Option<String> {
     if v["ok"].as_bool() == Some(true) {
         return None;
     }
-    let Some(code) = v["error"].as_str() else { return Some("Slack sent an answer DumbSlab couldn't read.".into()) };
+    let Some(code) = v["error"].as_str() else { return Some(UNREADABLE.into()) };
     Some(match code {
-        "invalid_auth" | "not_authed" | "token_revoked" | "token_expired" | "account_inactive" => {
-            "Slack rejected the saved credentials. Reconnect Slack in Settings › Connected apps.".into()
-        }
-        "missing_scope" => "Slack didn't allow searching with this connection. Reconnect Slack in Settings › Connected apps.".into(),
-        "ratelimited" => "Slack's rate limit was reached. Try again in a minute.".into(),
+        "invalid_auth" | "not_authed" | "token_revoked" | "token_expired" | "account_inactive" => REJECTED.into(),
+        "missing_scope" => MISSING_SCOPE.into(),
+        "ratelimited" => RATE_LIMITED.into(),
         other => format!("Slack couldn't do that ({other})."),
     })
 }
+
+// What `failure` and read_profile say in fixed words (see `Connector::public_reasons`).
+const UNREADABLE: &str = "Slack sent an answer DumbSlab couldn't read.";
+const REJECTED: &str = "Slack rejected the saved credentials. Reconnect Slack in Settings › Connected apps.";
+const MISSING_SCOPE: &str = "Slack didn't allow searching with this connection. Reconnect Slack in Settings › Connected apps.";
+const RATE_LIMITED: &str = "Slack's rate limit was reached. Try again in a minute.";
+const NO_USER: &str = "Slack didn't say whose account that is.";
 
 /// Slack's message markup as plain text: `<@U1|ada>` → `@ada`, `<#C1|general>` → `#general`,
 /// `<!here>` → `@here`, `<https://x|label>` → `label`, and `&amp;`, `&lt;`, `&gt;` decoded. Slack
@@ -176,13 +181,17 @@ impl Connector for Slack {
         let v = r.json();
         let (user, team) = (s(&v["user"]), s(&v["team"]));
         if user.is_empty() {
-            return Err("Slack didn't say whose account that is.".into());
+            return Err(NO_USER.into());
         }
         let label = if team.is_empty() { format!("@{user}") } else { format!("@{user} · {team}") };
         Ok(Account {
             label,
             settings: json!({ "user": user, "user_id": s(&v["user_id"]), "team": team, "team_id": s(&v["team_id"]), "url": s(&v["url"]) }),
         })
+    }
+
+    fn public_reasons(&self, _cred: &Credential) -> Vec<String> {
+        [UNREADABLE, REJECTED, MISSING_SCOPE, RATE_LIMITED, NO_USER].map(String::from).to_vec()
     }
 
     fn search(&self, cred: &Credential, _account: &Account, q: &str, limit: usize) -> Vec<HttpCall> {
