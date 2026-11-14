@@ -24,6 +24,7 @@ pub use directory::Directory;
 pub use workspace::Workspace;
 
 use chrono::Utc;
+use dumbslab_core::assets;
 use dumbslab_core::http::{WORKSPACE_ROBOTS_TXT, is_core_path};
 use dumbslab_core::slack;
 use dumbslab_core::sync::github_app::{self, Routed};
@@ -99,7 +100,7 @@ async fn route(req: Request, env: Env, url: &Url) -> Result<Response> {
 
     if !multi {
         if !is_core_path(&path) {
-            return env.assets("ASSETS")?.fetch_request(req).await;
+            return asset(&env, req, url).await;
         }
         if let Some(limited) = rate_limited(&req, &env).await? {
             return Ok(limited);
@@ -117,7 +118,7 @@ async fn route(req: Request, env: Env, url: &Url) -> Result<Response> {
                 return text_response(WORKSPACE_ROBOTS_TXT.into(), "text/plain; charset=utf-8");
             }
             if !is_core_path(&path) {
-                return env.assets("ASSETS")?.fetch_request(req).await;
+                return asset(&env, req, url).await;
             }
             if let Some(limited) = rate_limited(&req, &env).await? {
                 return Ok(limited);
@@ -126,6 +127,35 @@ async fn route(req: Request, env: Env, url: &Url) -> Result<Response> {
         }
         _ => error_response(404, "no_workspace", &format!("There's no workspace at this address. Create one at https://{root}/")),
     }
+}
+
+/// A static file from the assets. Scripts and stylesheets are never revalidated (see
+/// `dumbslab_core::assets`): a request for one reaches the assets without its conditional headers,
+/// so they can't answer `304`, and goes out as `no-store` without validators. Other files pass
+/// through as the assets answer.
+async fn asset(env: &Env, req: Request, url: &Url) -> Result<Response> {
+    let resp = if assets::is_script_or_style_path(url.path()) {
+        let headers = req.headers().clone();
+        for name in assets::CONDITIONAL_HEADERS {
+            headers.delete(name)?;
+        }
+        let mut init = RequestInit::new();
+        // Like the browser's own request, which gets any redirect itself.
+        init.with_method(req.method()).with_headers(headers).with_redirect(RequestRedirect::Manual);
+        env.assets("ASSETS")?.fetch_request(Request::new_with_init(url.as_str(), &init)?).await?
+    } else {
+        env.assets("ASSETS")?.fetch_request(req).await?
+    };
+    if !assets::is_script_or_style(&resp.headers().get("content-type")?.unwrap_or_default()) {
+        return Ok(resp);
+    }
+    // Fetched responses have immutable headers; a copy can be changed.
+    let headers = resp.headers().clone();
+    for name in assets::VALIDATORS {
+        headers.delete(name)?;
+    }
+    headers.set("cache-control", assets::NO_STORE)?;
+    Ok(resp.with_headers(headers))
 }
 
 /// Refuses a request once its client network has sent too many this minute. Each request that
@@ -264,7 +294,8 @@ async fn root_site(req: Request, env: &Env, root: &str, path: &str) -> Result<Re
         (Method::Post, "/api/stripe/webhook") => billing::webhook(req, env).await,
         // Static files the sign-up page uses.
         (Method::Get | Method::Head, p) if p.rsplit('/').next().is_some_and(|f| f.contains('.')) => {
-            env.assets("ASSETS")?.fetch_request(req).await
+            let url = req.url()?;
+            asset(env, req, &url).await
         }
         (_, p) if is_core_path(p) => error_response(
             404,

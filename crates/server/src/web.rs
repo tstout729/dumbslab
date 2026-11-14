@@ -4,6 +4,7 @@
 use axum::body::Body;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
+use dumbslab_core::assets;
 use rust_embed::RustEmbed;
 
 #[derive(RustEmbed)]
@@ -37,17 +38,26 @@ pub fn serve(path: &str, headers: &HeaderMap, csp: &str) -> Response {
             None => return Response::builder().status(StatusCode::NOT_FOUND).body(Body::from("web app not built")).unwrap_or_default(),
         },
     };
-    let etag = format!("\"{}\"", hex(&file.metadata.sha256_hash()[..12]));
-    if headers.get("if-none-match").and_then(|v| v.to_str().ok()) == Some(etag.as_str()) {
-        return Response::builder().status(StatusCode::NOT_MODIFIED).header("etag", etag).body(Body::empty()).unwrap_or_default();
-    }
-    let mime = mime_guess::from_path(&name).first_or_octet_stream();
+    // mime_guess doesn't know `.cjs`; serve it as JavaScript like `.js` and `.mjs`.
+    let mime = if name.ends_with(".cjs") {
+        "text/javascript".to_string()
+    } else {
+        mime_guess::from_path(&name).first_or_octet_stream().to_string()
+    };
     let mut b = Response::builder()
-        .header("content-type", mime.as_ref())
-        .header("etag", etag)
-        .header("cache-control", "no-cache")
+        .header("content-type", mime.as_str())
         .header("x-content-type-options", "nosniff")
         .header("referrer-policy", "strict-origin-when-cross-origin");
+    if assets::is_script_or_style(&mime) || assets::is_script_or_style_path(&name) {
+        // Never revalidated, so no ETag and never a 304 (see `dumbslab_core::assets`).
+        b = b.header("cache-control", assets::NO_STORE);
+    } else {
+        let etag = format!("\"{}\"", hex(&file.metadata.sha256_hash()[..12]));
+        if headers.get("if-none-match").and_then(|v| v.to_str().ok()) == Some(etag.as_str()) {
+            return Response::builder().status(StatusCode::NOT_MODIFIED).header("etag", etag).body(Body::empty()).unwrap_or_default();
+        }
+        b = b.header("etag", etag).header("cache-control", "no-cache");
+    }
     if name.ends_with(".html") {
         b = b.header("content-security-policy", csp).header("x-frame-options", "DENY");
     }

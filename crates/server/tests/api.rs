@@ -8000,6 +8000,51 @@ fn healthz_reports_build_identity_without_auth() {
     assert!(sha == "unknown" || ((sha.len() == 40 || sha.len() == 64) && sha.bytes().all(|b| b.is_ascii_hexdigit())));
 }
 
+/// Browsers never revalidate the web app's scripts and stylesheets (Safari reuses a broken memory
+/// copy on a 304), so those come whole every time, with no ETag. Pages and images still revalidate.
+#[test]
+fn scripts_and_styles_are_never_revalidated() {
+    use axum::http::{HeaderMap, HeaderValue, StatusCode};
+    let serve = |path: &str, if_none_match: Option<&str>| {
+        let mut headers = HeaderMap::new();
+        if let Some(value) = if_none_match {
+            headers.insert("if-none-match", HeaderValue::from_str(value).unwrap());
+        }
+        let resp = dumbslab::web::serve(path, &headers, "default-src 'self'");
+        let header = |name: &str| resp.headers().get(name).map(|v| v.to_str().unwrap().to_string());
+        let (status, etag, cache, content_type) = (resp.status(), header("etag"), header("cache-control"), header("content-type"));
+        let body = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(axum::body::to_bytes(resp.into_body(), usize::MAX))
+            .unwrap();
+        (status, etag, cache, content_type.unwrap_or_default(), body.len())
+    };
+
+    for path in ["/theme-init.js", "/app.js", "/styles.css", "/welcome.css"] {
+        let (status, etag, cache, content_type, size) = serve(path, None);
+        assert_eq!(status, StatusCode::OK, "{path}");
+        assert!(size > 0, "{path}");
+        assert!(dumbslab_core::assets::is_script_or_style(&content_type), "{path}: {content_type}");
+        assert_eq!((etag, cache.as_deref()), (None, Some("no-store")), "{path}");
+        // Whatever a browser sends to revalidate, it gets the whole file.
+        for sent in ["*", "W/\"anything\"", "\"anything\""] {
+            let (status, etag, cache, _, again) = serve(path, Some(sent));
+            assert_eq!((status, etag, cache.as_deref(), again), (StatusCode::OK, None, Some("no-store"), size), "{path} {sent}");
+        }
+    }
+
+    // Pages and images keep their ETag and 304s, and the app's routes are index.html.
+    for path in ["/index.html", "/favicon.svg", "/p/123"] {
+        let (status, etag, cache, _, size) = serve(path, None);
+        assert_eq!((status, cache.as_deref()), (StatusCode::OK, Some("no-cache")), "{path}");
+        assert!(size > 0, "{path}");
+        let etag = etag.expect(path);
+        let (status, again, _, _, size) = serve(path, Some(&etag));
+        assert_eq!((status, again.as_deref(), size), (StatusCode::NOT_MODIFIED, Some(etag.as_str()), 0), "{path}");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // People sync (BambooHR) and docs sync (GitHub, GitLab). The tests play the host and the apps:
 // they run each sync's steps with canned answers.
