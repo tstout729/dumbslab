@@ -344,6 +344,25 @@ impl Workspace {
                     Err(e) => api_error_response(&e),
                 }
             }
+            // The operator resets a locked-out person's password (`reset-password`).
+            "/_internal/reset-password" => {
+                if !matches!(self.stored()?, Stored::Workspace) {
+                    return error_response(404, "no_workspace", "no workspace here");
+                }
+                self.migrate()?;
+                let body = req.json::<Value>().await.unwrap_or_default();
+                let email = body["email"].as_str().unwrap_or_default().to_string();
+                let storage = self.state.storage();
+                let reset = transaction(&storage, self.db(), move |db| {
+                    let r = backup::refuse_writes(db).and_then(|_| dumbslab_core::auth::operator_reset_password(db, &email, Utc::now()));
+                    let ok = r.is_ok();
+                    (r, ok)
+                })?;
+                match reset {
+                    Ok(password) => json_response(200, &json!({ "temporary_password": password })),
+                    Err(e) => api_error_response(&e),
+                }
+            }
             "/_internal/delete" => {
                 // The operator deletes the home object first and then reads the final address
                 // list, so no move may be half done.

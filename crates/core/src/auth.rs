@@ -396,6 +396,28 @@ pub fn clear_failures(db: &dyn Db, key: &str) -> ApiResult<()> {
     Ok(())
 }
 
+/// The operator's way back in for someone locked out of a hosted workspace, such as its only
+/// admin after forgetting the password: sets a temporary password, returned once, signs them out
+/// everywhere and clears their failed sign-ins. Bots and deactivated people are refused.
+pub fn operator_reset_password(db: &dyn Db, email: &str, now: DateTime<Utc>) -> ApiResult<String> {
+    let email = email.trim();
+    let row = db
+        .one("SELECT id, is_bot, deactivated_at FROM users WHERE email = ?", &params![email])?
+        .ok_or_else(|| ApiError::not_found(format!("nobody in this workspace has the email `{email}`")))?;
+    if row.bool("is_bot") || row.opt_str("deactivated_at").is_some() {
+        return Err(ApiError::conflict("that account is a bot or deactivated; an admin manages it in Settings › People"));
+    }
+    let id = row.str("id");
+    let password = crate::util::new_secret("").chars().take(16).collect::<String>();
+    db.execute(
+        "UPDATE users SET password_hash = ?, updated_at = ? WHERE id = ?",
+        &params![hash_password(&password)?, ts(now), id.clone()],
+    )?;
+    db.execute("DELETE FROM sessions WHERE user_id = ?", &params![id])?;
+    clear_failures(db, &password_keys(email, None)[0].0)?;
+    Ok(password)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

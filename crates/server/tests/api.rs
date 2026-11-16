@@ -934,6 +934,30 @@ fn signed_signup_links_set_up_hosted_workspaces() {
 const ROOMY: dumbslab_core::tenancy::FreeBudget = dumbslab_core::tenancy::FreeBudget { writes_per_day: u64::MAX, storage_bytes: u64::MAX };
 
 #[test]
+fn the_operator_resets_a_locked_out_password() {
+    let h = H::new();
+    let (admin, _) = h.setup();
+    // Locked out: failed sign-ins pile up and the old session is still around.
+    for _ in 0..10 {
+        h.call("POST", "/api/v1/auth/login", Some(json!({ "email": "ada@acme.test", "password": "forgotten" })), &Auth::None);
+    }
+    let reset = |email: &str| {
+        let email = email.to_string();
+        h.store.with_tx(|db| (dumbslab_core::auth::operator_reset_password(db, &email, chrono::Utc::now()), true)).unwrap()
+    };
+    let temporary = reset(" ada@acme.test ").unwrap();
+    assert_eq!(temporary.len(), 16);
+    assert_eq!(h.call("GET", "/api/v1/me", None, &admin).status, 401, "signed out everywhere");
+    let back = h.call("POST", "/api/v1/auth/login", Some(json!({ "email": "ada@acme.test", "password": temporary })), &Auth::None);
+    assert_eq!(back.status, 200, "the throttle was cleared: {}", back.body);
+    assert_eq!(
+        h.call("POST", "/api/v1/auth/login", Some(json!({ "email": "ada@acme.test", "password": "correct horse" })), &Auth::None).status,
+        401
+    );
+    assert_eq!(reset("nobody@acme.test").unwrap_err().status, 404);
+}
+
+#[test]
 fn directory_reserves_addresses_within_limits() {
     use chrono::{Duration, Utc};
     use dumbslab_core::tenancy::{self, Limits};

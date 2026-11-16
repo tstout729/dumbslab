@@ -154,9 +154,10 @@ curl -H "Authorization: Bearer $OPERATOR_TOKEN" https://your-domain/api/operator
 curl -X POST -H "Authorization: Bearer $OPERATOR_TOKEN" https://your-domain/api/operator/workspaces/acme/disable    # or enable
 curl -X POST -H "Authorization: Bearer $OPERATOR_TOKEN" https://your-domain/api/operator/workspaces/acme/delete     # erases it; its addresses become free
 curl -X POST -H "Authorization: Bearer $OPERATOR_TOKEN" https://your-domain/api/operator/workspaces/acme/grant-pro  # Pro without paying; or revoke-pro
+curl -X POST -H "Authorization: Bearer $OPERATOR_TOKEN" -d '{"email":"ada@example.com"}' https://your-domain/api/operator/workspaces/acme/reset-password  # a temporary password, shown once
 ```
 
-Any of a workspace's addresses works in these URLs. The list shows each workspace's current `address`, its `previous_addresses`, its plan, writes in the last 24 hours, size and Stripe status, and the free plan's totals against their budget (`free_plan`). Deleting a workspace that someone still pays for is refused; cancel its subscription in the Stripe Dashboard first. Deleting one detaches its Stripe customers, so if someone claims the address later, the old customer's events never reach the new workspace.
+Any of a workspace's addresses works in these URLs. The list shows each workspace's current `address`, its `previous_addresses`, its plan, writes in the last 24 hours, size and Stripe status, and the free plan's totals against their budget (`free_plan`). Deleting a workspace that someone still pays for is refused; cancel its subscription in the Stripe Dashboard first. Deleting one detaches its Stripe customers, so if someone claims the address later, the old customer's events never reach the new workspace. Resetting a password signs that person out everywhere; confirm who is asking before you send them the temporary password, privately, and they change it under Settings › Profile.
 
 ## Single-workspace mode
 
