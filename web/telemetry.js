@@ -330,7 +330,8 @@ async function startQuill(quill, user, workspace) {
     // Recording settings still come from the project's remote config (GET /array/{token}/config).
     advanced_disable_feature_flags: true,
     advanced_disable_feature_flags_on_first_load: true,
-    // Each workspace keeps its own visitor id: no cookie for every *.dumbslab.com.
+    // Each workspace keeps its own visitor id, in local storage only: no cookie at all.
+    persistence: 'localStorage',
     cross_subdomain_cookie: false,
     disable_capture_url_hashes: true,
     // Campaign parameters are words from the address bar; captured URLs drop them as well.

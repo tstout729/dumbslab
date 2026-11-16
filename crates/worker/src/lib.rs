@@ -257,6 +257,11 @@ async fn root_site(req: Request, env: &Env, root: &str, path: &str) -> Result<Re
         url.set_path(page);
         return env.assets("ASSETS")?.fetch_request(Request::new(url.as_str(), Method::Get)?).await;
     }
+    if path.starts_with("/api/signup")
+        && let Some(limited) = rate_limited(&req, env).await?
+    {
+        return Ok(limited);
+    }
     match (method, path) {
         (Method::Get, "/healthz") => {
             json_response(200, &json!({ "ok": true, "version": dumbslab_core::VERSION, "git_sha": dumbslab_core::GIT_SHA }))
@@ -471,8 +476,9 @@ async fn signup(mut req: Request, env: &Env, root: &str) -> Result<Response> {
     if let Err(message) = tenancy::validate_slug(&slug) {
         return error_response(400, "bad_request", &message);
     }
+    // By network, like the sign-in limits: one IPv6 user has a whole /64 of addresses.
     let ip = req.headers().get("cf-connecting-ip")?.unwrap_or_else(|| "unknown".into());
-    let ip_hash = sha256_hex(&format!("{secret}:{ip}"));
+    let ip_hash = sha256_hex(&format!("{secret}:{}", dumbslab_core::auth::client_network(&ip)));
     let name = input.workspace_name.trim().to_string();
     let (status, reply) = call_object(
         env,

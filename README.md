@@ -49,11 +49,11 @@ Options (flags or environment variables):
 | | `DUMBSLAB_CONNECTOR_KEY` | unset: [connected apps](docs/connected-apps.md), [single sign-on](docs/sso.md) with your own app, [Slack](docs/slack.md), people sync and docs sync are off |
 | | `DUMBSLAB_SSO_GOOGLE_CLIENT_ID`, `DUMBSLAB_SSO_MICROSOFT_CLIENT_ID`, `DUMBSLAB_SLACK_CLIENT_ID` and their `_CLIENT_SECRET`s | unset: no one-click single sign-on with that provider ([sign-in apps](docs/hosting/sign-in-apps.md)) |
 | `--open-setup` | | off (local development only: setup without a token) |
-| `--quill-host` | `DUMBSLAB_QUILL_HOST` | off: record sessions in this [Quill](https://github.com/164investments/quill) or other PostHog-compatible server |
+| `--quill-host` | `DUMBSLAB_QUILL_HOST` | off: record sessions in this PostHog-compatible server |
 | `--quill-token` | `DUMBSLAB_QUILL_TOKEN` | off: that project's public `phc_` token |
 | `--sentry-dsn` | `DUMBSLAB_SENTRY_DSN` | off: report the web app's errors to this Sentry DSN |
 
-Session recordings and error reports stay off unless you set them, so a self-hosted server sends nothing anywhere. What they record and mask: [docs/cloudflare.md](docs/cloudflare.md#session-recordings-and-error-reports).
+Session recordings and error reports stay off unless you set them, so a self-hosted server sends nothing anywhere. The same goes for the Cloudflare Worker: the checked-in `wrangler.toml` leaves them unset. What they record and mask: [docs/cloudflare.md](docs/cloudflare.md#session-recordings-and-error-reports).
 
 ### Docker
 

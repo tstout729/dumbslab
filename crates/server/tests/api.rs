@@ -959,6 +959,8 @@ fn directory_reserves_addresses_within_limits() {
     assert_eq!(unavailable("acme", t0), None);
     assert_eq!(status(reserve("acme", "ip1", t0)), None);
     assert_eq!(unavailable("acme", t0).as_deref(), Some("acme is taken; pick another address"));
+    // Going back to fix the name gets the same visitor their reservation again; it counts once.
+    assert_eq!(status(reserve("acme", "ip1", t0)), None);
     let matches = |slug: &'static str, expires: i64, at| {
         h.store.with_tx(|db| (tenancy::reservation_matches(db, slug, expires, at), true)).unwrap().unwrap()
     };
@@ -978,6 +980,8 @@ fn directory_reserves_addresses_within_limits() {
     run(&|db| tenancy::activate(db, "delta", t0)).unwrap();
     run(&|db| tenancy::activate(db, "eps", t0)).unwrap();
     assert_eq!(status(reserve("zeta", "ip11", t0)), Some(429));
+    // Once beta's reservation lapses unused, it no longer counts against ip1 or the day.
+    assert_eq!(status(reserve("gamma", "ip1", t0 + Duration::minutes(61))), None);
     // Two days later: beta's abandoned reservation is free again, then the total cap applies.
     assert!(unavailable("beta", t0).is_some());
     assert_eq!(unavailable("beta", t1), None);
