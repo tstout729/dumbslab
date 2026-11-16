@@ -199,6 +199,15 @@ fn hour_of(now: DateTime<Utc>) -> i64 {
     now.timestamp().div_euclid(3600)
 }
 
+/// Whether a hosted request's database writes count against its workspace's plan. Failed sign-ins
+/// don't: anyone can fail to sign in, so counting them would let a stranger use up a workspace's
+/// allowance, and the sign-in limits bound those writes. Everything else counts, successful
+/// sign-ins and sign-outs included. Counting never refuses a sign-in; only operations check the
+/// allowance.
+pub fn counts_writes(path: &str, status: u16) -> bool {
+    !path.starts_with("/api/v1/auth/") || (200..300).contains(&status)
+}
+
 /// Adds the rows a request wrote to the current hour, and forgets hours older than a day.
 pub fn record_writes(db: &dyn Db, now: DateTime<Utc>, rows: u64) -> ApiResult<()> {
     // A workspace frozen for a copy records nothing more (see `backup::freeze`).
@@ -499,6 +508,17 @@ fn is_address(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_sign_ins_are_not_metered() {
+        assert!(counts_writes("/api/v1/posts", 200));
+        assert!(counts_writes("/api/v1/posts", 400), "a rolled-back write still counts");
+        assert!(counts_writes("/api/v1/auth/login", 200));
+        assert!(counts_writes("/api/v1/auth/logout", 204));
+        assert!(!counts_writes("/api/v1/auth/login", 401));
+        assert!(!counts_writes("/api/v1/auth/login", 429));
+        assert!(!counts_writes("/api/v1/auth/setup", 409));
+    }
 
     #[test]
     fn labels() {

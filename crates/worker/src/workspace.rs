@@ -636,10 +636,15 @@ impl DurableObject for Workspace {
             }
         })?;
         // Hosted workspaces count every row a request's statements wrote, even when it was rolled
-        // back, against their plan. Signing in doesn't count: anyone can fail to sign in, and the
-        // sign-in limits bound those writes. A sign-up that failed left no table to count in.
+        // back, against their plan, except a failed sign-in's (`plan::counts_writes`). A sign-up
+        // that failed left no table to count in.
         if let Some(h) = move_cfg.hosting.as_ref() {
-            let metered = !path.starts_with("/api/v1/auth/")
+            let status = match &result {
+                Ok(Some(o)) => o.response.status,
+                Ok(None) => 404,
+                Err(e) => e.status,
+            };
+            let metered = plan::counts_writes(&path, status)
                 && (self.migrated.get() || (creating && matches!(&result, Ok(Some(o)) if o.response.status == 200)));
             if metered
                 && db.rows_written() > 0
