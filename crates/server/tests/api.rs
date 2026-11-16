@@ -959,8 +959,8 @@ fn directory_reserves_addresses_within_limits() {
     assert_eq!(unavailable("acme", t0), None);
     assert_eq!(status(reserve("acme", "ip1", t0)), None);
     assert_eq!(unavailable("acme", t0).as_deref(), Some("acme is taken; pick another address"));
-    // Going back to fix the name gets the same visitor their reservation again; it counts once.
-    assert_eq!(status(reserve("acme", "ip1", t0)), None);
+    // A live reservation is the reserver's alone, even on the same network.
+    assert_eq!(status(reserve("acme", "ip1", t0)), Some(409));
     let matches = |slug: &'static str, expires: i64, at| {
         h.store.with_tx(|db| (tenancy::reservation_matches(db, slug, expires, at), true)).unwrap().unwrap()
     };
@@ -2528,6 +2528,10 @@ fn directory_budgets_the_free_plan() {
         db_run(&h, |db| tenancy::activate(db, slug, t0));
     }
     assert_eq!(cap(t0), Default::default());
+    // A workspace's report marks it active, should the call that activates it have been lost.
+    db_run(&h, |db| tenancy::reserve(db, "eps", "Name", "eps", t0, limits).map(|_| ()));
+    report("eps", "free", 0, 0, t0);
+    assert!(db_run(&h, tenancy::list).iter().any(|e| e.slug == "eps" && e.status == "active"));
 
     // Free workspaces' latest reports add up; Pro ones don't count.
     report("acme", "free", 600, 4_000, t0);

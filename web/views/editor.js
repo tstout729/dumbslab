@@ -510,7 +510,8 @@ function mountEditor(ctx, { post, initial, templates, startTemplate }) {
   tabWrite.addEventListener('click', () => setTab('write'));
   tabPreview.addEventListener('click', () => setTab('preview'));
 
-  let previewHidden = localStorage.getItem('ds-preview-hidden') === '1';
+  let previewHidden = false;
+  try { previewHidden = localStorage.getItem('ds-preview-hidden') === '1'; } catch { /* storage blocked */ }
   const previewToggle = button('', { icon: 'layers', variant: 'ghost', size: 'sm', 'aria-label': 'Toggle preview', 'aria-pressed': String(!previewHidden), title: 'Show or hide the preview' });
   previewToggle.addEventListener('click', () => {
     previewHidden = !previewHidden;
@@ -638,6 +639,10 @@ function mountEditor(ctx, { post, initial, templates, startTemplate }) {
 
   async function save({ publish = false, view = false, force = false } = {}) {
     if (saving) return;
+    if (uploads) {
+      toast('Wait for the upload to finish before saving.', { type: 'error' });
+      return;
+    }
     const snap = snapshot();
     if (!snap.title.trim()) {
       toast('Add a title before saving.', { type: 'error' });

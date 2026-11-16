@@ -531,12 +531,21 @@ async fn serve(
         .layer(tower_http::trace::TraceLayer::new_for_http());
     let listener = tokio::net::TcpListener::bind(bind).await.with_context(|| format!("binding {bind}"))?;
     info!("DumbSlab {} listening on http://{bind}", dumbslab_core::VERSION);
-    axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>())
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
-        .await?;
+    axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>()).with_graceful_shutdown(shutdown_signal()).await?;
     Ok(())
+}
+
+/// Ctrl-C, or SIGTERM (what `docker stop` and systemd send).
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    if let Ok(mut term) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = term.recv() => {}
+        }
+        return;
+    }
+    let _ = tokio::signal::ctrl_c().await;
 }
 
 async fn handle(
@@ -566,8 +575,11 @@ async fn handle(
         None
     };
     let header = |name: &str| parts.headers.get(name).and_then(|v| v.to_str().ok()).map(str::to_string);
-    let scheme = header("x-forwarded-proto").unwrap_or_else(|| "http".into());
-    let host = header("x-forwarded-host").or_else(|| header("host")).unwrap_or_else(|| "localhost".into());
+    // Forwarded headers count only from a private or loopback peer (a reverse proxy); anyone else
+    // could name any origin for the links, webhooks and OAuth metadata built from it.
+    let proxied = |name: &str| if is_public(peer.ip()) { None } else { header(name) };
+    let scheme = proxied("x-forwarded-proto").unwrap_or_else(|| "http".into());
+    let host = proxied("x-forwarded-host").or_else(|| header("host")).unwrap_or_else(|| "localhost".into());
     let core_req = Request {
         method: parts.method.as_str().to_string(),
         path,

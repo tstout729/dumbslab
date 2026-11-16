@@ -120,6 +120,28 @@ addressInput.addEventListener('change', () => {
   }
 });
 
+const submitLabel = submit.textContent;
+// This tab's own setup links, by address: Back from the setup page and submitting again goes to
+// the same link instead of finding the address taken by the visitor's own reservation.
+const SETUP_LINK_MS = 55 * 60 * 1000; // reservations last an hour
+function rememberedSetup(address) {
+  try {
+    const saved = JSON.parse(sessionStorage.getItem(`ds-signup:${address}`) || 'null');
+    if (saved && saved.until > Date.now() && typeof saved.url === 'string') return saved.url;
+  } catch { /* storage blocked */ }
+  return null;
+}
+function rememberSetup(address, url) {
+  try { sessionStorage.setItem(`ds-signup:${address}`, JSON.stringify({ url, until: Date.now() + SETUP_LINK_MS })); } catch { /* storage blocked */ }
+}
+function resetSubmit() {
+  submit.disabled = false;
+  submit.removeAttribute('aria-busy');
+  submit.textContent = submitLabel;
+}
+// Back from the setup page shows this page as it was left, "Creating…" included.
+window.addEventListener('pageshow', (e) => { if (e.persisted) resetSubmit(); });
+
 form.addEventListener('submit', async (e) => {
   e.preventDefault();
   errorBox.hidden = true;
@@ -129,7 +151,13 @@ form.addEventListener('submit', async (e) => {
     addressInput.focus();
     return;
   }
-  const label = submit.textContent;
+  const again = rememberedSetup(address);
+  if (again) {
+    const url = new URL(again);
+    url.searchParams.set('name', nameFor(address));
+    location.href = url.href;
+    return;
+  }
   submit.disabled = true;
   submit.setAttribute('aria-busy', 'true');
   submit.textContent = 'Creating…';
@@ -141,12 +169,11 @@ form.addEventListener('submit', async (e) => {
     });
     const body = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(sentence(body.error?.message || 'something went wrong; please try again', address));
+    rememberSetup(address, body.setup_url);
     location.href = body.setup_url;
   } catch (err) {
     showError(err instanceof TypeError ? 'Couldn’t reach DumbSlab. Check your connection and try again.' : err.message);
-    submit.disabled = false;
-    submit.removeAttribute('aria-busy');
-    submit.textContent = label;
+    resetSubmit();
   }
 });
 

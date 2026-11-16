@@ -336,28 +336,21 @@ pub fn reserve(db: &dyn Db, slug: &str, name: &str, ip_hash: &str, now: DateTime
         return Err(ApiError::bad_request("the workspace name must be 1 to 80 characters"));
     }
     let now_s = ts(now);
-    // Someone who goes back to fix the name gets their own reservation again.
-    let own = db
-        .one(
-            "SELECT 1 AS ok FROM workspaces WHERE slug = ? AND status = 'reserved' AND ip_hash = ? AND reserved_until > ?",
-            &params![slug, ip_hash, now_s.clone()],
-        )?
-        .is_some();
-    if !own && is_taken(db, slug, &now_s)? {
+    if is_taken(db, slug, &now_s)? {
         return Err(ApiError::conflict(taken_message(slug)));
     }
-    // The limits count the last day's workspaces and live reservations; one nobody set up stops
-    // counting when it lapses, and the reservation being replaced never counts.
+    // The limits count the last day's workspaces and live reservations: one nobody set up stops
+    // counting when it lapses.
     let day_ago = ts(now - Duration::days(1));
-    let counted = "created_at > ? AND slug != ? AND (status != 'reserved' OR reserved_until > ?)";
+    let counted = "created_at > ? AND (status != 'reserved' OR reserved_until > ?)";
     let from_ip = db.scalar_i64(
         &format!("SELECT COUNT(*) FROM workspaces WHERE ip_hash = ? AND {counted}"),
-        &params![ip_hash, day_ago.clone(), slug, now_s.clone()],
+        &params![ip_hash, day_ago.clone(), now_s.clone()],
     )?;
     if from_ip >= limits.per_ip_per_day {
         return Err(ApiError::too_many("you've created the maximum number of workspaces for today; try again tomorrow"));
     }
-    let today = db.scalar_i64(&format!("SELECT COUNT(*) FROM workspaces WHERE {counted}"), &params![day_ago, slug, now_s.clone()])?;
+    let today = db.scalar_i64(&format!("SELECT COUNT(*) FROM workspaces WHERE {counted}"), &params![day_ago, now_s.clone()])?;
     if today >= limits.per_day {
         return Err(ApiError::too_many("sign-ups are busy today; please try again tomorrow"));
     }
@@ -798,7 +791,9 @@ pub fn report_usage(db: &dyn Db, home: &str, plan: &str, writes_24h: u64, storag
            storage_bytes = excluded.storage_bytes, reported_at = excluded.reported_at",
         &params![home, plan, writes_24h as i64, storage_bytes as i64, ts(now)],
     )?;
-    Ok(())
+    // Only a workspace that was set up reports, so this also marks it active should the call
+    // that activates it right after setup have been lost (its address would lapse otherwise).
+    activate(db, home, now)
 }
 
 /// What all free workspaces used, by their latest reports: rows written in 24 hours (reports

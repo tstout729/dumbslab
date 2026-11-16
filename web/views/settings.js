@@ -1042,12 +1042,22 @@ async function planSection() {
   const p = await api.get('/plan');
   const query = new URLSearchParams(location.search);
   const justPaid = query.get('checkout') === 'done';
-  const look = Number(query.get('look') || 0);
-  if (justPaid && p.plan !== 'pro' && look < 10) {
-    // Stripe tells DumbSlab a moment after the payment; look again shortly (a new URL re-renders).
-    setTimeout(() => {
-      if (location.pathname === '/settings/plan') navigate(`/settings/plan?checkout=done&look=${look + 1}`, { replace: true });
-    }, 3000);
+  if (justPaid && p.plan !== 'pro') {
+    // Stripe tells DumbSlab a moment after the payment. Ask quietly, less often as time goes on,
+    // for about ten minutes, and show the page again once Pro is on (a new URL re-renders).
+    let tries = 0;
+    const look = async () => {
+      if (location.pathname !== '/settings/plan' || new URLSearchParams(location.search).get('checkout') !== 'done') return;
+      tries += 1;
+      try {
+        if ((await api.get('/plan')).plan === 'pro') {
+          navigate('/settings/plan?checkout=done&confirmed=1', { replace: true });
+          return;
+        }
+      } catch { /* look again */ }
+      if (tries < 40) setTimeout(look, Math.min(3000 * tries, 15000));
+    };
+    setTimeout(look, 3000);
   }
   const sub = p.subscription;
   const pro = p.plan === 'pro';
@@ -1065,7 +1075,7 @@ async function planSection() {
   const parts = [];
   if (justPaid) {
     parts.push(h('p', { class: 'callout', role: 'status' }, icon('check'),
-      h('span', null, pro ? 'Thanks! This workspace is on Pro.' : 'Thanks! Pro turns on as soon as Stripe confirms the payment, usually within a minute.')));
+      h('span', null, pro ? 'Thanks! This workspace is on Pro.' : 'Thanks! Pro turns on as soon as Stripe confirms the payment, usually within a minute. This page updates by itself; there’s no need to pay again.')));
   }
   if (sub && sub.status === 'past_due') {
     parts.push(h('p', { class: 'callout callout-warn', role: 'alert' }, icon('alert'),
@@ -1090,7 +1100,10 @@ async function planSection() {
       const r = await api.post('/plan/upgrade');
       location.assign(r.url);
     }).catch(toastError));
-    const actions = p.pro.available
+    // Right after paying, the upgrade button waits for Stripe's word, so nobody pays twice.
+    const actions = justPaid
+      ? null
+      : p.pro.available
       ? h('div', { class: 'plan-actions' }, upgrade, sub ? manage : null)
       : h('p', { class: 'muted small' }, 'Pro isn’t on sale yet. Until then, delete old files to make room, or export the workspace and self-host DumbSlab, which has no limits.');
     parts.push(panel(`Pro, ${p.pro.price}`, 'For workspaces that need more room. Payments go through Stripe; cancel any time and Pro lasts until the end of the paid month.', allowanceList(p.pro.allowance), actions));
