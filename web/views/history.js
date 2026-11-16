@@ -9,9 +9,12 @@ export function diffView(diffText) {
   let oldLn = 0;
   let newLn = 0;
   const lines = diffText.replace(/\n$/, '').split('\n');
+  let inHunk = false;
   for (const line of lines) {
-    if (line.startsWith('---') || line.startsWith('+++')) continue;
+    // File headers come before the first hunk; inside one, `---` is a removed `--` line.
+    if (!inHunk && (line.startsWith('---') || line.startsWith('+++'))) continue;
     if (line.startsWith('@@')) {
+      inHunk = true;
       const m = /@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(line);
       if (m) {
         oldLn = Number(m[1]);

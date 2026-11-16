@@ -60,20 +60,21 @@ simple = { limit = 1200, period = 60 }
 [vars]
 MULTI_TENANT = "true"
 ROOT_DOMAIN = "dumbslab.com"
-# Sign-up limits that keep a free deployment free.
-SIGNUPS_PER_IP_PER_DAY = "3"
-SIGNUPS_PER_DAY = "200"
-MAX_WORKSPACES = "1000"
+# Sign-up limits that keep a free deployment free. dumbslab.com's are sized for launch traffic.
+SIGNUPS_PER_IP_PER_DAY = "5"
+SIGNUPS_PER_DAY = "2000"
+MAX_WORKSPACES = "5000"
 # Plans. Every feature is on both; they differ in storage and in database rows written per 24
 # hours. Past either, changes stop; reading and signing in keep working.
 FREE_STORAGE_MB = "50"
 FREE_WRITES_PER_DAY = "50000"
 PRO_STORAGE_MB = "5120"
 PRO_WRITES_PER_DAY = "200000"
-# What all free workspaces together may use. Keep both inside what Workers Paid includes
-# (50 million rows written a month, 5 GB stored); sign-ups and free writes pause past them.
-FREE_TOTAL_WRITES_PER_DAY = "1000000"
-FREE_TOTAL_STORAGE_MB = "4096"
+# What all free workspaces together may use; sign-ups and free writes pause past them. Workers
+# Paid includes 50 million rows written a month and 5 GB stored. dumbslab.com allows more: at
+# both caps for a whole month, about 90 million rows and 20 GB, roughly $45 past what's included.
+FREE_TOTAL_WRITES_PER_DAY = "3000000"
+FREE_TOTAL_STORAGE_MB = "20480"
 # Connected apps (docs/connected-apps.md): the CONNECTOR_KEY secret turns them on; `<APP>_CLIENT_ID`
 # here and the `<APP>_CLIENT_SECRET` secret let people sign in to that app, e.g. GITHUB_CLIENT_ID.
 # ATLASSIAN_CLIENT_ID covers Jira and Confluence. How to register each: docs/hosting/connected-apps.md.
@@ -112,11 +113,10 @@ GITHUB_APP_CLIENT_ID = "Iv23liYdv3vvSkBRRfbt"
 BASE_URL = ""
 WORKSPACE_NAME = "main"
 OPEN_SETUP = "false"
-# Session recordings (Quill) and error reports (Sentry). All three are public: the web app sends
-# them to browsers. Empty turns each off. web/_headers must allow both hosts in connect-src.
-QUILL_HOST = "https://t.staykit.ai"
-QUILL_TOKEN = "phc_G0HH1nVnPAe978r7DlSWtaGHNgk8DexefGzVjGos"
-SENTRY_DSN = "https://85b018c97c1c741350b97406e8556a15@o4511072647970816.ingest.us.sentry.io/4512347076427776"
+# Session recordings (Quill) and error reports (Sentry) are off unless QUILL_HOST, QUILL_TOKEN
+# and SENTRY_DSN are set. They're public (the web app sends them to browsers), but dumbslab.com
+# sets them as Worker secrets so a copy of this file never reports to dumbslab.com's servers:
+# `npx wrangler secret put SENTRY_DSN`. web/_headers must allow both hosts in connect-src.
 
 [observability]
 enabled = true

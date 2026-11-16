@@ -339,13 +339,18 @@ pub fn reserve(db: &dyn Db, slug: &str, name: &str, ip_hash: &str, now: DateTime
     if is_taken(db, slug, &now_s)? {
         return Err(ApiError::conflict(taken_message(slug)));
     }
+    // The limits count the last day's workspaces and live reservations: one nobody set up stops
+    // counting when it lapses.
     let day_ago = ts(now - Duration::days(1));
-    let from_ip =
-        db.scalar_i64("SELECT COUNT(*) FROM workspaces WHERE ip_hash = ? AND created_at > ?", &params![ip_hash, day_ago.clone()])?;
+    let counted = "created_at > ? AND (status != 'reserved' OR reserved_until > ?)";
+    let from_ip = db.scalar_i64(
+        &format!("SELECT COUNT(*) FROM workspaces WHERE ip_hash = ? AND {counted}"),
+        &params![ip_hash, day_ago.clone(), now_s.clone()],
+    )?;
     if from_ip >= limits.per_ip_per_day {
         return Err(ApiError::too_many("you've created the maximum number of workspaces for today; try again tomorrow"));
     }
-    let today = db.scalar_i64("SELECT COUNT(*) FROM workspaces WHERE created_at > ?", &params![day_ago])?;
+    let today = db.scalar_i64(&format!("SELECT COUNT(*) FROM workspaces WHERE {counted}"), &params![day_ago, now_s.clone()])?;
     if today >= limits.per_day {
         return Err(ApiError::too_many("sign-ups are busy today; please try again tomorrow"));
     }
@@ -786,7 +791,9 @@ pub fn report_usage(db: &dyn Db, home: &str, plan: &str, writes_24h: u64, storag
            storage_bytes = excluded.storage_bytes, reported_at = excluded.reported_at",
         &params![home, plan, writes_24h as i64, storage_bytes as i64, ts(now)],
     )?;
-    Ok(())
+    // Only a workspace that was set up reports, so this also marks it active should the call
+    // that activates it right after setup have been lost (its address would lapse otherwise).
+    activate(db, home, now)
 }
 
 /// What all free workspaces used, by their latest reports: rows written in 24 hours (reports
@@ -840,9 +847,11 @@ pub fn customer_home(db: &dyn Db, customer: &str) -> ApiResult<Payer> {
 }
 
 pub fn record_subscription(db: &dyn Db, customer: &str, subscription: &str, status: &str, now: DateTime<Utc>) -> ApiResult<()> {
+    // Reports can land out of order; an ended subscription never comes back (see `plan::Subscription::ended`).
     db.execute(
-        "UPDATE billing SET subscription = ?, status = ?, updated_at = ? WHERE customer = ?",
-        &params![subscription, status, ts(now), customer],
+        "UPDATE billing SET subscription = ?, status = ?, updated_at = ? WHERE customer = ?
+           AND NOT (subscription IS ? AND status IN ('canceled', 'incomplete_expired') AND ? NOT IN ('canceled', 'incomplete_expired'))",
+        &params![subscription, status, ts(now), customer, subscription, status],
     )?;
     Ok(())
 }

@@ -257,6 +257,11 @@ async fn root_site(req: Request, env: &Env, root: &str, path: &str) -> Result<Re
         url.set_path(page);
         return env.assets("ASSETS")?.fetch_request(Request::new(url.as_str(), Method::Get)?).await;
     }
+    if path.starts_with("/api/signup")
+        && let Some(limited) = rate_limited(&req, env).await?
+    {
+        return Ok(limited);
+    }
     match (method, path) {
         (Method::Get, "/healthz") => {
             json_response(200, &json!({ "ok": true, "version": dumbslab_core::VERSION, "git_sha": dumbslab_core::GIT_SHA }))
@@ -471,8 +476,9 @@ async fn signup(mut req: Request, env: &Env, root: &str) -> Result<Response> {
     if let Err(message) = tenancy::validate_slug(&slug) {
         return error_response(400, "bad_request", &message);
     }
+    // By network, like the sign-in limits: one IPv6 user has a whole /64 of addresses.
     let ip = req.headers().get("cf-connecting-ip")?.unwrap_or_else(|| "unknown".into());
-    let ip_hash = sha256_hex(&format!("{secret}:{ip}"));
+    let ip_hash = sha256_hex(&format!("{secret}:{}", dumbslab_core::auth::client_network(&ip)));
     let name = input.workspace_name.trim().to_string();
     let (status, reply) = call_object(
         env,
@@ -503,9 +509,11 @@ async fn signup(mut req: Request, env: &Env, root: &str) -> Result<Response> {
 ///   workspace's addresses works; `delete` frees all of them and its Slack workspace (Add to
 ///   Slack), and refuses while someone pays.
 /// - `POST /api/operator/workspaces/{address}/grant-pro` (or `revoke-pro`): Pro without paying.
+/// - `POST /api/operator/workspaces/{address}/reset-password` with `{"email": …}`: a temporary
+///   password for someone locked out, returned once.
 /// - `/api/operator/backup/...` and `/api/operator/restore/...`: copying every object's data to
 ///   another deployment (see [`backup`]). Single-workspace deployments have only these.
-async fn operator(req: Request, env: &Env, path: &str) -> Result<Response> {
+async fn operator(mut req: Request, env: &Env, path: &str) -> Result<Response> {
     if let Err(e) = tenancy::operator_check(var(env, "OPERATOR_TOKEN").as_deref(), req.headers().get("authorization")?.as_deref()) {
         return api_error_response(&e);
     }
@@ -533,6 +541,19 @@ async fn operator(req: Request, env: &Env, path: &str) -> Result<Response> {
     // The workspace's answer decides the directory change: 404 means the address was reserved
     // but never set up.
     let directory: (&str, Value) = match action.as_str() {
+        "reset-password" => {
+            let email = req.json::<Value>().await.ok().and_then(|b| b["email"].as_str().map(str::to_string)).unwrap_or_default();
+            let (status, reply) = call_object(
+                env,
+                "WORKSPACE",
+                &format!("ws:{home}"),
+                Method::Post,
+                "/_internal/reset-password",
+                Some(&json!({ "email": email })),
+            )
+            .await?;
+            return json_response(status, &reply);
+        }
         "grant-pro" | "revoke-pro" => {
             let body = json!({ "home": home, "granted": action == "grant-pro" });
             let (status, reply) =

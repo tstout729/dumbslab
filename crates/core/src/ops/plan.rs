@@ -120,7 +120,8 @@ fn upgrade_plan(ctx: &mut Ctx, _: NoInput) -> ApiResult<BillingLink> {
     }
     let customer = state.subscription.map(|s| s.customer);
     let billing_id = plan::billing_id(ctx.db)?;
-    let call = plan::checkout_call(price, &h.home, &billing_id, &ctx.base_url, customer.as_deref(), &ctx.actor.email, ctx.now);
+    let attempt = plan::checkout_attempt(ctx.db, &ctx.actor.email, ctx.now)?;
+    let call = plan::checkout_call(price, &h.home, &billing_id, &ctx.base_url, customer.as_deref(), &attempt);
     // The host asks Stripe for the page and puts its URL in place of the placeholder.
     ctx.effects.push(Effect::Stripe(call));
     Ok(BillingLink { url: plan::STRIPE_URL_PENDING.into() })

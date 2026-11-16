@@ -93,12 +93,12 @@ Every feature is on every plan: MCP, the API, webhooks, uploads, people and bots
 
 How the limits work:
 
-- **Writes** are counted as Cloudflare bills them: every row a request's statements write, index and search-index rows included, even when the request is rolled back. Signing in doesn't count, since anyone can fail to sign in and the sign-in limits already bound those writes. Each workspace keeps hourly totals and refuses changes, including new app registrations, once the last 24 hours reach its allowance. Anonymous app registration (OAuth's `/oauth/register`) is also capped at 120 an hour per workspace. Measured costs: a new 2 KB post writes about 18 rows, an edit about 10, a comment about 10, an upload about 9, and an imported document about 19. Agents reading posts write nothing.
+- **Writes** are counted as Cloudflare bills them: every row a request's statements write, index and search-index rows included, even when the request is rolled back. A failed sign-in doesn't count, since anyone can fail to sign in and the sign-in limits already bound those writes; a successful one does. Each workspace keeps hourly totals and refuses changes, including new app registrations, once the last 24 hours reach its allowance. Anonymous app registration (OAuth's `/oauth/register`) is also capped at 120 an hour per workspace. Measured costs: a new 2 KB post writes about 18 rows, an edit about 10, a comment about 10, an upload about 9, and an imported document about 19. Agents reading posts write nothing.
 - **Storage** is the workspace database's size. A change that would take it past the plan's allowance is refused with `507 storage_full`.
 - **The free plan's totals.** Each busy workspace reports its plan, recent writes and size to the `Directory` every five minutes at most. Once free workspaces together reach `FREE_TOTAL_WRITES_PER_DAY`, free workspaces stop accepting changes (`503 free_capacity`) until the total falls. Once they reach `FREE_TOTAL_STORAGE_MB`, they stop growing. In both cases sign-ups pause. Pro workspaces are never paused.
 - **Request floods.** The `REQUEST_LIMITER` binding lets each client network (an IPv4 address or IPv6 /64) make 1,200 API, MCP and file requests a minute, enough for a whole office behind one address. The Worker refuses the rest with `429` before they reach a workspace. Static files aren't counted.
 
-What this costs. Workers Paid ($5 a month) includes 50 million rows written and 5 GB stored a month; past that, rows are $1.00 per million and storage $0.20 per GB-month. The free plan's totals keep free use inside the included amounts: 1 million rows a day is about 30 million a month, and 4 GB stays under 5 GB. A Pro workspace at its limits for a whole month writes about 6 million rows and stores 5 GB, roughly $7 if nothing else were included, which is less than its $8 price after Stripe's fee. Requests cost little (Workers $0.30 and Durable Objects $0.15 per million past what's included); the request limit stops any one network from running them up, and Cloudflare's DDoS protection handles floods from many.
+What this costs. Workers Paid ($5 a month) includes 50 million rows written and 5 GB stored a month; past that, rows are $1.00 per million and storage $0.20 per GB-month. dumbslab.com's free-plan totals allow somewhat more than that: at 3 million rows a day and 20 GB for a whole month, free use would cost roughly $45 past what's included. Totals of 1 million rows a day (about 30 million a month) and 4 GB stay inside it. A Pro workspace at its limits for a whole month writes about 6 million rows and stores 5 GB, roughly $7 if nothing else were included, which is less than its $8 price after Stripe's fee. Requests cost little (Workers $0.30 and Durable Objects $0.15 per million past what's included); the request limit stops any one network from running them up, and Cloudflare's DDoS protection handles floods from many.
 
 ### Selling Pro with Stripe
 
@@ -122,8 +122,8 @@ Pro goes on sale once three things are set. Until then, `upgrade_plan` answers `
 
 How it works:
 
-- An admin chooses **Upgrade to Pro** under Settings › Plan (or an agent calls `upgrade_plan`). The workspace asks Stripe for a Checkout page and sends the person there. Agents get the link to hand to a person.
-- Stripe calls `POST /api/stripe/webhook` on the root domain. The Worker checks the signature, then reads the subscription from Stripe and records it on the workspace. Events that arrive late, twice or out of order change nothing. The checkout links the Stripe customer to the workspace's first address, so moving the workspace doesn't break billing.
+- An admin chooses **Upgrade to Pro** under Settings › Plan (or an agent calls `upgrade_plan`). The workspace asks Stripe for a Checkout page and sends the person there. Agents get the link to hand to a person. Until Stripe reports the subscription, every Upgrade in that workspace, whoever asks, opens the same Checkout page (for up to 23 hours), so two admins can't buy Pro twice.
+- Stripe calls `POST /api/stripe/webhook` on the root domain. The Worker checks the signature, then reads the subscription from Stripe and records it on the workspace. Events that arrive late, twice or out of order change nothing: an older read of a subscription never replaces a newer one, and a canceled subscription never comes back. The checkout links the Stripe customer to the workspace's first address, so moving the workspace doesn't break billing.
 - Each subscription carries its workspace's billing id (made at its first checkout), and a workspace accepts only its own. A subscription made by hand in the Stripe Dashboard won't turn Pro on; use the operator API's `grant-pro` instead.
 - Pro stays on while a renewal is `past_due` and Stripe retries. Cancelling in the customer portal (**Manage billing**) keeps Pro until the paid period ends. After that the workspace is free again: nothing is deleted, but past the free limits it can only shrink.
 - Refunds, disputes and fraud warnings are noted on the workspace in the operator list (`billing_risk`) for you to look at.
@@ -154,9 +154,10 @@ curl -H "Authorization: Bearer $OPERATOR_TOKEN" https://your-domain/api/operator
 curl -X POST -H "Authorization: Bearer $OPERATOR_TOKEN" https://your-domain/api/operator/workspaces/acme/disable    # or enable
 curl -X POST -H "Authorization: Bearer $OPERATOR_TOKEN" https://your-domain/api/operator/workspaces/acme/delete     # erases it; its addresses become free
 curl -X POST -H "Authorization: Bearer $OPERATOR_TOKEN" https://your-domain/api/operator/workspaces/acme/grant-pro  # Pro without paying; or revoke-pro
+curl -X POST -H "Authorization: Bearer $OPERATOR_TOKEN" -d '{"email":"ada@example.com"}' https://your-domain/api/operator/workspaces/acme/reset-password  # a temporary password, shown once
 ```
 
-Any of a workspace's addresses works in these URLs. The list shows each workspace's current `address`, its `previous_addresses`, its plan, writes in the last 24 hours, size and Stripe status, and the free plan's totals against their budget (`free_plan`). Deleting a workspace that someone still pays for is refused; cancel its subscription in the Stripe Dashboard first. Deleting one detaches its Stripe customers, so if someone claims the address later, the old customer's events never reach the new workspace.
+Any of a workspace's addresses works in these URLs. The list shows each workspace's current `address`, its `previous_addresses`, its plan, writes in the last 24 hours, size and Stripe status, and the free plan's totals against their budget (`free_plan`). Deleting a workspace that someone still pays for is refused; cancel its subscription in the Stripe Dashboard first. Deleting one detaches its Stripe customers, so if someone claims the address later, the old customer's events never reach the new workspace. Resetting a password signs that person out everywhere; confirm who is asking before you send them the temporary password, privately, and they change it under Settings › Profile.
 
 ## Single-workspace mode
 
@@ -178,7 +179,7 @@ Open `https://your-domain/setup?token=<SETUP_TOKEN>` and create the admin accoun
 
 ## Session recordings and error reports
 
-The web app can record sessions in [Quill](https://github.com/164investments/quill) (or any PostHog-compatible server) and report its errors to Sentry. Both are off unless set, and only the parts you set turn on:
+The web app can record sessions in any PostHog-compatible server (dumbslab.com uses its own, Quill) and report its errors to Sentry. Both are off unless set, and only the parts you set turn on:
 
 | Variable | Native server | Meaning |
 | --- | --- | --- |
@@ -186,7 +187,7 @@ The web app can record sessions in [Quill](https://github.com/164investments/qui
 | `QUILL_TOKEN` | `DUMBSLAB_QUILL_TOKEN` | The Quill project's public `phc_` token |
 | `SENTRY_DSN` | `DUMBSLAB_SENTRY_DSN` | The Sentry project's DSN |
 
-All three are public: the browser needs them, so they go in `wrangler.toml`'s `[vars]`, not secrets. The checked-in file sets them for dumbslab.com; the `dev` environment leaves them empty (pass `--var QUILL_HOST:…` to `wrangler dev` to try them). The Quill project must allow your origins; for hosted mode that's `https://your-domain` and `https://*.your-domain`.
+All three are public, since the browser needs them, so they can go in `wrangler.toml`'s `[vars]`. The checked-in file leaves them out, so a deployment made from it never reports to dumbslab.com: dumbslab.com sets them as Worker secrets instead (`npx wrangler secret put QUILL_HOST`, and the same for the other two). Set yours either way, but not both, since a variable and a secret can't share a name. The `dev` environment leaves them empty (pass `--var QUILL_HOST:…` to `wrangler dev` to try them). The Quill project must allow your origins; for hosted mode that's `https://your-domain` and `https://*.your-domain`.
 
 The browser may only connect to hosts the Content-Security-Policy allows. The native server adds the configured hosts itself. On Cloudflare, `web/_headers` lists dumbslab.com's Quill and Sentry ingest hosts in `connect-src`; put yours there instead.
 
@@ -200,7 +201,7 @@ What is recorded, and what never leaves the browser:
 - **No flag requests.** Feature flags are off, so posthog-js never calls `/flags`, whose person properties wouldn't pass through these rules. Recording settings come from the project's remote config.
 - **Errors** go to Sentry tagged `runtime=browser` and the workspace's address, with the user id and no IP address (Sentry is told not to infer one). Error types, function names and line numbers stay; messages, chained causes and breadcrumb text become `[redacted]`, and every URL (the page, stack frames, breadcrumbs) is a route template. No session replay, tracing, release-health sessions, console or click breadcrumbs, and no breadcrumbs from excluded pages. API errors aren't reported from the browser: the person sees them, and the server's own failures are reported by the Worker.
 
-Server-side failures are reported by the Worker itself, to the same `SENTRY_DSN` (see "Optional Sentry error reporting" below). Because `SENTRY_DSN` is in `[vars]`, don't also add it as a secret: a variable and a secret can't share a name. A panic in the Worker (Rust compiled to wasm) aborts the request before any code can report it; a [Tail Worker](https://developers.cloudflare.com/workers/observability/logs/tail-workers/) that forwards `exception` outcomes to Sentry would cover those.
+Server-side failures are reported by the Worker itself, to the same `SENTRY_DSN` (see "Optional Sentry error reporting" below). A panic in the Worker (Rust compiled to wasm) aborts the request before any code can report it; a [Tail Worker](https://developers.cloudflare.com/workers/observability/logs/tail-workers/) that forwards `exception` outcomes to Sentry would cover those.
 
 ## Local development
 
@@ -287,7 +288,7 @@ Durable Objects can't move between accounts, so the data is copied into a fresh 
 
 ## Optional Sentry error reporting
 
-`SENTRY_DSN`, the `[vars]` value the web app's error reports use (see "Session
+`SENTRY_DSN`, the value the web app's error reports use (see "Session
 recordings and error reports" above), also makes the Worker report failed Worker
 requests and HTTP 5xx responses, including failures returned by workspace and
 directory Durable Objects. Leave it empty to disable reporting. Use an HTTPS DSN

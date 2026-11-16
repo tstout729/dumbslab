@@ -308,7 +308,8 @@ fn auth_state(db: &dyn Db, cfg: &HostConfig, req: &Request) -> Outcome {
         };
         Ok(json!({
             "needs_setup": needs_setup,
-            "setup_requires_token": needs_setup && !cfg.open_setup,
+            // The same rule `setup` applies: open setup only when nothing else guards it.
+            "setup_requires_token": needs_setup && !(cfg.open_setup && cfg.setup_token.is_none() && cfg.signup_secret.is_none()),
             "user": user,
             "workspace_name": crate::ops::admin::setting(db, "workspace_name")?.unwrap_or_else(|| "DumbSlab".into()),
             "version": crate::VERSION,

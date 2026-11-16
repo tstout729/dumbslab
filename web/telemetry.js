@@ -26,7 +26,7 @@ import { ApiError } from '/api.js';
 const PRIVATE_PATH = /^\/(setup|login|oauth|connect)(\/|$)/;
 
 /** Query parameters the app's pages read, none secret. Every other parameter is dropped. */
-const KEPT_PARAMS = new Set(['topic', 'template', 'as', 'filter', 'stale', 'type', 'archived', 'event', 'actor', 'checkout', 'look']);
+const KEPT_PARAMS = new Set(['topic', 'template', 'as', 'filter', 'stale', 'type', 'archived', 'event', 'actor', 'checkout', 'confirmed']);
 
 const FIXED_PATHS = new Set([
   '/', '/search', '/new', '/topics', '/drafts', '/templates', '/archive', '/trash', '/notifications', '/activity', '/insights',
@@ -49,8 +49,10 @@ const APP_FILES = new Set([
   '/app.js', '/api.js', '/state.js', '/ui.js', '/telemetry.js', '/theme-init.js', '/styles.css', '/favicon.svg',
   '/apple-touch-icon.png', '/og.png', '/index.html', '/welcome.html', '/welcome.js', '/welcome.css',
   '/vendor/posthog/array.no-external.js', '/vendor/posthog/posthog-recorder.js', '/vendor/sentry/bundle.min.js',
-  ...['activity', 'auth', 'common', 'connected', 'editor', 'history', 'home', 'insights', 'lists', 'notifications', 'people', 'post',
-    'search', 'settings', 'shell', 'topic'].map((v) => `/views/${v}.js`),
+  ...['activity', 'auth', 'common', 'connected', 'editor', 'history', 'home', 'import', 'insights', 'lists', 'notifications', 'people',
+    'post', 'search', 'settings', 'shell', 'slack', 'sync', 'topic'].map((v) => `/views/${v}.js`),
+  ...['confluence', 'destination', 'github-wiki', 'guru', 'html-to-markdown', 'index', 'markdown', 'markdown-folder', 'paths', 'plan',
+    'run', 'source', 'yaml', 'zip'].map((v) => `/importers/${v}.js`),
 ]);
 
 /** Attributes that carry people's words. `maskTextSelector` masks text nodes only. */
@@ -330,7 +332,8 @@ async function startQuill(quill, user, workspace) {
     // Recording settings still come from the project's remote config (GET /array/{token}/config).
     advanced_disable_feature_flags: true,
     advanced_disable_feature_flags_on_first_load: true,
-    // Each workspace keeps its own visitor id: no cookie for every *.dumbslab.com.
+    // Each workspace keeps its own visitor id, in local storage only: no cookie at all.
+    persistence: 'localStorage',
     cross_subdomain_cookie: false,
     disable_capture_url_hashes: true,
     // Campaign parameters are words from the address bar; captured URLs drop them as well.

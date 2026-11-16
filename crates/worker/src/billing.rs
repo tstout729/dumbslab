@@ -154,7 +154,9 @@ async fn sync(env: &Env, id: &str) -> Result<()> {
     if status != 200 {
         return Err(Error::RustError(format!("reading subscription {id}: Stripe answered {status}")));
     }
-    let sub = Subscription::from_stripe(&body).ok_or_else(|| Error::RustError(format!("subscription {id} has no customer or status")))?;
+    let mut sub =
+        Subscription::from_stripe(&body).ok_or_else(|| Error::RustError(format!("subscription {id} has no customer or status")))?;
+    sub.fetched_at = Some(Date::now().as_millis() as i64);
     // The customer was linked to its workspace when Checkout finished. The subscription's own
     // metadata is the fallback, for an event that arrives before that one, but never for a
     // customer whose workspace was deleted: someone else may have its address now.

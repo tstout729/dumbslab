@@ -344,6 +344,25 @@ impl Workspace {
                     Err(e) => api_error_response(&e),
                 }
             }
+            // The operator resets a locked-out person's password (`reset-password`).
+            "/_internal/reset-password" => {
+                if !matches!(self.stored()?, Stored::Workspace) {
+                    return error_response(404, "no_workspace", "no workspace here");
+                }
+                self.migrate()?;
+                let body = req.json::<Value>().await.unwrap_or_default();
+                let email = body["email"].as_str().unwrap_or_default().to_string();
+                let storage = self.state.storage();
+                let reset = transaction(&storage, self.db(), move |db| {
+                    let r = backup::refuse_writes(db).and_then(|_| dumbslab_core::auth::operator_reset_password(db, &email, Utc::now()));
+                    let ok = r.is_ok();
+                    (r, ok)
+                })?;
+                match reset {
+                    Ok(password) => json_response(200, &json!({ "temporary_password": password })),
+                    Err(e) => api_error_response(&e),
+                }
+            }
             "/_internal/delete" => {
                 // The operator deletes the home object first and then reads the final address
                 // list, so no move may be half done.
@@ -636,10 +655,15 @@ impl DurableObject for Workspace {
             }
         })?;
         // Hosted workspaces count every row a request's statements wrote, even when it was rolled
-        // back, against their plan. Signing in doesn't count: anyone can fail to sign in, and the
-        // sign-in limits bound those writes. A sign-up that failed left no table to count in.
+        // back, against their plan, except a failed sign-in's (`plan::counts_writes`). A sign-up
+        // that failed left no table to count in.
         if let Some(h) = move_cfg.hosting.as_ref() {
-            let metered = !path.starts_with("/api/v1/auth/")
+            let status = match &result {
+                Ok(Some(o)) => o.response.status,
+                Ok(None) => 404,
+                Err(e) => e.status,
+            };
+            let metered = plan::counts_writes(&path, status)
                 && (self.migrated.get() || (creating && matches!(&result, Ok(Some(o)) if o.response.status == 200)));
             if metered
                 && db.rows_written() > 0

@@ -1,6 +1,7 @@
 //! Markdown is the canonical post format. This module renders it to sanitized HTML and extracts
 //! structure (outline, sections, mentions, links to other posts) used across the app.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
@@ -53,8 +54,38 @@ fn sanitizer() -> &'static ammonia::Builder<'static> {
         b.add_tags(["input", "mark", "details", "summary"]);
         b.add_tag_attributes("input", ["type", "checked", "disabled"]);
         b.add_generic_attributes(["id", "class"]);
+        // Only the renderer's own classes survive, so a post can't borrow the app's styles (say,
+        // a full-page overlay that swallows clicks). Checkboxes are the only inputs.
+        b.attribute_filter(|element, attribute, value| match (element, attribute) {
+            (_, "class") => {
+                let kept: Vec<&str> = value.split_ascii_whitespace().filter(|c| allowed_class(c)).collect();
+                (!kept.is_empty()).then(|| Cow::Owned(kept.join(" ")))
+            }
+            ("input", "type") => value.eq_ignore_ascii_case("checkbox").then_some(Cow::Borrowed(value)),
+            _ => Some(Cow::Borrowed(value)),
+        });
         b
     })
+}
+
+/// Classes the renderer emits (mentions, callouts, footnotes, code languages).
+fn allowed_class(class: &str) -> bool {
+    matches!(
+        class,
+        "mention"
+            | "md-callout"
+            | "md-callout-title"
+            | "md-callout-note"
+            | "md-callout-tip"
+            | "md-callout-important"
+            | "md-callout-warning"
+            | "md-callout-caution"
+            | "footnote-definition"
+            | "footnote-definition-label"
+            | "footnote-reference"
+    ) || class
+        .strip_prefix("language-")
+        .is_some_and(|l| !l.is_empty() && l.chars().all(|c| c.is_ascii_alphanumeric() || "+#._-".contains(c)))
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema, PartialEq)]
@@ -457,6 +488,20 @@ pub fn heading_titles(md: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn posts_keep_only_the_renderers_classes() {
+        let html = render(
+            "<div class=\"backdrop btn mention\">x</div>\n\n<input type=\"text\"> <input type=\"checkbox\" checked>\n\n```rust\nfn main() {}\n```\n\nNote[^1].\n\n[^1]: Here.\n\n> [!TIP]\n> Hi",
+        );
+        assert!(!html.contains("backdrop") && !html.contains("btn"), "{html}");
+        assert!(html.contains("<div class=\"mention\">x</div>"), "{html}");
+        assert!(!html.contains("type=\"text\""), "{html}");
+        assert!(html.contains("type=\"checkbox\""), "{html}");
+        assert!(html.contains("class=\"language-rust\""), "{html}");
+        assert!(html.contains("class=\"footnote-reference\"") && html.contains("class=\"footnote-definition\""), "{html}");
+        assert!(html.contains("class=\"md-callout md-callout-tip\""), "{html}");
+    }
 
     #[test]
     fn renders_and_sanitizes() {

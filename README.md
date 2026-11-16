@@ -1,19 +1,31 @@
 # DumbSlab
 
+[![CI](https://github.com/tstout729/dumbslab/actions/workflows/ci.yml/badge.svg)](https://github.com/tstout729/dumbslab/actions/workflows/ci.yml)
+[![License: MIT or Apache-2.0](https://img.shields.io/badge/license-MIT%20or%20Apache--2.0-blue.svg)](#license)
+
 An open-source team knowledge base, written in Rust and built so AI agents can do everything people can.
 
-**Try it free at [dumbslab.com](https://dumbslab.com).** Pick an address, and your workspace lives at `name.dumbslab.com`. Every feature is free there; a Pro plan adds storage and daily writes for teams that need more room. Or self-host it from this repository, with no limits at all.
+- **Use it hosted.** Pick an address at [dumbslab.com](https://dumbslab.com), and your workspace lives at `name.dumbslab.com`. Every feature is free there; a Pro plan adds storage and daily writes for teams that need more room.
+- **Or self-host it** from this repository, with no limits at all: one binary and one SQLite file, or Docker. See the [quick start](#quick-start).
 
 - **One binary, one SQLite file.** Or deploy to Cloudflare, where each workspace is its own SQLite-backed Durable Object. It runs either as a hosted service anyone can sign up for, or as one private workspace.
 - **Every feature is an operation.** Each one is exposed four ways from a single definition: the REST API, a call-any-operation endpoint, MCP tools, and the CLI. The web app uses the same public API, so nothing is UI-only.
 - **Agents are first-class.** There's a built-in MCP server with OAuth, precise edits that never clobber a teammate's change, bot accounts with their own identity, an activity feed every agent change shows up in, and signed webhooks.
+
+## Connect an agent
+
+```sh
+claude mcp add --transport http dumbslab https://name.dumbslab.com/mcp
+```
+
+Any MCP client that supports OAuth (Claude, ChatGPT, Cursor and others) needs only the URL: you approve access in the browser, and the agent can then search, read, write and organize like any teammate. More in [For agents](#for-agents).
 
 ## Features
 
 | Area | What you get |
 | --- | --- |
 | Posts | Markdown posts with live preview, drafts, publish/archive, templates, duplicate, trash and restore |
-| Rich content | Embeds (paste a link on its own line: YouTube, Vimeo, Loom, Wistia, Google Docs/Sheets/Slides/Forms/Drive, Word/Excel/PowerPoint embed links from OneDrive or SharePoint, Figma, Canva, Miro, Lucid, Draw.io, Gliffy, Airtable, Smartsheet, monday.com, Mode, Typeform, Jotform, CodePen, JSFiddle, iorad, Ludus, SlideShare, Pingboard org charts, Dropbox images and videos; X posts and Otter conversations show as link cards), callouts (`> [!NOTE]`, `[!TIP]`, `[!IMPORTANT]`, `[!WARNING]`, `[!CAUTION]`), tables, checklists, toggles (`<details>`), linked URLs |
+| Rich content | Embeds from about 30 services: paste a YouTube, Loom, Google Docs, Figma, Miro, Airtable or similar link on its own line. Callouts (`> [!NOTE]`, `[!TIP]`, `[!WARNING]` and more), tables, checklists, toggles (`<details>`), linked URLs |
 | Images and files | Paste, drop or upload screenshots and files into a post (10 MB each). Images show inline; other files download |
 | History | Every save is a version; diff any two versions and restore any of them |
 | Topics | Nested topics, private topics with members, pinned posts, follow topics |
@@ -32,11 +44,23 @@ An open-source team knowledge base, written in Rust and built so AI agents can d
 
 ## Quick start
 
+You need [Rust](https://rustup.rs) 1.88 or newer, or Docker.
+
 ```sh
-cargo run --release -p dumbslab -- serve
+cargo install --path crates/server   # puts `dumbslab` on your PATH
+dumbslab serve
+```
+
+Or with Docker:
+
+```sh
+docker build -t dumbslab .
+docker run -p 127.0.0.1:8080:8080 -v dumbslab:/data dumbslab
 ```
 
 On first run the server logs a one-time setup link (`/setup?token=…`). Open it to create the admin account. A "Getting Started" topic is created for you.
+
+Forgot the admin password? `dumbslab call update_user '{"user":"you@example.com","new_password":"…"}' --as you@example.com` sets a new one straight in the database.
 
 Options (flags or environment variables):
 
@@ -49,20 +73,16 @@ Options (flags or environment variables):
 | | `DUMBSLAB_CONNECTOR_KEY` | unset: [connected apps](docs/connected-apps.md), [single sign-on](docs/sso.md) with your own app, [Slack](docs/slack.md), people sync and docs sync are off |
 | | `DUMBSLAB_SSO_GOOGLE_CLIENT_ID`, `DUMBSLAB_SSO_MICROSOFT_CLIENT_ID`, `DUMBSLAB_SLACK_CLIENT_ID` and their `_CLIENT_SECRET`s | unset: no one-click single sign-on with that provider ([sign-in apps](docs/hosting/sign-in-apps.md)) |
 | `--open-setup` | | off (local development only: setup without a token) |
-| `--quill-host` | `DUMBSLAB_QUILL_HOST` | off: record sessions in this [Quill](https://github.com/164investments/quill) or other PostHog-compatible server |
+| `--allow-private-webhooks` | `DUMBSLAB_ALLOW_PRIVATE_WEBHOOKS` | off: webhooks to loopback, private and link-local addresses are refused |
+| `--quill-host` | `DUMBSLAB_QUILL_HOST` | off: record sessions in this PostHog-compatible server |
 | `--quill-token` | `DUMBSLAB_QUILL_TOKEN` | off: that project's public `phc_` token |
 | `--sentry-dsn` | `DUMBSLAB_SENTRY_DSN` | off: report the web app's errors to this Sentry DSN |
 
-Session recordings and error reports stay off unless you set them, so a self-hosted server sends nothing anywhere. What they record and mask: [docs/cloudflare.md](docs/cloudflare.md#session-recordings-and-error-reports).
+Session recordings and error reports stay off unless you set them, so a self-hosted server sends nothing anywhere. The same goes for the Cloudflare Worker: the checked-in `wrangler.toml` leaves them unset. What they record and mask: [docs/cloudflare.md](docs/cloudflare.md#session-recordings-and-error-reports).
 
-### Docker
+### Sharing it
 
-```sh
-docker build -t dumbslab .
-docker run -p 127.0.0.1:8080:8080 -v dumbslab:/data dumbslab
-```
-
-This publishes the server on your machine only. Passwords and session cookies must not cross a network in the clear, so to share it, put it behind a reverse proxy that serves HTTPS (Caddy, nginx, a Cloudflare Tunnel) and start it with `--base-url https://your-host`. The public URL decides whether cookies are marked `Secure`, and connected apps' tokens only work at that address.
+The commands above publish the server on your machine only. Passwords and session cookies must not cross a network in the clear, so to share it, put it behind a reverse proxy that serves HTTPS (Caddy, nginx, a Cloudflare Tunnel) and start it with `--base-url https://your-host`. The public URL decides whether cookies are marked `Secure`, and connected apps' tokens only work at that address.
 
 ### Cloudflare
 
@@ -123,21 +143,6 @@ web/           the web app: plain HTML/CSS/JS modules, no build step (web/vendor
 
 The core talks to SQLite through a small synchronous `Db` trait. The native server implements it with `rusqlite`; the Worker implements it with the Durable Object SQL API inside `transactionSync`. Both hosts run every request as a single transaction and roll back when an operation fails.
 
-## Build identity
-
-`GET /healthz` returns `ok`, `version`, and `git_sha` on the native server,
-workspace Workers, and the hosted Worker's root domain. `git_sha` is embedded
-at compile time by the shared core for both native and wasm builds.
-
-Builds use the full checkout commit by default (including in Git worktrees).
-For source archives or CI builds without Git metadata, set `DUMBSLAB_GIT_SHA`
-to the full 40- or 64-character hexadecimal commit SHA before running Cargo or
-`worker-build`. An explicit value takes precedence over the checkout; invalid
-values fail the build. Without either source, the field is `unknown`.
-Docker excludes `.git`, so pass `--build-arg DUMBSLAB_GIT_SHA="$(git rev-parse HEAD)"`
-to `docker build` to identify the image's source commit. Changing the injected
-value or checkout commit causes Cargo to rebuild the metadata.
-
 ## Development
 
 ```sh
@@ -146,7 +151,7 @@ cargo run -p dumbslab -- serve --open-setup    # debug builds read web/ from dis
 cd crates/worker && npx wrangler dev --env dev   # the hosted Cloudflare build, locally (workspaces at name.localhost:8787)
 ```
 
-See [AGENTS.md](AGENTS.md) for conventions, which apply to people too.
+See [AGENTS.md](AGENTS.md) for conventions, which apply to people too, and [docs/build-identity.md](docs/build-identity.md) for how builds report their commit.
 
 ## Support
 

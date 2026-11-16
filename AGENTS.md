@@ -20,7 +20,7 @@
 ## Release
 
 - Production is dumbslab.com: the Cloudflare Worker in `crates/worker`. `docs/cloudflare.md` covers deploys and secrets.
-- Ship under the [engineering delivery policy](https://github.com/164investments/team-agents/blob/main/policies/engineering-delivery.md). CI here is the GitHub Actions `CI` workflow, not Vercel CI.
+- Maintainers ship under their own engineering delivery policy (it isn't public). Contributors: open a pull request; CI here is the GitHub Actions `CI` workflow.
 - Production check after a deploy: `curl -fsS https://dumbslab.com/healthz` shows the deployed commit as `git_sha`.
 
 ## Checks
