@@ -847,9 +847,11 @@ pub fn customer_home(db: &dyn Db, customer: &str) -> ApiResult<Payer> {
 }
 
 pub fn record_subscription(db: &dyn Db, customer: &str, subscription: &str, status: &str, now: DateTime<Utc>) -> ApiResult<()> {
+    // Reports can land out of order; an ended subscription never comes back (see `plan::Subscription::ended`).
     db.execute(
-        "UPDATE billing SET subscription = ?, status = ?, updated_at = ? WHERE customer = ?",
-        &params![subscription, status, ts(now), customer],
+        "UPDATE billing SET subscription = ?, status = ?, updated_at = ? WHERE customer = ?
+           AND NOT (subscription IS ? AND status IN ('canceled', 'incomplete_expired') AND ? NOT IN ('canceled', 'incomplete_expired'))",
+        &params![subscription, status, ts(now), customer, subscription, status],
     )?;
     Ok(())
 }

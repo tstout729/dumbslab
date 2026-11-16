@@ -99,6 +99,10 @@ pub struct Subscription {
     /// The [`billing_id`] of the workspace whose Checkout created it (its `billing_id` metadata).
     #[serde(default)]
     pub billing_id: Option<String>,
+    /// When the host read it from Stripe (Unix milliseconds), so an older read never replaces a
+    /// newer one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fetched_at: Option<i64>,
 }
 
 impl Subscription {
@@ -113,12 +117,18 @@ impl Subscription {
             period_end: cancel_at.or(item_end).or_else(|| v["current_period_end"].as_i64()),
             cancel_at_period_end: v["cancel_at_period_end"].as_bool().unwrap_or(false) || cancel_at.is_some(),
             billing_id: v["metadata"]["billing_id"].as_str().map(str::to_string),
+            fetched_at: None,
         })
     }
 
     /// Pro stays on while Stripe retries a failed renewal (`past_due`).
     pub fn in_good_standing(&self) -> bool {
         matches!(self.status.as_str(), "active" | "trialing" | "past_due")
+    }
+
+    /// Stripe never brings these back; buying again makes a new subscription.
+    pub fn ended(&self) -> bool {
+        matches!(self.status.as_str(), "canceled" | "incomplete_expired")
     }
 }
 
@@ -165,13 +175,19 @@ pub fn billing_id(db: &dyn Db) -> ApiResult<String> {
 }
 
 /// Records what Stripe reported about a subscription. Returns `false` when it was ignored: a new
-/// subscription that belongs to another workspace (by [`billing_id`]), or news about an older
-/// subscription that would undo a newer one in good standing. Changes to the subscription the
-/// workspace already holds always apply, so a cancellation can't be missed.
+/// subscription that belongs to another workspace (by [`billing_id`]), news about an older
+/// subscription that would undo a newer one in good standing, or a stale read of the one it holds
+/// (read before the one it has, or alive again after it ended: two webhooks can race). Other
+/// changes to the subscription the workspace holds always apply, so a cancellation can't be missed.
 pub fn apply_subscription(db: &dyn Db, sub: &Subscription) -> ApiResult<bool> {
     let held = current(db)?.subscription;
     let ours = setting(db, "billing_id")?;
     if held.as_ref().is_none_or(|h| h.id != sub.id) && (ours.is_none() || sub.billing_id != ours) {
+        return Ok(false);
+    }
+    if let Some(cur) = held.as_ref().filter(|h| h.id == sub.id)
+        && ((cur.ended() && !sub.ended()) || matches!((cur.fetched_at, sub.fetched_at), (Some(a), Some(b)) if b < a))
+    {
         return Ok(false);
     }
     if let Some(cur) = held
@@ -182,7 +198,36 @@ pub fn apply_subscription(db: &dyn Db, sub: &Subscription) -> ApiResult<bool> {
         return Ok(false);
     }
     put_setting(db, "plan_subscription", &serde_json::to_string(sub).map_err(|e| ApiError::internal(e.to_string()))?)?;
+    // Stripe has answered the purchase: the next Upgrade starts afresh.
+    db.execute("DELETE FROM settings WHERE key = 'checkout_attempt'", &[])?;
     Ok(true)
+}
+
+/// How long one purchase attempt keeps its Checkout session: a little under the session's own
+/// 24 hours, so the session it reuses hasn't expired.
+const CHECKOUT_ATTEMPT_SECS: i64 = 23 * 3600;
+
+/// One go at buying Pro, started by the first admin who chose Upgrade.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckoutAttempt {
+    pub id: String,
+    /// The starting admin's email, which Checkout fills in for whoever pays.
+    pub email: String,
+    /// When it started (Unix seconds).
+    pub started: i64,
+}
+
+/// The workspace's current purchase attempt, or a new one. Every Upgrade until Stripe reports a
+/// subscription (or the attempt ages out) gets the same Checkout session, whoever asks, so two
+/// admins, two tabs or a double click can't buy Pro twice.
+pub fn checkout_attempt(db: &dyn Db, email: &str, now: DateTime<Utc>) -> ApiResult<CheckoutAttempt> {
+    let held = setting(db, "checkout_attempt")?.and_then(|s| serde_json::from_str::<CheckoutAttempt>(&s).ok());
+    if let Some(a) = held.filter(|a| (0..CHECKOUT_ATTEMPT_SECS).contains(&(now.timestamp() - a.started))) {
+        return Ok(a);
+    }
+    let attempt = CheckoutAttempt { id: crate::util::new_secret(""), email: email.trim().to_string(), started: now.timestamp() };
+    put_setting(db, "checkout_attempt", &serde_json::to_string(&attempt).map_err(|e| ApiError::internal(e.to_string()))?)?;
+    Ok(attempt)
 }
 
 /// The operator grants Pro (or takes the grant back). A subscription is unaffected.
@@ -369,17 +414,16 @@ fn pairs(items: &[(&str, &str)]) -> Vec<(String, String)> {
 
 /// A Checkout session for one Pro subscription. `client_reference_id` names the workspace (by its
 /// first address), so the webhook can link the new customer to it, and the subscription carries
-/// the workspace's [`billing_id`]. Asking again within the hour returns the same session, so a
-/// double click or a second tab can't start a second subscription.
+/// the workspace's [`billing_id`]. The same [`CheckoutAttempt`] gets the same session.
 pub fn checkout_call(
     price: &str,
     home: &str,
     billing_id: &str,
     base_url: &str,
     customer: Option<&str>,
-    email: &str,
-    now: DateTime<Utc>,
+    attempt: &CheckoutAttempt,
 ) -> StripeCall {
+    let email = attempt.email.as_str();
     let return_url = format!("{base_url}/settings/plan");
     let success_url = format!("{return_url}?checkout=done");
     let mut form = pairs(&[
@@ -400,7 +444,7 @@ pub fn checkout_call(
         None => {}
     }
     let request: Vec<String> = form.iter().map(|(k, v)| format!("{k}={v}")).collect();
-    let key = sha256_hex(&format!("{billing_id}|{}|{}", hour_of(now), request.join("&")));
+    let key = sha256_hex(&format!("{billing_id}|{}|{}", attempt.id, request.join("&")));
     StripeCall { path: "checkout/sessions", form, idempotency_key: Some(format!("dumbslab-checkout-{key}")) }
 }
 
@@ -621,8 +665,8 @@ mod tests {
 
     #[test]
     fn checkout_names_the_workspace() {
-        let now = Utc::now();
-        let call = checkout_call("price_1", "acme", "bid_1", "https://docs.dumbslab.com", None, "ada@acme.test", now);
+        let attempt = CheckoutAttempt { id: "att_1".into(), email: "ada@acme.test".into(), started: 0 };
+        let call = checkout_call("price_1", "acme", "bid_1", "https://docs.dumbslab.com", None, &attempt);
         let get = |k: &str| call.form.iter().find(|(key, _)| key == k).map(|(_, v)| v.as_str());
         assert_eq!(call.path, "checkout/sessions");
         assert_eq!(get("client_reference_id"), Some("acme"));
@@ -631,13 +675,18 @@ mod tests {
         assert_eq!(get("customer"), None);
         assert!(get("payment_method_types").is_none());
         assert_eq!(get("subscription_data[metadata][billing_id]"), Some("bid_1"));
-        let again = checkout_call("price_1", "acme", "bid_1", "https://acme.dumbslab.com", Some("cus_1"), "ada@acme.test", now);
+        let again = checkout_call("price_1", "acme", "bid_1", "https://acme.dumbslab.com", Some("cus_1"), &attempt);
         assert!(again.form.contains(&("customer".into(), "cus_1".into())));
         assert!(!again.form.iter().any(|(k, _)| k == "customer_email"), "an existing customer keeps its email");
-        // The same request within the hour gets the same session; another workspace's doesn't.
-        let same = checkout_call("price_1", "acme", "bid_1", "https://docs.dumbslab.com", None, "ada@acme.test", now);
+        // The same attempt gets the same session; another attempt or workspace doesn't.
+        let same = checkout_call("price_1", "acme", "bid_1", "https://docs.dumbslab.com", None, &attempt);
         assert_eq!(same.idempotency_key, call.idempotency_key);
-        let other = checkout_call("price_1", "acme", "bid_2", "https://docs.dumbslab.com", None, "ada@acme.test", now);
+        let next = CheckoutAttempt { id: "att_2".into(), ..attempt.clone() };
+        assert_ne!(
+            checkout_call("price_1", "acme", "bid_1", "https://docs.dumbslab.com", None, &next).idempotency_key,
+            call.idempotency_key
+        );
+        let other = checkout_call("price_1", "acme", "bid_2", "https://docs.dumbslab.com", None, &attempt);
         assert_ne!(other.idempotency_key, call.idempotency_key);
         let portal = portal_call("cus_1", "https://acme.dumbslab.com", Some("bpc_1"));
         assert!(portal.form.contains(&("configuration".into(), "bpc_1".into())));

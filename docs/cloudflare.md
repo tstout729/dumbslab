@@ -122,8 +122,8 @@ Pro goes on sale once three things are set. Until then, `upgrade_plan` answers `
 
 How it works:
 
-- An admin chooses **Upgrade to Pro** under Settings › Plan (or an agent calls `upgrade_plan`). The workspace asks Stripe for a Checkout page and sends the person there. Agents get the link to hand to a person.
-- Stripe calls `POST /api/stripe/webhook` on the root domain. The Worker checks the signature, then reads the subscription from Stripe and records it on the workspace. Events that arrive late, twice or out of order change nothing. The checkout links the Stripe customer to the workspace's first address, so moving the workspace doesn't break billing.
+- An admin chooses **Upgrade to Pro** under Settings › Plan (or an agent calls `upgrade_plan`). The workspace asks Stripe for a Checkout page and sends the person there. Agents get the link to hand to a person. Until Stripe reports the subscription, every Upgrade in that workspace, whoever asks, opens the same Checkout page (for up to 23 hours), so two admins can't buy Pro twice.
+- Stripe calls `POST /api/stripe/webhook` on the root domain. The Worker checks the signature, then reads the subscription from Stripe and records it on the workspace. Events that arrive late, twice or out of order change nothing: an older read of a subscription never replaces a newer one, and a canceled subscription never comes back. The checkout links the Stripe customer to the workspace's first address, so moving the workspace doesn't break billing.
 - Each subscription carries its workspace's billing id (made at its first checkout), and a workspace accepts only its own. A subscription made by hand in the Stripe Dashboard won't turn Pro on; use the operator API's `grant-pro` instead.
 - Pro stays on while a renewal is `past_due` and Stripe retries. Cancelling in the customer portal (**Manage billing**) keeps Pro until the paid period ends. After that the workspace is free again: nothing is deleted, but past the free limits it can only shrink.
 - Refunds, disputes and fraud warnings are noted on the workspace in the operator list (`billing_risk`) for you to look at.

@@ -402,10 +402,19 @@ fn add_reaction(ctx: &mut Ctx, input: ReactionInput) -> ApiResult<ReactionResult
 }
 
 fn remove_reaction(ctx: &mut Ctx, input: ReactionInput) -> ApiResult<ReactionResult> {
-    reaction_target(ctx, &input)?;
-    ctx.db.execute(
+    let post_id = reaction_target(ctx, &input)?;
+    let emoji = input.emoji.trim().to_string();
+    let changed = ctx.db.execute(
         "DELETE FROM reactions WHERE target_type = ? AND target_id = ? AND user_id = ? AND emoji = ?",
-        &params![input.target_type.clone(), input.target_id.clone(), ctx.actor.user_id.clone(), input.emoji.trim()],
+        &params![input.target_type.clone(), input.target_id.clone(), ctx.actor.user_id.clone(), emoji.clone()],
     )?;
+    if changed > 0 {
+        emit(
+            ctx,
+            Event::new("reaction.removed", &input.target_type, &input.target_id, format!("removed the {emoji} reaction"))
+                .post(&post_id)
+                .data(json!({ "emoji": emoji })),
+        )?;
+    }
     Ok(ReactionResult { reactions: reaction_groups(ctx, &input.target_type, &input.target_id)? })
 }

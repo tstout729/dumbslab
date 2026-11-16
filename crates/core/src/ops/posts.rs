@@ -283,9 +283,15 @@ pub fn full_post(ctx: &Ctx, row: &Row, with_html: bool) -> ApiResult<Post> {
         Some(eid) => user_refs(ctx.db, std::slice::from_ref(&eid))?.remove(&eid),
         None => None,
     };
+    // Only topics the reader can see: a pin in a private topic says the topic exists.
+    let mut pp = params![id.clone()];
+    let topic_vis = topic_visible_sql(&ctx.actor, "t", &mut pp);
     let pinned_in = ctx
         .db
-        .query("SELECT topic_id FROM post_topics WHERE post_id = ? AND pinned = 1", &params![id.clone()])?
+        .query(
+            &format!("SELECT pt.topic_id FROM post_topics pt JOIN topics t ON t.id = pt.topic_id WHERE pt.post_id = ? AND pt.pinned = 1 AND {topic_vis}"),
+            &pp,
+        )?
         .iter()
         .map(|r| r.str("topic_id"))
         .collect();

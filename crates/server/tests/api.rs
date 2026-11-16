@@ -270,6 +270,14 @@ fn drafts_private_topics_and_roles() {
     assert!(!ids(&topics).contains(&tid));
     // Deleting the private topic would orphan (and expose) its posts, so it's refused.
     assert_eq!(h.call("DELETE", &format!("/api/v1/topics/{tid}"), None, &admin).status, 409);
+    // A post also in an org-wide topic is readable, but its pin in the private topic stays hidden.
+    let open = h.ok("POST", "/api/v1/topics", Some(json!({ "name": "Everyone" })), &admin);
+    let oid = open["id"].as_str().unwrap().to_string();
+    h.ok("PATCH", &format!("/api/v1/posts/{hid}"), Some(json!({ "topic_ids": [tid, oid] })), &admin);
+    h.ok("POST", &format!("/api/v1/topics/{tid}/pins"), Some(json!({ "post_id": hid })), &admin);
+    assert_eq!(h.ok("GET", &format!("/api/v1/posts/{hid}"), None, &admin)["pinned_in"], json!([tid]));
+    assert_eq!(h.ok("GET", &format!("/api/v1/posts/{hid}"), None, &viewer)["pinned_in"], json!([]));
+    h.ok("PATCH", &format!("/api/v1/posts/{hid}"), Some(json!({ "topic_ids": [tid] })), &admin);
 
     // Mentioning the viewer in the private post doesn't notify them.
     h.ok("POST", &format!("/api/v1/posts/{hid}/edit"), Some(json!({ "edits": [{ "type": "append", "content": "cc @vic" }] })), &member);
@@ -882,6 +890,8 @@ fn rest_routing_and_docs() {
     let removed =
         h.ok("DELETE", &format!("/api/v1/reactions?target_type=post&target_id={id}&emoji={}", urlencoding::encode("🎉")), None, &admin);
     assert!(removed["reactions"].as_array().unwrap().is_empty());
+    let feed = h.ok("GET", "/api/v1/activity?limit=5", None, &admin);
+    assert!(feed["items"].as_array().unwrap().iter().any(|a| a["event"] == "reaction.removed"), "{feed}");
     // The generic operations endpoint.
     let via_ops = h.ok("POST", "/api/v1/operations/get_post", Some(json!({ "id": id })), &admin);
     assert_eq!(via_ops["title"], "Routing");
@@ -2328,6 +2338,7 @@ fn sub(h: &H, id: &str, status: &str) -> dumbslab_core::plan::Subscription {
         period_end: Some(1_800_000_000),
         cancel_at_period_end: false,
         billing_id: Some(db_run(h, dumbslab_core::plan::billing_id)),
+        fetched_at: None,
     }
 }
 
@@ -2351,6 +2362,13 @@ fn hosted_workspaces_meter_writes() {
     use dumbslab_core::plan;
     let (mut h, admin) = hosted(Some("price_pro"));
     let (_, member) = h.user(&admin, "mo@acme.test", "Mo", "member");
+    h.user(&admin, "ola@acme.test", "Ola", "admin");
+    let ola = session_from(&h.call(
+        "POST",
+        "/api/v1/auth/login",
+        Some(json!({ "email": "ola@acme.test", "password": "password123" })),
+        &Auth::None,
+    ));
     let admin_token = Auth::Bearer(
         h.ok("POST", "/api/v1/tokens", Some(json!({ "name": "agent", "scopes": ["read", "write", "admin"] })), &admin)["token"]
             .as_str()
@@ -2420,6 +2438,12 @@ fn hosted_workspaces_meter_writes() {
     assert_eq!(form("client_reference_id").as_deref(), Some("acme"));
     assert_eq!(form("line_items[0][price]").as_deref(), Some("price_pro"));
     assert_eq!(form("customer_email").as_deref(), Some("ada@acme.test"));
+    // Another admin, or an agent, gets the same Checkout session until Stripe answers: nobody
+    // buys Pro twice.
+    let second = stripe_call(&h.call("POST", "/api/v1/plan/upgrade", None, &ola));
+    assert_eq!((&second.idempotency_key, &second.form), (&call.idempotency_key, &call.form));
+    assert_eq!(stripe_call(&via_mcp).idempotency_key, call.idempotency_key);
+    let first_attempt = call.idempotency_key.clone();
     assert_eq!(h.call("POST", "/api/v1/plan/billing", None, &admin).status, 409, "nothing bought yet");
 
     // A subscription some other workspace bought (or one made by hand in Stripe) doesn't apply.
@@ -2462,6 +2486,12 @@ fn hosted_workspaces_meter_writes() {
         db_run(&h, |db| plan::apply_subscription(db, &s))
     });
     assert_eq!(h.ok("GET", "/api/v1/plan", None, &member)["plan"], "pro");
+    // An older read of the same subscription never replaces a newer one (two webhooks can race).
+    let newer = plan::Subscription { fetched_at: Some(2_000), cancel_at_period_end: true, ..sub(&h, "sub_1", "active") };
+    assert!(db_run(&h, |db| plan::apply_subscription(db, &newer)));
+    let older = plan::Subscription { fetched_at: Some(1_000), ..sub(&h, "sub_1", "active") };
+    assert!(!db_run(&h, |db| plan::apply_subscription(db, &older)));
+    assert_eq!(h.ok("GET", "/api/v1/plan", None, &member)["subscription"]["cancel_at_period_end"], true);
 
     // Changes to the subscription the workspace holds apply even if its billing id went missing
     // (say, metadata edited in the Stripe Dashboard), so a cancellation is never ignored.
@@ -2475,9 +2505,16 @@ fn hosted_workspaces_meter_writes() {
         db_run(&h, |db| plan::apply_subscription(db, &s))
     };
     assert_eq!(h.ok("GET", "/api/v1/plan", None, &member)["plan"], "free");
+    // A late, stale read can't bring an ended subscription back.
+    assert!(!{
+        let s = sub(&h, "sub_1", "active");
+        db_run(&h, |db| plan::apply_subscription(db, &s))
+    });
+    assert_eq!(h.ok("GET", "/api/v1/plan", None, &member)["plan"], "free");
     assert_eq!(h.call("POST", "/api/v1/posts", Some(json!({ "title": "Over" })), &member).status, 429);
     let call = stripe_call(&h.call("POST", "/api/v1/plan/upgrade", None, &admin));
     assert!(call.form.contains(&("customer".into(), "cus_1".into())));
+    assert_ne!(call.idempotency_key, first_attempt, "buying again after Stripe answered starts a new session");
     assert_eq!(h.call("POST", "/api/v1/plan/billing", None, &admin).status, 200, "invoices stay reachable");
 
     // When the free plan is at capacity, free workspaces pause; Pro ones (here, granted) don't.
@@ -2581,6 +2618,12 @@ fn directory_budgets_the_free_plan() {
     assert_eq!(db_run(&h, |db| tenancy::customer_home(db, "cus_9")), tenancy::Payer::Workspace("beta".into()));
     assert_eq!(db_run(&h, |db| tenancy::customer_home(db, "cus_x")), tenancy::Payer::Unknown);
     db_run(&h, |db| tenancy::record_subscription(db, "cus_9", "sub_9", "active", t0));
+    assert!(db_run(&h, |db| tenancy::paying(db, "beta")));
+    // A late report can't bring an ended subscription back; a new subscription is news.
+    db_run(&h, |db| tenancy::record_subscription(db, "cus_9", "sub_9", "canceled", t0));
+    db_run(&h, |db| tenancy::record_subscription(db, "cus_9", "sub_9", "active", t0));
+    assert!(!db_run(&h, |db| tenancy::paying(db, "beta")));
+    db_run(&h, |db| tenancy::record_subscription(db, "cus_9", "sub_10", "active", t0));
     assert!(db_run(&h, |db| tenancy::paying(db, "beta")));
     db_run(&h, |db| tenancy::record_risk(db, "cus_9", "charge.dispute.created", t0));
     let entries = db_run(&h, tenancy::list);
