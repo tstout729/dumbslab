@@ -21,6 +21,7 @@
 
 - Production is dumbslab.com: the Cloudflare Worker in `crates/worker`. `docs/cloudflare.md` covers deploys and secrets.
 - Maintainers ship under their own engineering delivery policy (it isn't public). Contributors: open a pull request; CI here is the GitHub Actions `CI` workflow.
+- Merging to `main` deploys it: the `CI` workflow's `deploy` job runs after `check` and fails unless dumbslab.com reports the merged commit. Don't run `wrangler deploy` by hand. See "Automatic deploys" in `docs/cloudflare.md`, which also covers rolling back.
 - Production check after a deploy: `curl -fsS https://dumbslab.com/healthz` shows the deployed commit as `git_sha`.
 
 ## Checks
