@@ -10,7 +10,7 @@ import { state, emit, navigate, canAdmin, canEdit, myId } from '/state.js';
 import { connectionsSection } from '/views/connected.js';
 import { slackSection } from '/views/slack.js';
 import { importSection } from '/views/import.js';
-import { ssoMessage } from '/views/auth.js';
+import { ssoMessage, providerMark } from '/views/auth.js';
 import { peopleSyncSection, docsSyncSection } from '/views/sync.js';
 
 const SECTIONS = [
@@ -104,6 +104,8 @@ async function profileSection() {
       return b;
     }));
 
+  // Someone who signed up with Google or Microsoft has no password yet: they set a first one.
+  const first = state.auth.has_password === false;
   const current = input({ type: 'password', required: true, autocomplete: 'current-password' });
   const next = input({ type: 'password', required: true, minlength: 8, autocomplete: 'new-password' });
   const confirm = input({ type: 'password', required: true, minlength: 8, autocomplete: 'new-password' });
@@ -113,25 +115,79 @@ async function profileSection() {
       confirm.focus();
       return;
     }
-    await api.post('/me/password', { current_password: current.value, new_password: next.value });
+    await api.post('/me/password', first ? { new_password: next.value } : { current_password: current.value, new_password: next.value });
     f.reset();
+    if (first) {
+      state.auth.has_password = true;
+      toast('Password set. You can sign in with your email and it too.');
+      navigate('/settings/profile');
+      return;
+    }
     toast('Password changed. Other browser sessions were signed out.');
   },
-  field('Current password', current),
-  h('div', { class: 'grid-2' }, field('New password', next, { hint: 'At least 8 characters.' }), field('Confirm new password', confirm)),
-  h('div', null, button('Change password', { variant: 'subtle', type: 'submit' })));
+  first ? null : field('Current password', current),
+  h('div', { class: 'grid-2' }, field(first ? 'Password' : 'New password', next, { hint: 'At least 8 characters.' }), field(first ? 'Confirm password' : 'Confirm new password', confirm)),
+  h('div', null, button(first ? 'Set password' : 'Change password', { variant: 'subtle', type: 'submit' })));
 
   return frag(
     panel('Profile', null, h('div', { class: 'profile-preview' }, avatar(u, 'lg'), h('div', null, h('strong', null, u.name), h('p', { class: 'muted small' }, `${u.email}, ${u.role}`))), profileForm),
     await ssoProfilePanel(),
     panel('Appearance', 'Follow your system setting, or pick a theme for this browser.', themeGroup),
-    panel('Password', 'Changing your password signs out your other browser sessions.', pwForm));
+    first
+      ? panel('Password', 'You sign in with Google or Microsoft. Add a password to sign in with your email too. Set it within 15 minutes of signing in; after that, sign out and in again first.', pwForm)
+      : panel('Password', 'Changing your password signs out your other browser sessions.', pwForm));
+}
+
+/** Your accounts at Google or Microsoft that sign you in, when the workspace has no SSO of its own. */
+async function signInAccountsPanel() {
+  const providers = state.auth.sign_in_with || [];
+  if (!providers.length) return null;
+  const query = new URLSearchParams(location.search);
+  const r = await api.get('/sso/identities');
+  const nameOf = (p) => (providers.find((o) => o.provider === p) || {}).name || p;
+  const mine = r.items.filter((i) => providers.some((o) => o.provider === i.provider));
+  const notes = [];
+  if (query.get('sso_linked')) notes.push(h('p', { class: 'callout', role: 'status' }, icon('check', { size: 15 }), h('span', null, 'Your account is linked. You can sign in with it now.')));
+  if (query.get('sso_error')) notes.push(h('p', { class: 'callout callout-warn', role: 'alert' }, icon('alert', { size: 15 }), h('span', null, ssoMessage(query.get('sso_error'), nameOf(query.get('with')) || null))));
+  const body = h('div', { class: 'stack sign-in-accounts' }, ...notes);
+  if (mine.length) {
+    body.append(h('ul', { class: 'token-list' }, mine.map((i) => {
+      const unlink = button('Unlink', { size: 'xs', variant: 'ghost', cls: 'text-danger' });
+      const row = h('li', { class: 'token' },
+        h('div', { class: 'token-icon' }, providerMark(i.provider, 16)),
+        h('div', { class: 'token-main' },
+          h('div', { class: 'token-head' }, h('strong', null, i.email || `Your ${nameOf(i.provider)} account`)),
+          h('div', { class: 'token-meta' }, h('span', null, nameOf(i.provider)), h('span', null, 'Linked ', timeEl(i.linked_at)), i.last_used_at ? h('span', null, 'Last used ', timeEl(i.last_used_at)) : null)),
+        unlink);
+      unlink.addEventListener('click', async () => {
+        const ok = await confirmDialog({ title: `Unlink your ${nameOf(i.provider)} account?`, message: `It won’t sign you in here until you link it again.`, confirmLabel: 'Unlink', danger: true });
+        if (!ok) return;
+        busy(unlink, async () => {
+          await api.del(`/sso/identities/${enc(i.id)}`);
+          toast(`${nameOf(i.provider)} account unlinked`);
+          row.remove();
+        }).catch(toastError);
+      });
+      return row;
+    })));
+  }
+  const links = providers.filter((p) => !mine.some((i) => i.provider === p.provider)).map((p) => {
+    const b = button(`Link your ${p.name} account`, { variant: 'subtle', size: 'sm' });
+    b.prepend(providerMark(p.provider, 15));
+    b.addEventListener('click', () => busy(b, async () => {
+      const started = await api.post('/me/sso', { provider: p.provider });
+      location.assign(started.authorize_url);
+    }).catch(toastError));
+    return b;
+  });
+  if (links.length) body.append(h('div', { class: 'plan-actions' }, ...links));
+  return panel('Sign-in accounts', `Sign in with ${providers.map((p) => p.name).join(' or ')} instead of a password. Accounts at Gmail, or at your company’s Google Workspace or Microsoft domain, sign in with a matching email address on their own; link any other account here first.`, body);
 }
 
 /** Your account at the workspace's identity provider, when it signs in with one. */
 async function ssoProfilePanel() {
   const sso = state.auth.sso;
-  if (!sso) return null;
+  if (!sso) return signInAccountsPanel();
   const query = new URLSearchParams(location.search);
   const r = await api.get('/sso/identities');
   const mine = r.items.filter((i) => i.current);

@@ -2,6 +2,20 @@
 
 People can sign in with your organization's identity provider instead of a password: Google Workspace, Microsoft Entra ID, Okta, OneLogin, Slack, or any other OpenID Connect provider. Each workspace sets it up for itself, in Settings › Single sign-on. It's on every plan.
 
+## Continue with Google or Microsoft
+
+Without any setup, the sign-in page offers **Continue with Google** and **Continue with Microsoft**, on hosted DumbSlab and on any server that has DumbSlab's (or its own) Google and Microsoft sign-in apps (below). Anyone can use them, with a personal Google account or a work one:
+
+- **Signing up.** On a new workspace's setup page, the first admin can create their account with Google or Microsoft instead of a password. Their name and email come from the provider, which must have confirmed the address. They have no password until they set one in Settings › Profile, within 15 minutes of signing in (after that, sign out and in again first, so a stolen session can't add one).
+- **Signing in.** It finds only people already in the workspace. The first time, it matches you by email only when the provider is the authority on that address: Google for Gmail addresses and for a Google Workspace domain's, Microsoft for a domain its directory verified (`xms_edov`). For any other address on a Google account, Google confirmed it once, but it may have changed hands since, so link that account first: sign in with your password, then **Link your Google account** in Settings › Profile. After the first time, the link finds you whatever the account's address.
+- **Nobody joins this way.** An admin adds people (Settings › People) with their email address; they then sign in with Google or Microsoft, or with the password the admin set.
+- Microsoft accounts must be work or school accounts. Personal Microsoft accounts (Outlook.com, Hotmail) aren't served by DumbSlab's Microsoft app.
+- Your last way to sign in can't be unlinked: set a password first.
+
+Once a workspace sets up its own single sign-on (below), those buttons go: everyone signs in through the organization's provider, under its rules.
+
+Hosted DumbSlab signs everyone in through one redirect URI, `https://dumbslab.com/sso/callback`. A self-hosted server uses its own `/sso/callback` with the apps it's given (`DUMBSLAB_SSO_GOOGLE_CLIENT_ID` and `DUMBSLAB_SSO_GOOGLE_CLIENT_SECRET`, `DUMBSLAB_SSO_MICROSOFT_CLIENT_ID` and `DUMBSLAB_SSO_MICROSOFT_CLIENT_SECRET`); without them, the buttons don't show.
+
 ## Set it up with Google, Microsoft or Slack
 
 There's nothing to register. DumbSlab has its own Google, Microsoft and Slack sign-in apps, and you sign in once with your organization's account.
@@ -20,7 +34,7 @@ DumbSlab reads your organization from the account you sign in with:
 | Microsoft | your Microsoft Entra directory (the account's `tid`) | your email's domain, when Microsoft confirms its owner (`xms_edov`) |
 | Slack | your Slack workspace (`https://slack.com/team_id`) | none at first: Slack confirms your address, not that its domain is your organization's. Settings suggests it, and one click allows it |
 
-Personal Google accounts and personal Microsoft accounts can't be used: they have no organization. DumbSlab never allows or suggests a free-mail domain from Microsoft or Slack, such as gmail.com, outlook.com or tutamail.com (Google's domain is always your Workspace's own). When it can't take a domain from your sign-in, Settings says so, and you add your email domains there (or allow the one it suggests).
+Setting up needs an organization's account: a personal Google or Microsoft account has no organization to set up (people sign in with those through Continue with Google, above). DumbSlab never allows or suggests a free-mail domain from Microsoft or Slack, such as gmail.com, outlook.com or tutamail.com (Google's domain is always your Workspace's own). When it can't take a domain from your sign-in, Settings says so, and you add your email domains there (or allow the one it suggests).
 
 **Microsoft approval.** Some organizations let only their administrators approve new apps. If yours does, Microsoft asks for an administrator, and DumbSlab says so. A Microsoft Entra administrator can approve DumbSlab (under Enterprise applications › Admin consent requests, when your organization uses them), or do the setup themselves if they're an admin here too.
 

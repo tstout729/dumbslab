@@ -35,7 +35,7 @@ pub fn ops() -> Vec<Op> {
             .build(),
         op("users", "change_password", "POST", "/me/password", Access::Write, change_password)
             .title("Change your password")
-            .desc("Changes your password and signs out your other browser sessions. Only from a signed-in browser or the local CLI, never with a token.")
+            .desc("Changes your password and signs out your other browser sessions. Only from a signed-in browser or the local CLI, never with a token. No password yet (you signed up with Google or Microsoft)? Set one without `current_password` within 15 minutes of signing in.")
             .build(),
         op("users", "list_api_tokens", "GET", "/tokens", Access::Read, list_tokens)
             .title("List API tokens")
@@ -388,9 +388,16 @@ fn update_user(ctx: &mut Ctx, input: UpdateUserInput) -> ApiResult<User> {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ChangePasswordInput {
+    /// Required, unless you have no password yet (you signed up with Google or Microsoft): then
+    /// set one within 15 minutes of signing in.
+    #[serde(default)]
     pub current_password: String,
     pub new_password: String,
 }
+
+/// How recently someone without a password must have signed in to set one: a session stolen
+/// later can't turn itself into a password.
+const FIRST_PASSWORD_MINUTES: i64 = 15;
 
 fn change_password(ctx: &mut Ctx, input: ChangePasswordInput) -> ApiResult<Done> {
     // A token (a connected app's or a script's) must not be a way to guess, or replace, the
@@ -405,7 +412,21 @@ fn change_password(ctx: &mut Ctx, input: ChangePasswordInput) -> ApiResult<Done>
     // Guesses at the current password count against the same limits as sign-ins.
     let keys = auth::password_keys(&row.str("email"), None);
     auth::check_throttle(ctx.db, &keys, ctx.now)?;
-    let ok = row.opt_str("password_hash").is_some_and(|h| auth::verify_password(&input.current_password, &h));
+    let ok = match row.opt_str("password_hash") {
+        Some(h) => auth::verify_password(&input.current_password, &h),
+        // No password yet: the session must be a fresh sign-in (with Google or Microsoft).
+        None => {
+            let since = crate::util::ts(ctx.now - chrono::Duration::minutes(FIRST_PASSWORD_MINUTES));
+            let fresh = ctx.db.scalar_i64(
+                "SELECT COUNT(*) FROM sessions WHERE token_hash = ? AND user_id = ? AND created_at >= ?",
+                &params![ctx.actor.session_hash.clone(), ctx.actor.user_id.clone(), since],
+            )? > 0;
+            if !fresh {
+                return Err(ApiError::forbidden("to set your first password, sign out and sign in again, then set it within 15 minutes"));
+            }
+            true
+        }
+    };
     if !ok {
         auth::record_failures(ctx.db, &keys, ctx.now)?;
         // Keep the failure count although the request fails.

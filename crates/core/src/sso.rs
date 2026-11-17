@@ -111,6 +111,68 @@ const MICROSOFT_CONSUMERS: &str = "9188040d-6c67-4c5b-b112-36a304b66dad";
 /// providers have an issuer per organization, so each workspace registers its own app there.
 pub const SHARED: [Provider; 3] = [Provider::Google, Provider::Microsoft, Provider::Slack];
 
+/// The host's apps anyone may sign in with using their own account, organization or not
+/// ("Continue with Google"), and create a workspace with. Google personal accounts and work
+/// accounts both; Microsoft work and school accounts (its app serves organizations only).
+pub const PERSONAL: [Provider; 2] = [Provider::Google, Provider::Microsoft];
+
+/// Signing in with your own account, as the sign-in page offers it. Public: no secrets.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct PersonalOption {
+    pub provider: Provider,
+    /// For "Continue with …".
+    pub name: String,
+    /// Open this to sign in. Add `&next=/path` to land there afterwards.
+    pub url: String,
+}
+
+/// Who may sign in here with their own Google or Microsoft account: everyone, through the host's
+/// apps, unless the workspace set up single sign-on. Then that's the only provider (besides
+/// passwords), so its organization rules (allowed domains, one directory, "Require single
+/// sign-on") always apply.
+pub fn personal_providers(db: &dyn Db, cfg: &HostConfig) -> ApiResult<Vec<Provider>> {
+    if active(cfg, &load(db)?) {
+        return Ok(vec![]);
+    }
+    Ok(signup_providers(cfg))
+}
+
+/// The providers the first admin may create a workspace with: the host's apps for [`PERSONAL`].
+pub fn signup_providers(cfg: &HostConfig) -> Vec<Provider> {
+    PERSONAL.into_iter().filter(|p| cfg.sso_apps.get(*p).is_some()).collect()
+}
+
+pub fn personal_options(db: &dyn Db, cfg: &HostConfig, base_url: &str) -> ApiResult<Vec<PersonalOption>> {
+    Ok(personal_providers(db, cfg)?
+        .into_iter()
+        .map(|p| PersonalOption { provider: p, name: p.name().into(), url: format!("{base_url}{START_PATH}?with={}", p.as_str()) })
+        .collect())
+}
+
+/// The provider an issuer belongs to, for Google, Microsoft and Slack.
+pub fn provider_of_issuer(issuer: &str) -> Option<Provider> {
+    if issuer == "https://accounts.google.com" {
+        Some(Provider::Google)
+    } else if issuer.starts_with("https://login.microsoftonline.com/") {
+        Some(Provider::Microsoft)
+    } else if issuer == "https://slack.com" {
+        Some(Provider::Slack)
+    } else {
+        None
+    }
+}
+
+/// The provider a `?with=` names, if it's one people sign in with on their own.
+fn personal_named(name: &str) -> Option<Provider> {
+    PERSONAL.into_iter().find(|p| p.as_str() == name)
+}
+
+/// What a sign-in with the host's app for `p` must still match when it finishes: the same app.
+fn personal_fingerprint(cfg: &HostConfig, p: Provider) -> Option<String> {
+    let app = cfg.sso_apps.get(p)?;
+    Some(sha256_hex(&format!("personal|{}|{}", p.as_str(), app.client_id)))
+}
+
 /// The host's own sign-in apps, registered once with each provider so admins set up single sign-on
 /// by signing in. Cloudflare reads `SSO_GOOGLE_CLIENT_ID`, `SSO_MICROSOFT_CLIENT_ID` and
 /// `SLACK_CLIENT_ID` (vars) with the secrets `SSO_GOOGLE_CLIENT_SECRET`,
@@ -1179,12 +1241,14 @@ pub enum Problem {
     NotAdmin,
     /// Setting up: the server doesn't have its own app for that provider (any more).
     Unavailable,
+    /// Creating the workspace: someone already did.
+    AlreadySetUp,
     /// Anything else.
     Failed,
 }
 
 impl Problem {
-    pub const ALL: [Problem; 20] = [
+    pub const ALL: [Problem; 21] = [
         Problem::NotConfigured,
         Problem::Expired,
         Problem::OtherBrowser,
@@ -1204,6 +1268,7 @@ impl Problem {
         Problem::AdminConsent,
         Problem::NotAdmin,
         Problem::Unavailable,
+        Problem::AlreadySetUp,
         Problem::Failed,
     ];
 
@@ -1228,6 +1293,7 @@ impl Problem {
             Problem::AdminConsent => "admin_consent",
             Problem::NotAdmin => "not_admin",
             Problem::Unavailable => "unavailable",
+            Problem::AlreadySetUp => "already_set_up",
             Problem::Failed => "failed",
         }
     }
@@ -1254,11 +1320,7 @@ impl SetUp {
 
 /// Back to the sign-in page, saying what went wrong.
 fn to_login(base_url: &str, problem: Problem, next: &str) -> Response {
-    let mut url = format!("{base_url}/login?sso_error={}", problem.code());
-    if next != "/" {
-        url.push_str(&format!("&next={}", urlencoding::encode(next)));
-    }
-    no_store(Response::redirect(&url)).with_header("set-cookie", clear_browser_cookie(secure(base_url)))
+    to_login_with(base_url, problem, next, None)
 }
 
 /// Back to Settings › Profile after linking an account.
@@ -1279,20 +1341,86 @@ fn to_settings(base_url: &str, outcome: Result<SetUp, Problem>) -> Response {
     no_store(Response::redirect(&url))
 }
 
-/// Where a problem sends someone back to: the sign-in page, Settings › Profile when linking, or
-/// Settings › Single sign-on when setting up.
-fn back_to(base_url: &str, bound: bool, setup: bool, next: &str, problem: Problem) -> Response {
-    match (bound, setup) {
-        (true, true) => to_settings(base_url, Err(problem)),
-        (true, false) => to_profile(base_url, Err(problem)),
-        (false, _) => to_login(base_url, problem, next),
+/// Back to the sign-in page after signing in with your own account at `with` didn't work, naming
+/// the provider so the page can say which.
+fn to_login_with(base_url: &str, problem: Problem, next: &str, with: Option<Provider>) -> Response {
+    let mut url = format!("{base_url}/login?sso_error={}", problem.code());
+    if next != "/" {
+        url.push_str(&format!("&next={}", urlencoding::encode(next)));
     }
+    if let Some(p) = with {
+        url.push_str(&format!("&with={}", p.as_str()));
+    }
+    no_store(Response::redirect(&url)).with_header("set-cookie", clear_browser_cookie(secure(base_url)))
+}
+
+/// Back to the setup page after creating the workspace with Google or Microsoft didn't work, with
+/// what it had, so the person can try again (or set up with a password).
+fn to_setup(base_url: &str, problem: Problem, flow: &SignUpFlow, with: Option<Provider>) -> Response {
+    let mut url = format!(
+        "{base_url}/setup?token={}&name={}&sso_error={}",
+        urlencoding::encode(&flow.token),
+        urlencoding::encode(&flow.workspace_name),
+        problem.code()
+    );
+    if let Some(p) = with {
+        url.push_str(&format!("&with={}", p.as_str()));
+    }
+    no_store(Response::redirect(&url)).with_header("set-cookie", clear_browser_cookie(secure(base_url)))
+}
+
+/// Where a sign-in under way sends the browser back to when it doesn't work.
+enum Back<'a> {
+    /// The sign-in page.
+    Login { next: &'a str, with: Option<Provider> },
+    /// Settings › Profile, after linking an account.
+    Profile,
+    /// Settings › Single sign-on, after setting it up.
+    Settings,
+    /// The setup page, after creating the workspace by signing up.
+    Setup(&'a SignUpFlow, Option<Provider>),
+}
+
+impl<'a> Back<'a> {
+    fn of(bound: bool, flow: &'a Flow) -> Back<'a> {
+        match (bound, flow.setup.is_some(), &flow.signup) {
+            (true, true, _) => Back::Settings,
+            (true, false, _) => Back::Profile,
+            (false, _, Some(s)) => Back::Setup(s, flow.personal),
+            (false, _, None) => Back::Login { next: &flow.next, with: flow.personal },
+        }
+    }
+}
+
+/// Where a problem sends someone back to (see [`Back`]).
+fn back_to(base_url: &str, back: Back, problem: Problem) -> Response {
+    match back {
+        Back::Settings => to_settings(base_url, Err(problem)),
+        Back::Profile => to_profile(base_url, Err(problem)),
+        Back::Setup(flow, with) => to_setup(base_url, problem, flow, with),
+        Back::Login { next, with } => to_login_with(base_url, problem, next, with),
+    }
+}
+
+/// A sign-in with the person's own account may finish only while it's still offered here (a
+/// workspace that turned on single sign-on meanwhile takes it away; creating a workspace needs only
+/// the host's app) and through the same app it started with.
+fn personal_still(db: &dyn Db, cfg: &HostConfig, flow: &Flow, p: Provider) -> ApiResult<Result<(), Problem>> {
+    let offered = if flow.signup.is_some() { signup_providers(cfg).contains(&p) } else { personal_providers(db, cfg)?.contains(&p) };
+    Ok(match personal_fingerprint(cfg, p) {
+        _ if !offered && flow.signup.is_some() => Err(Problem::Unavailable),
+        _ if !offered => Err(Problem::NotConfigured),
+        Some(f) if f == flow.fingerprint => Ok(()),
+        _ => Err(Problem::Expired),
+    })
 }
 
 fn query_map(query: &str) -> BTreeMap<String, String> {
     query
         .split('&')
-        .filter_map(|p| p.split_once('='))
+        .filter(|p| !p.is_empty())
+        // A bare key (`?signup`) counts, with an empty value.
+        .map(|p| p.split_once('=').unwrap_or((p, "")))
         .map(|(k, v)| {
             let decode = |s: &str| urlencoding::decode(&s.replace('+', " ")).map(|c| c.into_owned()).unwrap_or_default();
             (decode(k), decode(v))
@@ -1317,6 +1445,21 @@ struct Flow {
     /// Setting up with the host's app for this provider (`setup_sso`), not signing in or linking.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     setup: Option<Provider>,
+    /// Signing in, linking or creating the workspace with the person's own account, through the
+    /// host's app for this provider, not the workspace's single sign-on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    personal: Option<Provider>,
+    /// Creating the workspace: its first admin signs up with `personal`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    signup: Option<SignUpFlow>,
+}
+
+/// A workspace being created by signing up with Google or Microsoft: what the setup page had.
+#[derive(Clone, Serialize, Deserialize)]
+struct SignUpFlow {
+    /// The sign-up link's token (or the server's setup token), checked again at the end.
+    token: String,
+    workspace_name: String,
 }
 
 /// A single sign-on job (see [`crate::connect::Job`]).
@@ -1331,10 +1474,14 @@ pub struct SsoJob {
 
 #[derive(Clone)]
 enum Kind {
-    /// Someone signing in from the sign-in page.
-    SignIn { next: String },
-    /// A signed-in person linking their account (`link_sso`), from one browser session.
-    Link { user_id: String, session_hash: String },
+    /// Someone signing in from the sign-in page: with the workspace's single sign-on, or with their
+    /// own account at `personal`.
+    SignIn { next: String, personal: Option<Provider> },
+    /// Creating the workspace from its setup page: its first admin signs up with `provider`.
+    SignUp { provider: Provider, flow: SignUpFlow },
+    /// A signed-in person linking their account (`link_sso`), from one browser session: at the
+    /// workspace's single sign-on, or their own account at `personal`.
+    Link { user_id: String, session_hash: String, personal: Option<Provider> },
     /// An admin setting single sign-on up by signing in with the host's app (`setup_sso`), from
     /// one browser session. `fingerprint` is [`setup_fingerprint`] as `setup_sso` saw the settings
     /// when it decided whether this replaces anything.
@@ -1372,6 +1519,7 @@ impl std::fmt::Debug for SsoJob {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let kind = match self.kind {
             Kind::SignIn { .. } => "sign-in",
+            Kind::SignUp { .. } => "sign-up",
             Kind::Link { .. } => "link",
             Kind::Setup { .. } => "setup",
             Kind::Check => "check",
@@ -1397,10 +1545,11 @@ impl SsoJob {
         SsoJob::new(base_url, Kind::Check)
     }
 
-    /// Starts linking `user_id`'s account at the provider, for the browser session whose token
-    /// hashes to `session_hash`; fills in `{ "authorize_url": … }`.
-    pub fn link(base_url: &str, user_id: &str, session_hash: &str) -> SsoJob {
-        SsoJob::new(base_url, Kind::Link { user_id: user_id.into(), session_hash: session_hash.into() })
+    /// Starts linking `user_id`'s account at the workspace's single sign-on, or (with `personal`)
+    /// their own account there, for the browser session whose token hashes to `session_hash`;
+    /// fills in `{ "authorize_url": … }`.
+    pub fn link(base_url: &str, user_id: &str, session_hash: &str, personal: Option<Provider>) -> SsoJob {
+        SsoJob::new(base_url, Kind::Link { user_id: user_id.into(), session_hash: session_hash.into(), personal })
     }
 
     /// Starts setting single sign-on up with the host's app for `provider`, by admin `user_id`
@@ -1422,17 +1571,54 @@ impl SsoJob {
 pub fn start(db: &dyn Db, cfg: &HostConfig, req: &Request) -> Outcome {
     let base = crate::http::base_url(cfg, req);
     let query = query_map(&req.query);
+    if query.contains_key("signup") {
+        return start_signup(db, cfg, &base, &query);
+    }
     let next = safe_next(query.get("next").map(String::as_str));
+    // `?with=google`: their own account, through the host's app. Otherwise the workspace's SSO.
+    let personal = query.get("with").map(|w| personal_named(w));
     let run = || -> ApiResult<Outcome> {
-        if !active(cfg, &load(db)?) {
-            return Ok(crate::http::done(to_login(&base, Problem::NotConfigured, &next)));
-        }
-        let mut out = crate::http::done(to_login(&base, Problem::Failed, &next));
-        let job = SsoJob::new(&base, Kind::SignIn { next: next.clone() });
-        out.effects.push(Effect::Connect(Job::Sso(job)));
+        let back = |problem: Problem| crate::http::done(to_login_with(&base, problem, &next, personal.flatten()));
+        let kind = match personal {
+            None if !active(cfg, &load(db)?) => return Ok(back(Problem::NotConfigured)),
+            None => Kind::SignIn { next: next.clone(), personal: None },
+            Some(Some(p)) if personal_providers(db, cfg)?.contains(&p) => Kind::SignIn { next: next.clone(), personal: Some(p) },
+            Some(_) => return Ok(back(Problem::NotConfigured)),
+        };
+        let mut out = back(Problem::Failed);
+        out.effects.push(Effect::Connect(Job::Sso(SsoJob::new(&base, kind))));
         Ok(out)
     };
     run().unwrap_or_else(|_| crate::http::done(to_login(&base, Problem::Failed, &next)))
+}
+
+/// `GET /sso/start?signup&with=google&token=…&name=…`: creates the workspace by signing up with
+/// Google or Microsoft, from its setup page. The same rule as setting up with a password: nobody
+/// has signed up yet, and the sign-up link (or the server's setup token) is good. Both are checked
+/// again when the person comes back.
+fn start_signup(db: &dyn Db, cfg: &HostConfig, base: &str, query: &BTreeMap<String, String>) -> Outcome {
+    let workspace_name = query.get("name").map(|n| n.trim().chars().take(120).collect::<String>()).filter(|n| !n.is_empty());
+    let flow = SignUpFlow {
+        token: query.get("token").map(|t| t.trim().chars().take(200).collect()).unwrap_or_default(),
+        workspace_name: workspace_name.unwrap_or_else(|| "DumbSlab".into()),
+    };
+    let provider = query.get("with").and_then(|w| personal_named(w));
+    let back = |problem: Problem| crate::http::done(to_setup(base, problem, &flow, provider));
+    let run = || -> ApiResult<Outcome> {
+        if crate::http::user_count(db)? > 0 {
+            return Ok(back(Problem::AlreadySetUp));
+        }
+        if crate::http::setup_refusal(cfg, Some(&flow.token), Utc::now()).is_some() {
+            return Ok(back(Problem::Expired));
+        }
+        let Some(provider) = provider.filter(|p| signup_providers(cfg).contains(p)) else {
+            return Ok(back(Problem::Unavailable));
+        };
+        let mut out = back(Problem::Failed);
+        out.effects.push(Effect::Connect(Job::Sso(SsoJob::new(base, Kind::SignUp { provider, flow: flow.clone() }))));
+        Ok(out)
+    };
+    run().unwrap_or_else(|_| back(Problem::Failed))
 }
 
 /// `GET /sso/callback`: the provider sent someone back. The sign-in must be one this browser
@@ -1457,7 +1643,7 @@ pub fn callback(db: &dyn Db, cfg: &HostConfig, req: &Request) -> Outcome {
         let flow: Flow = serde_json::from_str(&row.str("flow")).map_err(|e| ApiError::internal(e.to_string()))?;
         let link_user = row.opt_str("user_id");
         let setup = flow.setup;
-        let back = |problem: Problem| redirect(back_to(&base, link_user.is_some(), setup.is_some(), &flow.next, problem));
+        let back = |problem: Problem| redirect(back_to(&base, Back::of(link_user.is_some(), &flow), problem));
         let started = parse_ts(&row.str("created_at")).unwrap_or(now);
         if now - started > Duration::minutes(SIGN_IN_MINUTES) {
             return Ok(back(Problem::Expired));
@@ -1484,13 +1670,18 @@ pub fn callback(db: &dyn Db, cfg: &HostConfig, req: &Request) -> Outcome {
             }
         }
         let stored = load(db)?;
-        match setup {
-            Some(p) => match setup_fingerprint(cfg, p, &stored) {
+        match (setup, flow.personal) {
+            (Some(p), _) => match setup_fingerprint(cfg, p, &stored) {
                 None => return Ok(back(Problem::Unavailable)),
                 Some(f) if f != flow.fingerprint => return Ok(back(Problem::Expired)),
                 Some(_) => {}
             },
-            None => {
+            (None, Some(p)) => {
+                if let Err(problem) = personal_still(db, cfg, &flow, p)? {
+                    return Ok(back(problem));
+                }
+            }
+            (None, None) => {
                 let conf = effective(cfg, stored);
                 if !active(cfg, &conf) {
                     return Ok(back(Problem::NotConfigured));
@@ -1559,6 +1750,10 @@ struct Purpose<'a> {
     bound: Option<(&'a str, &'a str)>,
     /// Setting up with the host's app for this provider.
     setup: Option<Provider>,
+    /// With the person's own account, through the host's app for this provider.
+    personal: Option<Provider>,
+    /// Creating the workspace by signing up.
+    signup: Option<SignUpFlow>,
     /// What the settings must still match when it finishes.
     fingerprint: String,
 }
@@ -1604,6 +1799,8 @@ fn begin(
         basic_auth: d.basic_auth,
         next: purpose.next.to_string(),
         setup: purpose.setup,
+        personal: purpose.personal,
+        signup: purpose.signup,
     };
     db.execute(
         "INSERT INTO sso_requests (state_hash, browser_hash, user_id, flow, created_at) VALUES (?, ?, ?, ?, ?)",
@@ -1636,8 +1833,8 @@ fn begin(
                 _ => {}
             }
         }
-        // Setting up: let the admin pick their work account.
-        Some(Provider::Microsoft) if flow.setup.is_some() => query.push(("prompt", "select_account".into())),
+        // Setting up, or signing in with their own account: let them pick which account.
+        Some(Provider::Microsoft) if flow.setup.is_some() || flow.personal.is_some() => query.push(("prompt", "select_account".into())),
         Some(Provider::Slack) if !conf.team.is_empty() => query.push(("team", conf.team.clone())),
         _ => {}
     }
@@ -1717,7 +1914,78 @@ pub fn step(db: &dyn Db, cfg: &HostConfig, j: &mut SsoJob, replies: Vec<HttpRepl
                         next: SETTINGS_PATH,
                         bound: Some((user_id, session_hash)),
                         setup: Some(*provider),
+                        personal: None,
+                        signup: None,
                         fingerprint: fingerprint.clone(),
+                    };
+                    let (url, _) = begin(db, cfg, &target, &d, &base, purpose, now)?;
+                    fill(json!({ "authorize_url": url }))
+                }
+                Err(e) => Ok(Step::Done(Finish::Fail(ApiError::new(502, "sso_unavailable", e)))),
+            }
+        }
+        (Kind::SignIn { next, personal: Some(p) }, phase) => {
+            let (next, p) = (next.clone(), *p);
+            let back = |problem: Problem| Ok(respond(to_login_with(&base, problem, &next, Some(p))));
+            let (Some(target), Some(fingerprint)) = (setup_target(cfg, p), personal_fingerprint(cfg, p)) else {
+                return back(Problem::NotConfigured);
+            };
+            if !personal_providers(db, cfg)?.contains(&p) {
+                return back(Problem::NotConfigured);
+            }
+            if matches!(phase, Phase::Start) {
+                j.phase = Phase::Discovering;
+                return Ok(Step::Fetch(vec![HttpCall::get(discovery_url(&target.issuer)).header("accept", "application/json")]));
+            }
+            let Ok(d) = read_discovery(&target, &reply) else { return back(Problem::ProviderError) };
+            let purpose = Purpose { next: &next, bound: None, setup: None, personal: Some(p), signup: None, fingerprint };
+            let (url, browser) = begin(db, cfg, &target, &d, &base, purpose, now)?;
+            let cookie = browser_cookie(&browser.unwrap_or_default(), secure(&base));
+            Ok(respond(no_store(Response::redirect(&url)).with_header("set-cookie", cookie)))
+        }
+        (Kind::SignUp { provider, flow }, phase) => {
+            let (p, flow) = (*provider, flow.clone());
+            let back = |problem: Problem| Ok(respond(to_setup(&base, problem, &flow, Some(p))));
+            if crate::http::user_count(db)? > 0 {
+                return back(Problem::AlreadySetUp);
+            }
+            let (Some(target), Some(fingerprint)) = (setup_target(cfg, p), personal_fingerprint(cfg, p)) else {
+                return back(Problem::Unavailable);
+            };
+            if matches!(phase, Phase::Start) {
+                j.phase = Phase::Discovering;
+                return Ok(Step::Fetch(vec![HttpCall::get(discovery_url(&target.issuer)).header("accept", "application/json")]));
+            }
+            let Ok(d) = read_discovery(&target, &reply) else { return back(Problem::ProviderError) };
+            let purpose = Purpose { next: "/", bound: None, setup: None, personal: Some(p), signup: Some(flow.clone()), fingerprint };
+            let (url, browser) = begin(db, cfg, &target, &d, &base, purpose, now)?;
+            let cookie = browser_cookie(&browser.unwrap_or_default(), secure(&base));
+            Ok(respond(no_store(Response::redirect(&url)).with_header("set-cookie", cookie)))
+        }
+        (Kind::Link { user_id, session_hash, personal: Some(p) }, phase) => {
+            let p = *p;
+            let (Some(target), Some(fingerprint)) = (setup_target(cfg, p), personal_fingerprint(cfg, p)) else {
+                return Ok(Step::Done(Finish::Fail(shared_unavailable(p))));
+            };
+            if !personal_providers(db, cfg)?.contains(&p) {
+                return Ok(Step::Done(Finish::Fail(ApiError::bad_request(format!(
+                    "signing in with your own {} account isn't available in this workspace",
+                    p.name()
+                )))));
+            }
+            if matches!(phase, Phase::Start) {
+                j.phase = Phase::Discovering;
+                return Ok(Step::Fetch(vec![HttpCall::get(discovery_url(&target.issuer)).header("accept", "application/json")]));
+            }
+            match read_discovery(&target, &reply) {
+                Ok(d) => {
+                    let purpose = Purpose {
+                        next: "/settings/profile",
+                        bound: Some((user_id, session_hash)),
+                        setup: None,
+                        personal: Some(p),
+                        signup: None,
+                        fingerprint,
                     };
                     let (url, _) = begin(db, cfg, &target, &d, &base, purpose, now)?;
                     fill(json!({ "authorize_url": url }))
@@ -1732,7 +2000,7 @@ pub fn step(db: &dyn Db, cfg: &HostConfig, j: &mut SsoJob, replies: Vec<HttpRepl
             };
             if !usable {
                 return Ok(match &j.kind {
-                    Kind::SignIn { next } => respond(to_login(&base, Problem::NotConfigured, next)),
+                    Kind::SignIn { next, .. } => respond(to_login(&base, Problem::NotConfigured, next)),
                     Kind::Check => fill(settings_view(db, cfg, &base, None)?)?,
                     _ => Step::Done(Finish::Fail(ApiError::bad_request("single sign-on isn't set up for this workspace"))),
                 });
@@ -1747,21 +2015,23 @@ pub fn step(db: &dyn Db, cfg: &HostConfig, j: &mut SsoJob, replies: Vec<HttpRepl
             };
             fill(settings_view(db, cfg, &base, Some(check))?)
         }
-        (Kind::SignIn { next }, _) => match read_discovery(&conf, &reply) {
+        (Kind::SignIn { next, .. }, _) => match read_discovery(&conf, &reply) {
             Ok(d) => {
-                let purpose = Purpose { next, bound: None, setup: None, fingerprint: conf.fingerprint() };
+                let purpose = Purpose { next, bound: None, setup: None, personal: None, signup: None, fingerprint: conf.fingerprint() };
                 let (url, browser) = begin(db, cfg, &conf, &d, &base, purpose, now)?;
                 let cookie = browser_cookie(&browser.unwrap_or_default(), secure(&base));
                 Ok(respond(no_store(Response::redirect(&url)).with_header("set-cookie", cookie)))
             }
             Err(_) => Ok(respond(to_login(&base, Problem::ProviderError, next))),
         },
-        (Kind::Link { user_id, session_hash }, _) => match read_discovery(&conf, &reply) {
+        (Kind::Link { user_id, session_hash, .. }, _) => match read_discovery(&conf, &reply) {
             Ok(d) => {
                 let purpose = Purpose {
                     next: "/settings/profile",
                     bound: Some((user_id, session_hash)),
                     setup: None,
+                    personal: None,
+                    signup: None,
                     fingerprint: conf.fingerprint(),
                 };
                 let (url, _) = begin(db, cfg, &conf, &d, &base, purpose, now)?;
@@ -1794,17 +2064,23 @@ fn finish_step(
     now: DateTime<Utc>,
 ) -> ApiResult<Step> {
     let base = j.base_url.clone();
-    let back = |problem: Problem| respond(back_to(&base, r.link_user.is_some(), r.flow.setup.is_some(), &r.flow.next, problem));
+    let back = |problem: Problem| respond(back_to(&base, Back::of(r.link_user.is_some(), &r.flow), problem));
     // The app and settings this sign-in uses: the workspace's, unchanged since it started; or,
-    // setting up, the host's app, with the workspace's settings unchanged.
-    let target = match r.flow.setup {
-        Some(p) => match (setup_target(cfg, p), setup_fingerprint(cfg, p, &load(db)?)) {
+    // setting up or with the person's own account, the host's app (setting up: with the
+    // workspace's settings unchanged).
+    let target = match (r.flow.setup, r.flow.personal) {
+        (Some(p), _) => match (setup_target(cfg, p), setup_fingerprint(cfg, p, &load(db)?)) {
             (Some(t), Some(f)) if f == r.flow.fingerprint => t,
             (Some(_), Some(_)) => return Ok(back(Problem::Expired)),
             _ => return Ok(back(Problem::Unavailable)),
         },
-        None if !active(cfg, conf) || conf.fingerprint() != r.flow.fingerprint => return Ok(back(Problem::Expired)),
-        None => conf.clone(),
+        (None, Some(p)) => match (personal_still(db, cfg, &r.flow, p)?, setup_target(cfg, p)) {
+            (Ok(()), Some(t)) => t,
+            (Err(problem), _) => return Ok(back(problem)),
+            (Ok(()), None) => return Ok(back(Problem::Unavailable)),
+        },
+        (None, None) if !active(cfg, conf) || conf.fingerprint() != r.flow.fingerprint => return Ok(back(Problem::Expired)),
+        (None, None) => conf.clone(),
     };
     match phase {
         Phase::Start | Phase::Discovering => {
@@ -1827,6 +2103,16 @@ fn finish_step(
                 return match setup_org(&target, &claims, &r.flow.nonce, now) {
                     Ok((org, domains)) => complete_setup(db, cfg, j, r, &org, domains, &claims, now),
                     Err(problem) => Ok(back(problem)),
+                };
+            }
+            if r.flow.personal.is_some() {
+                let account = match personal_account(&target, &claims, &r.flow.nonce, now) {
+                    Ok(a) => a,
+                    Err(problem) => return Ok(back(problem)),
+                };
+                return match &r.flow.signup {
+                    Some(flow) => complete_signup(db, cfg, &base, &account, r, flow, &claims, now),
+                    None => complete(db, cfg, &base, &account, r, &claims, now),
                 };
             }
             if check_claims(&target, &claims, &r.flow.nonce, now).is_err() {
@@ -2143,6 +2429,8 @@ enum Matched {
     Email,
     /// They joined by signing in (auto-provisioning).
     Provisioned,
+    /// They created the workspace by signing up with it.
+    SignedUp,
 }
 
 /// Records a new link in the admins' activity log: it's a new way into the account.
@@ -2152,6 +2440,7 @@ fn record_link(db: &dyn Db, cfg: &HostConfig, base: &str, p: &Person, conf: &Con
         Matched::Themselves => ("self", format!("linked their {name} account")),
         Matched::Email => ("email", format!("signed in with {name} for the first time, linked by their verified email")),
         Matched::Provisioned => ("provisioned", format!("joined with their {name} account")),
+        Matched::SignedUp => ("signup", format!("created the workspace with their {name} account")),
     };
     let mut ctx = ctx_for(db, cfg, base, p, now);
     let data = json!({ "issuer": conf.issuer, "matched_by": matched });
@@ -2163,9 +2452,12 @@ fn record_link(db: &dyn Db, cfg: &HostConfig, base: &str, p: &Person, conf: &Con
 fn complete(db: &dyn Db, cfg: &HostConfig, base: &str, conf: &Config, r: &Returned, claims: &Value, now: DateTime<Utc>) -> ApiResult<Step> {
     let back = |problem: Problem| match r.link_user {
         Some(_) => respond(to_profile(base, Err(problem))),
-        None => respond(to_login(base, problem, &r.flow.next)),
+        None => respond(to_login_with(base, problem, &r.flow.next, r.flow.personal)),
     };
-    if let Err(problem) = org_check(conf, claims) {
+    // With their own account (`personal`), anyone's account at the provider may sign in, but it
+    // finds only people already here: by a link, or by an address the provider is the authority on.
+    let personal = r.flow.personal.is_some();
+    if !personal && let Err(problem) = org_check(conf, claims) {
         return Ok(back(problem));
     }
     let Some(key) = identity_key(conf, claims) else { return Ok(back(Problem::InvalidToken)) };
@@ -2201,7 +2493,7 @@ fn complete(db: &dyn Db, cfg: &HostConfig, base: &str, conf: &Config, r: &Return
             person(&row)
         }
         None => {
-            let email = match vouched_email(conf, claims) {
+            let email = match if personal { personal_email(conf, claims) } else { vouched_email(conf, claims) } {
                 Ok(e) => e,
                 Err(problem) => return Ok(back(problem)),
             };
@@ -2222,7 +2514,7 @@ fn complete(db: &dyn Db, cfg: &HostConfig, base: &str, conf: &Config, r: &Return
                     record_link(db, cfg, base, &p, conf, Matched::Email, now)?;
                     p
                 }
-                None if conf.auto_provision => provision(db, cfg, base, conf, (&key, claims), &email, now)?,
+                None if conf.auto_provision && !personal => provision(db, cfg, base, conf, (&key, claims), &email, now)?,
                 None => return Ok(back(Problem::NoAccount)),
             }
         }
@@ -2251,16 +2543,7 @@ fn provision(
     email: &str,
     now: DateTime<Utc>,
 ) -> ApiResult<Person> {
-    let given = [claims["given_name"].as_str(), claims["family_name"].as_str()].into_iter().flatten().collect::<Vec<_>>().join(" ");
-    let local = email.split('@').next().unwrap_or(email);
-    let name = [claims["name"].as_str().unwrap_or_default(), given.as_str(), local]
-        .into_iter()
-        .map(str::trim)
-        .find(|n| !n.is_empty())
-        .unwrap_or(local)
-        .chars()
-        .take(120)
-        .collect::<String>();
+    let name = display_name(claims, email);
     let placeholder = Person {
         id: String::new(),
         name: name.clone(),
@@ -2282,6 +2565,124 @@ fn provision(
     )?;
     record_link(db, cfg, base, &p, conf, Matched::Provisioned, now)?;
     Ok(p)
+}
+
+/// The name to give someone joining from a provider: the token's name, or given and family
+/// names, or the email address's local part.
+fn display_name(claims: &Value, email: &str) -> String {
+    let given = [claims["given_name"].as_str(), claims["family_name"].as_str()].into_iter().flatten().collect::<Vec<_>>().join(" ");
+    let local = email.split('@').next().unwrap_or(email);
+    [claims["name"].as_str().unwrap_or_default(), given.as_str(), local]
+        .into_iter()
+        .map(str::trim)
+        .find(|n| !n.is_empty())
+        .unwrap_or(local)
+        .chars()
+        .take(120)
+        .collect()
+}
+
+/// Google's own consumer domains, where Google is the authority on who owns an address.
+const GOOGLE_MAIL: [&str; 2] = ["gmail.com", "googlemail.com"];
+
+/// Signing in with their own account: checks the ID token against the host's app (`target`, from
+/// [`setup_target`]) and answers with the settings it was checked with, which say which issuer
+/// accounts are linked under. Microsoft's directory must be in the issuer exactly, as for setting
+/// up; personal Microsoft accounts aren't served (the host's app is for organizations).
+fn personal_account(target: &Config, claims: &Value, nonce: &str, now: DateTime<Utc>) -> Result<Config, Problem> {
+    let mut conf = target.clone();
+    if conf.provider == Some(Provider::Microsoft) {
+        let tid = claims["tid"].as_str().unwrap_or_default();
+        let tenant = normalize_tenant(tid).filter(|t| t != MICROSOFT_CONSUMERS).ok_or(Problem::PersonalAccount)?;
+        conf.issuer = microsoft_issuer(tid);
+        check_claims(&conf, claims, nonce, now).map_err(|_| Problem::InvalidToken)?;
+        conf.issuer = microsoft_issuer(&tenant);
+        conf.tenant = tenant;
+    } else {
+        check_claims(&conf, claims, nonce, now).map_err(|_| Problem::InvalidToken)?;
+    }
+    if identity_key(&conf, claims).is_none() {
+        return Err(Problem::InvalidToken);
+    }
+    Ok(conf)
+}
+
+/// The address a first sign-in with someone's own account may find them by: only one the provider
+/// is the authority on. Google is for Gmail addresses and for a Google Workspace domain's (`hd`);
+/// for any other address on a Google account, `email_verified` says it was confirmed once, not
+/// that it still belongs to that account (Google's guidance:
+/// <https://developers.google.com/identity/openid-connect/openid-connect#an-id-tokens-payload>).
+/// Microsoft's needs `xms_edov`, as for single sign-on.
+fn personal_email(conf: &Config, claims: &Value) -> Result<String, Problem> {
+    let email = claims["email"].as_str().map(|e| e.trim().to_ascii_lowercase()).unwrap_or_default();
+    let domain = email.rsplit_once('@').map(|(_, d)| d).unwrap_or_default();
+    let authoritative = match conf.provider {
+        Some(Provider::Google) => {
+            let hd = claims["hd"].as_str().is_some_and(|hd| !hd.is_empty() && hd.eq_ignore_ascii_case(domain));
+            truthy(&claims["email_verified"]) && (GOOGLE_MAIL.contains(&domain) || hd)
+        }
+        Some(Provider::Microsoft) => truthy(&claims["xms_edov"]),
+        _ => false,
+    };
+    if email.is_empty() || domain.is_empty() || !authoritative {
+        return Err(Problem::UnverifiedEmail);
+    }
+    Ok(email)
+}
+
+/// The address the first admin of a new workspace gets from the provider: one it confirmed
+/// (Google's `email_verified`; Microsoft's `xms_edov`). Creating a workspace matches nobody, so a
+/// confirmed address on any Google account will do.
+fn signup_email(conf: &Config, claims: &Value) -> Result<String, Problem> {
+    let email = claims["email"].as_str().map(|e| e.trim().to_ascii_lowercase()).unwrap_or_default();
+    let confirmed = match conf.provider {
+        Some(Provider::Google) => truthy(&claims["email_verified"]),
+        Some(Provider::Microsoft) => truthy(&claims["xms_edov"]),
+        _ => false,
+    };
+    if !confirmed || !crate::util::is_valid_email(&email) {
+        return Err(Problem::UnverifiedEmail);
+    }
+    Ok(email)
+}
+
+/// Creating the workspace by signing up checked out: makes the person its first admin, with no
+/// password and their account linked, and signs them in. Only while nobody has (the setup page's
+/// own rule), and only with a sign-up link (or setup token) that's still good.
+#[allow(clippy::too_many_arguments)]
+fn complete_signup(
+    db: &dyn Db,
+    cfg: &HostConfig,
+    base: &str,
+    conf: &Config,
+    r: &Returned,
+    flow: &SignUpFlow,
+    claims: &Value,
+    now: DateTime<Utc>,
+) -> ApiResult<Step> {
+    let back = |problem: Problem| Ok(respond(to_setup(base, problem, flow, r.flow.personal)));
+    if crate::http::user_count(db)? > 0 {
+        return back(Problem::AlreadySetUp);
+    }
+    if crate::http::setup_refusal(cfg, Some(&flow.token), now).is_some() {
+        return back(Problem::Expired);
+    }
+    let Some(key) = identity_key(conf, claims) else { return back(Problem::InvalidToken) };
+    let email = match signup_email(conf, claims) {
+        Ok(e) => e,
+        Err(problem) => return back(problem),
+    };
+    let uid = crate::http::create_first_admin(db, cfg, base, &email, &display_name(claims, &email), None, &flow.workspace_name, now)?;
+    link_identity(db, &uid, conf, &key, claims, now)?;
+    let p = find_person(db, &uid)?.ok_or_else(|| ApiError::internal("user vanished"))?;
+    record_link(db, cfg, base, &p, conf, Matched::SignedUp, now)?;
+    let token = auth::create_session(db, &uid, r.user_agent.as_deref(), now)?;
+    let secure = secure(base);
+    Ok(respond(
+        no_store(Response::redirect(&format!("{base}/")))
+            .with_header("set-cookie", auth::session_cookie(&token, secure))
+            .with_header("set-cookie", clear_browser_cookie(secure)),
+    ))
 }
 
 #[cfg(test)]
@@ -2427,12 +2828,14 @@ mod tests {
             basic_auth: true,
             next: "/".into(),
             setup: Some(Provider::Google),
+            personal: None,
+            signup: Some(SignUpFlow { token: "the-signup-token".into(), workspace_name: "Acme".into() }),
         };
         let returned = Returned { code: "the-code".into(), flow, link_user: None, link_session: None, user_agent: None };
         let mut job = SsoJob::new("https://kb.test", Kind::Finish(Box::new(returned)));
         job.phase = Phase::Exchanging;
         let printed = format!("{job:?}");
-        for secret in ["the-nonce", "the-verifier", "the-code"] {
+        for secret in ["the-nonce", "the-verifier", "the-code", "the-signup-token"] {
             assert!(!printed.contains(secret), "{printed}");
         }
     }

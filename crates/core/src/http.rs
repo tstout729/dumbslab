@@ -295,7 +295,7 @@ fn set_cookie(mut out: Outcome, cookie: String) -> Outcome {
     out
 }
 
-fn user_count(db: &dyn Db) -> ApiResult<i64> {
+pub(crate) fn user_count(db: &dyn Db) -> ApiResult<i64> {
     db.scalar_i64("SELECT COUNT(*) FROM users", &[])
 }
 
@@ -317,6 +317,19 @@ fn auth_state(db: &dyn Db, cfg: &HostConfig, req: &Request) -> Outcome {
             "api_url": format!("{}{API_PREFIX}", base_url(cfg, req)),
             // Signing in with the workspace's identity provider, when it's set up.
             "sso": crate::sso::sign_in_option(db, cfg, &base_url(cfg, req))?,
+            // Signing in with your own Google or Microsoft account ("Continue with Google").
+            "sign_in_with": if needs_setup { vec![] } else { crate::sso::personal_options(db, cfg, &base_url(cfg, req))? },
+            // Creating the workspace with one ("Sign up with Google"), on the setup page.
+            "sign_up_with": if needs_setup {
+                crate::sso::signup_providers(cfg).into_iter().map(|p| json!({ "provider": p, "name": p.name() })).collect::<Vec<_>>()
+            } else {
+                vec![]
+            },
+            // Whether the signed-in person has a password (someone who signed up with Google may not).
+            "has_password": match &user {
+                Some(u) => db.scalar_i64("SELECT COUNT(*) FROM users WHERE id = ? AND password_hash IS NOT NULL", &params![u.id.clone()])? > 0,
+                None => false,
+            },
             // Session recordings and browser error reports, or null when the host didn't set them up.
             "telemetry": cfg.telemetry.web_config(cfg.workspace.as_deref()),
         }))
@@ -343,46 +356,80 @@ fn setup(db: &dyn Db, cfg: &HostConfig, req: &Request) -> Outcome {
         if user_count(db)? > 0 {
             return Err(ApiError::conflict("this workspace is already set up; sign in instead"));
         }
-        let token = input.setup_token.as_deref().map(str::trim);
-        let signed_link = matches!((&cfg.signup_secret, &cfg.workspace, token),
-            (Some(secret), Some(ws), Some(t)) if crate::tenancy::verify_signup_token(secret, ws, t, Utc::now().timestamp()));
-        let static_token = matches!((&cfg.setup_token, token), (Some(expected), Some(t)) if secure_eq(t, expected));
-        let open = cfg.open_setup && cfg.setup_token.is_none() && cfg.signup_secret.is_none();
-        if !(signed_link || static_token || open) {
-            return Err(ApiError::forbidden(if cfg.signup_secret.is_some() {
-                "this sign-up link is invalid or has expired; start again from the sign-up page"
-            } else if cfg.setup_token.is_some() {
-                "the setup token is missing or wrong; find it in the server log or your deployment's SETUP_TOKEN secret"
-            } else {
-                "setup is locked: start the server with a setup token"
-            }));
+        if let Some(refused) = setup_refusal(cfg, input.setup_token.as_deref(), Utc::now()) {
+            return Err(refused);
         }
         let hash = auth::hash_password(&input.password)?;
-        let system = Actor {
-            user_id: String::new(),
-            name: input.name.clone(),
-            handle: String::new(),
-            email: input.email.clone(),
-            role: Role::Admin,
-            scopes: auth::Scopes::ALL,
-            via: Via::Web,
-            token_id: None,
-            session_hash: None,
-        };
-        let mut ctx = new_ctx(db, cfg, req, system);
-        let uid = crate::ops::users::insert_user(&ctx, &input.email, &input.name, None, Role::Admin, Some(hash), false)?;
-        let workspace = input.workspace_name.map(|w| w.trim().to_string()).filter(|w| !w.is_empty()).unwrap_or_else(|| "DumbSlab".into());
-        crate::ops::admin::put_setting(db, "workspace_name", &workspace)?;
+        let workspace = input.workspace_name.unwrap_or_default();
+        let uid = create_first_admin(db, cfg, &base_url(cfg, req), &input.email, &input.name, Some(hash), &workspace, Utc::now())?;
         let row = db
             .one(&format!("SELECT {USER_COLS} FROM users WHERE id = ?"), &params![uid.clone()])?
             .ok_or_else(|| ApiError::internal("user vanished"))?;
-        ctx.actor = auth_actor_for(&row);
-        crate::seed::seed_workspace(&mut ctx, &workspace)?;
         let token = auth::create_session(db, &uid, req.header("user-agent"), Utc::now())?;
         let out = done(Response::json(200, &json!({ "user": User::from_row(&row) })));
         Ok(set_cookie(out, auth::session_cookie(&token, secure_cookies(cfg, req))))
     };
     run().unwrap_or_else(|e| failed(&e))
+}
+
+/// Why the first admin may not be created with `token` now, if they may not: a hosted workspace
+/// needs its sign-up link's token, a self-hosted server its setup token, unless it was started to
+/// let anyone set it up (and nothing else guards it). Setting up with a password and signing up
+/// with Google or Microsoft both ask.
+pub(crate) fn setup_refusal(cfg: &HostConfig, token: Option<&str>, now: chrono::DateTime<Utc>) -> Option<ApiError> {
+    let token = token.map(str::trim).filter(|t| !t.is_empty());
+    let signed_link = matches!((&cfg.signup_secret, &cfg.workspace, token),
+        (Some(secret), Some(ws), Some(t)) if crate::tenancy::verify_signup_token(secret, ws, t, now.timestamp()));
+    let static_token = matches!((&cfg.setup_token, token), (Some(expected), Some(t)) if secure_eq(t, expected));
+    let open = cfg.open_setup && cfg.setup_token.is_none() && cfg.signup_secret.is_none();
+    if signed_link || static_token || open {
+        return None;
+    }
+    Some(ApiError::forbidden(if cfg.signup_secret.is_some() {
+        "this sign-up link is invalid or has expired; start again from the sign-up page"
+    } else if cfg.setup_token.is_some() {
+        "the setup token is missing or wrong; find it in the server log or your deployment's SETUP_TOKEN secret"
+    } else {
+        "setup is locked: start the server with a setup token"
+    }))
+}
+
+/// Creates the workspace's first admin, names the workspace (`DumbSlab` when blank) and seeds its
+/// first posts. The caller has checked that nobody signed up yet and that they may
+/// ([`setup_refusal`]). `password_hash` is `None` for an admin who signed up with Google or
+/// Microsoft. Returns their user id.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn create_first_admin(
+    db: &dyn Db,
+    cfg: &HostConfig,
+    base_url: &str,
+    email: &str,
+    name: &str,
+    password_hash: Option<String>,
+    workspace: &str,
+    now: chrono::DateTime<Utc>,
+) -> ApiResult<String> {
+    let system = Actor {
+        user_id: String::new(),
+        name: name.to_string(),
+        handle: String::new(),
+        email: email.to_string(),
+        role: Role::Admin,
+        scopes: auth::Scopes::ALL,
+        via: Via::Web,
+        token_id: None,
+        session_hash: None,
+    };
+    let mut ctx = Ctx { db, actor: system, now, cfg, base_url: base_url.to_string(), effects: vec![] };
+    let uid = crate::ops::users::insert_user(&ctx, email, name, None, Role::Admin, password_hash, false)?;
+    let workspace = Some(workspace.trim()).filter(|w| !w.is_empty()).unwrap_or("DumbSlab").to_string();
+    crate::ops::admin::put_setting(db, "workspace_name", &workspace)?;
+    let row = db
+        .one(&format!("SELECT {USER_COLS} FROM users WHERE id = ?"), &params![uid.clone()])?
+        .ok_or_else(|| ApiError::internal("user vanished"))?;
+    ctx.actor = auth_actor_for(&row);
+    crate::seed::seed_workspace(&mut ctx, &workspace)?;
+    Ok(uid)
 }
 
 fn auth_actor_for(row: &crate::db::Row) -> Actor {

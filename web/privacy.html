@@ -71,7 +71,7 @@
     <ul>
       <li><strong>Workspace content.</strong> Posts and their earlier versions, comments, reactions, topics, uploaded files and images, and the search index built from them. Also who follows what, notifications, and which posts each person has viewed.</li>
       <li><strong>Accounts.</strong> Each person's name, email address, handle, role, and optional bio and picture. Your password is stored only as an Argon2 hash; we never keep the password itself. If an admin turns on people sync, profiles also get job title, department, location, work phone, pronouns and manager from BambooHR.</li>
-      <li><strong>Single sign-on.</strong> If you sign in through Google, Microsoft, Slack, Okta or another identity provider, we keep the provider's ID for your account and the email address it gave.</li>
+      <li><strong>Single sign-on.</strong> If you sign in or sign up through Google, Microsoft, Slack, Okta or another identity provider, we keep the provider's ID for your account and the email address it gave. Signing up that way also takes your name from it.</li>
       <li><strong>Sessions.</strong> Signing in sets one cookie, <code>dumbslab_session</code>, holding a random token. We store only a SHA-256 hash of that token, with your browser's user-agent string and when the session ends. Sessions last up to 30 days.</li>
       <li><strong>API tokens.</strong> Personal access tokens, and the tokens AI tools get when you approve them, are stored only as SHA-256 hashes. A token is shown once, when it's made.</li>
       <li><strong>Activity events.</strong> A feed of changes: who did what, to which post, topic or setting, and when. It doesn't copy comment text.</li>
@@ -128,6 +128,7 @@
   <section id="google" aria-labelledby="google-title">
     <h2 id="google-title">Google user data</h2>
     <p>DumbSlab's use and transfer to any other app of information received from Google APIs will adhere to the <a href="https://developers.google.com/terms/api-services-user-data-policy">Google API Services User Data Policy</a>, including the Limited Use requirements.</p>
+    <p>When you sign in or sign up with Google, DumbSlab asks only for your basic profile (<code>openid email profile</code>): your Google account ID, name and email address. It uses them to sign you in and, when you create a workspace with Google, to name your account. It never gets access to your Gmail, Drive or other Google data this way.</p>
     <p>When you connect Google Drive, DumbSlab asks for read-only access to Drive (<code>drive.readonly</code>) and your email address. It uses them only so you can search your Drive from DumbSlab:</p>
     <ul>
       <li>When you search, Google runs the search and returns the matching files' names, types, links, last-changed times and owners' names. DumbSlab shows them to you and doesn't save them.</li>
