@@ -651,6 +651,7 @@ dialog { color: var(--ink); }
 .palette-snippet { font-size: 12.5px; color: var(--ink-3); line-height: 1.45; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
 .palette-topics { display: flex; gap: 4px; flex: none; padding-top: 1px; }
 .palette-empty { padding: 28px 16px; text-align: center; color: var(--ink-3); }
+.palette-note { padding: 4px 10px 8px 39px; font-size: 12.5px; color: var(--ink-3); }
 .palette-foot { display: flex; gap: 16px; padding: 9px 16px; border-top: 1px solid var(--line); background: var(--bg-sunk); font-size: 12px; color: var(--ink-3); }
 .palette-foot kbd { font-size: 10.5px; }
 mark { background: var(--mark-bg); color: inherit; border-radius: 3px; padding: 0 1px; }
@@ -1085,6 +1086,8 @@ a.stat:hover { background: var(--bg-hover); text-decoration: none; }
 .plan-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 .connected-results { margin-top: 28px; display: flex; flex-direction: column; gap: 14px; }
 .connected-title { font-size: 15px; font-weight: 650; }
+.search-none { display: flex; align-items: center; gap: 8px; padding: 6px 2px 2px; }
+.search-none + .connected-results { margin-top: 10px; }
 .connected-group { display: flex; flex-direction: column; gap: 8px; }
 .connected-app { font-size: 13px; font-weight: 650; color: var(--ink-2); text-transform: uppercase; letter-spacing: .04em; }
 .connected-hint { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }

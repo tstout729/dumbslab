@@ -7,25 +7,52 @@ import { h, icon, button, busy, toast, toastError, confirmDialog, field, input, 
 let listing = null;
 /** Link previews by URL. They depend on the person's connections, so they go when those change. */
 const previews = new Map();
+/** Connected-app searches by query and limit, so retyping a query doesn't ask every app again. */
+const searches = new Map();
+const MAX_SEARCHES = 40;
 
 /** The apps and the person's connections, fetched once per page load. */
 export function connections({ fresh = false } = {}) {
   if (!listing || fresh) {
     previews.clear();
+    searches.clear();
     listing = api.get('/connections').catch((e) => { listing = null; throw e; });
   }
   return listing;
 }
 
+/** The searchable apps this person connected, or none when connected apps are off or unreachable. */
+export async function searchableConnections() {
+  try {
+    const list = await connections();
+    return list.enabled ? list.apps.filter((a) => a.search && a.connected) : [];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Searches the person's connected apps. Answers are kept for the page's life (failures aren't),
+ * and one query asked twice at once shares one request.
+ */
+export function searchConnected(q, limit) {
+  const key = `${limit}\n${q}`;
+  if (!searches.has(key)) {
+    if (searches.size >= MAX_SEARCHES) searches.delete(searches.keys().next().value);
+    searches.set(key, api.get('/search/connected', { q, limit }).catch((e) => { searches.delete(key); throw e; }));
+  }
+  return searches.get(key);
+}
+
 /** Only web links become links: app answers are someone else's data. */
-const webUrl = (url) => (/^https?:\/\//i.test(url || '') ? url : null);
+export const webUrl = (url) => (/^https?:\/\//i.test(url || '') ? url : null);
 
 function external(url, label, cls) {
   const href = webUrl(url);
   return href ? h('a', { class: cls, href, target: '_blank', rel: 'noopener noreferrer' }, label) : h('span', { class: cls }, label);
 }
 
-const KIND_LABEL = {
+export const KIND_LABEL = {
   issue: 'Issue', pull_request: 'Pull request', repository: 'Repository', merge_request: 'Merge request', message: 'Message',
   page: 'Page', ticket: 'Ticket', article: 'Article', task: 'Task', project: 'Project', card: 'Card', file: 'File', folder: 'Folder',
   document: 'Doc', spreadsheet: 'Sheet', presentation: 'Slides', form: 'Form', story: 'Story', item: 'Item',
@@ -34,17 +61,20 @@ const KIND_LABEL = {
 // ---------------------------------------------------------------------------
 // Search page
 
-/** A section that fills in with results from the person's connected apps. */
-export function connectedResults(q) {
+/**
+ * A section that fills in with results from the person's connected apps. `onSettled` hears how
+ * many results the apps found once they've answered (0 when nothing was searched or it failed).
+ */
+export function connectedResults(q, { onSettled = () => {} } = {}) {
   const section = h('section', { class: 'connected-results', 'aria-label': 'Results from your connected apps' });
   (async () => {
     let list;
     try {
       list = await connections();
     } catch {
-      return;
+      return onSettled(0);
     }
-    if (!list.enabled) return;
+    if (!list.enabled) return onSettled(0);
     const searchable = list.apps.filter((a) => a.search);
     const mine = searchable.filter((a) => a.connected);
     if (!mine.length) {
@@ -53,16 +83,16 @@ export function connectedResults(q) {
           h('span', null, `Search ${searchable.slice(0, 3).map((a) => a.name).join(', ')} and more from here: `),
           h('a', { href: '/settings/connections' }, 'connect your apps')));
       }
-      return;
+      return onSettled(0);
     }
     const status = h('p', { class: 'muted small', role: 'status' }, `Searching ${mine.map((a) => a.name).join(', ')}…`);
     section.append(h('h2', { class: 'connected-title' }, 'From your connected apps'), status);
     let r;
     try {
-      r = await api.get('/search/connected', { q, limit: 5 });
+      r = await searchConnected(q, 5);
     } catch (e) {
       status.textContent = `Couldn't search your connected apps: ${e.message}`;
-      return;
+      return onSettled(0);
     }
     status.remove();
     for (const app of r.apps) {
@@ -77,6 +107,7 @@ export function connectedResults(q) {
       }
       section.append(group);
     }
+    onSettled(r.items.length);
   })();
   return section;
 }
