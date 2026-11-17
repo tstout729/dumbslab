@@ -4,10 +4,14 @@ import { api } from '/api.js';
 import { h, icon, kbd, modKey, debounce, timeEl, topicChip, urlPath, button, busy, toastError, emptyState, pageHeader, userLink, select, checkbox, setTheme, themePref } from '/ui.js';
 import { state, navigate, canEdit } from '/state.js';
 import { statusBadges, inlineLoading } from '/views/common.js';
-import { connectedResults } from '/views/connected.js';
+import { connectedResults, searchableConnections, searchConnected, webUrl, KIND_LABEL as APP_KIND_LABEL } from '/views/connected.js';
 
 const KIND_ICON = { post: 'file', comment: 'comment', topic: 'hash' };
 const KIND_LABEL = { post: 'Post', comment: 'Comment', topic: 'Topic' };
+/** The palette shows this many results from each connected app. */
+const APP_HITS = 3;
+/** Shorter queries don't ask connected apps: they'd match too much to be worth the wait. */
+const APP_MIN_CHARS = 2;
 
 let palette = null;
 
@@ -118,19 +122,26 @@ export function openPalette(initial = '') {
     return all.filter((a) => a.label.toLowerCase().includes(needle));
   }
 
-  function renderOptions(groups) {
+  /**
+   * Shows the groups of options. `keep` re-renders in place: the option that was highlighted stays
+   * highlighted, so results arriving late don't move the person's place.
+   */
+  function renderOptions(groups, { keep = false } = {}) {
+    const was = keep && items[active] ? items[active].el.id : null;
     list.replaceChildren();
     items = [];
     for (const g of groups) {
-      if (!g.items.length) continue;
+      if (!g.items.length && !g.note) continue;
       if (g.label) list.appendChild(groupLabel(g.label));
       for (const it of g.items) {
         items.push(it);
         list.appendChild(it.el);
       }
+      if (g.note) list.appendChild(g.note);
     }
     if (!items.length) list.appendChild(h('div', { class: 'palette-empty' }, 'No matches. Try fewer or different words.'));
-    setActive(0);
+    const again = was ? items.findIndex((it) => it.el.id === was) : -1;
+    setActive(again >= 0 ? again : 0);
   }
 
   async function showDefault() {
@@ -149,6 +160,52 @@ export function openPalette(initial = '') {
     ]);
   }
 
+  // What the palette shows for the current query: the workspace's own results, then (when the
+  // person connected apps that search) results from those apps, which take longer to arrive.
+  let shown = null; // { q, hits }
+  let apps = null; // { q, names } while searching, { q, r } once answered, { q, error } after a failure
+
+  function appOption(it, i) {
+    const url = webUrl(it.url);
+    const kind = APP_KIND_LABEL[it.kind] || it.kind;
+    return option(`c-${it.provider}-${i}`, [
+      h('span', { class: 'palette-kind', title: kind }, icon('external', { size: 16 })),
+      h('span', { class: 'palette-text' },
+        h('span', { class: 'palette-title' }, h('span', null, it.title || '(untitled)')),
+        h('span', { class: 'palette-snippet' }, [kind, it.context, it.author].filter(Boolean).join(' · '))),
+    ], () => {
+      if (!url) return;
+      close();
+      window.open(url, '_blank', 'noopener,noreferrer');
+    });
+  }
+
+  function appGroups() {
+    if (!apps || !shown || apps.q !== shown.q) return [];
+    const muted = (text) => h('div', { class: 'palette-note', role: 'presentation' }, text);
+    if (apps.names) return [{ label: '', items: [], note: muted(`Searching ${apps.names}…`) }];
+    if (apps.error) return [{ label: '', items: [], note: muted(`Couldn’t search your connected apps: ${apps.error}`) }];
+    return apps.r.apps.map((app) => {
+      const hits = apps.r.items.filter((it) => it.provider === app.provider).slice(0, APP_HITS);
+      // An app that failed says so quietly; one with nothing to show takes no room.
+      const note = app.ok ? null : muted(app.error || `${app.name} couldn’t be searched.`);
+      return { label: hits.length || note ? app.name : '', items: hits.map((it, i) => appOption(it, i)), note };
+    });
+  }
+
+  function render({ keep = false } = {}) {
+    if (!shown) return;
+    const { q, hits } = shown;
+    const all = option('all', [h('span', { class: 'palette-kind' }, icon('search', { size: 16 })), h('span', { class: 'palette-text' }, h('span', { class: 'palette-title' }, `See all results for “${q}”`))], () => go(`/search?q=${encodeURIComponent(q)}`));
+    const acts = actions(q).map((a) => option(`a-${a.id}`, [h('span', { class: 'palette-kind' }, icon(a.iconName, { size: 16 })), h('span', { class: 'palette-text' }, h('span', { class: 'palette-title' }, a.label))], a.run));
+    renderOptions([
+      { label: hits.length ? 'Results' : '', items: hits.map((hit) => option(`h-${hit.kind}-${hit.id}`, hitContent(hit), () => go(urlPath(hit.url)))) },
+      ...appGroups(),
+      { label: '', items: [all] },
+      { label: acts.length ? 'Actions' : '', items: acts },
+    ], { keep });
+  }
+
   const runSearch = debounce(async (q) => {
     const mySeq = ++seq;
     let r;
@@ -163,18 +220,41 @@ export function openPalette(initial = '') {
     if (mySeq !== seq || !palette) return;
     hint.hidden = !r.broadened;
     hint.textContent = r.broadened ? 'No result has every word, so these match some of them.' : '';
-    const hits = r.items.map((hit) => option(`h-${hit.kind}-${hit.id}`, hitContent(hit), () => go(urlPath(hit.url))));
-    const all = option('all', [h('span', { class: 'palette-kind' }, icon('search', { size: 16 })), h('span', { class: 'palette-text' }, h('span', { class: 'palette-title' }, `See all results for “${q}”`))], () => go(`/search?q=${encodeURIComponent(q)}`));
-    const acts = actions(q).map((a) => option(`a-${a.id}`, [h('span', { class: 'palette-kind' }, icon(a.iconName, { size: 16 })), h('span', { class: 'palette-text' }, h('span', { class: 'palette-title' }, a.label))], a.run));
-    renderOptions([{ label: hits.length ? 'Results' : '', items: hits }, { label: '', items: [all] }, { label: acts.length ? 'Actions' : '', items: acts }]);
+    shown = { q, hits: r.items };
+    render();
   }, 150);
+
+  // Connected apps answer in seconds and each query asks every one, so wait for a pause in typing.
+  const runApps = debounce(async (q) => {
+    if (q.length < APP_MIN_CHARS) return;
+    const mine = await searchableConnections();
+    if (!mine.length || !palette || inputEl.value.trim() !== q) return;
+    apps = { q, names: mine.map((a) => a.name).join(', ') };
+    render({ keep: true });
+    let next;
+    try {
+      next = { q, r: await searchConnected(q, APP_HITS) };
+    } catch (e) {
+      next = { q, error: e.message };
+    }
+    // Only the newest query's answer counts.
+    if (!palette || inputEl.value.trim() !== q) return;
+    apps = next;
+    render({ keep: true });
+  }, 350);
 
   inputEl.addEventListener('input', () => {
     const q = inputEl.value.trim();
+    apps = null;
     if (!q) {
       runSearch.cancel();
+      runApps.cancel();
+      shown = null;
       showDefault();
-    } else runSearch(q);
+    } else {
+      runSearch(q);
+      runApps(q);
+    }
   });
   inputEl.addEventListener('keydown', (e) => {
     if (e.key === 'ArrowDown') { e.preventDefault(); setActive(active + 1); }
@@ -194,8 +274,13 @@ export function openPalette(initial = '') {
   dialog.showModal();
   palette = { close, input: inputEl };
   inputEl.focus();
-  if (initial) runSearch.flush(initial);
-  else showDefault();
+  searchableConnections().then((mine) => {
+    if (mine.length && palette) inputEl.placeholder = 'Search posts, topics and your connected apps';
+  });
+  if (initial) {
+    runSearch.flush(initial);
+    runApps(initial.trim());
+  } else showDefault();
   void themePref;
 }
 
@@ -260,13 +345,20 @@ export async function renderPage(ctx) {
   if (first.broadened) {
     results.appendChild(h('p', { class: 'callout' }, icon('info', { size: 15 }), h('span', null, 'Nothing matched every word, so these results match some of them.')));
   }
-  if (!first.items.length) {
-    results.appendChild(emptyState({ iconName: 'search', title: `No results for “${q}”`, body: 'Check the spelling, use fewer words, or include archived posts.' }));
-  } else {
+  const noResults = () => emptyState({ iconName: 'search', title: `No results for “${q}”`, body: 'Check the spelling, use fewer words, or include archived posts.' });
+  if (first.items.length) {
     add(first);
-    results.append(list, more);
+    results.append(list, more, connectedResults(q));
+  } else if (!(await searchableConnections()).length) {
+    if (!ctx.isCurrent()) return;
+    results.append(noResults(), connectedResults(q));
+  } else {
+    // The person's connected apps may well have it: say so briefly while they answer, and show the
+    // full "no results" only if they find nothing either.
+    if (!ctx.isCurrent()) return;
+    const none = h('p', { class: 'search-none muted' }, icon('search', { size: 15 }), h('span', null, `No posts match “${q}”.`));
+    results.append(none, connectedResults(q, { onSettled: (found) => { if (!found) none.replaceWith(noResults()); } }));
   }
-  results.append(connectedResults(q));
   ctx.main.replaceChildren(page);
   void inlineLoading;
   void state;
