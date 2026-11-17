@@ -40,6 +40,7 @@ Any MCP client that supports OAuth (Claude, ChatGPT, Cursor and others) needs on
 | Admin | Workspace settings, API tokens with scopes, signed webhooks, JSON export |
 | Slack | `/dumbslab search` and `/dumbslab new` from Slack as yourself, previews of links to posts everyone can see, and messages in chosen channels when posts are published or updated. See [docs/slack.md](docs/slack.md) |
 | Connected apps | Everyone connects their own GitHub, Google Drive, Slack, Jira, Confluence, Zendesk, Asana, Box, Dropbox, Guru and more, to search them from DumbSlab and preview links to them in posts. See [docs/connected-apps.md](docs/connected-apps.md) |
+| Continue with Google | Sign up and sign in with a Google account (personal or work) or a Microsoft work account, no setup needed. See [docs/sso.md](docs/sso.md#continue-with-google-or-microsoft) |
 | Single sign-on | Sign in with Google Workspace, Microsoft Entra ID, Okta, OneLogin, Slack or any OpenID Connect provider, set up per workspace on every plan. Google, Microsoft and Slack set up in one click: an admin signs in once with DumbSlab's own app. Optional auto-provisioning, and an option to require it for everyone but admins. See [docs/sso.md](docs/sso.md) |
 
 ## Quick start
@@ -71,7 +72,7 @@ Options (flags or environment variables):
 | `--base-url` | `DUMBSLAB_BASE_URL` | the request's origin |
 | `--setup-token` | `DUMBSLAB_SETUP_TOKEN` | generated and logged |
 | | `DUMBSLAB_CONNECTOR_KEY` | unset: [connected apps](docs/connected-apps.md), [single sign-on](docs/sso.md) with your own app, [Slack](docs/slack.md), people sync and docs sync are off |
-| | `DUMBSLAB_SSO_GOOGLE_CLIENT_ID`, `DUMBSLAB_SSO_MICROSOFT_CLIENT_ID`, `DUMBSLAB_SLACK_CLIENT_ID` and their `_CLIENT_SECRET`s | unset: no one-click single sign-on with that provider ([sign-in apps](docs/hosting/sign-in-apps.md)) |
+| | `DUMBSLAB_SSO_GOOGLE_CLIENT_ID`, `DUMBSLAB_SSO_MICROSOFT_CLIENT_ID`, `DUMBSLAB_SLACK_CLIENT_ID` and their `_CLIENT_SECRET`s | unset: no Continue with Google or Microsoft, and no one-click single sign-on with that provider ([sign-in apps](docs/hosting/sign-in-apps.md)) |
 | `--open-setup` | | off (local development only: setup without a token) |
 | `--allow-private-webhooks` | `DUMBSLAB_ALLOW_PRIVATE_WEBHOOKS` | off: webhooks to loopback, private and link-local addresses are refused |
 | `--quill-host` | `DUMBSLAB_QUILL_HOST` | off: record sessions in this PostHog-compatible server |
@@ -129,7 +130,7 @@ Give each agent its own bot account (Settings → People → Add bot) and token.
 - **Drafts** are visible only to their author and admins. So is the **trash**: a trashed post disappears for everyone else until it's restored.
 - **Private topics.** A post whose topics are all private is visible only to members of those topics. It is hidden from lists, search, activity and notifications for everyone else. Removing its last private topic is refused, because a post without topics is visible to everyone; to share it, add an org-wide topic.
 - **Files** are stored in the workspace database and open only for signed-in people. A file that belongs to a post (uploaded for it, or referenced when its uploader saves the post) opens only for people who can see that post. PNG, JPEG, GIF, WebP and AVIF images, recognized by their bytes, show inline; everything else, including SVG and HTML, downloads.
-- **Single sign-on.** A first sign-in joins an existing account only when the provider says its email is verified and the domain is one the workspace allows (Microsoft: only with `xms_edov`). When a workspace requires single sign-on, only admins can still sign in with a password. See [docs/sso.md](docs/sso.md).
+- **Single sign-on.** A first sign-in joins an existing account only when the provider says its email is verified and the domain is one the workspace allows (Microsoft: only with `xms_edov`). Continue with Google matches an existing account only by an address Google is the authority on (Gmail, or the account's Google Workspace domain), and never adds anyone. When a workspace requires single sign-on, only admins can still sign in with a password. See [docs/sso.md](docs/sso.md).
 - **Tokens** carry `read`, `write` and/or `admin` scopes. A token never exceeds its owner's role, and an MCP connection from a read-only token lists only read-only tools. Tokens can't change passwords, and a connected app can't create tokens or revoke other credentials unless it was granted `admin`.
 
 ## Architecture

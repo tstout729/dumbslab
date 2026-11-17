@@ -35,7 +35,7 @@ pub fn ops() -> Vec<Op> {
             .build(),
         op("users", "change_password", "POST", "/me/password", Access::Write, change_password)
             .title("Change your password")
-            .desc("Changes your password and signs out your other browser sessions. Only from a signed-in browser or the local CLI, never with a token.")
+            .desc("Changes your password and signs out your other browser sessions. Only from a signed-in browser or the local CLI, never with a token. No password yet (you signed up with Google or Microsoft)? Set one without `current_password` within 15 minutes of signing in.")
             .build(),
         op("users", "list_api_tokens", "GET", "/tokens", Access::Read, list_tokens)
             .title("List API tokens")
@@ -388,6 +388,9 @@ fn update_user(ctx: &mut Ctx, input: UpdateUserInput) -> ApiResult<User> {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ChangePasswordInput {
+    /// Required, unless you have no password yet (you signed up with Google or Microsoft): then
+    /// set one within 15 minutes of signing in.
+    #[serde(default)]
     pub current_password: String,
     pub new_password: String,
 }
@@ -405,7 +408,30 @@ fn change_password(ctx: &mut Ctx, input: ChangePasswordInput) -> ApiResult<Done>
     // Guesses at the current password count against the same limits as sign-ins.
     let keys = auth::password_keys(&row.str("email"), None);
     auth::check_throttle(ctx.db, &keys, ctx.now)?;
-    let ok = row.opt_str("password_hash").is_some_and(|h| auth::verify_password(&input.current_password, &h));
+    let ok = match row.opt_str("password_hash") {
+        Some(h) => auth::verify_password(&input.current_password, &h),
+        // No password yet: the session must be a fresh sign-in (with Google or Microsoft).
+        None => {
+            // In a workspace with its own single sign-on, people without a password were added by
+            // it: a password of their own would outlast the organization removing them there.
+            // Admins keep theirs, as the way in should the provider fail.
+            let conf = crate::sso::load(ctx.db)?;
+            if crate::sso::configured(&conf) && ctx.actor.role != Role::Admin {
+                return Err(ApiError::forbidden(format!(
+                    "this workspace signs in with {}; ask a workspace admin if you need a password",
+                    conf.name()
+                )));
+            }
+            let session = ctx.actor.session_hash.clone().unwrap_or_default();
+            if !crate::sso::fresh_session(ctx.db, &ctx.actor.user_id, &session, ctx.now)? {
+                return Err(ApiError::forbidden(format!(
+                    "to set your first password, sign out and sign in again, then set it within {} minutes",
+                    crate::sso::FRESH_MINUTES
+                )));
+            }
+            true
+        }
+    };
     if !ok {
         auth::record_failures(ctx.db, &keys, ctx.now)?;
         // Keep the failure count although the request fails.

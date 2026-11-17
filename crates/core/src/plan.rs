@@ -250,6 +250,11 @@ fn hour_of(now: DateTime<Utc>) -> i64 {
 /// sign-ins and sign-outs included. Counting never refuses a sign-in; only operations check the
 /// allowance.
 pub fn counts_writes(path: &str, status: u16) -> bool {
+    // Signing in with a provider writes only its own short-lived, capped records, and anyone can
+    // start one (a sign-up's first admin is counted with the job, which isn't either: see the hosts).
+    if path == crate::sso::START_PATH || path == crate::sso::CALLBACK_PATH {
+        return false;
+    }
     !path.starts_with("/api/v1/auth/") || (200..300).contains(&status)
 }
 
@@ -562,6 +567,8 @@ mod tests {
         assert!(!counts_writes("/api/v1/auth/login", 401));
         assert!(!counts_writes("/api/v1/auth/login", 429));
         assert!(!counts_writes("/api/v1/auth/setup", 409));
+        assert!(!counts_writes("/sso/start", 302), "anyone can start signing in");
+        assert!(!counts_writes("/sso/callback", 302));
     }
 
     #[test]

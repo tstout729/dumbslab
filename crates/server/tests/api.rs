@@ -4257,7 +4257,14 @@ mod sso {
             let Some(code) = q.get("sso_error") else { return String::new() };
             let known: Vec<&str> = dumbslab_core::sso::Problem::ALL.iter().map(|p| p.code()).collect();
             assert!(known.contains(&code.as_str()), "unknown code `{code}` in {}", self.location);
-            assert!(q.keys().all(|k| k == "sso_error" || k == "next"), "only a code and where to go: {}", self.location);
+            assert!(
+                q.keys().all(|k| ["sso_error", "next", "with"].contains(&k.as_str())),
+                "only a code and where to go: {}",
+                self.location
+            );
+            if let Some(with) = q.get("with") {
+                assert!(["google", "microsoft"].contains(&with.as_str()), "{}", self.location);
+            }
             code.clone()
         }
     }
@@ -5211,6 +5218,287 @@ mod sso {
     }
 
     const SETTINGS: &str = "https://kb.test/settings/sso";
+
+    // -----------------------------------------------------------------------
+    // Signing in, and signing up, with your own Google or Microsoft account.
+
+    /// Starts a sign-in (or sign-up) at `path`, answering discovery with `disco`.
+    fn start_at(h: &H, path: &str, disco: Value) -> Started {
+        let r = h.call("GET", path, None, &Auth::None);
+        let (finish, _) = drive(h, job_of(&r), &|_| ok(disco.clone()));
+        let landing = land(&r, Some(finish));
+        let cookie = landing
+            .cookies
+            .iter()
+            .find_map(|c| c.strip_prefix("dumbslab_sso="))
+            .unwrap_or_else(|| panic!("a cookie, landing at {}", landing.location));
+        Started { query: query_of(&landing.location), url: landing.location.clone(), cookie: cookie.split(';').next().unwrap().to_string() }
+    }
+
+    fn google(sub: &str, email: &str, extra: Value) -> Value {
+        let mut c = claims(GOOGLE, sub, email, json!({ "aud": "google-app", "email_verified": true }));
+        for (k, v) in extra.as_object().unwrap() {
+            c[k] = v.clone();
+        }
+        c
+    }
+
+    fn continue_with_google(h: &H, id_claims: Value) -> Landing {
+        let s = start_at(h, "/sso/start?with=google", discovery(GOOGLE));
+        come_back(h, &s, id_claims, &tokens).0
+    }
+
+    #[test]
+    fn continue_with_google_finds_the_people_google_vouches_for() {
+        let (h, admin) = shared_workspace();
+        h.user(&admin, "mo@gmail.com", "Mo", "member");
+        h.user(&admin, "zed@acme.test", "Zed", "member");
+        // Offered on the sign-in page, for every account: no organization, no `hd`.
+        let state = h.ok("GET", "/api/v1/auth/state", None, &Auth::None);
+        let offered: Vec<&str> = state["sign_in_with"].as_array().unwrap().iter().map(|o| o["provider"].as_str().unwrap()).collect();
+        assert_eq!(offered, ["google", "microsoft"]);
+        assert_eq!(state["sign_in_with"][0]["url"], "https://kb.test/sso/start?with=google");
+        let s = start_at(&h, "/sso/start?with=google", discovery(GOOGLE));
+        assert!(s.url.starts_with("https://accounts.google.com/authorize?"), "{}", s.url);
+        assert_eq!((s.query["client_id"].as_str(), s.query["prompt"].as_str()), ("google-app", "select_account"));
+        assert!(!s.query.contains_key("hd"), "any Google account: {}", s.url);
+
+        // A Gmail address: Google is the authority on it, so the first sign-in finds Mo and links him.
+        let landing = continue_with_google(&h, google("g-mo", "mo@gmail.com", json!({})));
+        assert_eq!(landing.error(), "");
+        assert_eq!(me(&h, &landing.session().expect("signed in"))["email"], "mo@gmail.com");
+        // From then on the link finds him, whatever address the account has.
+        let landing = continue_with_google(&h, google("g-mo", "mo.renamed@gmail.com", json!({})));
+        assert_eq!(me(&h, &landing.session().expect("signed in by the link"))["email"], "mo@gmail.com");
+
+        // Another domain on a plain Google account: Google confirmed it once, but isn't its authority.
+        let landing = continue_with_google(&h, google("g-zed", "zed@acme.test", json!({})));
+        assert_eq!((landing.error().as_str(), landing.session().is_none()), ("unverified_email", true));
+        assert!(landing.location.ends_with("&with=google"), "{}", landing.location);
+        // A Google Workspace account at that domain is Google's to vouch for.
+        let landing = continue_with_google(&h, google("g-zed", "zed@acme.test", json!({ "hd": "acme.test" })));
+        assert_eq!(me(&h, &landing.session().expect("signed in"))["email"], "zed@acme.test");
+        // Unverified, or nobody here with it: nobody is found, and nobody is added.
+        let landing = continue_with_google(&h, google("g-x", "x@gmail.com", json!({ "email_verified": false })));
+        assert_eq!(landing.error(), "unverified_email");
+        let people = count(&h, "SELECT COUNT(*) FROM users");
+        let landing = continue_with_google(&h, google("g-new", "new@gmail.com", json!({})));
+        assert_eq!((landing.error().as_str(), count(&h, "SELECT COUNT(*) FROM users")), ("no_account", people));
+        // A token meant for another app is refused.
+        let landing = continue_with_google(&h, google("g-mo", "mo@gmail.com", json!({ "aud": "someone-elses-app" })));
+        assert_eq!(landing.error(), "invalid_token");
+    }
+
+    #[test]
+    fn continue_with_microsoft_needs_a_work_account_and_xms_edov() {
+        let (h, admin) = shared_workspace();
+        h.user(&admin, "mia@contoso.test", "Mia", "member");
+        let ms = |sub: &str, extra: Value| {
+            let mut c = claims(&ms_issuer(), sub, "mia@contoso.test", json!({ "aud": "microsoft-app", "tid": TENANT }));
+            for (k, v) in extra.as_object().unwrap() {
+                c[k] = v.clone();
+            }
+            let s = start_at(&h, "/sso/start?with=microsoft", ms_organizations());
+            assert_eq!(s.query["prompt"], "select_account");
+            come_back(&h, &s, c, &tokens).0
+        };
+        assert_eq!(ms("ms-mia", json!({})).error(), "unverified_email");
+        let consumers = "9188040d-6c67-4c5b-b112-36a304b66dad";
+        let personal = ms(
+            "ms-mia",
+            json!({ "tid": consumers, "iss": format!("https://login.microsoftonline.com/{consumers}/v2.0"), "xms_edov": true }),
+        );
+        assert_eq!(personal.error(), "personal_account");
+        // The token must name its own directory as its issuer.
+        assert_eq!(
+            ms("ms-mia", json!({ "xms_edov": true, "iss": "https://login.microsoftonline.com/another/v2.0" })).error(),
+            "invalid_token"
+        );
+        let landing = ms("ms-mia", json!({ "xms_edov": true }));
+        assert_eq!(me(&h, &landing.session().expect("signed in"))["email"], "mia@contoso.test");
+        let linked = count(&h, &format!("SELECT COUNT(*) FROM sso_identities WHERE issuer = '{}' AND subject LIKE 'oid:%'", ms_issuer()));
+        assert_eq!(linked, 1, "linked by oid under the directory's issuer, like single sign-on's");
+    }
+
+    #[test]
+    fn a_workspace_with_single_sign_on_offers_only_that() {
+        let (mut h, admin) = shared_workspace();
+        h.cfg.connectors.key = Some("connector-key".into());
+        h.user(&admin, "mo@gmail.com", "Mo", "member");
+        // Started before the workspace turns single sign-on on…
+        let early = start_at(&h, "/sso/start?with=google", discovery(GOOGLE));
+        okta(&h, &admin, json!({}));
+        // …it can't finish after: the organization's rules apply to everyone now.
+        let (landing, _) = come_back(&h, &early, google("g-mo", "mo@gmail.com", json!({})), &tokens);
+        assert_eq!((landing.error().as_str(), landing.session().is_none()), ("not_configured", true));
+        assert_eq!(h.ok("GET", "/api/v1/auth/state", None, &Auth::None)["sign_in_with"], json!([]));
+        let r = h.call("GET", "/sso/start?with=google", None, &Auth::None);
+        assert_eq!(land(&r, None).location, "https://kb.test/login?sso_error=not_configured&with=google");
+        assert_eq!(h.call("POST", "/api/v1/me/sso", Some(json!({ "provider": "google" })), &admin).status, 400);
+        // Slack isn't one of them, nor is a made-up provider.
+        let (h2, _) = shared_workspace();
+        for p in ["slack", "okta", "nope"] {
+            let r = h2.call("GET", &format!("/sso/start?with={p}"), None, &Auth::None);
+            assert!(r.effects.is_empty() && land(&r, None).location.contains("sso_error=not_configured"), "{p}");
+        }
+    }
+
+    #[test]
+    fn signing_up_with_google_makes_the_first_admin_without_a_password() {
+        let mut h = H::new();
+        h.cfg.sso_apps = shared_apps();
+        let state = h.ok("GET", "/api/v1/auth/state", None, &Auth::None);
+        assert_eq!((state["needs_setup"].as_bool(), state["sign_in_with"].clone()), (Some(true), json!([])));
+        assert_eq!(
+            state["sign_up_with"],
+            json!([{ "provider": "google", "name": "Google" }, { "provider": "microsoft", "name": "Microsoft" }])
+        );
+        let setup_error = |location: &str| {
+            assert!(location.starts_with("https://kb.test/setup?"), "{location}");
+            query_of(location).get("sso_error").cloned().unwrap_or_default()
+        };
+        // Without the setup token (or with a wrong one), it doesn't start.
+        let r = h.call("GET", "/sso/start?signup&with=google&token=WRONG&name=Acme%20Co", None, &Auth::None);
+        let back = land(&r, None).location;
+        assert_eq!(setup_error(&back), "expired");
+        assert_eq!(query_of(&back)["name"], "Acme Co", "the page keeps the workspace's name");
+        assert!(!query_of(&back).contains_key("token"), "never the token: {back}");
+
+        let path = "/sso/start?signup&with=google&token=SETUP&name=Acme%20Co";
+        let unverified = start_at(&h, path, discovery(GOOGLE));
+        let (landing, _) = come_back(&h, &unverified, google("g-ada", "ada@gmail.com", json!({ "email_verified": false })), &tokens);
+        assert_eq!(setup_error(&landing.location), "unverified_email");
+        assert_eq!(count(&h, "SELECT COUNT(*) FROM users"), 0);
+
+        let s = start_at(&h, path, discovery(GOOGLE));
+        // Two tabs: both started before either finished.
+        let second = start_at(&h, path, discovery(GOOGLE));
+        let (landing, _) = come_back(&h, &s, google("g-ada", "Ada@Example.test", json!({ "name": "Ada Lovelace" })), &tokens);
+        let ada = landing.session().expect("signed in as the new admin");
+        assert_eq!(landing.location, "https://kb.test/");
+        let user = me(&h, &ada);
+        assert_eq!(
+            (user["email"].as_str(), user["name"].as_str(), user["role"].as_str()),
+            (Some("ada@example.test"), Some("Ada Lovelace"), Some("admin"))
+        );
+        let state = h.ok("GET", "/api/v1/auth/state", None, &ada);
+        assert_eq!((state["workspace_name"].as_str(), state["has_password"].as_bool()), (Some("Acme Co"), Some(false)));
+        assert_eq!(count(&h, "SELECT COUNT(*) FROM sso_identities WHERE issuer = 'https://accounts.google.com' AND subject = 'g-ada'"), 1);
+        assert!(count(&h, "SELECT COUNT(*) FROM posts") > 0, "seeded like any new workspace");
+        // The other tab can't make a second admin.
+        let (landing, _) = come_back(&h, &second, google("g-eve", "eve@gmail.com", json!({})), &tokens);
+        assert_eq!((setup_error(&landing.location), landing.session().is_none()), ("already_set_up".to_string(), true));
+        let r = h.call("GET", path, None, &Auth::None);
+        assert_eq!(setup_error(&land(&r, None).location), "already_set_up");
+        // She signs in with Google from now on.
+        assert!(continue_with_google(&h, google("g-ada", "ada@example.test", json!({}))).session().is_some());
+
+        // Her Google account is her only way in, so it can't be unlinked yet.
+        let ids = h.ok("GET", "/api/v1/sso/identities", None, &ada);
+        assert_eq!(ids["items"][0]["provider"], "google");
+        let id = ids["items"][0]["id"].as_str().unwrap().to_string();
+        assert_eq!(h.call("DELETE", &format!("/api/v1/sso/identities/{id}"), None, &ada).status, 409);
+        // A first password needs no current one, from a fresh sign-in only.
+        let stale = sign_in_session_aged(&h, &ada, 20);
+        assert_eq!(h.call("POST", "/api/v1/me/password", Some(json!({ "new_password": "a-new-password" })), &stale).status, 403);
+        let fresh = continue_with_google(&h, google("g-ada", "ada@example.test", json!({}))).session().unwrap();
+        assert_eq!(h.call("POST", "/api/v1/me/password", Some(json!({ "new_password": "a-new-password" })), &fresh).status, 200);
+        assert!(h.ok("GET", "/api/v1/auth/state", None, &fresh)["has_password"].as_bool().unwrap());
+        // Now it needs the current one, like anyone's.
+        assert_eq!(h.call("POST", "/api/v1/me/password", Some(json!({ "new_password": "another-one" })), &fresh).status, 403);
+        sign_in(&h, "ada@example.test", "a-new-password");
+        assert_eq!(h.call("DELETE", &format!("/api/v1/sso/identities/{id}"), None, &fresh).status, 200);
+    }
+
+    #[test]
+    fn once_the_workspace_configures_single_sign_on_its_rules_hold() {
+        let mut h = H::new();
+        h.cfg.sso_apps = shared_apps();
+        h.cfg.connectors.key = Some("connector-key".into());
+        let s = start_at(&h, "/sso/start?signup&with=google&token=SETUP&name=Acme", discovery(GOOGLE));
+        let ada = come_back(&h, &s, google("g-ada", "ada@acme.test", json!({})), &tokens).0.session().expect("signed up");
+        okta(&h, &ada, json!({}));
+        // People Okta signs in, without a password, can't make one that outlasts Okta removing them.
+        let (mo_id, _) = h.user(&ada, "mo@acme.test", "Mo", "member");
+        h.store
+            .with_tx(|db| (db.execute("UPDATE users SET password_hash = NULL WHERE id = ?", &dumbslab_core::params![mo_id.clone()]), true))
+            .unwrap()
+            .unwrap();
+        let mo =
+            sign_in_with(&h, OKTA, claims(OKTA, "okta-mo", "mo@acme.test", json!({ "email_verified": true }))).session().expect("Okta");
+        let r = h.call("POST", "/api/v1/me/password", Some(json!({ "new_password": "a-new-password" })), &mo);
+        assert_eq!(r.status, 403, "{}", r.body);
+        // The admin who signed up with Google keeps a way in should Okta fail.
+        assert_eq!(h.call("POST", "/api/v1/me/password", Some(json!({ "new_password": "a-new-password" })), &ada).status, 200);
+        // Turned off, it still keeps Continue with Google away: that would go around the organization.
+        let r = h.call("PATCH", "/api/v1/sso", Some(json!({ "enabled": false })), &ada);
+        assert_eq!(r.status, 200, "{}", r.body);
+        drive(&h, job_of(&r), &|_| ok(discovery(OKTA)));
+        assert_eq!(h.ok("GET", "/api/v1/auth/state", None, &Auth::None)["sign_in_with"], json!([]));
+        let r = h.call("GET", "/sso/start?with=google", None, &Auth::None);
+        assert!(r.effects.is_empty() && land(&r, None).location.contains("sso_error=not_configured"));
+        let r = h.call("POST", "/api/v1/me/password", Some(json!({ "new_password": "x-new-password" })), &mo);
+        assert_eq!(r.status, 403, "{}", r.body);
+    }
+
+    #[test]
+    fn linking_your_own_account_needs_a_fresh_sign_in() {
+        let (h, admin) = shared_workspace();
+        h.user(&admin, "zed@acme.test", "Zed", "member");
+        let stale = sign_in_session_aged(&h, &sign_in(&h, "zed@acme.test", "password123"), 20);
+        let r = h.call("POST", "/api/v1/me/sso", Some(json!({ "provider": "google" })), &stale);
+        assert_eq!(r.status, 403, "a stolen session can't add a lasting way in: {}", r.body);
+        let fresh = sign_in(&h, "zed@acme.test", "password123");
+        assert_eq!(h.call("POST", "/api/v1/me/sso", Some(json!({ "provider": "google" })), &fresh).status, 200);
+        // The same for the workspace's own single sign-on.
+        let (h, admin) = workspace();
+        h.user(&admin, "mo@acme.test", "Mo", "member");
+        okta(&h, &admin, json!({}));
+        let stale = sign_in_session_aged(&h, &sign_in(&h, "mo@acme.test", "password123"), 20);
+        assert_eq!(h.call("POST", "/api/v1/me/sso", None, &stale).status, 403);
+        assert_eq!(h.call("POST", "/api/v1/me/sso", None, &sign_in(&h, "mo@acme.test", "password123")).status, 200);
+    }
+
+    /// A Google sign-in of the person with session `auth` made `minutes` ago.
+    fn sign_in_session_aged(h: &H, auth: &Auth, minutes: i64) -> Auth {
+        let Auth::Cookie(token) = auth else { unreachable!() };
+        let then = (chrono::Utc::now() - chrono::Duration::minutes(minutes)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let hash = dumbslab_core::util::sha256_hex(token);
+        h.store
+            .with_tx(|db| {
+                (
+                    db.execute(
+                        "UPDATE sessions SET created_at = ? WHERE token_hash = ?",
+                        &dumbslab_core::params![then.clone(), hash.clone()],
+                    ),
+                    true,
+                )
+            })
+            .unwrap()
+            .unwrap();
+        auth.clone()
+    }
+
+    #[test]
+    fn people_link_their_own_google_account_from_their_profile() {
+        let (h, admin) = shared_workspace();
+        h.user(&admin, "zed@acme.test", "Zed", "member");
+        let zed = sign_in(&h, "zed@acme.test", "password123");
+        let r = h.call("POST", "/api/v1/me/sso", Some(json!({ "provider": "google" })), &zed);
+        assert_eq!(r.status, 200, "{}", r.body);
+        let (finish, _) = drive(&h, job_of(&r), &|_| ok(discovery(GOOGLE)));
+        let Finish::Fill(v) = finish else { panic!("{finish:?}") };
+        let q = query_of(v["authorize_url"].as_str().unwrap());
+        assert_eq!(q["client_id"], "google-app");
+        let back = h.send(&callback_request(&format!("code=c&state={}", urlencoding::encode(&q["state"])), &[cookie_of(&zed)]));
+        // A personal Google account whose address Google isn't the authority on: linking it is fine.
+        let id = jwt(&google("g-zed", "zed.personal@outlook.test", json!({ "nonce": q["nonce"] })));
+        let (finish, _) = drive(&h, job_of(&back), &|c| tokens(c, &id));
+        assert_eq!(land(&back, Some(finish)).location, "https://kb.test/settings/profile?sso_linked=1");
+        // And now it signs her in.
+        let landing = continue_with_google(&h, google("g-zed", "zed.personal@outlook.test", json!({})));
+        assert_eq!(me(&h, &landing.session().expect("signed in by the link"))["email"], "zed@acme.test");
+    }
 
     #[test]
     fn setting_up_by_signing_in_with_the_servers_own_apps() {

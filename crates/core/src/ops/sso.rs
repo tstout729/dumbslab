@@ -39,11 +39,11 @@ pub fn ops() -> Vec<Op> {
             .build(),
         op("sso", "link_sso", "POST", "/me/sso", Access::Write, link_sso)
             .title("Link your sign-in account")
-            .desc("Starts linking your account at the workspace's identity provider to yours here, so you can sign in with it even when the provider doesn't vouch for your email address. Answers with an `authorize_url` to open in the same browser; you come back to Settings › Profile. Only from a signed-in browser.")
+            .desc("Starts linking your account at the workspace's identity provider to yours here, so you can sign in with it even when the provider doesn't vouch for your email address. Or, with `provider` (`google` or `microsoft`), your own account there, to sign in with \"Continue with Google\" (offered when the workspace hasn't set up single sign-on). Answers with an `authorize_url` to open in the same browser; you come back to Settings › Profile. Only from a browser that signed in within the last 15 minutes.")
             .build(),
         op("sso", "unlink_sso", "DELETE", "/sso/identities/{id}", Access::Write, unlink_sso)
             .title("Unlink a sign-in account")
-            .desc("Unlink an account at the identity provider (yours; admins: anyone's). It can't sign in here until it's linked again, or matched by a verified email on its next sign-in.")
+            .desc("Unlink an account at the identity provider (yours; admins: anyone's). It can't sign in here until it's linked again, or matched by a verified email on its next sign-in. Your last way to sign in can't be unlinked: set a password first.")
             .destructive()
             .build(),
     ]
@@ -383,16 +383,37 @@ pub struct LinkStart {
     pub authorize_url: String,
 }
 
-fn link_sso(ctx: &mut Ctx, _: NoInput) -> ApiResult<Deferred<LinkStart>> {
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LinkSsoInput {
+    /// `google` or `microsoft`: link your own account there. Omit for the workspace's single sign-on.
+    pub provider: Option<Provider>,
+}
+
+fn link_sso(ctx: &mut Ctx, input: LinkSsoInput) -> ApiResult<Deferred<LinkStart>> {
     // The provider sends the person back to their browser, which must still be signed in to this
     // same session to finish.
     let Some(session_hash) = ctx.actor.session_hash.clone() else {
         return Err(ApiError::forbidden("link your sign-in account in the web app, under Settings › Profile"));
     };
-    if !sso::active(ctx.cfg, &sso::load(ctx.db)?) {
-        return Err(ApiError::bad_request("single sign-on isn't set up for this workspace"));
+    match input.provider {
+        Some(p) if !sso::personal_providers(ctx.db, ctx.cfg)?.contains(&p) => {
+            return Err(ApiError::bad_request(format!("signing in with your own {} account isn't available in this workspace", p.name())));
+        }
+        None if !sso::active(ctx.cfg, &sso::load(ctx.db)?) => {
+            return Err(ApiError::bad_request("single sign-on isn't set up for this workspace"));
+        }
+        _ => {}
     }
-    ctx.effects.push(Effect::Connect(Job::Sso(SsoJob::link(&ctx.base_url, &ctx.actor.user_id, &session_hash))));
+    // A link is a lasting way in, at any provider: only from a fresh sign-in, so a stolen session
+    // can't add one.
+    if !sso::fresh_session(ctx.db, &ctx.actor.user_id, &session_hash, ctx.now)? {
+        return Err(ApiError::forbidden(format!(
+            "to link an account, sign out and sign in again, then link it within {} minutes",
+            sso::FRESH_MINUTES
+        )));
+    }
+    ctx.effects.push(Effect::Connect(Job::Sso(SsoJob::link(&ctx.base_url, &ctx.actor.user_id, &session_hash, input.provider))));
     Ok(Deferred::Pending)
 }
 
@@ -409,6 +430,8 @@ pub struct SsoIdentity {
     pub user: UserRef,
     /// The provider's issuer.
     pub issuer: String,
+    /// Google, Microsoft or Slack, when the issuer is theirs.
+    pub provider: Option<Provider>,
     /// The address the provider gave when it was linked.
     pub email: String,
     /// At the issuer the workspace signs in with now.
@@ -446,6 +469,7 @@ fn list_identities(ctx: &mut Ctx, input: ListIdentitiesInput) -> ApiResult<SsoId
                 id: r.str("id"),
                 user: user_ref(&users, &r.str("user_id")),
                 current: r.str("issuer") == issuer,
+                provider: sso::provider_of_issuer(&r.str("issuer")),
                 issuer: r.str("issuer"),
                 email: r.str("email"),
                 linked_at: r.str("created_at"),
@@ -469,6 +493,17 @@ fn unlink_sso(ctx: &mut Ctx, input: IdentityIdInput) -> ApiResult<Done> {
     let user_id = row.str("user_id");
     if user_id != ctx.actor.user_id {
         ctx.actor.require_admin()?;
+    } else {
+        // Someone who signed up with Google has no password: their last link that can still sign
+        // in is their only way in.
+        let password =
+            ctx.db.scalar_i64("SELECT COUNT(*) FROM users WHERE id = ? AND password_hash IS NOT NULL", &params![user_id.clone()])? > 0;
+        let others =
+            ctx.db.query("SELECT issuer FROM sso_identities WHERE user_id = ? AND id != ?", &params![user_id.clone(), input.id.clone()])?;
+        let usable = sso::usable_issuers(ctx.db, ctx.cfg)?;
+        if !password && !others.iter().any(|r| usable(&r.str("issuer"))) {
+            return Err(ApiError::conflict("this is your only way to sign in: set a password under Settings › Profile first"));
+        }
     }
     ctx.db.execute("DELETE FROM sso_identities WHERE id = ?", &params![input.id.clone()])?;
     let who = user_refs(ctx.db, std::slice::from_ref(&user_id))?;
