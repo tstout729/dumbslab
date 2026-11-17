@@ -111,14 +111,17 @@ Pro goes on sale once three things are set. Until then, `upgrade_plan` answers `
    ```
 
 2. For the Worker, create a [restricted key](https://docs.stripe.com/keys#limit-access) that can only write Checkout Sessions and Customer portal, and read Subscriptions and Charges.
-3. Put the printed `STRIPE_PRICE_ID` and `STRIPE_PORTAL_CONFIG` in `wrangler.toml`, add the secrets and deploy:
+3. Add them to the Worker as secrets. Each `secret put` takes effect at once; there's nothing to deploy:
 
    ```sh
    cd crates/worker
    npx wrangler secret put STRIPE_SECRET_KEY       # the Worker's restricted key
    npx wrangler secret put STRIPE_WEBHOOK_SECRET   # whsec_… printed by the script
-   npx wrangler deploy
+   npx wrangler secret put STRIPE_PRICE_ID         # price_… printed by the script
+   npx wrangler secret put STRIPE_PORTAL_CONFIG    # bpc_… printed by the script (optional)
    ```
+
+   They're secrets rather than `[vars]` so you can move from a Stripe sandbox to live mode, or take Pro off sale (`npx wrangler secret delete STRIPE_PRICE_ID`), without a deploy. A deploy keeps them. Don't also add them under `[vars]`: Cloudflare refuses a var and a secret with the same name.
 
 How it works:
 
