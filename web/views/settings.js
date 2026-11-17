@@ -106,6 +106,8 @@ async function profileSection() {
 
   // Someone who signed up with Google or Microsoft has no password yet: they set a first one.
   const first = state.auth.has_password === false;
+  // Added by the workspace's own single sign-on, with no password: that's how they sign in.
+  const ssoOnly = first && state.auth.sso;
   const current = input({ type: 'password', required: true, autocomplete: 'current-password' });
   const next = input({ type: 'password', required: true, minlength: 8, autocomplete: 'new-password' });
   const confirm = input({ type: 'password', required: true, minlength: 8, autocomplete: 'new-password' });
@@ -133,7 +135,9 @@ async function profileSection() {
     panel('Profile', null, h('div', { class: 'profile-preview' }, avatar(u, 'lg'), h('div', null, h('strong', null, u.name), h('p', { class: 'muted small' }, `${u.email}, ${u.role}`))), profileForm),
     await ssoProfilePanel(),
     panel('Appearance', 'Follow your system setting, or pick a theme for this browser.', themeGroup),
-    first
+    ssoOnly
+      ? null
+      : first
       ? panel('Password', 'You sign in with Google or Microsoft. Add a password to sign in with your email too. Set it within 15 minutes of signing in; after that, sign out and in again first.', pwForm)
       : panel('Password', 'Changing your password signs out your other browser sessions.', pwForm));
 }

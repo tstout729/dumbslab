@@ -416,6 +416,15 @@ fn change_password(ctx: &mut Ctx, input: ChangePasswordInput) -> ApiResult<Done>
         Some(h) => auth::verify_password(&input.current_password, &h),
         // No password yet: the session must be a fresh sign-in (with Google or Microsoft).
         None => {
+            // In a workspace with its own single sign-on, people without a password were added by
+            // it: a password of their own would outlast the organization removing them there.
+            let conf = crate::sso::load(ctx.db)?;
+            if crate::sso::active(ctx.cfg, &conf) {
+                return Err(ApiError::forbidden(format!(
+                    "this workspace signs in with {}; ask a workspace admin if you need a password",
+                    conf.name()
+                )));
+            }
             let since = crate::util::ts(ctx.now - chrono::Duration::minutes(FIRST_PASSWORD_MINUTES));
             let fresh = ctx.db.scalar_i64(
                 "SELECT COUNT(*) FROM sessions WHERE token_hash = ? AND user_id = ? AND created_at >= ?",

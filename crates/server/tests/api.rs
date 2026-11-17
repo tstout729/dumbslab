@@ -5413,6 +5413,20 @@ mod sso {
         assert_eq!(h.call("DELETE", &format!("/api/v1/sso/identities/{id}"), None, &fresh).status, 200);
     }
 
+    #[test]
+    fn no_first_password_once_the_workspace_has_its_own_single_sign_on() {
+        let mut h = H::new();
+        h.cfg.sso_apps = shared_apps();
+        h.cfg.connectors.key = Some("connector-key".into());
+        let s = start_at(&h, "/sso/start?signup&with=google&token=SETUP&name=Acme", discovery(GOOGLE));
+        let ada = come_back(&h, &s, google("g-ada", "ada@acme.test", json!({})), &tokens).0.session().expect("signed up");
+        // The organization's provider now decides who's in: a password of her own would outlast it.
+        okta(&h, &ada, json!({}));
+        let r = h.call("POST", "/api/v1/me/password", Some(json!({ "new_password": "a-new-password" })), &ada);
+        assert_eq!(r.status, 403, "{}", r.body);
+        assert!(!h.ok("GET", "/api/v1/auth/state", None, &ada)["has_password"].as_bool().unwrap());
+    }
+
     /// A Google sign-in of the person with session `auth` made `minutes` ago.
     fn sign_in_session_aged(h: &H, auth: &Auth, minutes: i64) -> Auth {
         let Auth::Cookie(token) = auth else { unreachable!() };
