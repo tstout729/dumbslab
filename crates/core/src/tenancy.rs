@@ -141,8 +141,17 @@ pub fn root_robots_txt(root: &str) -> String {
 
 /// The sign-up site's pages, by path, with the static file each is served from (`web/welcome.html`
 /// is served at `/welcome`). The privacy policy and terms are public URLs that apps such as Google
-/// and Slack ask for before people may sign in with them.
-const ROOT_PAGES: [(&str, &str); 3] = [("/", "/welcome"), ("/privacy", "/privacy"), ("/terms", "/terms")];
+/// and Slack ask for before people may sign in with them. The guides live in `web/site/`.
+const ROOT_PAGES: [(&str, &str); 8] = [
+    ("/", "/welcome"),
+    ("/mcp-knowledge-base", "/site/mcp-knowledge-base"),
+    ("/confluence-alternative", "/site/confluence-alternative"),
+    ("/guru-alternative", "/site/guru-alternative"),
+    ("/self-hosted-wiki", "/site/self-hosted-wiki"),
+    ("/wiki-with-sso", "/site/wiki-with-sso"),
+    ("/privacy", "/privacy"),
+    ("/terms", "/terms"),
+];
 
 /// The static page the sign-up site serves at `path`, as the path of its file without `.html`.
 pub fn root_page(path: &str) -> Option<&'static str> {
@@ -186,6 +195,12 @@ Hosted workspaces are free at https://{root}/ with no credit card. Each workspac
 - Single sign-on (Google Workspace, Microsoft Entra ID, Okta, OneLogin, Slack or any OpenID Connect provider) and Continue with Google or Microsoft, on every plan.
 - Each person can connect GitHub, GitLab, Google Drive, Dropbox, Slack, Jira, Confluence, Linear, Asana, Trello, monday.com, ClickUp, Todoist or Shortcut and search them from DumbSlab.
 - A Slack app (`/dumbslab search`, `/dumbslab new`, link previews, channel updates), imports from Confluence, Guru, GitHub wikis and Markdown, GitHub and GitLab docs sync, and BambooHR people sync.
+
+## Guides
+
+- [MCP knowledge base](https://{root}/mcp-knowledge-base): connecting Claude, ChatGPT, Cursor or Claude Code to a workspace.
+- [Moving from Confluence](https://{root}/confluence-alternative) and [from Guru](https://{root}/guru-alternative): what the imports bring across.
+- [Self-hosting](https://{root}/self-hosted-wiki) and [single sign-on](https://{root}/wiki-with-sso).
 
 ## Self-host
 
@@ -1130,7 +1145,7 @@ mod tests {
         assert!(robots.contains("Allow: /\n") && robots.contains("Disallow: /api/\n"), "{robots}");
         assert!(robots.ends_with("Sitemap: https://kb.test/sitemap.xml\n"), "{robots}");
         let sitemap = root_sitemap_xml("kb.test");
-        for loc in ["https://kb.test/", "https://kb.test/privacy", "https://kb.test/terms"] {
+        for loc in ["https://kb.test/", "https://kb.test/privacy", "https://kb.test/terms", "https://kb.test/confluence-alternative"] {
             assert!(sitemap.contains(&format!("<loc>{loc}</loc>")), "{sitemap}");
         }
         let llms = root_llms_txt("kb.test");

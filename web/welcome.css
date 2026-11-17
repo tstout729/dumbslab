@@ -113,7 +113,8 @@
 .w-status[data-state="ok"]::before { content: ""; flex: none; width: 8px; height: 8px; border-radius: 50%; background: currentColor; }
 .w-fine { font-size: 13.5px; line-height: 1.5; color: var(--ink-3); }
 /* Links inside running text are underlined, so color isn't the only thing that marks them. */
-.w-fine a, .w-faq-list p a, .w-rules a { text-decoration: underline; text-underline-offset: 2px; }
+.w-fine a, .w-faq-list p a, .w-rules a, .w-feature-list dd a, .w-agents-intro .w-more { text-decoration: underline; text-underline-offset: 2px; }
+.w-agents-intro .w-more { color: #fff; font-weight: 600; }
 
 /* The demo: an agent's edit landing in a doc. */
 
@@ -328,3 +329,39 @@
 .w-missing { padding-block: clamp(72px, 12vw, 144px); }
 .w-missing h1 { font-family: var(--font-serif); font-size: clamp(32px, 5vw, 48px); font-weight: 600; letter-spacing: -.02em; }
 .w-missing p { max-width: 34em; margin-top: 14px; font-size: 17px; line-height: 1.65; color: var(--ink-2); }
+
+/* ---------------------------------------------------------------------------
+   Guides (web/site/): a hero, then one readable column */
+
+.w-top-go { margin-left: 4px; }
+.w-crumbs { font-size: 14px; color: var(--ink-3); }
+.w-crumbs a { color: var(--ink-2); text-decoration: underline; text-underline-offset: 2px; }
+.w-guide-hero { padding-block: clamp(32px, 6vw, 72px) 8px; }
+.w-guide-hero h1 {
+  max-width: 17em; margin-top: 14px; font-family: var(--font-serif); font-weight: 600;
+  font-size: clamp(34px, 5vw, 54px); line-height: 1.08; letter-spacing: -.02em; text-wrap: balance;
+}
+.w-guide-hero .w-lede { max-width: 36em; margin-top: 18px; font-size: 18px; line-height: 1.65; color: var(--ink-2); }
+.w-guide-cta { display: flex; flex-wrap: wrap; gap: 12px; margin: 28px 0 10px; }
+.w-guide { padding-block: 8px clamp(56px, 7vw, 88px); }
+.w-guide > * { max-width: 760px; }
+.w-page .w-guide h2 { margin-top: clamp(48px, 6vw, 64px); font-size: clamp(26px, 3vw, 32px); }
+.w-guide p, .w-guide li { font-size: 17px; line-height: 1.7; color: var(--ink-2); }
+.w-guide p { margin-top: 14px; }
+.w-guide ul, .w-guide ol { display: grid; gap: 8px; margin-top: 16px; padding-left: 24px; }
+.w-guide ul { list-style: disc; }
+.w-guide ol { list-style: decimal; }
+.w-guide strong { font-weight: 600; color: var(--ink); }
+.w-guide code { font-size: .88em; overflow-wrap: anywhere; }
+.w-guide pre { margin-top: 16px; padding: 16px 18px; overflow-x: auto; font-size: 13.5px; line-height: 1.75; color: var(--w-night-ink); background: var(--w-night); border-radius: 12px; }
+.w-guide pre code { font-size: inherit; overflow-wrap: normal; }
+.w-guide table { width: 100%; margin-top: 18px; border-collapse: collapse; font-size: 15.5px; }
+.w-guide th, .w-guide td { padding: 11px 12px 11px 0; text-align: left; vertical-align: top; border-bottom: 1px solid var(--line); }
+.w-guide th { font-weight: 650; color: var(--ink); }
+.w-guide td { line-height: 1.55; color: var(--ink-2); }
+.w-guide p a, .w-guide li a, .w-guide td a { text-decoration: underline; text-underline-offset: 2px; }
+.w-foot nav a[aria-current="page"] { color: var(--ink); font-weight: 600; }
+@media (max-width: 560px) {
+  .w-top-go { display: none; }
+  .w-guide table { font-size: 14.5px; }
+}
