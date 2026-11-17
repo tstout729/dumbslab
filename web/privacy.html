@@ -28,7 +28,7 @@
 
 <main id="main" class="w-legal w-wrap" tabindex="-1">
   <h1>Privacy Policy</h1>
-  <p class="w-legal-updated">Last updated: November 13, 2026</p>
+  <p class="w-legal-updated">Last updated: November 16, 2026</p>
 
   <div class="w-legal-summary">
     <p><strong>The short version.</strong></p>
@@ -78,7 +78,7 @@
       <li><strong>Usage.</strong> The workspace's size and how many database rows it writes each hour, to apply plan limits.</li>
       <li><strong>Sign-in protection.</strong> Counts of failed sign-ins, keyed by a hash of the email address and a hash of the network address, so we can slow down password guessing. They are cleared after a short window.</li>
       <li><strong>Sign-up protection.</strong> To limit how many workspaces one visitor can create, the sign-up service keeps a keyed hash of the IP address that created each workspace, never the address itself.</li>
-      <li><strong>Billing.</strong> When Pro is on sale and a workspace subscribes, we keep its Stripe customer and subscription IDs and the subscription's status. Card details go to Stripe and never reach us.</li>
+      <li><strong>Billing.</strong> When a workspace subscribes to Pro, we keep its Stripe customer and subscription IDs and the subscription's status. Card details go to Stripe and never reach us.</li>
     </ul>
     <p>Your browser also keeps a few things in local storage: your light or dark theme, whether you hid the editor preview, which topics you collapsed in the sidebar, and a recovery copy of a post you're editing until it's saved, so a crash or a closed tab doesn't lose your work. Signing out clears the recovery copies. The sign-up page remembers the setup link it just made, for that browser tab only. When session recording is on, the recorder keeps a random visitor ID there too. The session cookie is the only cookie we set, and none of this is used for advertising.</p>
   </section>
@@ -157,8 +157,8 @@
   <section id="processors" aria-labelledby="processors-title">
     <h2 id="processors-title">Companies that help us</h2>
     <ul>
-      <li><strong>Cloudflare</strong> hosts DumbSlab and stores all workspace data, uploads included. Its network carries every request and protects the service from attacks. It keeps short-lived request logs to run and protect the service.</li>
-      <li><strong>Stripe</strong> handles payments for Pro, once Pro is on sale.</li>
+      <li><strong>Cloudflare</strong> hosts DumbSlab and stores all workspace data, uploads included. Its network carries every request and protects the service from attacks. It keeps short-lived request logs to run and protect the service. On the sign-up site and these policy pages only (not in workspaces), Cloudflare Web Analytics counts visits: the page, the site that linked to it, and how fast it loaded. It sets no cookies and doesn't build a profile of you.</li>
+      <li><strong>Stripe</strong> handles payments for Pro.</li>
       <li><strong>Sentry</strong> receives error reports.
         <ul>
           <li>From your browser, only on signed-in pages: the type of error, function names and line numbers, the page as a route template (like <code>/p/:id</code>), your user ID and your workspace's address. Error messages are replaced with "[redacted]", and no IP address is sent.</li>
@@ -189,7 +189,7 @@
       <li><strong>Disconnecting an app</strong> deletes its stored credential right away.</li>
       <li><strong>Sessions</strong> end after 30 days, or when you sign out.</li>
       <li><strong>Accounts.</strong> Admins can deactivate people. To have your personal data removed from a workspace, ask its admins, or email us.</li>
-      <li><strong>Backups.</strong> Cloudflare can restore a workspace's storage to any point in the last 30 days. So deleted data can remain in that recovery window for up to 30 days before it's gone for good.</li>
+      <li><strong>Backups.</strong> Cloudflare can restore a workspace's storage to any point in the last 30 days. We also keep an encrypted copy of every workspace each night, for 14 days, on computers we control. So deleted data can remain in backups for up to 30 days before it's gone for good.</li>
       <li><strong>Error reports and recordings</strong> are used only to find and fix problems.</li>
     </ul>
   </section>
