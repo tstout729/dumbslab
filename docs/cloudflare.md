@@ -218,6 +218,22 @@ npx wrangler dev --env dev
 
 The `dev` environment runs hosted mode on `localhost` with throwaway secrets: open http://localhost:8787 and create a workspace. It appears at `http://name.localhost:8787`, and browsers resolve `*.localhost` to your machine.
 
+## Automatic deploys
+
+dumbslab.com deploys itself. When a push to `main` passes the `check` job, the `deploy` job in `.github/workflows/ci.yml` builds the Worker, runs `wrangler deploy`, and fails unless `https://dumbslab.com/healthz` then reports that commit. Pull requests and forks never deploy.
+
+- **Only the newest commit deploys.** If `main` has moved on by the time a commit's checks pass, that run deploys nothing and the newer commit's run does.
+- **A failed deploy** leaves production on the version it had. Read the run with `gh run view --log-failed`, then fix it with a new pull request, or re-run the job if the fault was Cloudflare's.
+- **Rolling back.** `npx wrangler rollback --message "<why>"` in `crates/worker` returns to the previous version at once. Then revert the commit on `main`, or the next merge deploys it again. A rollback changes the code only: a database migration that already ran stays.
+- **Secrets and `[vars]`.** `wrangler secret put` is still done by hand and takes effect at once. A `[vars]` change in `wrangler.toml` goes live with the merge that makes it.
+
+The job reads two values from the repository's `production` environment (Settings › Environments). Limit that environment to the `main` branch, so no other branch's workflow can read the token.
+
+- Secret `CLOUDFLARE_API_TOKEN`: an API token for the account that owns the Worker, with **Account › Workers Scripts › Edit**, **Account › Account Settings › Read**, **Zone › Workers Routes › Edit** and **Zone › Zone › Read** for the domain's zone, and nothing else. Never a global API key or a personal Wrangler login.
+- Variable `CLOUDFLARE_ACCOUNT_ID`: that account's ID.
+
+To deploy your own domain this way from a fork, change the repository name and the address in the `deploy` job and add the same two values.
+
 ## Backups
 
 - Admins can export a workspace as JSON with the `export_workspace` operation: `GET /api/v1/export`.
@@ -279,7 +295,7 @@ Durable Objects can't move between accounts, so the data is copied into a fresh 
    CLOUDFLARE_ACCOUNT_ID=<new account> npx wrangler deploy --config wrangler.move.toml
    ```
 
-   The old deployment must run this commit too (merging to `main` deploys it), so both ends speak the same backup format and schema. `curl https://dumbslab.com/healthz` shows the old one's `git_sha`; the new one has no domain yet and answers only the operator API, where `curl -H "Authorization: Bearer $TO_OPERATOR_TOKEN" https://dumbslab.<subdomain>.workers.dev/api/operator/backup/objects` shows its `git_sha`. `backup copy` also says when they differ.
+   The old deployment must run this commit too (merging to `main` deploys it; see [Automatic deploys](#automatic-deploys)), so both ends speak the same backup format and schema. `curl https://dumbslab.com/healthz` shows the old one's `git_sha`; the new one has no domain yet and answers only the operator API, where `curl -H "Authorization: Bearer $TO_OPERATOR_TOKEN" https://dumbslab.<subdomain>.workers.dev/api/operator/backup/objects` shows its `git_sha`. `backup copy` also says when they differ.
 3. **Secrets.** On the new Worker set the same `CONNECTOR_KEY` (sealed credentials need it) and fresh `SIGNUP_SECRET` and `OPERATOR_TOKEN`, each with `CLOUDFLARE_ACCOUNT_ID=<new account> npx wrangler secret put <NAME> --config wrangler.move.toml`. Set the other secrets with the values the old Worker uses, from wherever you keep them (Cloudflare never shows a secret again): Stripe, Slack, the GitHub App and the sign-in apps are registered to the domain, which doesn't change.
 4. **Freeze the old deployment.** `backup copy` does it first thing, as above, and leaves it frozen. Nothing is disabled: workspaces disabled for abuse stay disabled, and nobody needs to re-enable anything on the new deployment.
 5. **Copy, then check.** Run the `backup copy` command above with `--from https://dumbslab.com --to https://dumbslab.<subdomain>.workers.dev`, and `--save backup.dslab` for a copy on disk if you want one. Every line of its table must read `copied, verified` (or `empty, skipped`). If one fails, run the same command again. `backup verify` repeats the check any time.

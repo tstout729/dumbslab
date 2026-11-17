@@ -30,3 +30,69 @@ jobs:
         run: for f in $(find web -name '*.js'); do cp "$f" /tmp/check.mjs && node --check /tmp/check.mjs || exit 1; done
       - name: Importer tests
         run: node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON --test 'tests/importers/*.test.mjs'
+
+  # Deploys dumbslab.com once `main` passes the checks (docs/cloudflare.md, "Automatic deploys").
+  # Pull requests never deploy, and neither does a fork.
+  deploy:
+    needs: check
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && github.repository == 'tstout729/dumbslab'
+    runs-on: ubuntu-latest
+    # The Cloudflare token lives in this environment, which only `main` may use.
+    environment:
+      name: production
+      url: https://dumbslab.com
+    permissions:
+      contents: read
+    # One deploy at a time; a newer merge waits for the one under way.
+    concurrency:
+      group: production-deploy
+      cancel-in-progress: false
+    steps:
+      # Actions are pinned to a commit here, since this job builds what production runs.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      # Two merges' checks can finish out of order. Only the newest commit deploys, so an older
+      # one never replaces it.
+      - name: Check this is still the newest commit
+        id: newest
+        run: |
+          head=$(git ls-remote origin refs/heads/main | cut -f1)
+          if [ "$head" = "$GITHUB_SHA" ]; then
+            echo "deploy=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "main is at $head now; its own run deploys it." >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Install Rust
+        if: steps.newest.outputs.deploy == 'true'
+        run: |
+          rustup toolchain install stable --profile minimal --target wasm32-unknown-unknown --no-self-update
+          rustup default stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        if: steps.newest.outputs.deploy == 'true'
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        if: steps.newest.outputs.deploy == 'true'
+        with:
+          node-version: 26
+      - name: Install worker-build
+        if: steps.newest.outputs.deploy == 'true'
+        run: '[ "$(worker-build --version 2>/dev/null)" = 0.8.7 ] || cargo install worker-build --version 0.8.7 --locked'
+      - name: Deploy
+        if: steps.newest.outputs.deploy == 'true'
+        working-directory: crates/worker
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          DUMBSLAB_GIT_SHA: ${{ github.sha }}
+        run: npx --yes wrangler@4.158.0 deploy --message "${GITHUB_SHA::7} $(git log -1 --format=%s | cut -c1-80)"
+      - name: Check dumbslab.com serves this commit
+        if: steps.newest.outputs.deploy == 'true'
+        run: |
+          for _ in $(seq 1 12); do
+            live=$(curl -fsS --max-time 10 https://dumbslab.com/healthz | jq -r .git_sha || true)
+            if [ "$live" = "$GITHUB_SHA" ]; then
+              echo "dumbslab.com serves $live" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "dumbslab.com serves ${live:-nothing}, not $GITHUB_SHA"
+          exit 1
