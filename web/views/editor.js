@@ -549,7 +549,7 @@ function mountEditor(ctx, { post, initial, templates, startTemplate }) {
 
   function persistRecovery() {
     try {
-      localStorage.setItem(recoveryKey, JSON.stringify({ ...snapshot(), base_version: baseVersion, at: new Date().toISOString() }));
+      localStorage.setItem(recoveryKey, JSON.stringify({ ...snapshot(), base_version: baseVersion, base_topic_ids: saved.topic_ids, at: new Date().toISOString() }));
     } catch {
       /* storage full or unavailable */
     }
@@ -663,7 +663,15 @@ function mountEditor(ctx, { post, initial, templates, startTemplate }) {
           template_id: templateId || undefined,
         });
       } else {
-        const body = { title: snap.title.trim(), content: snap.content, topic_ids: snap.topic_ids, is_template: snap.is_template };
+        const body = { title: snap.title.trim(), content: snap.content, is_template: snap.is_template };
+        // Only the topics added or removed here are sent, never the whole list: a teammate may
+        // have changed the post's topics since it was opened (that doesn't change its version),
+        // and sending the old list back would undo it, such as sharing again a post they had
+        // just made private.
+        const added = snap.topic_ids.filter((id) => !saved.topic_ids.includes(id));
+        const removed = saved.topic_ids.filter((id) => !snap.topic_ids.includes(id));
+        if (added.length) body.add_topic_ids = added;
+        if (removed.length) body.remove_topic_ids = removed;
         if (!force) body.base_version = baseVersion;
         if (publish && status !== 'published') body.status = 'published';
         result = await api.patch(`/posts/${enc(postId)}`, body);
@@ -701,7 +709,9 @@ function mountEditor(ctx, { post, initial, templates, startTemplate }) {
     } catch (e) {
       saving = false;
       updateChrome();
-      if (e.status === 409) conflictDialog(e, { publish, view });
+      // Only a changed version is a conflict to overwrite. Other refusals with that status (such
+      // as removing a post's last private topic) say why themselves.
+      if (e.status === 409 && e.details && e.details.current_version) conflictDialog(e, { publish, view });
       else toastError(e, 'Couldn’t save');
     }
   }
@@ -785,10 +795,26 @@ function mountEditor(ctx, { post, initial, templates, startTemplate }) {
         h('span', null, `You have unsaved changes from ${relTime(rec.at)}${post && rec.base_version && rec.base_version !== post.version ? `, made on version ${rec.base_version} (the post is now version ${post.version})` : ''}.`),
         h('div', { class: 'banner-actions' }, restore, discard));
       restore.addEventListener('click', () => {
+        // The restored text was written on the copy's version. Saving it as an edit of that
+        // version lets the server refuse it when the post changed since, so the usual dialog
+        // asks before it replaces someone else's newer text.
+        if (post && rec.base_version) baseVersion = rec.base_version;
         titleEl.value = rec.title || '';
         ta.value = rec.content || '';
-        topicIds.clear();
-        for (const id of rec.topic_ids || []) if (topicById(id)) topicIds.add(id);
+        // Topics. A post that was never saved takes the copy's list: nobody else can have
+        // changed it. For a saved post, only what the copy itself added or removed, against the
+        // topics it started from, is applied to the topics the post has now: putting the copy's
+        // whole list back would undo a teammate's change since. A copy from before that was
+        // recorded keeps the post's topics.
+        const copied = rec.topic_ids || [];
+        const base = Array.isArray(rec.base_topic_ids) ? rec.base_topic_ids : null;
+        if (!post) {
+          topicIds.clear();
+          for (const id of copied) if (topicById(id)) topicIds.add(id);
+        } else if (base) {
+          for (const id of base) if (!copied.includes(id)) topicIds.delete(id);
+          for (const id of copied) if (!base.includes(id) && topicById(id)) topicIds.add(id);
+        }
         templateInput.checked = !!rec.is_template;
         picker.redraw();
         recoveryBanner.remove();

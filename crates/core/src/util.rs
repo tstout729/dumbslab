@@ -95,7 +95,12 @@ pub fn is_valid_email(s: &str) -> bool {
     let s = s.trim();
     match s.split_once('@') {
         Some((local, domain)) => {
-            !local.is_empty() && domain.contains('.') && !domain.starts_with('.') && !s.contains(' ') && s.len() <= 254
+            !local.is_empty()
+                && domain.contains('.')
+                && !domain.starts_with('.')
+                && !s.contains(' ')
+                && !s.chars().any(char::is_control)
+                && s.len() <= 254
         }
         None => false,
     }
@@ -125,6 +130,14 @@ mod tests {
         assert_eq!(slugify("Getting Started: Ops 101"), "getting-started-ops-101");
         assert_eq!(slugify("  --  "), "untitled");
         assert_eq!(slugify("Café déjà vu"), "café-déjà-vu");
+    }
+
+    #[test]
+    fn emails() {
+        assert!(is_valid_email("ada@acme.test"));
+        assert!(!is_valid_email("ada@acme"));
+        assert!(!is_valid_email("ada @acme.test"));
+        assert!(!is_valid_email("ada@acme.test\0x"), "the database compares emails only up to a NUL");
     }
 
     #[test]

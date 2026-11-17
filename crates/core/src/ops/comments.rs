@@ -236,9 +236,10 @@ fn create_comment(ctx: &mut Ctx, input: CreateCommentInput) -> ApiResult<Comment
             message: format!("{} mentioned you in a comment on “{title}”", ctx.actor.name),
         },
     )?;
-    if let Some(pa) = parent_author
-        && !mentioned.contains(&pa)
-    {
+    // Whoever hears of this comment as a reply to theirs hears of it once: not again as a follower
+    // of the post (commenting follows it) or as its author.
+    let replied_to = parent_author.filter(|pa| !mentioned.contains(pa));
+    if let Some(pa) = &replied_to {
         notify::send(
             ctx,
             [pa.clone()],
@@ -253,7 +254,7 @@ fn create_comment(ctx: &mut Ctx, input: CreateCommentInput) -> ApiResult<Comment
     }
     let mut recipients = notify::followers(ctx.db, "post", &post_id)?;
     recipients.push(post.str("author_id"));
-    recipients.retain(|u| !mentioned.contains(u));
+    recipients.retain(|u| !mentioned.contains(u) && replied_to.as_ref() != Some(u));
     notify::send(
         ctx,
         recipients,

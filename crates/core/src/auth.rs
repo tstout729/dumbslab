@@ -327,8 +327,10 @@ pub fn form_csrf(session_hash: &str) -> String {
 
 const WINDOW_MINUTES: i64 = 15;
 /// Failed password checks allowed per window: for one account, from one client address, and in
-/// the whole workspace. The last bounds password hashing (and these records) however many
-/// emails or addresses someone rotates through.
+/// the whole workspace. The last bounds the hashing that guesses at unknown emails cost (and
+/// these records) however many emails or addresses someone rotates through. A sign-in to an
+/// account with a password is still checked past it, so reaching it keeps nobody out (see
+/// `http::login`).
 const MAX_FAILURES: i64 = 10;
 const MAX_CLIENT_FAILURES: i64 = 30;
 const MAX_WORKSPACE_FAILURES: i64 = 200;

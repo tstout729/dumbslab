@@ -1262,6 +1262,66 @@ fn directory_forwards_github_installations_to_the_workspaces_that_connected_them
     assert_eq!((full.status, full.code), (409, "installation_full"), "a code the workspace can tell the admin");
 }
 
+#[test]
+fn a_reply_notifies_the_comment_author_once() {
+    let h = H::new();
+    let (_, admin) = h.setup();
+    let (_, mia) = h.user(&admin, "mia@acme.test", "Mia Member", "member");
+    let (_, otto) = h.user(&admin, "otto@acme.test", "Otto Other", "member");
+    let post = h.ok("POST", "/api/v1/posts", Some(json!({ "title": "Plan", "content": "x", "status": "published" })), &admin);
+    let comments = format!("/api/v1/posts/{}/comments", post["id"].as_str().unwrap());
+    // What someone heard about one comment.
+    let kinds = |who: &Auth, comment: &Value| -> Vec<String> {
+        h.ok("GET", "/api/v1/notifications", None, who)["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|n| n["comment_id"] == comment["id"])
+            .map(|n| n["kind"].as_str().unwrap().to_string())
+            .collect()
+    };
+
+    // Commenting follows the post, so Mia would hear of the reply as a follower too.
+    let question = h.ok("POST", &comments, Some(json!({ "body": "A question" })), &mia);
+    let answer = h.ok("POST", &comments, Some(json!({ "body": "An answer", "parent_id": question["id"] })), &otto);
+    assert_eq!(kinds(&mia, &answer), ["reply"], "one notice for one reply");
+    assert_eq!(kinds(&admin, &answer), ["comment"], "the post's author still hears of it");
+
+    // The same when the comment's author also wrote the post.
+    let note = h.ok("POST", &comments, Some(json!({ "body": "A note" })), &admin);
+    let thanks = h.ok("POST", &comments, Some(json!({ "body": "Thanks", "parent_id": note["id"] })), &otto);
+    assert_eq!(kinds(&admin, &thanks), ["reply"]);
+    assert_eq!(kinds(&mia, &thanks), ["comment"], "other followers still hear of it");
+}
+
+#[test]
+fn updated_since_takes_any_rfc3339_time() {
+    use chrono::{DateTime, Duration, FixedOffset, SecondsFormat};
+    let h = H::new();
+    let (_, admin) = h.setup();
+    let post = h.ok("POST", "/api/v1/posts", Some(json!({ "title": "Fresh", "content": "x", "status": "published" })), &admin);
+    let id = post["id"].as_str().unwrap().to_string();
+    let updated = DateTime::parse_from_rfc3339(post["updated_at"].as_str().unwrap()).unwrap();
+    let found =
+        |since: &str| ids(&h.ok("GET", &format!("/api/v1/posts?updated_since={}", urlencoding::encode(since)), None, &admin)).contains(&id);
+    let at = |t: DateTime<FixedOffset>, hours: i32| {
+        t.with_timezone(&FixedOffset::east_opt(hours * 3600).unwrap()).to_rfc3339_opts(SecondsFormat::Millis, false)
+    };
+
+    // The same instant, however it's written.
+    for hours in [0, 2, -8] {
+        assert!(found(&at(updated, hours)), "at or after {}", at(updated, hours));
+        assert!(!found(&at(updated + Duration::seconds(1), hours)), "before {}", at(updated + Duration::seconds(1), hours));
+    }
+    // Without milliseconds: the start of that second.
+    assert!(found(&updated.to_utc().to_rfc3339_opts(SecondsFormat::Secs, true)));
+    // A date alone still works as it did.
+    assert!(found("2020-01-01"));
+    assert!(!found("2999-01-01"));
+    // A time that is past the year 9999 in UTC matches nothing.
+    assert!(!found("9999-12-31T23:59:59-01:00"));
+}
+
 fn count(h: &H, sql: &str) -> i64 {
     h.store.with_tx(|db| (db.scalar_i64(sql, &[]), true)).unwrap().unwrap()
 }
@@ -1489,6 +1549,14 @@ fn sign_in_limits_cover_every_email() {
     // A failure counts against the email, the client's address and the whole workspace.
     assert_eq!(login(&h, "first@acme.test", "203.0.113.7", "https://kb.test").status, 401);
     assert_eq!(count(&h, "SELECT COUNT(*) FROM login_attempts"), 3, "only the email is throttled");
+    // An address with a NUL is nobody's: it's refused without a lookup or a count.
+    assert_eq!(login(&h, "ada@acme.test\0x", "203.0.113.7", "https://kb.test").status, 401);
+    assert_eq!(count(&h, "SELECT COUNT(*) FROM login_attempts"), 3);
+    assert_eq!(count(&h, "SELECT failures FROM login_attempts WHERE key = 'workspace'"), 1);
+    // A line break around the address is trimmed like any space, so it's checked as usual.
+    assert_eq!(login(&h, "first@acme.test\n", "203.0.113.7", "https://kb.test").status, 401);
+    assert_eq!(count(&h, "SELECT failures FROM login_attempts WHERE key = 'workspace'"), 2);
+    assert_eq!(count(&h, "SELECT COUNT(*) FROM login_attempts"), 3, "the same account's limit");
 
     // An address that failed many times with other emails is stopped before any password check.
     h.store.with_tx(|db| (db.execute("UPDATE login_attempts SET failures = 1000 WHERE key LIKE 'ip:%'", &[]), true)).unwrap().unwrap();
@@ -1497,6 +1565,27 @@ fn sign_in_limits_cover_every_email() {
     // So is everyone, once the workspace as a whole has failed too often (addresses are cheap).
     h.store.with_tx(|db| (db.execute("UPDATE login_attempts SET failures = 1000 WHERE key = 'workspace'", &[]), true)).unwrap().unwrap();
     assert_eq!(login(&h, "other@acme.test", "192.0.2.1", "https://kb.test").status, 429);
+    // Except the people who work here: anyone can reach that limit on purpose, so an account with
+    // a password is still checked past it. The right password signs in; a wrong one is throttled.
+    let ada = |h: &H, password: &str| {
+        h.send(&Request {
+            method: "POST".into(),
+            path: "/api/v1/auth/login".into(),
+            headers: vec![("content-type".into(), "application/json".into()), ("x-dumbslab-client".into(), "web".into())],
+            body: serde_json::to_vec(&json!({ "email": "ada@acme.test", "password": password })).unwrap(),
+            origin: "https://kb.test".into(),
+            client_ip: Some("192.0.2.1".into()),
+            ..Default::default()
+        })
+        .status
+    };
+    assert_eq!(ada(&h, "not-the-password"), 429);
+    assert_eq!(ada(&h, "correct horse"), 200);
+    // Her own limit still bounds the guesses at her password.
+    for _ in 0..10 {
+        assert_eq!(ada(&h, "not-the-password"), 429);
+    }
+    assert_eq!(ada(&h, "correct horse"), 429, "ten wrong guesses stop even the right password");
     h.store.with_tx(|db| (db.execute("DELETE FROM login_attempts", &[]), true)).unwrap().unwrap();
 
     // Behind a proxy that doesn't forward the scheme, an HTTPS public URL still gets Secure cookies.
