@@ -1,4 +1,5 @@
 //! Minimal Sentry envelopes: deliberately accepts no request or error text.
+use dumbslab_core::tenancy::Warning;
 use serde_json::json;
 use worker::Url;
 
@@ -43,6 +44,21 @@ impl Destination {
         });
         format!("{}\n{}\n{}\n", json!({"event_id": event_id, "dsn": self.dsn}), json!({"type": "event"}), event)
     }
+
+    /// A limit's warning: its fixed sentence and the totals, never a workspace or a person.
+    pub fn warning_envelope(&self, event_id: &str, warning: &Warning) -> String {
+        let event = json!({
+            "event_id": event_id,
+            "platform": "other",
+            "level": if warning.percent >= 100 { "error" } else { "warning" },
+            "logger": "dumbslab.capacity",
+            "release": concat!("dumbslab@", env!("CARGO_PKG_VERSION")),
+            "message": warning.message(),
+            "fingerprint": ["dumbslab.capacity", warning.limit, warning.percent.to_string()],
+            "extra": { "used": warning.used, "allowed": warning.allowed, "percent": warning.percent },
+        });
+        format!("{}\n{}\n{}\n", json!({"event_id": event_id, "dsn": self.dsn}), json!({"type": "event"}), event)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -62,9 +78,23 @@ impl Failure {
 
 /// Delivery is best effort and cannot change the application's response.
 pub(crate) async fn send(destination: Destination, failure: Failure) -> worker::Result<()> {
+    let body = destination.envelope(&new_event_id(), failure);
+    post(&destination, body).await
+}
+
+/// Tells the operator a hosted limit reached one of its warning levels. Sentry groups each limit
+/// and level into one issue, so a new level, or one crossed again after the issue was resolved,
+/// sends one email.
+pub(crate) async fn send_warning(destination: &Destination, warning: &Warning) -> worker::Result<()> {
+    post(destination, destination.warning_envelope(&new_event_id(), warning)).await
+}
+
+fn new_event_id() -> String {
+    dumbslab_core::util::sha256_hex(&dumbslab_core::util::new_secret(""))[..32].to_string()
+}
+
+async fn post(destination: &Destination, body: String) -> worker::Result<()> {
     use worker::*;
-    let id = dumbslab_core::util::sha256_hex(&dumbslab_core::util::new_secret(""))[..32].to_string();
-    let body = destination.envelope(&id, failure);
     let headers = Headers::new();
     headers.set("content-type", "application/x-sentry-envelope")?;
     let mut init = RequestInit::new();
@@ -105,5 +135,23 @@ mod tests {
             assert_eq!(keys, ["event_id", "fingerprint", "level", "logger", "message", "platform", "release"]);
             assert_eq!(event["message"], failure.category());
         }
+    }
+
+    #[test]
+    fn warning_envelope_carries_only_the_limit_and_totals() {
+        let destination = Destination::parse("https://abc123@o1.ingest.sentry.io/42").unwrap();
+        let warning = Warning { limit: "free_storage", percent: 75, used: 75, allowed: 100 };
+        let envelope = destination.warning_envelope("0123456789abcdef0123456789abcdef", &warning);
+        let event: serde_json::Value = serde_json::from_str(envelope.lines().nth(2).unwrap()).unwrap();
+        let keys: Vec<_> = event.as_object().unwrap().keys().map(String::as_str).collect();
+        assert_eq!(keys, ["event_id", "extra", "fingerprint", "level", "logger", "message", "platform", "release"]);
+        assert_eq!(event["level"], "warning");
+        assert_eq!(event["fingerprint"], json!(["dumbslab.capacity", "free_storage", "75"]));
+        assert_eq!(event["message"], "Free plan: storage is at 75% of the shared cap");
+        let reached = Warning { percent: 100, ..warning };
+        let event: serde_json::Value =
+            serde_json::from_str(destination.warning_envelope("0123456789abcdef0123456789abcdef", &reached).lines().nth(2).unwrap())
+                .unwrap();
+        assert_eq!(event["level"], "error");
     }
 }
