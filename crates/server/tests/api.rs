@@ -5450,6 +5450,13 @@ mod sso {
         assert_eq!(r.status, 403, "a stolen session can't add a lasting way in: {}", r.body);
         let fresh = sign_in(&h, "zed@acme.test", "password123");
         assert_eq!(h.call("POST", "/api/v1/me/sso", Some(json!({ "provider": "google" })), &fresh).status, 200);
+        // The same for the workspace's own single sign-on.
+        let (h, admin) = workspace();
+        h.user(&admin, "mo@acme.test", "Mo", "member");
+        okta(&h, &admin, json!({}));
+        let stale = sign_in_session_aged(&h, &sign_in(&h, "mo@acme.test", "password123"), 20);
+        assert_eq!(h.call("POST", "/api/v1/me/sso", None, &stale).status, 403);
+        assert_eq!(h.call("POST", "/api/v1/me/sso", None, &sign_in(&h, "mo@acme.test", "password123")).status, 200);
     }
 
     /// A Google sign-in of the person with session `auth` made `minutes` ago.

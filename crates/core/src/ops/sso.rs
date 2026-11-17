@@ -39,7 +39,7 @@ pub fn ops() -> Vec<Op> {
             .build(),
         op("sso", "link_sso", "POST", "/me/sso", Access::Write, link_sso)
             .title("Link your sign-in account")
-            .desc("Starts linking your account at the workspace's identity provider to yours here, so you can sign in with it even when the provider doesn't vouch for your email address. Or, with `provider` (`google` or `microsoft`), your own account there, to sign in with \"Continue with Google\" (offered when the workspace hasn't set up single sign-on). Answers with an `authorize_url` to open in the same browser; you come back to Settings › Profile. Only from a signed-in browser.")
+            .desc("Starts linking your account at the workspace's identity provider to yours here, so you can sign in with it even when the provider doesn't vouch for your email address. Or, with `provider` (`google` or `microsoft`), your own account there, to sign in with \"Continue with Google\" (offered when the workspace hasn't set up single sign-on). Answers with an `authorize_url` to open in the same browser; you come back to Settings › Profile. Only from a browser that signed in within the last 15 minutes.")
             .build(),
         op("sso", "unlink_sso", "DELETE", "/sso/identities/{id}", Access::Write, unlink_sso)
             .title("Unlink a sign-in account")
@@ -400,17 +400,18 @@ fn link_sso(ctx: &mut Ctx, input: LinkSsoInput) -> ApiResult<Deferred<LinkStart>
         Some(p) if !sso::personal_providers(ctx.db, ctx.cfg)?.contains(&p) => {
             return Err(ApiError::bad_request(format!("signing in with your own {} account isn't available in this workspace", p.name())));
         }
-        // A link is a lasting way in: only from a fresh sign-in, so a stolen session can't add one.
-        Some(_) if !sso::fresh_session(ctx.db, &ctx.actor.user_id, &session_hash, ctx.now)? => {
-            return Err(ApiError::forbidden(format!(
-                "to link an account, sign out and sign in again, then link it within {} minutes",
-                sso::FRESH_MINUTES
-            )));
-        }
         None if !sso::active(ctx.cfg, &sso::load(ctx.db)?) => {
             return Err(ApiError::bad_request("single sign-on isn't set up for this workspace"));
         }
         _ => {}
+    }
+    // A link is a lasting way in, at any provider: only from a fresh sign-in, so a stolen session
+    // can't add one.
+    if !sso::fresh_session(ctx.db, &ctx.actor.user_id, &session_hash, ctx.now)? {
+        return Err(ApiError::forbidden(format!(
+            "to link an account, sign out and sign in again, then link it within {} minutes",
+            sso::FRESH_MINUTES
+        )));
     }
     ctx.effects.push(Effect::Connect(Job::Sso(SsoJob::link(&ctx.base_url, &ctx.actor.user_id, &session_hash, input.provider))));
     Ok(Deferred::Pending)
