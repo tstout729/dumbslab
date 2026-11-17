@@ -549,7 +549,7 @@ function mountEditor(ctx, { post, initial, templates, startTemplate }) {
 
   function persistRecovery() {
     try {
-      localStorage.setItem(recoveryKey, JSON.stringify({ ...snapshot(), base_version: baseVersion, at: new Date().toISOString() }));
+      localStorage.setItem(recoveryKey, JSON.stringify({ ...snapshot(), base_version: baseVersion, base_topic_ids: saved.topic_ids, at: new Date().toISOString() }));
     } catch {
       /* storage full or unavailable */
     }
@@ -799,8 +799,19 @@ function mountEditor(ctx, { post, initial, templates, startTemplate }) {
         if (post && rec.base_version) baseVersion = rec.base_version;
         titleEl.value = rec.title || '';
         ta.value = rec.content || '';
-        topicIds.clear();
-        for (const id of rec.topic_ids || []) if (topicById(id)) topicIds.add(id);
+        // Topics: only what the copy itself added or removed, against the topics it started
+        // from, is applied to the topics the post has now. Putting the copy's whole list back
+        // would undo a teammate's change since. A copy from before this was recorded keeps the
+        // post's topics (a new post has no teammates yet, so it takes the copy's).
+        const copied = rec.topic_ids || [];
+        const base = Array.isArray(rec.base_topic_ids) ? rec.base_topic_ids : null;
+        if (base) {
+          for (const id of base) if (!copied.includes(id)) topicIds.delete(id);
+          for (const id of copied) if (!base.includes(id) && topicById(id)) topicIds.add(id);
+        } else if (!post) {
+          topicIds.clear();
+          for (const id of copied) if (topicById(id)) topicIds.add(id);
+        }
         templateInput.checked = !!rec.is_template;
         picker.redraw();
         recoveryBanner.remove();
