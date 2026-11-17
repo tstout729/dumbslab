@@ -801,18 +801,19 @@ function mountEditor(ctx, { post, initial, templates, startTemplate }) {
         if (post && rec.base_version) baseVersion = rec.base_version;
         titleEl.value = rec.title || '';
         ta.value = rec.content || '';
-        // Topics: only what the copy itself added or removed, against the topics it started
-        // from, is applied to the topics the post has now. Putting the copy's whole list back
-        // would undo a teammate's change since. A copy from before this was recorded keeps the
-        // post's topics (a new post has no teammates yet, so it takes the copy's).
+        // Topics. A post that was never saved takes the copy's list: nobody else can have
+        // changed it. For a saved post, only what the copy itself added or removed, against the
+        // topics it started from, is applied to the topics the post has now: putting the copy's
+        // whole list back would undo a teammate's change since. A copy from before that was
+        // recorded keeps the post's topics.
         const copied = rec.topic_ids || [];
         const base = Array.isArray(rec.base_topic_ids) ? rec.base_topic_ids : null;
-        if (base) {
-          for (const id of base) if (!copied.includes(id)) topicIds.delete(id);
-          for (const id of copied) if (!base.includes(id) && topicById(id)) topicIds.add(id);
-        } else if (!post) {
+        if (!post) {
           topicIds.clear();
           for (const id of copied) if (topicById(id)) topicIds.add(id);
+        } else if (base) {
+          for (const id of base) if (!copied.includes(id)) topicIds.delete(id);
+          for (const id of copied) if (!base.includes(id) && topicById(id)) topicIds.add(id);
         }
         templateInput.checked = !!rec.is_template;
         picker.redraw();

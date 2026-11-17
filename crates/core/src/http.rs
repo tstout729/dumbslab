@@ -464,7 +464,7 @@ fn login(db: &dyn Db, cfg: &HostConfig, req: &Request) -> Outcome {
     }
     // No address has control characters. Refused here because the database compares emails only up
     // to a NUL, so spellings that differ after one would reach one account under many limits.
-    if input.email.chars().any(char::is_control) {
+    if input.email.trim().chars().any(char::is_control) {
         return failed(&ApiError::unauthorized("email or password is incorrect"));
     }
     let keys = auth::password_keys(&input.email, req.client_ip.as_deref());

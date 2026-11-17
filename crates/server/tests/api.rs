@@ -1542,6 +1542,11 @@ fn sign_in_limits_cover_every_email() {
     // An address with a control character is nobody's: it's refused without a lookup or a count.
     assert_eq!(login(&h, "ada@acme.test\0x", "203.0.113.7", "https://kb.test").status, 401);
     assert_eq!(count(&h, "SELECT COUNT(*) FROM login_attempts"), 3);
+    assert_eq!(count(&h, "SELECT failures FROM login_attempts WHERE key = 'workspace'"), 1);
+    // A line break around the address is trimmed like any space, so it's checked as usual.
+    assert_eq!(login(&h, "first@acme.test\n", "203.0.113.7", "https://kb.test").status, 401);
+    assert_eq!(count(&h, "SELECT failures FROM login_attempts WHERE key = 'workspace'"), 2);
+    assert_eq!(count(&h, "SELECT COUNT(*) FROM login_attempts"), 3, "the same account's limit");
 
     // An address that failed many times with other emails is stopped before any password check.
     h.store.with_tx(|db| (db.execute("UPDATE login_attempts SET failures = 1000 WHERE key LIKE 'ip:%'", &[]), true)).unwrap().unwrap();
