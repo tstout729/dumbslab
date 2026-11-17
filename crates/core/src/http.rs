@@ -463,10 +463,25 @@ fn login(db: &dyn Db, cfg: &HostConfig, req: &Request) -> Outcome {
         return failed(&ApiError::bad_request("email or password is too long"));
     }
     let keys = auth::password_keys(&input.email, req.client_ip.as_deref());
+    // The account's and the client address's limits, then the workspace-wide one.
+    let (own, shared) = keys.split_at(keys.len() - 1);
     let run = || -> ApiResult<Outcome> {
-        auth::check_throttle(db, &keys, now)?;
+        auth::check_throttle(db, own, now)?;
+        // The workspace-wide limit bounds the hashing that guesses at unknown emails cost. Anyone
+        // can reach it on purpose, so it must not keep the people who work here out: while it's
+        // reached, an account with a password is still checked (its own limit bounds that), a right
+        // password signs in, and everything else is refused as throttled, unknown emails and
+        // accounts without a password before any hashing. Only then does the time a refusal takes
+        // tell the two apart.
+        let flooded = auth::check_throttle(db, shared, now).err();
         let row =
             db.one("SELECT id, role, password_hash FROM users WHERE email = ? AND deactivated_at IS NULL", &params![input.email.trim()])?;
+        let has_password = row.as_ref().is_some_and(|r| r.opt_str("password_hash").is_some());
+        if let Some(throttled) = &flooded
+            && !has_password
+        {
+            return Err(throttled.clone());
+        }
         let user_id = match row {
             Some(r) if r.opt_str("password_hash").is_some_and(|h| auth::verify_password(&input.password, &h)) => {
                 // A workspace that requires single sign-on takes passwords from admins only.
@@ -475,23 +490,16 @@ fn login(db: &dyn Db, cfg: &HostConfig, req: &Request) -> Outcome {
                 }
                 r.str("id")
             }
-            Some(_) => {
+            _ => {
+                // An unknown email, and an account without a password (it signs in with Google,
+                // Microsoft or single sign-on, or is a bot), take as long as a wrong password.
+                if !has_password {
+                    auth::dummy_verify(&input.password);
+                }
                 auth::record_failures(db, &keys, now)?;
                 // Commit the failure count even though the request fails.
-                return Ok(Outcome {
-                    response: Response::error(&ApiError::unauthorized("email or password is incorrect")),
-                    commit: true,
-                    effects: vec![],
-                });
-            }
-            None => {
-                auth::dummy_verify(&input.password);
-                auth::record_failures(db, &keys, now)?;
-                return Ok(Outcome {
-                    response: Response::error(&ApiError::unauthorized("email or password is incorrect")),
-                    commit: true,
-                    effects: vec![],
-                });
+                let refusal = flooded.unwrap_or_else(|| ApiError::unauthorized("email or password is incorrect"));
+                return Ok(Outcome { response: Response::error(&refusal), commit: true, effects: vec![] });
             }
         };
         // Only the account's own count resets; the address and workspace counts run out their window.

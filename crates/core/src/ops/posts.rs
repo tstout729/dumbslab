@@ -191,6 +191,10 @@ fn list_posts(ctx: &mut Ctx, input: ListPostsInput) -> ApiResult<PostList> {
         }
     }
     if let Some(since) = clean(input.updated_since) {
+        // Times are stored in UTC with milliseconds and compared as text, so an RFC 3339 time
+        // written another way (with an offset, or without milliseconds) is first put in that form.
+        // Anything else, such as a date alone, is compared as it's written.
+        let since = crate::util::parse_ts(&since).map(crate::util::ts).unwrap_or(since);
         conds.push("p.updated_at >= ?".into());
         p.push(since.into());
     }

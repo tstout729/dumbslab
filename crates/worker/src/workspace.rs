@@ -954,7 +954,13 @@ fn send_webhooks(state: &State, effects: Vec<Effect>) {
                 let _ = headers.set(k, v);
             }
             let mut init = RequestInit::new();
-            init.with_method(Method::Post).with_headers(headers).with_body(Some(JsValue::from_str(&d.body)));
+            // Never follow a redirect, like the native server: the signed body goes only to the
+            // address the admin gave, and a redirect is recorded as a failed delivery (following a
+            // 301 would send a GET without the event and call it delivered).
+            init.with_method(Method::Post)
+                .with_headers(headers)
+                .with_redirect(RequestRedirect::Manual)
+                .with_body(Some(JsValue::from_str(&d.body)));
             let result = match Request::new_with_init(&d.url, &init) {
                 Ok(r) => Fetch::Request(r).send().await,
                 Err(e) => Err(e),

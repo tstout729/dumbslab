@@ -663,7 +663,15 @@ function mountEditor(ctx, { post, initial, templates, startTemplate }) {
           template_id: templateId || undefined,
         });
       } else {
-        const body = { title: snap.title.trim(), content: snap.content, topic_ids: snap.topic_ids, is_template: snap.is_template };
+        const body = { title: snap.title.trim(), content: snap.content, is_template: snap.is_template };
+        // Only the topics added or removed here are sent, never the whole list: a teammate may
+        // have changed the post's topics since it was opened (that doesn't change its version),
+        // and sending the old list back would undo it, such as sharing again a post they had
+        // just made private.
+        const added = snap.topic_ids.filter((id) => !saved.topic_ids.includes(id));
+        const removed = saved.topic_ids.filter((id) => !snap.topic_ids.includes(id));
+        if (added.length) body.add_topic_ids = added;
+        if (removed.length) body.remove_topic_ids = removed;
         if (!force) body.base_version = baseVersion;
         if (publish && status !== 'published') body.status = 'published';
         result = await api.patch(`/posts/${enc(postId)}`, body);
@@ -785,6 +793,10 @@ function mountEditor(ctx, { post, initial, templates, startTemplate }) {
         h('span', null, `You have unsaved changes from ${relTime(rec.at)}${post && rec.base_version && rec.base_version !== post.version ? `, made on version ${rec.base_version} (the post is now version ${post.version})` : ''}.`),
         h('div', { class: 'banner-actions' }, restore, discard));
       restore.addEventListener('click', () => {
+        // The restored text was written on the copy's version. Saving it as an edit of that
+        // version lets the server refuse it when the post changed since, so the usual dialog
+        // asks before it replaces someone else's newer text.
+        if (post && rec.base_version) baseVersion = rec.base_version;
         titleEl.value = rec.title || '';
         ta.value = rec.content || '';
         topicIds.clear();
