@@ -205,8 +205,10 @@ pub const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0014_docs_sync_apps.sql"),
     // What docs sync through DumbSlab's GitLab app adds.
     include_str!("migrations/0015_docs_sync_gitlab.sql"),
-    // Why a sign-in with a connected app didn't work, for Settings. Listed last.
+    // Why a sign-in with a connected app didn't work, for Settings.
     include_str!("migrations/0016_connect_attempts.sql"),
+    // Who made each API token, so only the person's own can use their connected apps.
+    include_str!("migrations/0017_token_creator.sql"),
 ];
 
 /// Brings the schema up to date. Safe to call on every start.

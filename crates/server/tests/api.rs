@@ -131,6 +131,16 @@ impl H {
         let t = self.ok("POST", "/api/v1/tokens", Some(json!({ "name": "t", "user": id })), admin);
         (id, Auth::Bearer(t["token"].as_str().unwrap().to_string()))
     }
+
+    /// Like [`H::user`], but the person signs in and makes their own token, which connected apps
+    /// need: a token an admin made for someone can't use their connections.
+    fn member(&self, admin: &Auth, email: &str, name: &str, role: &str) -> (String, Auth) {
+        let (id, _) = self.user(admin, email, name, role);
+        let r = self.call("POST", "/api/v1/auth/login", Some(json!({ "email": email, "password": "password123" })), &Auth::None);
+        assert_eq!(r.status, 200, "{}", r.body);
+        let t = self.ok("POST", "/api/v1/tokens", Some(json!({ "name": "mine" })), &session_from(&r));
+        (id, Auth::Bearer(t["token"].as_str().unwrap().to_string()))
+    }
 }
 
 fn session_from(r: &Res) -> Auth {
@@ -2853,7 +2863,7 @@ mod connected {
     fn people_connect_and_search_their_own_apps() {
         let mut h = H::new();
         let (admin, admin_token) = h.setup();
-        let (_, mo) = h.user(&admin, "mo@acme.test", "Mo", "member");
+        let (_, mo) = h.member(&admin, "mo@acme.test", "Mo", "member");
 
         // Without a connector key, nothing can be connected.
         let list = h.ok("GET", "/api/v1/connections", None, &admin);
@@ -2907,6 +2917,28 @@ mod connected {
         let r = h.call("GET", "/api/v1/search/connected?q=deploy", None, &mo);
         assert!(r.effects.is_empty());
         assert_eq!(r.body["items"], json!([]));
+        // A token an admin made for someone can't list, use or change that person's connections:
+        // otherwise the admin could search Mo's own Google Drive as Mo.
+        let mo_id = h.ok("GET", "/api/v1/me", None, &mo)["user"]["id"].as_str().unwrap().to_string();
+        let made_for_mo = h.ok("POST", "/api/v1/tokens", Some(json!({ "name": "as mo", "user": mo_id })), &admin_token)["token"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let made_for_mo = Auth::Bearer(made_for_mo);
+        for (method, path) in [
+            ("GET", "/api/v1/connections"),
+            ("GET", "/api/v1/search/connected?q=deploy"),
+            ("GET", "/api/v1/connections/preview?url=https%3A%2F%2Fgithub.com%2Facme%2Fapi%2Fissues%2F7"),
+            ("DELETE", "/api/v1/connections/github"),
+        ] {
+            let r = h.call(method, path, None, &made_for_mo);
+            assert_eq!(r.status, 403, "{method} {path}: {}", r.body);
+        }
+        let r = h.call("POST", "/api/v1/connections", Some(json!({ "app": "github", "fields": { "token": "t" } })), &made_for_mo);
+        assert_eq!(r.status, 403);
+        assert!(r.effects.is_empty());
+        // Ada's own token still works.
+        assert_eq!(h.call("GET", "/api/v1/connections", None, &admin_token).status, 200);
 
         // Previews: a connected app's link is read with the viewer's account.
         let r = h.call("GET", "/api/v1/connections/preview?url=https%3A%2F%2Fgithub.com%2Facme%2Fapi%2Fissues%2F7", None, &admin);
@@ -3015,6 +3047,166 @@ mod connected {
             .unwrap()
             .to_string();
         assert!(query_of(&url)["state"].starts_with("acme."));
+    }
+
+    /// Google, answering Drive's sign-in, `about` and file search for ada@acme.com.
+    fn google(call: &HttpCall) -> HttpReply {
+        let url = call.url.as_str();
+        if url == "https://oauth2.googleapis.com/token" {
+            ok(json!({ "access_token": "ya29.drive", "refresh_token": "1//refresh", "expires_in": 3599, "token_type": "Bearer",
+                "scope": "https://www.googleapis.com/auth/drive.metadata.readonly" }))
+        } else if url == "https://www.googleapis.com/drive/v3/about?fields=user(emailAddress)" {
+            ok(json!({ "user": { "emailAddress": "ada@acme.com" } }))
+        } else if url.starts_with("https://www.googleapis.com/drive/v3/files?") {
+            ok(json!({ "files": [{ "name": "Launch plan", "mimeType": "application/vnd.google-apps.document",
+                "webViewLink": "https://docs.google.com/document/d/1/edit", "modifiedTime": "2026-11-01T00:00:00Z" }] }))
+        } else {
+            HttpReply { status: 404, body: "{}".into() }
+        }
+    }
+
+    #[test]
+    fn google_drive_asks_only_to_search_file_details_and_waits_for_review() {
+        let mut h = H::new();
+        let (admin, _) = h.setup();
+        with_key(&mut h);
+        h.cfg.connectors.apps.insert("google-drive".into(), OAuthApp { client_id: "gid".into(), client_secret: "gsecret".into() });
+        let drive_app = |h: &H| {
+            h.ok("GET", "/api/v1/connections", None, &admin)["apps"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|a| a["id"] == "google-drive")
+                .unwrap()
+                .clone()
+        };
+        assert_eq!((drive_app(&h)["sign_in"].as_bool(), drive_app(&h)["awaiting_review"].clone()), (Some(true), Value::Null));
+
+        // One scope, which can't read what's in a file, and no older grants folded in.
+        let url = h.ok("POST", "/api/v1/connections", Some(json!({ "app": "google-drive" })), &admin)["authorize_url"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(url.starts_with("https://accounts.google.com/o/oauth2/v2/auth?"), "{url}");
+        let q = query_of(&url);
+        assert_eq!(q["scope"], "https://www.googleapis.com/auth/drive.metadata.readonly");
+        assert_eq!((q["access_type"].as_str(), q["prompt"].as_str()), ("offline", "consent"));
+        assert!(!q.contains_key("include_granted_scopes") && q.contains_key("code_challenge"), "{url}");
+
+        // The account comes from Drive itself; nothing asks Google for a profile.
+        let r = h.call("GET", &format!("/connect/callback?code=the-code&state={}", urlencoding::encode(&q["state"])), None, &admin);
+        let (finish, sent) = drive(&h, job_of(&r), &google);
+        assert!(matches!(&finish, Finish::Redirect(u) if u.ends_with("connected=google-drive")), "{finish:?}");
+        assert!(sent.iter().all(|c| !c.url.contains("userinfo") && !c.url.contains("openidconnect")), "{sent:?}");
+        assert_eq!(drive_app(&h)["connected"]["account"], "ada@acme.com");
+
+        // Search: Drive runs the full-text search and answers with file details only.
+        let r = h.call("GET", "/api/v1/search/connected?q=launch", None, &admin);
+        let (finish, sent) = drive(&h, job_of(&r), &google);
+        let search = sent.iter().find(|c| c.url.contains("/drive/v3/files?")).unwrap();
+        assert!(
+            search.url.contains(&*urlencoding::encode("fullText contains 'launch'")) && search.url.contains("fields="),
+            "{}",
+            search.url
+        );
+        assert_eq!(filled(&r, finish)["items"][0]["title"], "Launch plan");
+
+        // While Google reviews DumbSlab, only the test workspaces may sign in. Others say why.
+        h.cfg.workspace = Some("acme".into());
+        h.cfg.connectors.test_workspaces =
+            connect::test_workspaces(|name| (name == "GOOGLE_DRIVE_TEST_WORKSPACES").then(|| " QA, review ".into()));
+        assert_eq!(h.cfg.connectors.test_workspaces["google-drive"], ["qa", "review"]);
+        let app = drive_app(&h);
+        assert_eq!(app["sign_in"], false);
+        assert!(app["awaiting_review"].as_str().unwrap().contains("test workspaces"), "{app}");
+        let refused = h.call("POST", "/api/v1/connections", Some(json!({ "app": "google-drive" })), &admin);
+        assert_eq!((refused.status, refused.body["error"]["code"].as_str()), (403, Some("awaiting_review")), "{}", refused.body);
+        // Other apps aren't held back, and the connection made earlier still searches.
+        assert_eq!(h.ok("GET", "/api/v1/connections", None, &admin)["apps"][0]["sign_in"], false, "github has no OAuth app here");
+        let r = h.call("GET", "/api/v1/search/connected?q=launch", None, &admin);
+        let (finish, _) = drive(&h, job_of(&r), &google);
+        assert_eq!(filled(&r, finish)["items"][0]["title"], "Launch plan");
+        // In a test workspace, signing in works.
+        h.cfg.workspace = Some("review".into());
+        assert_eq!((drive_app(&h)["sign_in"].as_bool(), drive_app(&h)["awaiting_review"].clone()), (Some(true), Value::Null));
+        assert_eq!(h.call("POST", "/api/v1/connections", Some(json!({ "app": "google-drive" })), &admin).status, 200);
+        // Also after it moves to a new address: its first one still counts.
+        h.cfg.workspace = Some("renamed".into());
+        assert_eq!(drive_app(&h)["sign_in"], false);
+        h.cfg.hosting =
+            Some(dumbslab_core::Hosting { plans: plans(None), home: "qa".into(), storage_bytes: 0, capacity: Default::default() });
+        assert_eq!(drive_app(&h)["sign_in"], true);
+    }
+
+    #[test]
+    fn deactivating_someone_deletes_their_connected_apps() {
+        let mut h = H::new();
+        let (admin, _) = h.setup();
+        let (mo_id, mo) = h.member(&admin, "mo@acme.test", "Mo", "member");
+        with_key(&mut h);
+        connect_github(&h, &mo);
+        connect_github(&h, &admin);
+        assert_eq!(count(&h, "SELECT COUNT(*) FROM connections"), 2);
+        h.ok("PATCH", &format!("/api/v1/users/{mo_id}"), Some(json!({ "deactivated": true })), &admin);
+        let left = h.store.with_tx(|db| (db.query("SELECT user_id FROM connections", &[]), true)).unwrap().unwrap();
+        assert_eq!(left.len(), 1, "only the admin's connection is left");
+        assert_ne!(left[0].str("user_id"), mo_id);
+        // Reactivated, Mo starts with no connections.
+        h.ok("PATCH", &format!("/api/v1/users/{mo_id}"), Some(json!({ "deactivated": false })), &admin);
+        assert_eq!(count(&h, "SELECT COUNT(*) FROM connections"), 1);
+
+        // Someone else setting your password could sign in as you, so your connections go too.
+        let (bo_id, bo) = h.member(&admin, "bo@acme.test", "Bo", "member");
+        connect_github(&h, &bo);
+        let mine = format!("SELECT COUNT(*) FROM connections WHERE user_id = '{bo_id}'");
+        h.ok("PATCH", &format!("/api/v1/users/{bo_id}"), Some(json!({ "bio": "hi" })), &admin);
+        assert_eq!(count(&h, &mine), 1, "other changes keep them");
+        h.ok("PATCH", &format!("/api/v1/users/{bo_id}"), Some(json!({ "new_password": "a new password" })), &admin);
+        assert_eq!(count(&h, &mine), 0);
+        // So does the operator's reset for someone locked out.
+        let (cy_id, cy) = h.member(&admin, "cy@acme.test", "Cy", "member");
+        connect_github(&h, &cy);
+        h.store
+            .with_tx(|db| (dumbslab_core::auth::operator_reset_password(db, "cy@acme.test", chrono::Utc::now()), true))
+            .unwrap()
+            .unwrap();
+        assert_eq!(count(&h, &format!("SELECT COUNT(*) FROM connections WHERE user_id = '{cy_id}'")), 0);
+        assert_eq!(count(&h, "SELECT COUNT(*) FROM connections"), 1, "the admin's own is left");
+    }
+
+    #[test]
+    fn existing_tokens_learn_who_made_them() {
+        use dumbslab_core::db::MIGRATIONS;
+        let h = H::new();
+        let (admin, admin_token) = h.setup();
+        let (mo_id, made_for_mo) = h.user(&admin, "mo@acme.test", "Mo", "member");
+        let (bo_id, bo_own) = h.member(&admin, "bo@acme.test", "Bo", "member");
+        // As before the migration: nobody knows.
+        db_run(&h, |db| db.execute("UPDATE api_tokens SET created_by = NULL", &[]));
+        let backfill = MIGRATIONS.last().unwrap().replace("ALTER TABLE api_tokens ADD COLUMN created_by TEXT;", "");
+        assert!(MIGRATIONS.last().unwrap().contains("ADD COLUMN created_by") && !backfill.contains("ALTER TABLE"));
+        h.store.with_tx(|db| (db.execute_batch(&backfill), true)).unwrap().unwrap();
+        let maker = |user: &str| -> Vec<String> {
+            h.store
+                .with_tx(|db| (db.query("SELECT created_by FROM api_tokens WHERE user_id = ?", &dumbslab_core::params![user]), true))
+                .unwrap()
+                .unwrap()
+                .iter()
+                .map(|r| r.opt_str("created_by").unwrap_or_default())
+                .collect()
+        };
+        let ada_id = h.ok("GET", "/api/v1/me", None, &admin)["user"]["id"].as_str().unwrap().to_string();
+        assert_eq!(maker(&mo_id), vec![ada_id.clone()]);
+        // Bo has the admin's token from `user` and the one Bo made.
+        let mut bo_makers = maker(&bo_id);
+        bo_makers.sort();
+        let mut want = vec![ada_id.clone(), bo_id.clone()];
+        want.sort();
+        assert_eq!(bo_makers, want);
+        assert!(maker(&ada_id).iter().all(|m| *m == ada_id));
+        assert_eq!(h.call("GET", "/api/v1/connections", None, &made_for_mo).status, 403);
+        assert_eq!(h.call("GET", "/api/v1/connections", None, &bo_own).status, 200);
+        assert_eq!(h.call("GET", "/api/v1/connections", None, &admin_token).status, 200);
     }
 
     /// Zendesk at `acme.zendesk.com`, answering a global OAuth client's sign-in and the API.
@@ -3580,7 +3772,7 @@ mod connected {
     fn gitlab_previews_work_item_links() {
         let mut h = H::new();
         let (admin, _) = h.setup();
-        let (_, mo) = h.user(&admin, "mo@acme.test", "Mo", "member");
+        let (_, mo) = h.member(&admin, "mo@acme.test", "Mo", "member");
         with_key(&mut h);
         // gitlab.com: a task in a nested group, and an issue, each where GitLab links it now.
         let gitlab = |c: &HttpCall| -> HttpReply {
@@ -3645,7 +3837,7 @@ mod connected {
     fn a_failed_sign_in_says_why_in_settings() {
         let mut h = H::new();
         let (admin, admin_token) = h.setup();
-        let (_, mo) = h.user(&admin, "mo@acme.test", "Mo", "member");
+        let (_, mo) = h.member(&admin, "mo@acme.test", "Mo", "member");
         with_key(&mut h);
         h.cfg.connectors.apps.insert("jira".into(), OAuthApp { client_id: "atl".into(), client_secret: "atl-secret".into() });
         let jira = |auth: &Auth| {
@@ -14171,6 +14363,8 @@ mod syncs {
         assert!(github < gitlab, "the GitLab app's comes after the GitHub app's");
         assert!(!MIGRATIONS[github].contains("docs_hook_cleanup"), "the GitHub app's migration is left as it shipped");
         h.store.with_tx(|db| (db.execute_batch("DROP TABLE docs_hook_cleanup"), true)).unwrap().unwrap();
+        // Nor what the later migrations added, which run again.
+        h.store.with_tx(|db| (db.execute_batch("ALTER TABLE api_tokens DROP COLUMN created_by"), true)).unwrap().unwrap();
         db_run(&h, |db| db.execute("UPDATE meta SET value = ? WHERE key = 'schema_version'", &dumbslab_core::params![gitlab.to_string()]));
         // The new version starts: it runs the GitLab app's migration.
         h.store = Store::open(&h._dir.path().join("t.db")).unwrap();

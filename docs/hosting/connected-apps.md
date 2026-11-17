@@ -204,13 +204,16 @@ Steps:
 - **Register at:** a Google Cloud project for DumbSlab. Enable the **Google Drive API**. Then [Google Auth Platform › Clients](https://console.cloud.google.com/auth/clients) › Create client.
 - **App type:** **Web application**.
 - **Fill in:** Authorized redirect URIs: the redirect URI.
-- **Scopes:** under Data access, add `https://www.googleapis.com/auth/drive.readonly`, `openid` and `email`. Sign-in asks for the same, with offline access and a consent prompt so a refresh token comes back.
+- **Scopes:** under Data access, add only `https://www.googleapis.com/auth/drive.metadata.readonly` ("See information about your Google Drive files"). Sign-in asks for exactly that, with offline access and a consent prompt so a refresh token comes back. The account's email, the connection's label, comes from Drive's `about`, so there's no `openid` or `email` scope.
+  - Why not `drive.readonly`: DumbSlab shows only what Drive's search answers (names, types, links, times, owners) and never reads a file's contents, which `drive.metadata.readonly` can't do. Drive's `fullText contains` search still covers what's inside Docs and other files.
+  - Why not `drive.file`: it reaches only files the person picks one by one in Google's picker (picking a folder doesn't reach the files in it), so search would find almost nothing.
 - **Values:** `GOOGLE_DRIVE_CLIENT_ID` and `GOOGLE_DRIVE_CLIENT_SECRET`.
-- **Before the public can use it:** this is the slowest. `drive.readonly` is a **restricted** scope.
+- **Before the public can use it:** this is the slowest. `drive.metadata.readonly` is a **restricted** scope.
   - While the app's audience is "Testing", only up to 100 test users you list can connect, and their access ends after 7 days.
-  - Published but unverified, the app takes at most 100 new people and shows an "unverified app" screen.
+  - Published but unverified, the app takes at most 100 new people and shows an "unverified app" screen. Google asks public apps not to send production traffic to scopes it hasn't verified, so list the workspaces that may sign in meanwhile in `GOOGLE_DRIVE_TEST_WORKSPACES` (dumbslab.com: its QA, test and Google-reviewer workspaces). Remove the line once Google approves.
   - To remove the limits: brand verification (usually 2–3 business days), then restricted-scope verification with a demo video (several weeks). Because DumbSlab keeps tokens for restricted data on its servers, Google also requires a paid third-party security assessment (CASA), repeated every 12 months.
-  
+  - Google's reviewers need a way in: an account in one of the test workspaces, with steps to Settings › Connected apps › Google Drive.
+
   [Restricted-scope verification](https://developers.google.com/identity/protocols/oauth2/production-readiness/restricted-scope-verification), [Drive scopes](https://developers.google.com/workspace/drive/api/guides/api-specific-auth), [unverified apps](https://support.google.com/cloud/answer/7454865).
 
 ## Apps without sign-in

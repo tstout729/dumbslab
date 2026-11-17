@@ -1,13 +1,23 @@
 //! Google Drive: Docs, Sheets, Slides and other files the connected account can open, including
-//! shared drives. Google has no personal tokens, so it needs the host's OAuth app. Drive's
-//! read-only scope is "restricted": a public app needs Google's verification before more than
-//! 100 people can connect.
+//! shared drives. Google has no personal tokens, so it needs the host's OAuth app.
+//!
+//! It asks for one scope, `drive.metadata.readonly`: Drive runs the full-text search itself and
+//! answers with file names, types, links, times and owners, which is all DumbSlab shows, and
+//! the account's email comes from Drive's `about`. That scope can't read or download what's in
+//! a file. `drive.file` would be narrower, but it reaches only files the person picks one by
+//! one (picking a folder doesn't reach the files in it), so search would find almost nothing.
+//! `drive.metadata.readonly` is still "restricted": a public app needs Google's verification,
+//! with a yearly security assessment, before more than 100 people can connect (see
+//! docs/hosting/connected-apps.md).
 
 use serde_json::json;
 
 use crate::connect::{Account, Connector, Credential, Hit, HttpCall, HttpReply, OAuthSpec, ProviderInfo, http_error, opt, s};
 
 pub struct GoogleDrive;
+
+/// See and search the metadata of the person's Drive files; no file contents.
+pub const SCOPE: &str = "https://www.googleapis.com/auth/drive.metadata.readonly";
 
 static INFO: ProviderInfo = ProviderInfo {
     id: "google-drive",
@@ -18,11 +28,13 @@ static INFO: ProviderInfo = ProviderInfo {
     oauth: Some(OAuthSpec {
         authorize_url: "https://accounts.google.com/o/oauth2/v2/auth",
         token_url: "https://oauth2.googleapis.com/token",
-        scopes: &["https://www.googleapis.com/auth/drive.readonly", "openid", "email"],
+        scopes: &[SCOPE],
         scope_param: "scope",
         scope_separator: " ",
         // A refresh token, every time: Google sends one only when the person is asked to consent.
-        extra: &[("access_type", "offline"), ("prompt", "consent"), ("include_granted_scopes", "true")],
+        // No `include_granted_scopes`: a token holds only the scope asked for here, never one an
+        // older version of DumbSlab was granted.
+        extra: &[("access_type", "offline"), ("prompt", "consent")],
         pkce: true,
         site: None,
         refresh_revokes: false,
@@ -54,8 +66,9 @@ impl Connector for GoogleDrive {
         &INFO
     }
 
+    /// The Drive account's email address, from Drive itself: no sign-in scope needed.
     fn profile(&self, cred: &Credential) -> Vec<HttpCall> {
-        vec![HttpCall::get("https://openidconnect.googleapis.com/v1/userinfo").bearer(&cred.token)]
+        vec![HttpCall::get("https://www.googleapis.com/drive/v3/about?fields=user(emailAddress)").bearer(&cred.token)]
     }
 
     fn read_profile(&self, _cred: &Credential, replies: &[HttpReply]) -> Result<Account, String> {
@@ -63,7 +76,15 @@ impl Connector for GoogleDrive {
         if !r.ok() {
             return Err(http_error("Google Drive", &r));
         }
-        Ok(Account { label: s(&r.json()["email"]), settings: json!({}) })
+        let email = s(&r.json()["user"]["emailAddress"]);
+        if email.is_empty() {
+            return Err("Google Drive didn't say which account this is. Try connecting again.".into());
+        }
+        Ok(Account { label: email, settings: json!({}) })
+    }
+
+    fn public_reasons(&self, _cred: &Credential) -> Vec<String> {
+        vec!["Google Drive didn't say which account this is. Try connecting again.".into()]
     }
 
     fn search(&self, cred: &Credential, _account: &Account, q: &str, limit: usize) -> Vec<HttpCall> {
@@ -130,7 +151,20 @@ mod tests {
         assert_eq!((hits[0].kind.as_str(), hits[0].context.as_str(), hits[0].author.as_deref()), ("document", "Google Doc", Some("Ada")));
         assert_eq!((hits[1].kind.as_str(), hits[1].context.as_str()), ("file", "PDF"));
         assert!(GoogleDrive.read_search(&Account::default(), &[reply(401, json!({}))], 5).unwrap_err().contains("Reconnect"));
-        let account = GoogleDrive.read_profile(&Credential::default(), &[reply(200, json!({ "email": "ada@acme.com" }))]).unwrap();
+    }
+
+    #[test]
+    fn asks_only_for_drive_metadata() {
+        let oauth = INFO.oauth.unwrap();
+        assert_eq!(oauth.scopes, ["https://www.googleapis.com/auth/drive.metadata.readonly"]);
+        assert!(!oauth.extra.iter().any(|(k, _)| *k == "include_granted_scopes"));
+        // The account comes from Drive's `about`, which that scope covers.
+        let calls = GoogleDrive.profile(&Credential { token: "t".into(), ..Default::default() });
+        assert_eq!(calls[0].url, "https://www.googleapis.com/drive/v3/about?fields=user(emailAddress)");
+        let account =
+            GoogleDrive.read_profile(&Credential::default(), &[reply(200, json!({ "user": { "emailAddress": "ada@acme.com" } }))]).unwrap();
         assert_eq!(account.label, "ada@acme.com");
+        let none = GoogleDrive.read_profile(&Credential::default(), &[reply(200, json!({ "user": {} }))]).unwrap_err();
+        assert!(GoogleDrive.public_reasons(&Credential::default()).contains(&none));
     }
 }

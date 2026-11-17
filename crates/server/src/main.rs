@@ -35,7 +35,7 @@ use dumbslab::{backup, web};
 fn connectors_from_env() -> Connectors {
     let var = |k: &str| std::env::var(k).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
     let apps = connect::oauth_apps(|name| var(&format!("DUMBSLAB_{name}")));
-    Connectors { key: var("DUMBSLAB_CONNECTOR_KEY"), apps, callback_url: None }
+    Connectors { key: var("DUMBSLAB_CONNECTOR_KEY"), apps, ..Default::default() }
 }
 
 /// DumbSlab's GitHub App for docs sync, from `DUMBSLAB_GITHUB_APP_ID`, `_SLUG`, `_CLIENT_ID`,

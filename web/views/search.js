@@ -1,7 +1,7 @@
 // Search: the ⌘K command palette and the full /search page.
 
 import { api } from '/api.js';
-import { h, icon, kbd, modKey, debounce, timeEl, topicChip, urlPath, button, busy, toastError, emptyState, pageHeader, userLink, select, checkbox, setTheme, themePref } from '/ui.js';
+import { h, icon, kbd, modKey, debounce, timeEl, topicChip, urlPath, button, busy, toastError, emptyState, pageHeader, userLink, select, checkbox, setTheme, themePref, BLOCK_RECORDING } from '/ui.js';
 import { state, navigate, canEdit } from '/state.js';
 import { statusBadges, inlineLoading } from '/views/common.js';
 import { connectedResults, searchableConnections, searchConnected, webUrl, KIND_LABEL as APP_KIND_LABEL } from '/views/connected.js';
@@ -168,9 +168,10 @@ export function openPalette(initial = '') {
   function appOption(it, i) {
     const url = webUrl(it.url);
     const kind = APP_KIND_LABEL[it.kind] || it.kind;
+    // Someone's own data in another app (their Drive's file names): an empty box in recordings.
     return option(`c-${it.provider}-${i}`, [
       h('span', { class: 'palette-kind', title: kind }, icon('external', { size: 16 })),
-      h('span', { class: 'palette-text' },
+      h('span', { class: ['palette-text', BLOCK_RECORDING] },
         h('span', { class: 'palette-title' }, h('span', null, it.title || '(untitled)')),
         h('span', { class: 'palette-snippet' }, [kind, it.context, it.author].filter(Boolean).join(' · '))),
     ], () => {
