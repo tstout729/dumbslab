@@ -180,6 +180,13 @@ Hosted workspaces are free at https://{root}/ with no credit card. Each workspac
 - Every workspace serves a full agent guide at `https://<address>.{root}/llms.txt`.
 - Edits are precise: find and replace, or change one section by its heading. Pass `base_version` to get a 409 conflict instead of overwriting a teammate's change.
 
+## Plans and integrations
+
+- Every feature is on every plan, with unlimited people, bots and agents. Free limits each workspace's storage and daily database writes; Pro raises both for a monthly price. `GET https://{root}/api/plans` gives the current limits and price.
+- Single sign-on (Google Workspace, Microsoft Entra ID, Okta, OneLogin, Slack or any OpenID Connect provider) and Continue with Google or Microsoft, on every plan.
+- Each person can connect GitHub, GitLab, Google Drive, Dropbox, Slack, Jira, Confluence, Linear, Asana, Trello, monday.com, ClickUp, Todoist or Shortcut and search them from DumbSlab.
+- A Slack app (`/dumbslab search`, `/dumbslab new`, link previews, channel updates), imports from Confluence, Guru, GitHub wikis and Markdown, GitHub and GitLab docs sync, and BambooHR people sync.
+
 ## Self-host
 
 - [Source code](https://github.com/tstout729/dumbslab): Rust, dual-licensed MIT or Apache-2.0.
@@ -1128,7 +1135,12 @@ mod tests {
         }
         let llms = root_llms_txt("kb.test");
         assert!(llms.starts_with("# DumbSlab\n\n> "), "llms.txt opens with a title and summary");
-        for want in ["POST https://kb.test/api/signup", "https://<address>.kb.test/mcp", "{\"workspace_name\": \"Acme\""] {
+        for want in [
+            "POST https://kb.test/api/signup",
+            "https://<address>.kb.test/mcp",
+            "{\"workspace_name\": \"Acme\"",
+            "https://kb.test/api/plans",
+        ] {
             assert!(llms.contains(want), "missing {want}");
         }
     }

@@ -309,10 +309,13 @@ async fn root_site(req: Request, env: &Env, root: &str, path: &str) -> Result<Re
         (Method::Get, gitlab_app::CALLBACK_PATH) => connect::root_callback_redirect(&req.url()?, root, gitlab_app::CALLBACK_PATH),
         (Method::Post, "/hooks/github") => github_hook(req, env, root).await,
         (Method::Post, "/api/stripe/webhook") => billing::webhook(req, env).await,
-        // Static files the sign-up page uses.
+        // Static files the sign-up page uses. A missing one gets the web app's page from the assets
+        // (they fall back to it for the workspaces' routes); here it's not found.
         (Method::Get | Method::Head, p) if p.rsplit('/').next().is_some_and(|f| f.contains('.')) => {
             let url = req.url()?;
-            asset(env, req, &url).await
+            let resp = asset(env, req, &url).await?;
+            let html = resp.headers().get("content-type")?.is_some_and(|t| t.starts_with("text/html"));
+            if html && !p.ends_with(".html") && resp.status_code() == 200 { not_found_page(env, &url).await } else { Ok(resp) }
         }
         (_, p) if is_core_path(p) => error_response(
             404,
@@ -321,13 +324,21 @@ async fn root_site(req: Request, env: &Env, root: &str, path: &str) -> Result<Re
                 "The API and MCP server live at your workspace's address, e.g. https://acme.{root}/api/v1 and https://acme.{root}/mcp"
             ),
         ),
-        _ => {
-            let mut url = req.url()?;
-            url.set_path("/");
-            url.set_query(None);
-            Response::redirect(url)
-        }
+        // Anything else is a page the sign-up site doesn't have: a real 404, so search engines
+        // don't index it as a copy of the home page.
+        _ => not_found_page(env, &req.url()?).await,
     }
+}
+
+/// The sign-up site's "page not found" (`web/404.html`), with status 404.
+async fn not_found_page(env: &Env, url: &Url) -> Result<Response> {
+    let mut page = url.clone();
+    page.set_path("/404");
+    page.set_query(None);
+    let mut resp = env.assets("ASSETS")?.fetch_request(Request::new(page.as_str(), Method::Get)?).await?;
+    let headers = resp.headers().clone();
+    let body = resp.bytes().await?;
+    Ok(Response::from_bytes(body)?.with_status(404).with_headers(headers))
 }
 
 /// `https://dumbslab.com` (with the port in development).

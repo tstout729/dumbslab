@@ -5,7 +5,8 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="light dark">
 <title>DumbSlab: the free team wiki your AI agents can use too</title>
-<meta name="description" content="A free, open-source team wiki and knowledge base with a built-in MCP server and REST API, so Claude, ChatGPT and Cursor can search and edit docs alongside your team.">
+<meta name="description" content="Free, open-source team wiki and knowledge base with a built-in MCP server, so Claude, ChatGPT and Cursor can search and edit docs alongside your team.">
+<meta name="robots" content="index, follow, max-image-preview:large, max-snippet:-1">
 <!-- Hosting the sign-up site on another domain? Replace https://dumbslab.com in this file's links, social tags and structured data. -->
 <link rel="canonical" href="https://dumbslab.com/">
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
@@ -15,6 +16,7 @@
 <meta name="theme-color" content="#15161c" media="(prefers-color-scheme: dark)">
 <meta property="og:type" content="website">
 <meta property="og:site_name" content="DumbSlab">
+<meta property="og:locale" content="en_US">
 <meta property="og:url" content="https://dumbslab.com/">
 <meta property="og:title" content="DumbSlab: the free team wiki your AI agents can use too">
 <meta property="og:description" content="Free, open-source team wiki. Every workspace has its own MCP server and REST API, so Claude, ChatGPT and Cursor can search and edit docs with your team.">
@@ -32,10 +34,20 @@
   "@context": "https://schema.org",
   "@graph": [
     {
+      "@type": "Organization",
+      "@id": "https://dumbslab.com/#org",
+      "name": "DumbSlab",
+      "url": "https://dumbslab.com/",
+      "logo": { "@type": "ImageObject", "url": "https://dumbslab.com/apple-touch-icon.png", "width": 180, "height": 180 },
+      "sameAs": ["https://github.com/tstout729/dumbslab"]
+    },
+    {
       "@type": "WebSite",
       "@id": "https://dumbslab.com/#website",
       "url": "https://dumbslab.com/",
       "name": "DumbSlab",
+      "description": "The free, open-source team wiki and knowledge base your AI agents can use too.",
+      "publisher": { "@id": "https://dumbslab.com/#org" },
       "inLanguage": "en"
     },
     {
@@ -49,7 +61,18 @@
       "applicationSubCategory": "Team wiki and knowledge base",
       "operatingSystem": "Web",
       "isAccessibleForFree": true,
-      "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" },
+      "publisher": { "@id": "https://dumbslab.com/#org" },
+      "offers": [
+        { "@type": "Offer", "name": "Free", "price": "0", "priceCurrency": "USD", "url": "https://dumbslab.com/#pricing" },
+        {
+          "@type": "Offer",
+          "name": "Pro",
+          "price": "8",
+          "priceCurrency": "USD",
+          "url": "https://dumbslab.com/#pricing",
+          "priceSpecification": { "@type": "UnitPriceSpecification", "price": "8", "priceCurrency": "USD", "billingDuration": "P1M", "unitText": "MONTH" }
+        }
+      ],
       "featureList": [
         "Markdown posts organized into nested and private topics",
         "Full-text search across posts, comments and topics",
@@ -59,7 +82,12 @@
         "Built-in MCP server with OAuth for Claude, ChatGPT and Cursor",
         "REST API with an OpenAPI 3.1 spec",
         "Bot accounts and an activity feed for agent edits",
-        "Signed webhooks, Markdown import and JSON export"
+        "Search GitHub, Google Drive, Slack, Jira, Confluence, Linear, Asana and more from one place",
+        "Slack app: search and create posts from Slack, with link previews and channel updates",
+        "Single sign-on with Google Workspace, Microsoft Entra ID, Okta, OneLogin or any OpenID Connect provider, on every plan",
+        "Import from Confluence, Guru, GitHub wikis and Markdown files",
+        "GitHub and GitLab docs sync, and BambooHR people sync",
+        "Signed webhooks and JSON export"
       ],
       "sameAs": ["https://github.com/tstout729/dumbslab"]
     },
@@ -82,6 +110,10 @@
         { "@type": "Question", "name": "Who can see my workspace?", "acceptedAnswer": { "@type": "Answer", "text": "Only the people you add. Admins add people and choose each person's role: admin, member or viewer. Private topics are visible only to their members, and drafts only to their author. Search engines are told to stay out of workspaces." } },
         { "@type": "Question", "name": "Can I change my address later?", "acceptedAnswer": { "@type": "Answer", "text": "Yes. Admins can move the workspace to a new address in Settings. Anyone who opens the old address in a browser is sent to the new one; AI tools need the new MCP URL." } },
         { "@type": "Question", "name": "Can I get my data out?", "acceptedAnswer": { "@type": "Answer", "text": "Yes. Posts are Markdown, and an admin can download the whole workspace as JSON at any time from Settings. You can bring Markdown files in, too." } },
+        { "@type": "Question", "name": "What does Pro add?", "acceptedAnswer": { "@type": "Answer", "text": "More room, nothing else. Pro gives a workspace 5 GB of storage instead of 50 MB and 200,000 database writes a day instead of 50,000, for $8 a month. Every feature is the same on both plans, and you can cancel any time." } },
+        { "@type": "Question", "name": "Does DumbSlab work with Slack and our other tools?", "acceptedAnswer": { "@type": "Answer", "text": "Yes. The Slack app lets people search and create posts from Slack, previews links to posts, and posts updates to the channels you choose. Each person can also connect GitHub, GitLab, Google Drive, Dropbox, Jira, Confluence, Linear, Asana, Trello, monday.com, ClickUp, Todoist or Shortcut, and search them from DumbSlab." } },
+        { "@type": "Question", "name": "Is single sign-on extra?", "acceptedAnswer": { "@type": "Answer", "text": "No. Single sign-on with Google Workspace, Microsoft Entra ID, Okta, OneLogin, Slack or any OpenID Connect provider is included on every plan, Free too. People can also continue with a Google or Microsoft account with no setup." } },
+        { "@type": "Question", "name": "Can we move over from Confluence or Guru?", "acceptedAnswer": { "@type": "Answer", "text": "Yes. Import Confluence spaces, Guru collections, GitHub wikis and folders of Markdown files, with their links, images and attachments. You see a preview first, and running an import again skips what's already there." } },
         { "@type": "Question", "name": "Can I self-host DumbSlab?", "acceptedAnswer": { "@type": "Answer", "text": "Yes. It's one Rust binary and one SQLite file, or a Cloudflare Worker with a separate database for each workspace. The source is on GitHub under the MIT or Apache-2.0 license." } }
       ]
     }
@@ -97,6 +129,7 @@
     <a href="#how">How it works</a>
     <a href="#agents">For agents</a>
     <a href="#features">Features</a>
+    <a href="#integrations">Integrations</a>
     <a href="#pricing">Pricing</a>
     <a href="#faq">FAQ</a>
     <a href="https://github.com/tstout729/dumbslab">GitHub</a>
@@ -239,7 +272,24 @@
       <div><dt>Embeds and files</dt><dd>Upload images and files, or paste a YouTube, Loom, Google Docs, Figma, Canva or Typeform link to embed it.</dd></div>
       <div><dt>Roles and private topics</dt><dd>Admins, members and viewers. Private topics for the things only some people should see.</dd></div>
       <div><dt>Follows and notifications</dt><dd>Follow posts and topics to hear about mentions, replies and new posts.</dd></div>
-      <div><dt>Import and export</dt><dd>Bring Markdown files in all at once. Download the whole workspace as JSON whenever you like.</dd></div>
+      <div><dt>Import and export</dt><dd>Bring in Confluence spaces, Guru collections, GitHub wikis or Markdown files. Download the whole workspace as JSON whenever you like.</dd></div>
+    </dl>
+  </section>
+
+  <section id="integrations" class="w-integrations w-wrap" aria-labelledby="integrations-title">
+    <h2 id="integrations-title">Works with the tools you already use</h2>
+    <p class="w-section-lede">Search your other apps from DumbSlab, work from Slack, and sign in the way your company already does. All of it is on every plan.</p>
+    <ul class="w-apps" aria-label="Apps you can search from DumbSlab">
+      <li>GitHub</li><li>GitLab</li><li>Google Drive</li><li>Dropbox</li><li>Slack</li><li>Jira</li><li>Confluence</li>
+      <li>Linear</li><li>Asana</li><li>Trello</li><li>monday.com</li><li>ClickUp</li><li>Todoist</li><li>Shortcut</li>
+    </ul>
+    <dl class="w-feature-list">
+      <div><dt>One search for everything</dt><dd>Each person connects their own apps and searches them next to your docs, so results follow each person's access. Links to them in posts show previews.</dd></div>
+      <div><dt>Slack</dt><dd>Use <code>/dumbslab search</code> and <code>/dumbslab new</code> without leaving Slack, see a preview when someone shares a post, and send new and updated posts to the channels you choose.</dd></div>
+      <div><dt>Single sign-on, free</dt><dd>Continue with Google or Microsoft, or require single sign-on with Google Workspace, Microsoft Entra ID, Okta, OneLogin, Slack or any OpenID Connect provider.</dd></div>
+      <div><dt>Move in from Confluence or Guru</dt><dd>Import Confluence spaces, Guru collections, GitHub wikis and Markdown folders with their links, images and attachments. You see a preview first.</dd></div>
+      <div><dt>Docs that stay in sync</dt><dd>Keep a GitHub or GitLab folder of Markdown as read-only posts that update on every push. Sub-folders become sub-topics.</dd></div>
+      <div><dt>A people directory from BambooHR</dt><dd>Titles, departments, locations and managers stay in sync from BambooHR, matched by work email.</dd></div>
     </dl>
   </section>
 
@@ -254,6 +304,7 @@
           <li><span data-free-storage>50 MB</span> of storage, uploads included</li>
           <li><span data-free-writes>50,000</span> database writes a day</li>
           <li>Unlimited people, bots and agents</li>
+          <li>Single sign-on, Slack and connected apps</li>
         </ul>
       </div>
       <div class="w-plan w-plan-pro">
@@ -306,6 +357,22 @@ cargo run --release -p dumbslab -- serve</code></pre>
       <details>
         <summary>Can I get my data out?</summary>
         <p>Yes. Posts are Markdown, and an admin can download the whole workspace as JSON at any time from Settings. You can bring Markdown files in, too.</p>
+      </details>
+      <details>
+        <summary>What does Pro add?</summary>
+        <p>More room, nothing else. Pro gives a workspace 5 GB of storage instead of 50 MB and 200,000 database writes a day instead of 50,000, for $8 a month. Every feature is the same on both plans, and you can cancel any time.</p>
+      </details>
+      <details>
+        <summary>Does DumbSlab work with Slack and our other tools?</summary>
+        <p>Yes. The Slack app lets people search and create posts from Slack, previews links to posts, and posts updates to the channels you choose. Each person can also connect GitHub, GitLab, Google Drive, Dropbox, Jira, Confluence, Linear, Asana, Trello, monday.com, ClickUp, Todoist or Shortcut, and search them from DumbSlab.</p>
+      </details>
+      <details>
+        <summary>Is single sign-on extra?</summary>
+        <p>No. Single sign-on with Google Workspace, Microsoft Entra ID, Okta, OneLogin, Slack or any OpenID Connect provider is included on every plan, Free too. People can also continue with a Google or Microsoft account with no setup.</p>
+      </details>
+      <details>
+        <summary>Can we move over from Confluence or Guru?</summary>
+        <p>Yes. Import Confluence spaces, Guru collections, GitHub wikis and folders of Markdown files, with their links, images and attachments. You see a preview first, and running an import again skips what's already there.</p>
       </details>
       <details>
         <summary>Can I self-host DumbSlab?</summary>
