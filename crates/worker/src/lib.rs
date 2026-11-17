@@ -100,13 +100,13 @@ async fn route(req: Request, env: Env, url: &Url) -> Result<Response> {
 
     if !multi {
         if !is_core_path(&path) {
-            return asset(&env, req, url).await;
+            return untouched(asset(&env, req, url).await?);
         }
         if let Some(limited) = rate_limited(&req, &env).await? {
             return Ok(limited);
         }
         let name = var(&env, "WORKSPACE_NAME").unwrap_or_else(|| "main".into());
-        return forward(&env, &name, req, None).await;
+        return untouched(forward(&env, &name, req, None).await?);
     }
 
     let root = var(&env, "ROOT_DOMAIN").ok_or_else(|| worker::Error::RustError("ROOT_DOMAIN is not set".into()))?;
@@ -118,7 +118,7 @@ async fn route(req: Request, env: Env, url: &Url) -> Result<Response> {
                 return text_response(WORKSPACE_ROBOTS_TXT.into(), "text/plain; charset=utf-8");
             }
             if !is_core_path(&path) {
-                return asset(&env, req, url).await;
+                return untouched(asset(&env, req, url).await?);
             }
             if let Some(limited) = rate_limited(&req, &env).await? {
                 return Ok(limited);
@@ -130,10 +130,27 @@ async fn route(req: Request, env: Env, url: &Url) -> Result<Response> {
             {
                 return Ok(limited);
             }
-            forward(&env, &format!("ws:{slug}"), req, Some(&slug)).await
+            untouched(forward(&env, &format!("ws:{slug}"), req, Some(&slug)).await?)
         }
         _ => error_response(404, "no_workspace", &format!("There's no workspace at this address. Create one at https://{root}/")),
     }
+}
+
+/// A workspace's page with `Cache-Control: no-transform`, so Cloudflare's proxy writes nothing into
+/// it. Cloudflare Web Analytics injects its script into every page of a zone (its rules can't
+/// leave the workspaces out on the free plan); the sign-up site uses it, but workspaces are
+/// private and their CSP would block it anyway.
+fn untouched(resp: Response) -> Result<Response> {
+    if !resp.headers().get("content-type")?.is_some_and(|t| t.starts_with("text/html")) {
+        return Ok(resp);
+    }
+    let headers = resp.headers().clone();
+    let cache = headers.get("cache-control")?.unwrap_or_default();
+    if cache.split(',').any(|d| d.trim().eq_ignore_ascii_case("no-transform")) {
+        return Ok(resp);
+    }
+    headers.set("cache-control", &if cache.trim().is_empty() { "no-transform".into() } else { format!("{cache}, no-transform") })?;
+    Ok(resp.with_headers(headers))
 }
 
 /// A static file from the assets. Scripts and stylesheets are never revalidated (see
