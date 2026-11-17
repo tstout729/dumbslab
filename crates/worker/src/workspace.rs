@@ -445,6 +445,16 @@ impl Workspace {
         Ok(finish)
     }
 
+    /// Whether the directory still holds `slug` for the sign-up link `token` (its expiry names the
+    /// reservation): links for deleted, disabled or already-used addresses stop working.
+    async fn reservation_live(&self, slug: &str, token: Option<&str>) -> Result<bool> {
+        let expires = token.and_then(|t| t.split_once('.')).and_then(|(e, _)| e.parse::<i64>().ok()).unwrap_or(0);
+        let (status, reply) =
+            call_object(&self.env, "DIRECTORY", "directory", Method::Post, "/check", Some(&json!({ "slug": slug, "expires": expires })))
+                .await?;
+        Ok(status == 200 && reply["ok"] == json!(true))
+    }
+
     /// Answers for an address nobody has set up yet, without creating storage.
     fn unclaimed(&self, method: &Method, path: &str, url: &Url, origin: &str, slug: &str) -> Result<Response> {
         let root = var(&self.env, "ROOT_DOMAIN").unwrap_or_default();
@@ -526,36 +536,29 @@ impl DurableObject for Workspace {
         // Set when this request creates the workspace: schema and first admin commit together.
         let mut creating = false;
         if let Some(slug) = &workspace {
+            // What creates the first admin: setting up with a password, or signing up with Google
+            // or Microsoft (which starts here and finishes at the callback). Both need a valid
+            // sign-up link for a live reservation while nobody has signed up.
+            let signup_start = method == Method::Get && path == dumbslab_core::sso::START_PATH;
+            let token = if signup_start {
+                let query: Vec<(String, String)> = url.query_pairs().map(|(k, v)| (k.into_owned(), v.into_owned())).collect();
+                let signup = query.iter().any(|(k, _)| k == "signup");
+                query.into_iter().find(|(k, _)| signup && k == "token").map(|(_, t)| t.trim().to_string())
+            } else {
+                serde_json::from_slice::<Value>(&body).ok().and_then(|v| v["setup_token"].as_str().map(|t| t.trim().to_string()))
+            };
+            let first_admin = (signup_start && token.is_some()) || (method == Method::Post && path == "/api/v1/auth/setup");
+            let signed = first_admin
+                && matches!((&signup_secret, &token), (Some(secret), Some(t))
+                    if dumbslab_core::tenancy::verify_signup_token(secret, slug, t, Utc::now().timestamp()));
             if matches!(self.stored()?, Stored::Nothing) {
-                // Only a valid sign-up link may create the workspace's storage: setting up with a
-                // password, or starting to sign up with Google or Microsoft.
-                let signup_start = method == Method::Get && path == dumbslab_core::sso::START_PATH;
-                let token = if signup_start {
-                    let query: Vec<(String, String)> = url.query_pairs().map(|(k, v)| (k.into_owned(), v.into_owned())).collect();
-                    let signup = query.iter().any(|(k, _)| k == "signup");
-                    query.into_iter().find(|(k, _)| signup && k == "token").map(|(_, t)| t.trim().to_string())
-                } else {
-                    serde_json::from_slice::<Value>(&body).ok().and_then(|v| v["setup_token"].as_str().map(|t| t.trim().to_string()))
-                };
-                let signed = (signup_start || (method == Method::Post && path == "/api/v1/auth/setup"))
-                    && matches!((&signup_secret, &token), (Some(secret), Some(t))
-                        if dumbslab_core::tenancy::verify_signup_token(secret, slug, t, Utc::now().timestamp()));
+                // Only a valid sign-up link may create the workspace's storage.
                 if !signed {
                     return self.unclaimed(&method, &path, &url, &origin, slug);
                 }
                 // The link must also name the address's live reservation, so links for deleted,
                 // disabled or already-used addresses stop working.
-                let expires = token.as_deref().and_then(|t| t.split_once('.')).and_then(|(e, _)| e.parse::<i64>().ok()).unwrap_or(0);
-                let (status, reply) = call_object(
-                    &self.env,
-                    "DIRECTORY",
-                    "directory",
-                    Method::Post,
-                    "/check",
-                    Some(&json!({ "slug": slug, "expires": expires })),
-                )
-                .await?;
-                if status != 200 || reply["ok"] != json!(true) {
+                if !self.reservation_live(slug, token.as_deref()).await? {
                     return error_response(403, "forbidden", "This sign-up link is no longer valid. Start again from the sign-up page.");
                 }
                 // A workspace may have moved to this address while the check was running.
@@ -582,6 +585,12 @@ impl DurableObject for Workspace {
                     };
                     let new_origin = tenancy::origin_for(&origin, slug, &current);
                     return to_response(tenancy::moved_response(method.as_ref(), &accept, &new_origin, &target, &current));
+                }
+                // Storage, but nobody signed up yet (a sign-up with Google or Microsoft started and
+                // didn't finish): the same rule as creating it. Core checks the link again too.
+                let nobody = first_admin && self.db().scalar_i64("SELECT COUNT(*) FROM users", &[]).unwrap_or(1) == 0;
+                if nobody && (!signed || !self.reservation_live(slug, token.as_deref()).await?) {
+                    return error_response(403, "forbidden", "This sign-up link is no longer valid. Start again from the sign-up page.");
                 }
             }
         } else {
