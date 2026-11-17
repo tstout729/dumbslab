@@ -709,7 +709,9 @@ function mountEditor(ctx, { post, initial, templates, startTemplate }) {
     } catch (e) {
       saving = false;
       updateChrome();
-      if (e.status === 409) conflictDialog(e, { publish, view });
+      // Only a changed version is a conflict to overwrite. Other refusals with that status (such
+      // as removing a post's last private topic) say why themselves.
+      if (e.status === 409 && e.details && e.details.current_version) conflictDialog(e, { publish, view });
       else toastError(e, 'Couldn’t save');
     }
   }

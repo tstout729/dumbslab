@@ -1308,6 +1308,8 @@ fn updated_since_takes_any_rfc3339_time() {
     // A date alone still works as it did.
     assert!(found("2020-01-01"));
     assert!(!found("2999-01-01"));
+    // A time that is past the year 9999 in UTC matches nothing.
+    assert!(!found("9999-12-31T23:59:59-01:00"));
 }
 
 fn count(h: &H, sql: &str) -> i64 {
@@ -1537,6 +1539,9 @@ fn sign_in_limits_cover_every_email() {
     // A failure counts against the email, the client's address and the whole workspace.
     assert_eq!(login(&h, "first@acme.test", "203.0.113.7", "https://kb.test").status, 401);
     assert_eq!(count(&h, "SELECT COUNT(*) FROM login_attempts"), 3, "only the email is throttled");
+    // An address with a control character is nobody's: it's refused without a lookup or a count.
+    assert_eq!(login(&h, "ada@acme.test\0x", "203.0.113.7", "https://kb.test").status, 401);
+    assert_eq!(count(&h, "SELECT COUNT(*) FROM login_attempts"), 3);
 
     // An address that failed many times with other emails is stopped before any password check.
     h.store.with_tx(|db| (db.execute("UPDATE login_attempts SET failures = 1000 WHERE key LIKE 'ip:%'", &[]), true)).unwrap().unwrap();

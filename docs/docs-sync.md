@@ -12,7 +12,7 @@ There's nothing to copy: on GitHub, choose **Connect GitHub**, install DumbSlab'
   - its files are skipped, and the result gives the reason;
   - its visibility is never changed.
   Make it private with the topic's members, or delete it so the next sync makes a new one; the next sync then puts the posts back.
-  This covers the topics the sync makes. Someone who can see a synced post can still share it themselves, as with any post, by adding it to a topic more people can see. The post stays in that topic, so later changes from the repository show there too.
+  This covers the topics the sync makes. A member or admin who can see a synced post can still share it themselves, as with any post, by adding it to a topic more people can see. The post stays in that topic, so later changes from the repository show there too.
 - **Links.** Relative links between synced files point at their posts, `#anchors` included; a link to a folder points at its README. Other relative links (source code, files outside the folder) point at the file on GitHub or GitLab.
 - **Images.** PNG, JPEG, GIF, WebP and AVIF images inside the folder, up to 3 MB, are uploaded once and reused until they change. Other images (SVG, larger ones, ones outside the folder) link to the repository, so they only show if the reader can see the repository.
 - **Other uploads stay private.** A synced post only gets the images the sync uploaded itself. If the text names another upload here (`/files/…`), that file isn't attached to the post, so the link opens only for people who could already open it. Anyone who can push to the repository writes these posts, so this keeps them from exposing private files.

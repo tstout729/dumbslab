@@ -462,6 +462,11 @@ fn login(db: &dyn Db, cfg: &HostConfig, req: &Request) -> Outcome {
     if input.email.len() > 254 || input.password.len() > 256 {
         return failed(&ApiError::bad_request("email or password is too long"));
     }
+    // No address has control characters. Refused here because the database compares emails only up
+    // to a NUL, so spellings that differ after one would reach one account under many limits.
+    if input.email.chars().any(char::is_control) {
+        return failed(&ApiError::unauthorized("email or password is incorrect"));
+    }
     let keys = auth::password_keys(&input.email, req.client_ip.as_deref());
     // The account's and the client address's limits, then the workspace-wide one.
     let (own, shared) = keys.split_at(keys.len() - 1);
@@ -471,8 +476,8 @@ fn login(db: &dyn Db, cfg: &HostConfig, req: &Request) -> Outcome {
         // can reach it on purpose, so it must not keep the people who work here out: while it's
         // reached, an account with a password is still checked (its own limit bounds that), a right
         // password signs in, and everything else is refused as throttled, unknown emails and
-        // accounts without a password before any hashing. Only then does the time a refusal takes
-        // tell the two apart.
+        // accounts without a password before any hashing and without counting. Only then can a
+        // refusal tell the two apart, by the time it takes and by what it counts against.
         let flooded = auth::check_throttle(db, shared, now).err();
         let row =
             db.one("SELECT id, role, password_hash FROM users WHERE email = ? AND deactivated_at IS NULL", &params![input.email.trim()])?;
