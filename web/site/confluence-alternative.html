@@ -1,0 +1,223 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Free Confluence alternative with Confluence import · DumbSlab</title>
+<meta name="description" content="Move your Confluence spaces into DumbSlab, a free, open-source team wiki with a built-in MCP server. Pages, attachments and links come across.">
+<meta name="robots" content="index, follow, max-image-preview:large, max-snippet:-1">
+<!-- Generated from one template with the other guide pages; keep their header and footer alike. -->
+<link rel="canonical" href="https://dumbslab.com/confluence-alternative">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#15161c" media="(prefers-color-scheme: dark)">
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="DumbSlab">
+<meta property="og:locale" content="en_US">
+<meta property="og:url" content="https://dumbslab.com/confluence-alternative">
+<meta property="og:title" content="Free Confluence alternative with Confluence import · DumbSlab">
+<meta property="og:description" content="Move your Confluence spaces into DumbSlab, a free, open-source team wiki with a built-in MCP server. Pages, attachments and links come across.">
+<meta property="og:image" content="https://dumbslab.com/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="DumbSlab: the free team wiki your AI agents can use too">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="stylesheet" href="/styles.css">
+<link rel="stylesheet" href="/welcome.css">
+<script src="/theme-init.js"></script>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@graph": [
+    {
+      "@type": "WebPage",
+      "@id": "https://dumbslab.com/confluence-alternative#page",
+      "url": "https://dumbslab.com/confluence-alternative",
+      "name": "Free Confluence alternative with Confluence import · DumbSlab",
+      "description": "Move your Confluence spaces into DumbSlab, a free, open-source team wiki with a built-in MCP server. Pages, attachments and links come across.",
+      "inLanguage": "en",
+      "isPartOf": {
+        "@id": "https://dumbslab.com/#website"
+      },
+      "about": {
+        "@id": "https://dumbslab.com/#app"
+      },
+      "publisher": {
+        "@id": "https://dumbslab.com/#org"
+      },
+      "primaryImageOfPage": "https://dumbslab.com/og.png",
+      "breadcrumb": {
+        "@id": "https://dumbslab.com/confluence-alternative#crumbs"
+      }
+    },
+    {
+      "@type": "BreadcrumbList",
+      "@id": "https://dumbslab.com/confluence-alternative#crumbs",
+      "itemListElement": [
+        {
+          "@type": "ListItem",
+          "position": 1,
+          "name": "DumbSlab",
+          "item": "https://dumbslab.com/"
+        },
+        {
+          "@type": "ListItem",
+          "position": 2,
+          "name": "Confluence alternative",
+          "item": "https://dumbslab.com/confluence-alternative"
+        }
+      ]
+    },
+    {
+      "@type": "FAQPage",
+      "@id": "https://dumbslab.com/confluence-alternative#faq",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "Is DumbSlab really free?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Yes. Every feature is free at dumbslab.com, with no credit card and no trial, including single sign-on, the MCP server and the API. The free plan limits only storage and daily database writes. Pro raises them for $8 a month."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Does it work with Confluence Data Center?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Yes. Export the space as HTML from Space tools › Content tools › Export › HTML and import the zip the same way as a Confluence Cloud export. Confluence's XML export isn't supported."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Do comments and page history come across?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "No. Confluence's HTML export doesn't include comments, page history or blog posts. In DumbSlab, every save from then on is a version you can compare and restore."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "What about a large space?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "A zip can be up to 1 GB and 200,000 files. If an import reaches the free plan's daily write limit, it stops; run it again once the allowance refills and it continues where it stopped. Or upgrade to Pro for more room."
+          }
+        }
+      ]
+    }
+  ]
+}
+</script>
+</head>
+<body class="w-page">
+<a class="skip-link" href="#main">Skip to content</a>
+<header class="w-top">
+  <a class="w-brand" href="/" aria-label="DumbSlab home"><img src="/favicon.svg" alt="" width="28" height="28"><span>DumbSlab</span></a>
+  <nav class="w-nav" aria-label="Site">
+    <a href="/#features">Features</a>
+    <a href="/#integrations">Integrations</a>
+    <a href="/#pricing">Pricing</a>
+    <a href="https://github.com/tstout729/dumbslab">GitHub</a>
+  </nav>
+  <a class="btn btn-sm btn-primary w-top-go" href="/#signup">Create a workspace</a>
+</header>
+
+<main id="main">
+  <section class="w-guide-hero w-wrap" aria-labelledby="page-title">
+    <nav class="w-crumbs" aria-label="Breadcrumb"><a href="/">DumbSlab</a> <span aria-hidden="true">›</span> <span aria-current="page">Confluence alternative</span></nav>
+    <h1 id="page-title">A free Confluence alternative that brings your spaces with you</h1>
+    <p class="w-lede">DumbSlab is a simple, fast team wiki: Markdown docs, nested topics, search and history, free for your whole team. Bring your Confluence spaces over from their HTML export, and your AI agents can work in them on day one.</p>
+    <p class="w-guide-cta"><a class="btn btn-primary w-end-go" href="/#signup">Create a free workspace</a>
+      <a class="btn w-end-go" href="#import">How the import works</a></p>
+    <p class="w-fine">Free, with no credit card. Every feature is on every plan.</p>
+  </section>
+
+  <article class="w-guide w-wrap">
+    <h2>Why teams move to DumbSlab</h2>
+    <ul>
+      <li><strong>Writing is simple.</strong> Markdown with a live preview, callouts, tables, checklists and toggles, plus embeds from about 30 services such as Loom, Figma and Google Docs.</li>
+      <li><strong>Finding is fast.</strong> Full-text search across posts, comments and topics from anywhere with <kbd>⌘K</kbd>, and search across connected apps such as Jira and GitHub.</li>
+      <li><strong>Docs stay current.</strong> Mark a doc verified for a set time, and stale or expired docs show up in Insights for review.</li>
+      <li><strong>Every feature is free.</strong> Single sign-on, the API, webhooks and uploads are on the free plan. Pro only adds room.</li>
+      <li><strong>Agents are first-class.</strong> Every workspace has its own MCP server, so Claude, ChatGPT and Cursor can search and edit alongside your team.</li>
+      <li><strong>It's open source.</strong> Use the free hosted service, or run it yourself under the MIT or Apache-2.0 license.</li>
+    </ul>
+
+    <h2 id="import">How the Confluence import works</h2>
+    <ol>
+      <li>Export the space as HTML. In Confluence Cloud: <strong>Space settings › Export space › HTML</strong>. In Data Center: <strong>Space tools › Content tools › Export › HTML</strong>. Download the zip.</li>
+      <li>In DumbSlab, open <strong>Settings › Import</strong> and choose the zip. Your browser converts every page to Markdown; nothing is sent yet.</li>
+      <li>Check the preview: how many pages, topics and attachments there are, what will be skipped and why, and what the import needs from your plan. You can rename the top topic or import everything as drafts.</li>
+      <li>Choose <strong>Import</strong>. The report lists what came across, what was already there and anything that failed.</li>
+    </ol>
+    <p>You can run the same import again at any time. Pages that are already there aren't duplicated, and anything they still lack, such as an image that failed to upload, is added.</p>
+
+    <h2>What comes across</h2>
+    <table>
+      <thead><tr><th>In Confluence</th><th>In DumbSlab</th></tr></thead>
+      <tbody>
+        <tr><td>A space</td><td>A top-level topic</td></tr>
+        <tr><td>A page with child pages</td><td>A topic holding that page and its children</td></tr>
+        <tr><td>A page</td><td>A Markdown post</td></tr>
+        <tr><td>Info, tip, note and warning macros, and panels</td><td>Callouts</td></tr>
+        <tr><td>Expand macros</td><td>Toggles</td></tr>
+        <tr><td>Links between pages</td><td>Links to the imported posts</td></tr>
+        <tr><td>Images and attachments</td><td>Uploaded files, readable by exactly that page's readers</td></tr>
+      </tbody>
+    </table>
+    <p>Headings, lists, tables, code blocks with their language and embedded videos come across too. Confluence's HTML export has no comments, page history or blog posts, so the import doesn't either, and page permissions don't carry over: import into a private topic to keep a space private.</p>
+
+    <h2>Let an agent do the migration</h2>
+    <p>Many teams migrate with an AI agent. Through MCP or the REST API, an agent can read an export, convert each page, import pages in batches with <code>import_documents</code>, upload their files and fix the links between them. The <a href="https://github.com/tstout729/dumbslab/blob/main/docs/import.md">import guide</a> has the steps.</p>
+  </article>
+
+  <section id="faq" class="w-faq w-wrap" aria-labelledby="faq-title">
+    <h2 id="faq-title">Questions</h2>
+    <div class="w-faq-list">
+      <details>
+        <summary>Is DumbSlab really free?</summary>
+        <p>Yes. Every feature is free at dumbslab.com, with no credit card and no trial, including single sign-on, the MCP server and the API. The free plan limits only storage and daily database writes. Pro raises them for $8 a month.</p>
+      </details>
+      <details>
+        <summary>Does it work with Confluence Data Center?</summary>
+        <p>Yes. Export the space as HTML from Space tools › Content tools › Export › HTML and import the zip the same way as a Confluence Cloud export. Confluence's XML export isn't supported.</p>
+      </details>
+      <details>
+        <summary>Do comments and page history come across?</summary>
+        <p>No. Confluence's HTML export doesn't include comments, page history or blog posts. In DumbSlab, every save from then on is a version you can compare and restore.</p>
+      </details>
+      <details>
+        <summary>What about a large space?</summary>
+        <p>A zip can be up to 1 GB and 200,000 files. If an import reaches the free plan's daily write limit, it stops; run it again once the allowance refills and it continues where it stopped. Or upgrade to Pro for more room.</p>
+      </details>
+    </div>
+  </section>
+
+  <section class="w-end w-wrap" aria-labelledby="end-title">
+    <h2 id="end-title">Move your first space today</h2>
+    <p>Create a free workspace, export a space as HTML, and import it in a few minutes.</p>
+    <a class="btn btn-primary w-end-go" href="/#signup">Pick your address</a>
+  </section>
+</main>
+
+<footer class="w-foot w-wrap">
+  <p>DumbSlab is open source under MIT or Apache-2.0.</p>
+  <nav aria-label="Guides">
+    <a href="/mcp-knowledge-base">MCP knowledge base</a>
+    <a href="/confluence-alternative" aria-current="page">Confluence alternative</a>
+    <a href="/guru-alternative">Guru alternative</a>
+    <a href="/self-hosted-wiki">Self-hosted wiki</a>
+    <a href="/wiki-with-sso">Free single sign-on</a>
+  </nav>
+  <nav aria-label="Footer">
+    <a href="https://github.com/tstout729/dumbslab">GitHub</a>
+    <a href="/llms.txt">llms.txt</a>
+    <a href="/privacy">Privacy</a>
+    <a href="/terms">Terms</a>
+  </nav>
+</footer>
+</body>
+</html>

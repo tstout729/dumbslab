@@ -1,0 +1,225 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>MCP knowledge base for your team · DumbSlab</title>
+<meta name="description" content="Give Claude, ChatGPT and Cursor your team&#x27;s docs through MCP. DumbSlab is a free team wiki with a built-in MCP server and edits that don&#x27;t clobber.">
+<meta name="robots" content="index, follow, max-image-preview:large, max-snippet:-1">
+<!-- Generated from one template with the other guide pages; keep their header and footer alike. -->
+<link rel="canonical" href="https://dumbslab.com/mcp-knowledge-base">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#15161c" media="(prefers-color-scheme: dark)">
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="DumbSlab">
+<meta property="og:locale" content="en_US">
+<meta property="og:url" content="https://dumbslab.com/mcp-knowledge-base">
+<meta property="og:title" content="MCP knowledge base for your team · DumbSlab">
+<meta property="og:description" content="Give Claude, ChatGPT and Cursor your team&#x27;s docs through MCP. DumbSlab is a free team wiki with a built-in MCP server and edits that don&#x27;t clobber.">
+<meta property="og:image" content="https://dumbslab.com/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="DumbSlab: the free team wiki your AI agents can use too">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="stylesheet" href="/styles.css">
+<link rel="stylesheet" href="/welcome.css">
+<script src="/theme-init.js"></script>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@graph": [
+    {
+      "@type": "WebPage",
+      "@id": "https://dumbslab.com/mcp-knowledge-base#page",
+      "url": "https://dumbslab.com/mcp-knowledge-base",
+      "name": "MCP knowledge base for your team · DumbSlab",
+      "description": "Give Claude, ChatGPT and Cursor your team's docs through MCP. DumbSlab is a free team wiki with a built-in MCP server and edits that don't clobber.",
+      "inLanguage": "en",
+      "isPartOf": {
+        "@id": "https://dumbslab.com/#website"
+      },
+      "about": {
+        "@id": "https://dumbslab.com/#app"
+      },
+      "publisher": {
+        "@id": "https://dumbslab.com/#org"
+      },
+      "primaryImageOfPage": "https://dumbslab.com/og.png",
+      "breadcrumb": {
+        "@id": "https://dumbslab.com/mcp-knowledge-base#crumbs"
+      }
+    },
+    {
+      "@type": "BreadcrumbList",
+      "@id": "https://dumbslab.com/mcp-knowledge-base#crumbs",
+      "itemListElement": [
+        {
+          "@type": "ListItem",
+          "position": 1,
+          "name": "DumbSlab",
+          "item": "https://dumbslab.com/"
+        },
+        {
+          "@type": "ListItem",
+          "position": 2,
+          "name": "MCP knowledge base",
+          "item": "https://dumbslab.com/mcp-knowledge-base"
+        }
+      ]
+    },
+    {
+      "@type": "FAQPage",
+      "@id": "https://dumbslab.com/mcp-knowledge-base#faq",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "What is an MCP knowledge base?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "A knowledge base that AI tools can use through the Model Context Protocol (MCP), the open standard Claude, ChatGPT, Cursor and other assistants use to reach outside tools. Instead of pasting docs into a chat, the assistant searches and reads your team's docs itself, and can write and update them too."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Which AI tools work with DumbSlab?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Any MCP client. Claude, ChatGPT, Cursor and other clients that support OAuth need only your workspace's MCP URL, and you approve access in the browser. Other tools can use a personal access token with the MCP server or the REST API."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Can an agent see private topics?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Only if the person who connected it can. An agent acts with that person's access, so private topics, drafts and admin-only settings stay out of its reach unless they are in that person's. Give an agent its own bot account to decide exactly what it can see."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Is it free?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Yes. The MCP server, the API and webhooks are on the free plan, with every other feature. The free plan limits only storage and daily database writes; Pro raises them for $8 a month."
+          }
+        }
+      ]
+    }
+  ]
+}
+</script>
+</head>
+<body class="w-page">
+<a class="skip-link" href="#main">Skip to content</a>
+<header class="w-top">
+  <a class="w-brand" href="/" aria-label="DumbSlab home"><img src="/favicon.svg" alt="" width="28" height="28"><span>DumbSlab</span></a>
+  <nav class="w-nav" aria-label="Site">
+    <a href="/#features">Features</a>
+    <a href="/#integrations">Integrations</a>
+    <a href="/#pricing">Pricing</a>
+    <a href="https://github.com/tstout729/dumbslab">GitHub</a>
+  </nav>
+  <a class="btn btn-sm btn-primary w-top-go" href="/#signup">Create a workspace</a>
+</header>
+
+<main id="main">
+  <section class="w-guide-hero w-wrap" aria-labelledby="page-title">
+    <nav class="w-crumbs" aria-label="Breadcrumb"><a href="/">DumbSlab</a> <span aria-hidden="true">›</span> <span aria-current="page">MCP knowledge base</span></nav>
+    <h1 id="page-title">A team knowledge base your AI agents can read and write</h1>
+    <p class="w-lede">Every DumbSlab workspace has its own MCP server. Paste one URL into Claude, ChatGPT or Cursor, approve it in your browser, and your agents can search, read and edit the same docs your team uses.</p>
+    <p class="w-guide-cta"><a class="btn btn-primary w-end-go" href="/#signup">Create a free workspace</a>
+      <a class="btn w-end-go" href="#connect">See how to connect</a></p>
+    <p class="w-fine">Free, with no credit card. Every feature is on every plan.</p>
+  </section>
+
+  <article class="w-guide w-wrap">
+    <h2 id="connect">Connect an agent in about a minute</h2>
+    <ol>
+      <li><a href="/#signup">Create a free workspace</a>. It gets its own address, such as <code>acme.dumbslab.com</code>.</li>
+      <li>In Claude, ChatGPT or Cursor, add a custom connector with your workspace's MCP URL: <code>https://acme.dumbslab.com/mcp</code>. In Claude Code, run the command below.</li>
+      <li>Approve access in the browser. The connection then shows under Settings › API tokens, where you can revoke it any time.</li>
+    </ol>
+    <pre><code>claude mcp add --transport http dumbslab https://acme.dumbslab.com/mcp</code></pre>
+    <p>Clients without OAuth can send a personal access token from Settings › API tokens instead. Any client that speaks MCP over Streamable HTTP works.</p>
+
+    <h2>What your agents can do</h2>
+    <p>Everything a person can do in DumbSlab, an agent can do too. The web app runs on the same public API, so nothing is out of reach.</p>
+    <ul>
+      <li><strong>Search</strong> posts, comments and topics, with only what the person who connected it can see.</li>
+      <li><strong>Read</strong> any post as Markdown, with its topic, history and comments.</li>
+      <li><strong>Write</strong> new posts and topics, and comment on existing ones.</li>
+      <li><strong>Edit precisely</strong>: replace one passage, or append to one section by its heading, instead of rewriting the whole doc.</li>
+      <li><strong>Keep up</strong> with the activity feed, or have webhooks call your own agent when something changes.</li>
+    </ul>
+    <p>The default toolset has about 15 everyday tools plus <code>call_operation</code>, which reaches every other operation. Add <code>?toolset=read</code> to the URL for a connection that can only read.</p>
+
+    <h2>Built so agents can't clobber your team's work</h2>
+    <ul>
+      <li><strong>Conflicts, not overwrites.</strong> An agent sends the version it last read. If a teammate saved since then, the edit is refused with a conflict instead of erasing their change.</li>
+      <li><strong>Every save is a version.</strong> Compare any two versions of a doc and restore any of them.</li>
+      <li><strong>A name on every change.</strong> Give each agent its own bot account. Its edits show in history and activity under its name, marked MCP, API or CLI.</li>
+      <li><strong>Read-only when you want it.</strong> A read-only connection or token can search and read, and nothing else.</li>
+    </ul>
+
+    <h2>More than MCP</h2>
+    <table>
+      <thead><tr><th>Interface</th><th>Where</th></tr></thead>
+      <tbody>
+        <tr><td>MCP server</td><td><code>https://acme.dumbslab.com/mcp</code></td></tr>
+        <tr><td>REST API</td><td><code>https://acme.dumbslab.com/api/v1</code>, described by OpenAPI 3.1</td></tr>
+        <tr><td>Agent guide</td><td><code>https://acme.dumbslab.com/llms.txt</code></td></tr>
+        <tr><td>Webhooks</td><td>Signed with HMAC-SHA256, set up by admins</td></tr>
+      </tbody>
+    </table>
+  </article>
+
+  <section id="faq" class="w-faq w-wrap" aria-labelledby="faq-title">
+    <h2 id="faq-title">Questions</h2>
+    <div class="w-faq-list">
+      <details>
+        <summary>What is an MCP knowledge base?</summary>
+        <p>A knowledge base that AI tools can use through the Model Context Protocol (MCP), the open standard Claude, ChatGPT, Cursor and other assistants use to reach outside tools. Instead of pasting docs into a chat, the assistant searches and reads your team's docs itself, and can write and update them too.</p>
+      </details>
+      <details>
+        <summary>Which AI tools work with DumbSlab?</summary>
+        <p>Any MCP client. Claude, ChatGPT, Cursor and other clients that support OAuth need only your workspace's MCP URL, and you approve access in the browser. Other tools can use a personal access token with the MCP server or the REST API.</p>
+      </details>
+      <details>
+        <summary>Can an agent see private topics?</summary>
+        <p>Only if the person who connected it can. An agent acts with that person's access, so private topics, drafts and admin-only settings stay out of its reach unless they are in that person's. Give an agent its own bot account to decide exactly what it can see.</p>
+      </details>
+      <details>
+        <summary>Is it free?</summary>
+        <p>Yes. The MCP server, the API and webhooks are on the free plan, with every other feature. The free plan limits only storage and daily database writes; Pro raises them for $8 a month.</p>
+      </details>
+    </div>
+  </section>
+
+  <section class="w-end w-wrap" aria-labelledby="end-title">
+    <h2 id="end-title">Give your agents a wiki of their own</h2>
+    <p>It's free, takes about a minute, and your agents can join on day one.</p>
+    <a class="btn btn-primary w-end-go" href="/#signup">Pick your address</a>
+  </section>
+</main>
+
+<footer class="w-foot w-wrap">
+  <p>DumbSlab is open source under MIT or Apache-2.0.</p>
+  <nav aria-label="Guides">
+    <a href="/mcp-knowledge-base" aria-current="page">MCP knowledge base</a>
+    <a href="/confluence-alternative">Confluence alternative</a>
+    <a href="/guru-alternative">Guru alternative</a>
+    <a href="/self-hosted-wiki">Self-hosted wiki</a>
+    <a href="/wiki-with-sso">Free single sign-on</a>
+  </nav>
+  <nav aria-label="Footer">
+    <a href="https://github.com/tstout729/dumbslab">GitHub</a>
+    <a href="/llms.txt">llms.txt</a>
+    <a href="/privacy">Privacy</a>
+    <a href="/terms">Terms</a>
+  </nav>
+</footer>
+</body>
+</html>

@@ -225,7 +225,7 @@
     <div class="w-wrap w-agents-grid">
       <div class="w-agents-intro">
         <h2 id="agents-title">Built for agents, not bolted on</h2>
-        <p>Everything a person can do in DumbSlab, an agent can do through MCP or the REST API. The web app runs on the same public API, so nothing is out of an agent's reach.</p>
+        <p>Everything a person can do in DumbSlab, an agent can do through MCP or the REST API. The web app runs on the same public API, so nothing is out of an agent's reach. <a class="w-more" href="/mcp-knowledge-base">How agents connect</a></p>
         <div class="w-connect">
           <p class="w-connect-label" id="connect-cli">Claude Code</p>
           <div class="w-copy">
@@ -286,8 +286,8 @@
     <dl class="w-feature-list">
       <div><dt>One search for everything</dt><dd>Each person connects their own apps and searches them next to your docs, so results follow each person's access. Links to them in posts show previews.</dd></div>
       <div><dt>Slack</dt><dd>Use <code>/dumbslab search</code> and <code>/dumbslab new</code> without leaving Slack, see a preview when someone shares a post, and send new and updated posts to the channels you choose.</dd></div>
-      <div><dt>Single sign-on, free</dt><dd>Continue with Google or Microsoft, or require single sign-on with Google Workspace, Microsoft Entra ID, Okta, OneLogin, Slack or any OpenID Connect provider.</dd></div>
-      <div><dt>Move in from Confluence or Guru</dt><dd>Import Confluence spaces, Guru collections, GitHub wikis and Markdown folders with their links, images and attachments. You see a preview first.</dd></div>
+      <div><dt>Single sign-on, free</dt><dd>Continue with Google or Microsoft, or require single sign-on with Google Workspace, Microsoft Entra ID, Okta, OneLogin, Slack or any OpenID Connect provider. <a href="/wiki-with-sso">How it works</a></dd></div>
+      <div><dt>Move in from Confluence or Guru</dt><dd>Import Confluence spaces, Guru collections, GitHub wikis and Markdown folders with their links, images and attachments. You see a preview first. Guides: <a href="/confluence-alternative">from Confluence</a>, <a href="/guru-alternative">from Guru</a>.</dd></div>
       <div><dt>Docs that stay in sync</dt><dd>Keep a GitHub or GitLab folder of Markdown as read-only posts that update on every push. Sub-folders become sub-topics.</dd></div>
       <div><dt>A people directory from BambooHR</dt><dd>Titles, departments, locations and managers stay in sync from BambooHR, matched by work email.</dd></div>
     </dl>
@@ -324,7 +324,7 @@
     <div>
       <h2 id="open-title">Dumb on purpose</h2>
       <p>DumbSlab is one Rust binary and one SQLite file. Run it on a laptop or a small server, or deploy it to Cloudflare Workers, where each workspace gets its own database. The code is MIT or Apache-2.0, so you can read it, fork it or host it for your company.</p>
-      <p class="w-open-links"><a href="https://github.com/tstout729/dumbslab">Source on GitHub</a> <a href="https://github.com/tstout729/dumbslab/blob/main/docs/cloudflare.md">Deploy to Cloudflare</a></p>
+      <p class="w-open-links"><a href="/self-hosted-wiki">Self-hosting guide</a> <a href="https://github.com/tstout729/dumbslab">Source on GitHub</a> <a href="https://github.com/tstout729/dumbslab/blob/main/docs/cloudflare.md">Deploy to Cloudflare</a></p>
     </div>
     <pre class="w-terminal" aria-label="Run DumbSlab from source"><code>git clone https://github.com/tstout729/dumbslab
 cd dumbslab
@@ -396,6 +396,13 @@ cargo run --release -p dumbslab -- serve</code></pre>
 
 <footer class="w-foot w-wrap">
   <p>DumbSlab is open source under MIT or Apache-2.0.</p>
+  <nav aria-label="Guides">
+    <a href="/mcp-knowledge-base">MCP knowledge base</a>
+    <a href="/confluence-alternative">Confluence alternative</a>
+    <a href="/guru-alternative">Guru alternative</a>
+    <a href="/self-hosted-wiki">Self-hosted wiki</a>
+    <a href="/wiki-with-sso">Free single sign-on</a>
+  </nav>
   <nav aria-label="Footer">
     <a href="https://github.com/tstout729/dumbslab">GitHub</a>
     <a href="https://github.com/tstout729/dumbslab/blob/main/docs/cloudflare.md">Self-hosting</a>

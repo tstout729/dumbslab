@@ -1,0 +1,220 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Open-source self-hosted team wiki · DumbSlab</title>
+<meta name="description" content="Run DumbSlab yourself: one Rust binary and one SQLite file, Docker, or Cloudflare Workers. An open-source team wiki with MCP, a REST API and SSO.">
+<meta name="robots" content="index, follow, max-image-preview:large, max-snippet:-1">
+<!-- Generated from one template with the other guide pages; keep their header and footer alike. -->
+<link rel="canonical" href="https://dumbslab.com/self-hosted-wiki">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#15161c" media="(prefers-color-scheme: dark)">
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="DumbSlab">
+<meta property="og:locale" content="en_US">
+<meta property="og:url" content="https://dumbslab.com/self-hosted-wiki">
+<meta property="og:title" content="Open-source self-hosted team wiki · DumbSlab">
+<meta property="og:description" content="Run DumbSlab yourself: one Rust binary and one SQLite file, Docker, or Cloudflare Workers. An open-source team wiki with MCP, a REST API and SSO.">
+<meta property="og:image" content="https://dumbslab.com/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="DumbSlab: the free team wiki your AI agents can use too">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="stylesheet" href="/styles.css">
+<link rel="stylesheet" href="/welcome.css">
+<script src="/theme-init.js"></script>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@graph": [
+    {
+      "@type": "WebPage",
+      "@id": "https://dumbslab.com/self-hosted-wiki#page",
+      "url": "https://dumbslab.com/self-hosted-wiki",
+      "name": "Open-source self-hosted team wiki · DumbSlab",
+      "description": "Run DumbSlab yourself: one Rust binary and one SQLite file, Docker, or Cloudflare Workers. An open-source team wiki with MCP, a REST API and SSO.",
+      "inLanguage": "en",
+      "isPartOf": {
+        "@id": "https://dumbslab.com/#website"
+      },
+      "about": {
+        "@id": "https://dumbslab.com/#app"
+      },
+      "publisher": {
+        "@id": "https://dumbslab.com/#org"
+      },
+      "primaryImageOfPage": "https://dumbslab.com/og.png",
+      "breadcrumb": {
+        "@id": "https://dumbslab.com/self-hosted-wiki#crumbs"
+      }
+    },
+    {
+      "@type": "BreadcrumbList",
+      "@id": "https://dumbslab.com/self-hosted-wiki#crumbs",
+      "itemListElement": [
+        {
+          "@type": "ListItem",
+          "position": 1,
+          "name": "DumbSlab",
+          "item": "https://dumbslab.com/"
+        },
+        {
+          "@type": "ListItem",
+          "position": 2,
+          "name": "Self-hosted wiki",
+          "item": "https://dumbslab.com/self-hosted-wiki"
+        }
+      ]
+    },
+    {
+      "@type": "FAQPage",
+      "@id": "https://dumbslab.com/self-hosted-wiki#faq",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "What does DumbSlab need to run?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Rust 1.88 or newer to build it, or Docker. It then runs as one binary with one SQLite file, so a small server or a laptop is enough for a team."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Does a self-hosted server send data anywhere?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "No. Session recordings and error reports are off unless you configure them, and connected apps, Slack and single sign-on only talk to the services you set up."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Is there a user limit?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "No. Self-hosted DumbSlab has no plans and no limits beyond your own server's."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "What license is it under?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "DumbSlab is dual-licensed under MIT or Apache-2.0, so you can read it, fork it and host it for your company."
+          }
+        }
+      ]
+    }
+  ]
+}
+</script>
+</head>
+<body class="w-page">
+<a class="skip-link" href="#main">Skip to content</a>
+<header class="w-top">
+  <a class="w-brand" href="/" aria-label="DumbSlab home"><img src="/favicon.svg" alt="" width="28" height="28"><span>DumbSlab</span></a>
+  <nav class="w-nav" aria-label="Site">
+    <a href="/#features">Features</a>
+    <a href="/#integrations">Integrations</a>
+    <a href="/#pricing">Pricing</a>
+    <a href="https://github.com/tstout729/dumbslab">GitHub</a>
+  </nav>
+  <a class="btn btn-sm btn-primary w-top-go" href="/#signup">Create a workspace</a>
+</header>
+
+<main id="main">
+  <section class="w-guide-hero w-wrap" aria-labelledby="page-title">
+    <nav class="w-crumbs" aria-label="Breadcrumb"><a href="/">DumbSlab</a> <span aria-hidden="true">›</span> <span aria-current="page">Self-hosted wiki</span></nav>
+    <h1 id="page-title">An open-source team wiki you can run yourself</h1>
+    <p class="w-lede">DumbSlab is one Rust binary and one SQLite file. Run it on a laptop, a small server or Cloudflare Workers, with every feature and no limits, under the MIT or Apache-2.0 license.</p>
+    <p class="w-guide-cta"><a class="btn btn-primary w-end-go" href="/#signup">Create a free workspace</a>
+      <a class="btn w-end-go" href="https://github.com/tstout729/dumbslab">Source on GitHub</a></p>
+    <p class="w-fine">Free, with no credit card. Every feature is on every plan.</p>
+  </section>
+
+  <article class="w-guide w-wrap">
+    <h2>Run it in a minute</h2>
+    <p>With <a href="https://rustup.rs">Rust</a> 1.88 or newer:</p>
+    <pre><code>git clone https://github.com/tstout729/dumbslab
+cd dumbslab
+cargo install --path crates/server
+dumbslab serve</code></pre>
+    <p>Or with Docker:</p>
+    <pre><code>docker build -t dumbslab .
+docker run -p 127.0.0.1:8080:8080 -v dumbslab:/data dumbslab</code></pre>
+    <p>On first run the server logs a one-time setup link. Open it to create the admin account, and a Getting Started topic is waiting inside.</p>
+
+    <h2>Dumb on purpose</h2>
+    <ul>
+      <li><strong>One binary, one file.</strong> No separate database server, queue or search cluster. Search runs on SQLite's full-text index.</li>
+      <li><strong>Nothing phones home.</strong> Session recordings and error reports stay off unless you set them, so a self-hosted server sends nothing anywhere.</li>
+      <li><strong>Every feature.</strong> Posts, topics, search, history, verification, comments, roles and private topics, imports, webhooks and JSON export.</li>
+      <li><strong>Agents included.</strong> The MCP server is at <code>/mcp</code> on your own host, with OAuth, and local agents can use stdio: <code>dumbslab mcp --as you@example.com</code>.</li>
+      <li><strong>Your sign-in.</strong> Single sign-on with Google Workspace, Microsoft Entra ID, Okta, OneLogin, Slack or any OpenID Connect provider, using your own app.</li>
+    </ul>
+
+    <h2>Or deploy it to Cloudflare</h2>
+    <p>The same code runs as a Cloudflare Worker, where each workspace is its own SQLite-backed Durable Object. Run one private workspace for your company, or a hosted service anyone can sign up for, which is how dumbslab.com runs. The <a href="https://github.com/tstout729/dumbslab/blob/main/docs/cloudflare.md">Cloudflare guide</a> covers the setup.</p>
+
+    <h2>Hosted or self-hosted</h2>
+    <table>
+      <thead><tr><th></th><th>dumbslab.com</th><th>Self-hosted</th></tr></thead>
+      <tbody>
+        <tr><td>Price</td><td>Free, or $8 a month for Pro's extra room</td><td>Free</td></tr>
+        <tr><td>Limits</td><td>Storage and daily writes per plan</td><td>None but your server's</td></tr>
+        <tr><td>Upkeep</td><td>None</td><td>Yours: updates and backups</td></tr>
+        <tr><td>Connected apps and Slack</td><td>Ready to use</td><td>Register your own apps</td></tr>
+      </tbody>
+    </table>
+  </article>
+
+  <section id="faq" class="w-faq w-wrap" aria-labelledby="faq-title">
+    <h2 id="faq-title">Questions</h2>
+    <div class="w-faq-list">
+      <details>
+        <summary>What does DumbSlab need to run?</summary>
+        <p>Rust 1.88 or newer to build it, or Docker. It then runs as one binary with one SQLite file, so a small server or a laptop is enough for a team.</p>
+      </details>
+      <details>
+        <summary>Does a self-hosted server send data anywhere?</summary>
+        <p>No. Session recordings and error reports are off unless you configure them, and connected apps, Slack and single sign-on only talk to the services you set up.</p>
+      </details>
+      <details>
+        <summary>Is there a user limit?</summary>
+        <p>No. Self-hosted DumbSlab has no plans and no limits beyond your own server's.</p>
+      </details>
+      <details>
+        <summary>What license is it under?</summary>
+        <p>DumbSlab is dual-licensed under MIT or Apache-2.0, so you can read it, fork it and host it for your company.</p>
+      </details>
+    </div>
+  </section>
+
+  <section class="w-end w-wrap" aria-labelledby="end-title">
+    <h2 id="end-title">Rather not run a server?</h2>
+    <p>dumbslab.com hosts the same software for free. Create a workspace in about a minute.</p>
+    <a class="btn btn-primary w-end-go" href="/#signup">Pick your address</a>
+  </section>
+</main>
+
+<footer class="w-foot w-wrap">
+  <p>DumbSlab is open source under MIT or Apache-2.0.</p>
+  <nav aria-label="Guides">
+    <a href="/mcp-knowledge-base">MCP knowledge base</a>
+    <a href="/confluence-alternative">Confluence alternative</a>
+    <a href="/guru-alternative">Guru alternative</a>
+    <a href="/self-hosted-wiki" aria-current="page">Self-hosted wiki</a>
+    <a href="/wiki-with-sso">Free single sign-on</a>
+  </nav>
+  <nav aria-label="Footer">
+    <a href="https://github.com/tstout729/dumbslab">GitHub</a>
+    <a href="/llms.txt">llms.txt</a>
+    <a href="/privacy">Privacy</a>
+    <a href="/terms">Terms</a>
+  </nav>
+</footer>
+</body>
+</html>
