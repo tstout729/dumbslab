@@ -463,6 +463,11 @@ impl Workspace {
                     "mcp_url": format!("{origin}/mcp"),
                     "api_url": format!("{origin}/api/v1"),
                     "signup_url": signup_url,
+                    // Creating it with Google or Microsoft, from the setup page.
+                    "sign_up_with": dumbslab_core::sso::signup_providers_of(&crate::connect::sso_apps(&self.env, origin, true))
+                        .into_iter()
+                        .map(|p| json!({ "provider": p, "name": p.name() }))
+                        .collect::<Vec<_>>(),
                 }),
             );
         }
@@ -522,11 +527,17 @@ impl DurableObject for Workspace {
         let mut creating = false;
         if let Some(slug) = &workspace {
             if matches!(self.stored()?, Stored::Nothing) {
-                // Only a valid sign-up link may create the workspace's storage.
-                let token =
-                    serde_json::from_slice::<Value>(&body).ok().and_then(|v| v["setup_token"].as_str().map(|t| t.trim().to_string()));
-                let signed = method == Method::Post
-                    && path == "/api/v1/auth/setup"
+                // Only a valid sign-up link may create the workspace's storage: setting up with a
+                // password, or starting to sign up with Google or Microsoft.
+                let signup_start = method == Method::Get && path == dumbslab_core::sso::START_PATH;
+                let token = if signup_start {
+                    let query: Vec<(String, String)> = url.query_pairs().map(|(k, v)| (k.into_owned(), v.into_owned())).collect();
+                    let signup = query.iter().any(|(k, _)| k == "signup");
+                    query.into_iter().find(|(k, _)| signup && k == "token").map(|(_, t)| t.trim().to_string())
+                } else {
+                    serde_json::from_slice::<Value>(&body).ok().and_then(|v| v["setup_token"].as_str().map(|t| t.trim().to_string()))
+                };
+                let signed = (signup_start || (method == Method::Post && path == "/api/v1/auth/setup"))
                     && matches!((&signup_secret, &token), (Some(secret), Some(t))
                         if dumbslab_core::tenancy::verify_signup_token(secret, slug, t, Utc::now().timestamp()));
                 if !signed {
@@ -641,8 +652,10 @@ impl DurableObject for Workspace {
             match dumbslab_core::handle(db, &cfg, &core_req) {
                 None => (Ok(None), true),
                 Some(o) => {
-                    // A failed setup leaves no schema behind.
-                    let commit = o.commit && (!creating || o.response.status == 200);
+                    // A failed setup leaves no schema behind. Starting to sign up with Google or
+                    // Microsoft keeps it: the sign-in job that follows records itself there.
+                    let starts_signup = o.effects.iter().any(|e| matches!(e, Effect::Connect(_)));
+                    let commit = o.commit && (!creating || o.response.status == 200 || starts_signup);
                     // Upgrading must work when the workspace is full; its first one stores a billing id.
                     let upgrading = o.effects.iter().any(|e| matches!(e, Effect::Stripe(_)));
                     if let Some(h) = cfg.hosting.as_ref().filter(|_| commit && !exempt && !upgrading)
@@ -683,17 +696,22 @@ impl DurableObject for Workspace {
             Ok(None) => return error_response(404, "not_found", "not found"),
             Err(e) => return api_error_response(&e),
         };
-        if creating && outcome.response.status == 200 {
+        if creating && (outcome.response.status == 200 || outcome.effects.iter().any(|e| matches!(e, Effect::Connect(_)))) {
             self.migrated.set(true);
         }
 
         // A new workspace's first admin exists: mark its address active in the directory.
-        if let Some(slug) = workspace.filter(|_| path == "/api/v1/auth/setup" && outcome.response.status == 200) {
+        if let Some(slug) = workspace.clone().filter(|_| path == "/api/v1/auth/setup" && outcome.response.status == 200) {
             let env = self.env.clone();
             self.state.wait_until(async move {
                 let _ = call_object(&env, "DIRECTORY", "directory", Method::Post, "/activate", Some(&json!({ "slug": slug }))).await;
             });
         }
+
+        // Coming back from a provider to a workspace nobody has set up yet may create its first
+        // admin (signing up with Google or Microsoft): see whether it did, once the job has run.
+        let users = |db: &DoDb| db.scalar_i64("SELECT COUNT(*) FROM users", &[]).unwrap_or(0);
+        let signing_up = workspace.is_some() && path == dumbslab_core::sso::CALLBACK_PATH && users(&self.db()) == 0;
 
         let mut effects = outcome.effects;
         let mut response = outcome.response;
@@ -704,6 +722,12 @@ impl DurableObject for Workspace {
             let Effect::Connect(job) = effects.remove(i) else { unreachable!() };
             let finish = self.run_job(job, &move_cfg).await?;
             response = dumbslab_core::connect::respond(response, finish);
+            if let Some(slug) = workspace.as_ref().filter(|_| signing_up && users(&self.db()) > 0) {
+                let (env, slug) = (self.env.clone(), slug.clone());
+                self.state.wait_until(async move {
+                    let _ = call_object(&env, "DIRECTORY", "directory", Method::Post, "/activate", Some(&json!({ "slug": slug }))).await;
+                });
+            }
         }
         // upgrade_plan and manage_billing: the answer holds a placeholder for the Stripe page's URL.
         if let Some(Effect::Stripe(call)) = effects.iter().find(|e| matches!(e, Effect::Stripe(_))) {
@@ -821,8 +845,12 @@ async fn drive_job(state: &State, env: &Env, mut job: Job, cfg: &HostConfig) -> 
         // allowance without this step's rows.
         let rows = db.rows_written();
         written += rows;
+        // A sign-in's rows don't count against the plan: anyone can start one, and its records are
+        // short-lived and capped (`dumbslab_core::sso`), so counting them would let a stranger use
+        // up the workspace's allowance.
         if cfg.hosting.is_some()
             && rows > 0
+            && !signs_in
             && let Err(e) = plan::record_writes(&DoDb::new(state.storage().sql()), Utc::now(), rows)
         {
             console_error!("recording usage failed: {}", e.message);

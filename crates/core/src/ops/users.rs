@@ -395,10 +395,6 @@ pub struct ChangePasswordInput {
     pub new_password: String,
 }
 
-/// How recently someone without a password must have signed in to set one: a session stolen
-/// later can't turn itself into a password.
-const FIRST_PASSWORD_MINUTES: i64 = 15;
-
 fn change_password(ctx: &mut Ctx, input: ChangePasswordInput) -> ApiResult<Done> {
     // A token (a connected app's or a script's) must not be a way to guess, or replace, the
     // password that signs in with the account's full role.
@@ -418,20 +414,20 @@ fn change_password(ctx: &mut Ctx, input: ChangePasswordInput) -> ApiResult<Done>
         None => {
             // In a workspace with its own single sign-on, people without a password were added by
             // it: a password of their own would outlast the organization removing them there.
+            // Admins keep theirs, as the way in should the provider fail.
             let conf = crate::sso::load(ctx.db)?;
-            if crate::sso::active(ctx.cfg, &conf) {
+            if crate::sso::configured(&conf) && ctx.actor.role != Role::Admin {
                 return Err(ApiError::forbidden(format!(
                     "this workspace signs in with {}; ask a workspace admin if you need a password",
                     conf.name()
                 )));
             }
-            let since = crate::util::ts(ctx.now - chrono::Duration::minutes(FIRST_PASSWORD_MINUTES));
-            let fresh = ctx.db.scalar_i64(
-                "SELECT COUNT(*) FROM sessions WHERE token_hash = ? AND user_id = ? AND created_at >= ?",
-                &params![ctx.actor.session_hash.clone(), ctx.actor.user_id.clone(), since],
-            )? > 0;
-            if !fresh {
-                return Err(ApiError::forbidden("to set your first password, sign out and sign in again, then set it within 15 minutes"));
+            let session = ctx.actor.session_hash.clone().unwrap_or_default();
+            if !crate::sso::fresh_session(ctx.db, &ctx.actor.user_id, &session, ctx.now)? {
+                return Err(ApiError::forbidden(format!(
+                    "to set your first password, sign out and sign in again, then set it within {} minutes",
+                    crate::sso::FRESH_MINUTES
+                )));
             }
             true
         }

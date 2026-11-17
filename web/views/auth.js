@@ -49,7 +49,19 @@ function providerButton(option, { href, onClick } = {}) {
 function providerName(params, options) {
   const w = params.get('with');
   const o = (options || []).find((x) => x.provider === w);
-  return o ? o.name : { google: 'Google', microsoft: 'Microsoft' }[w] || null;
+  const known = { google: 'Google', microsoft: 'Microsoft' };
+  return o ? o.name : Object.hasOwn(known, w) ? known[w] : null;
+}
+
+// The sign-up link's token, kept in this browser while signing up with Google or Microsoft: the
+// server never puts it back in a URL.
+const SETUP_TOKEN_KEY = 'ds-setup-token';
+function savedSetupToken() {
+  try {
+    return sessionStorage.getItem(SETUP_TOKEN_KEY) || '';
+  } catch {
+    return '';
+  }
 }
 
 function card(title, sub, form, foot) {
@@ -74,8 +86,9 @@ function showError(box, err) {
 export function renderSetup(root, authState) {
   document.title = 'Set up DumbSlab';
   const params = new URLSearchParams(location.search);
+  const setupToken = params.get('token') || savedSetupToken();
   // On hosted DumbSlab, an address nobody has signed up for has nothing to set up.
-  if (authState.exists === false && !params.get('token')) {
+  if (authState.exists === false && !setupToken) {
     const link = h('a', { class: 'btn btn-primary btn-block', href: authState.signup_url || '/' }, 'Create a workspace');
     root.replaceChildren(card('There’s no workspace here', `Nobody has created ${location.hostname} yet. You can claim it for free.`, link));
     return;
@@ -86,7 +99,7 @@ export function renderSetup(root, authState) {
   const name = input({ name: 'name', required: true, autocomplete: 'name' });
   const email = input({ name: 'email', type: 'email', required: true, autocomplete: 'email' });
   const password = input({ name: 'password', type: 'password', required: true, minlength: 8, autocomplete: 'new-password' });
-  const token = input({ name: 'setup_token', value: params.get('token') || '', autocomplete: 'off', spellcheck: 'false' });
+  const token = input({ name: 'setup_token', value: setupToken, autocomplete: 'off', spellcheck: 'false' });
   const err = errorBox();
   const submit = button('Create workspace', { variant: 'primary', type: 'submit', cls: 'btn-block' });
   const form = h('form', { class: 'auth-form', novalidate: true },
@@ -95,7 +108,7 @@ export function renderSetup(root, authState) {
     field('Email', email),
     field('Password', password, { hint: 'At least 8 characters.' }),
     // A sign-up link carries its token; only self-hosted setups ask for one.
-    authState.setup_requires_token && !params.get('token')
+    authState.setup_requires_token && !setupToken
       ? field('Setup token', token, { hint: 'Printed in the server log when it started, or your deployment’s SETUP_TOKEN secret.' })
       : null,
     err,
@@ -133,7 +146,9 @@ export function renderSetup(root, authState) {
         ws.focus();
         return;
       }
-      const q = new URLSearchParams({ signup: '1', with: p.provider, token: params.get('token') || token.value.trim(), name: ws.value.trim() });
+      const t = setupToken || token.value.trim();
+      try { sessionStorage.setItem(SETUP_TOKEN_KEY, t); } catch { /* the page still works, it just can't retry */ }
+      const q = new URLSearchParams({ signup: '1', with: p.provider, token: t, name: ws.value.trim() });
       location.assign(`/sso/start?${q}`);
     };
     body = h('div', { class: 'auth-sso' },

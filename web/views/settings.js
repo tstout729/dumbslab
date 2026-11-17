@@ -107,7 +107,7 @@ async function profileSection() {
   // Someone who signed up with Google or Microsoft has no password yet: they set a first one.
   const first = state.auth.has_password === false;
   // Added by the workspace's own single sign-on, with no password: that's how they sign in.
-  const ssoOnly = first && state.auth.sso;
+  const ssoOnly = first && state.auth.sso && state.auth.user && state.auth.user.role !== 'admin';
   const current = input({ type: 'password', required: true, autocomplete: 'current-password' });
   const next = input({ type: 'password', required: true, minlength: 8, autocomplete: 'new-password' });
   const confirm = input({ type: 'password', required: true, minlength: 8, autocomplete: 'new-password' });
@@ -148,7 +148,8 @@ async function signInAccountsPanel() {
   if (!providers.length) return null;
   const query = new URLSearchParams(location.search);
   const r = await api.get('/sso/identities');
-  const nameOf = (p) => (providers.find((o) => o.provider === p) || {}).name || p;
+  // Only the providers offered here: `?with=` comes from a link anyone can make.
+  const nameOf = (p) => (providers.find((o) => o.provider === p) || {}).name || null;
   const mine = r.items.filter((i) => providers.some((o) => o.provider === i.provider));
   const notes = [];
   if (query.get('sso_linked')) notes.push(h('p', { class: 'callout', role: 'status' }, icon('check', { size: 15 }), h('span', null, 'Your account is linked. You can sign in with it now.')));
@@ -160,7 +161,7 @@ async function signInAccountsPanel() {
       const row = h('li', { class: 'token' },
         h('div', { class: 'token-icon' }, providerMark(i.provider, 16)),
         h('div', { class: 'token-main' },
-          h('div', { class: 'token-head' }, h('strong', null, i.email || `Your ${nameOf(i.provider)} account`)),
+          h('div', { class: 'token-head' }, h('strong', null, i.email || `Your ${nameOf(i.provider) || ''} account`)),
           h('div', { class: 'token-meta' }, h('span', null, nameOf(i.provider)), h('span', null, 'Linked ', timeEl(i.linked_at)), i.last_used_at ? h('span', null, 'Last used ', timeEl(i.last_used_at)) : null)),
         unlink);
       unlink.addEventListener('click', async () => {

@@ -400,6 +400,13 @@ fn link_sso(ctx: &mut Ctx, input: LinkSsoInput) -> ApiResult<Deferred<LinkStart>
         Some(p) if !sso::personal_providers(ctx.db, ctx.cfg)?.contains(&p) => {
             return Err(ApiError::bad_request(format!("signing in with your own {} account isn't available in this workspace", p.name())));
         }
+        // A link is a lasting way in: only from a fresh sign-in, so a stolen session can't add one.
+        Some(_) if !sso::fresh_session(ctx.db, &ctx.actor.user_id, &session_hash, ctx.now)? => {
+            return Err(ApiError::forbidden(format!(
+                "to link an account, sign out and sign in again, then link it within {} minutes",
+                sso::FRESH_MINUTES
+            )));
+        }
         None if !sso::active(ctx.cfg, &sso::load(ctx.db)?) => {
             return Err(ApiError::bad_request("single sign-on isn't set up for this workspace"));
         }
@@ -486,13 +493,14 @@ fn unlink_sso(ctx: &mut Ctx, input: IdentityIdInput) -> ApiResult<Done> {
     if user_id != ctx.actor.user_id {
         ctx.actor.require_admin()?;
     } else {
-        // Someone who signed up with Google has no password: their last link is their only way in.
-        let others = ctx.db.scalar_i64(
-            "SELECT (SELECT COUNT(*) FROM sso_identities WHERE user_id = ? AND id != ?)
-                  + (SELECT COUNT(*) FROM users WHERE id = ? AND password_hash IS NOT NULL)",
-            &params![user_id.clone(), input.id.clone(), user_id.clone()],
-        )?;
-        if others == 0 {
+        // Someone who signed up with Google has no password: their last link that can still sign
+        // in is their only way in.
+        let password =
+            ctx.db.scalar_i64("SELECT COUNT(*) FROM users WHERE id = ? AND password_hash IS NOT NULL", &params![user_id.clone()])? > 0;
+        let others =
+            ctx.db.query("SELECT issuer FROM sso_identities WHERE user_id = ? AND id != ?", &params![user_id.clone(), input.id.clone()])?;
+        let usable = sso::usable_issuers(ctx.db, ctx.cfg)?;
+        if !password && !others.iter().any(|r| usable(&r.str("issuer"))) {
             return Err(ApiError::conflict("this is your only way to sign in: set a password under Settings › Profile first"));
         }
     }

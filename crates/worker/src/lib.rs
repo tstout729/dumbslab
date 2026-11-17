@@ -123,6 +123,13 @@ async fn route(req: Request, env: Env, url: &Url) -> Result<Response> {
             if let Some(limited) = rate_limited(&req, &env).await? {
                 return Ok(limited);
             }
+            // Anyone can start signing in, and each start is a request to a provider and a record
+            // in the workspace: far fewer of those than other requests.
+            if path == dumbslab_core::sso::START_PATH
+                && let Some(limited) = rate_limited_by(&req, &env, "SSO_START_LIMITER").await?
+            {
+                return Ok(limited);
+            }
             forward(&env, &format!("ws:{slug}"), req, Some(&slug)).await
         }
         _ => error_response(404, "no_workspace", &format!("There's no workspace at this address. Create one at https://{root}/")),
@@ -161,7 +168,12 @@ async fn asset(env: &Env, req: Request, url: &Url) -> Result<Response> {
 /// Refuses a request once its client network has sent too many this minute. Each request that
 /// gets through costs a Durable Object request, and writes cost more; the plans meter those.
 async fn rate_limited(req: &Request, env: &Env) -> Result<Option<Response>> {
-    let Ok(limiter) = env.rate_limiter("REQUEST_LIMITER") else {
+    rate_limited_by(req, env, "REQUEST_LIMITER").await
+}
+
+/// [`rate_limited`] with the limiter bound as `binding`.
+async fn rate_limited_by(req: &Request, env: &Env, binding: &str) -> Result<Option<Response>> {
+    let Ok(limiter) = env.rate_limiter(binding) else {
         return Ok(None);
     };
     let Some(ip) = req.headers().get("cf-connecting-ip")? else {

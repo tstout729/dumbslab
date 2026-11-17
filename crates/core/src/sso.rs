@@ -127,19 +127,31 @@ pub struct PersonalOption {
 }
 
 /// Who may sign in here with their own Google or Microsoft account: everyone, through the host's
-/// apps, unless the workspace set up single sign-on. Then that's the only provider (besides
-/// passwords), so its organization rules (allowed domains, one directory, "Require single
-/// sign-on") always apply.
+/// apps, unless the workspace ever configured its own single sign-on. Then that's the only provider
+/// (besides passwords), so its organization's rules (allowed domains, one directory, "Require
+/// single sign-on", and the provider's own app assignment and MFA) always apply, also while it's
+/// turned off or broken (an unreadable secret, a host that lost its app): that must not open a
+/// way around the organization.
 pub fn personal_providers(db: &dyn Db, cfg: &HostConfig) -> ApiResult<Vec<Provider>> {
-    if active(cfg, &load(db)?) {
+    if configured(&load(db)?) {
         return Ok(vec![]);
     }
     Ok(signup_providers(cfg))
 }
 
+/// The workspace configured its own single sign-on (whether or not it works now).
+pub fn configured(conf: &Config) -> bool {
+    conf.provider.is_some()
+}
+
 /// The providers the first admin may create a workspace with: the host's apps for [`PERSONAL`].
 pub fn signup_providers(cfg: &HostConfig) -> Vec<Provider> {
-    PERSONAL.into_iter().filter(|p| cfg.sso_apps.get(*p).is_some()).collect()
+    signup_providers_of(&cfg.sso_apps)
+}
+
+/// [`signup_providers`] for a host's apps, before it has a workspace's configuration.
+pub fn signup_providers_of(apps: &SharedApps) -> Vec<Provider> {
+    PERSONAL.into_iter().filter(|p| apps.get(*p).is_some()).collect()
 }
 
 pub fn personal_options(db: &dyn Db, cfg: &HostConfig, base_url: &str) -> ApiResult<Vec<PersonalOption>> {
@@ -160,6 +172,29 @@ pub fn provider_of_issuer(issuer: &str) -> Option<Provider> {
     } else {
         None
     }
+}
+
+/// How recently a session must have signed in to add a lasting way in: link an account, or set a
+/// first password.
+pub const FRESH_MINUTES: i64 = 15;
+
+/// Whether the session hashing to `session_hash` is `user_id`'s and signed in within [`FRESH_MINUTES`].
+pub fn fresh_session(db: &dyn Db, user_id: &str, session_hash: &str, now: DateTime<Utc>) -> ApiResult<bool> {
+    Ok(db.scalar_i64(
+        "SELECT COUNT(*) FROM sessions WHERE token_hash = ? AND user_id = ? AND created_at >= ?",
+        &params![session_hash, user_id, ts(now - Duration::minutes(FRESH_MINUTES))],
+    )? > 0)
+}
+
+/// Which issuers' linked accounts can sign in here now: the workspace's single sign-on while it
+/// works, and Google's and Microsoft's while people sign in with their own accounts.
+pub fn usable_issuers(db: &dyn Db, cfg: &HostConfig) -> ApiResult<impl Fn(&str) -> bool + use<>> {
+    let conf = load(db)?;
+    let org = active(cfg, &conf).then(|| conf.issuer.clone());
+    let personal = personal_providers(db, cfg)?;
+    Ok(move |issuer: &str| {
+        org.as_deref() == Some(issuer) || provider_of_issuer(issuer).is_some_and(|p| PERSONAL.contains(&p) && personal.contains(&p))
+    })
 }
 
 /// The provider a `?with=` names, if it's one people sign in with on their own.
@@ -1355,14 +1390,11 @@ fn to_login_with(base_url: &str, problem: Problem, next: &str, with: Option<Prov
 }
 
 /// Back to the setup page after creating the workspace with Google or Microsoft didn't work, with
-/// what it had, so the person can try again (or set up with a password).
+/// the workspace's name, so the person can try again (or set up with a password).
 fn to_setup(base_url: &str, problem: Problem, flow: &SignUpFlow, with: Option<Provider>) -> Response {
-    let mut url = format!(
-        "{base_url}/setup?token={}&name={}&sso_error={}",
-        urlencoding::encode(&flow.token),
-        urlencoding::encode(&flow.workspace_name),
-        problem.code()
-    );
+    // Never the sign-up link's token: whoever ends up here (a browser that didn't start the
+    // sign-up, say) mustn't get it. The setup page kept it in the browser that did.
+    let mut url = format!("{base_url}/setup?name={}&sso_error={}", urlencoding::encode(&flow.workspace_name), problem.code());
     if let Some(p) = with {
         url.push_str(&format!("&with={}", p.as_str()));
     }

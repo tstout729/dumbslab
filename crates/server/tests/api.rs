@@ -5361,11 +5361,8 @@ mod sso {
         let r = h.call("GET", "/sso/start?signup&with=google&token=WRONG&name=Acme%20Co", None, &Auth::None);
         let back = land(&r, None).location;
         assert_eq!(setup_error(&back), "expired");
-        assert_eq!(
-            (query_of(&back)["token"].as_str(), query_of(&back)["name"].as_str()),
-            ("WRONG", "Acme Co"),
-            "the page keeps what it had"
-        );
+        assert_eq!(query_of(&back)["name"], "Acme Co", "the page keeps the workspace's name");
+        assert!(!query_of(&back).contains_key("token"), "never the token: {back}");
 
         let path = "/sso/start?signup&with=google&token=SETUP&name=Acme%20Co";
         let unverified = start_at(&h, path, discovery(GOOGLE));
@@ -5414,17 +5411,45 @@ mod sso {
     }
 
     #[test]
-    fn no_first_password_once_the_workspace_has_its_own_single_sign_on() {
+    fn once_the_workspace_configures_single_sign_on_its_rules_hold() {
         let mut h = H::new();
         h.cfg.sso_apps = shared_apps();
         h.cfg.connectors.key = Some("connector-key".into());
         let s = start_at(&h, "/sso/start?signup&with=google&token=SETUP&name=Acme", discovery(GOOGLE));
         let ada = come_back(&h, &s, google("g-ada", "ada@acme.test", json!({})), &tokens).0.session().expect("signed up");
-        // The organization's provider now decides who's in: a password of her own would outlast it.
         okta(&h, &ada, json!({}));
-        let r = h.call("POST", "/api/v1/me/password", Some(json!({ "new_password": "a-new-password" })), &ada);
+        // People Okta signs in, without a password, can't make one that outlasts Okta removing them.
+        let (mo_id, _) = h.user(&ada, "mo@acme.test", "Mo", "member");
+        h.store
+            .with_tx(|db| (db.execute("UPDATE users SET password_hash = NULL WHERE id = ?", &dumbslab_core::params![mo_id.clone()]), true))
+            .unwrap()
+            .unwrap();
+        let mo =
+            sign_in_with(&h, OKTA, claims(OKTA, "okta-mo", "mo@acme.test", json!({ "email_verified": true }))).session().expect("Okta");
+        let r = h.call("POST", "/api/v1/me/password", Some(json!({ "new_password": "a-new-password" })), &mo);
         assert_eq!(r.status, 403, "{}", r.body);
-        assert!(!h.ok("GET", "/api/v1/auth/state", None, &ada)["has_password"].as_bool().unwrap());
+        // The admin who signed up with Google keeps a way in should Okta fail.
+        assert_eq!(h.call("POST", "/api/v1/me/password", Some(json!({ "new_password": "a-new-password" })), &ada).status, 200);
+        // Turned off, it still keeps Continue with Google away: that would go around the organization.
+        let r = h.call("PATCH", "/api/v1/sso", Some(json!({ "enabled": false })), &ada);
+        assert_eq!(r.status, 200, "{}", r.body);
+        drive(&h, job_of(&r), &|_| ok(discovery(OKTA)));
+        assert_eq!(h.ok("GET", "/api/v1/auth/state", None, &Auth::None)["sign_in_with"], json!([]));
+        let r = h.call("GET", "/sso/start?with=google", None, &Auth::None);
+        assert!(r.effects.is_empty() && land(&r, None).location.contains("sso_error=not_configured"));
+        let r = h.call("POST", "/api/v1/me/password", Some(json!({ "new_password": "x-new-password" })), &mo);
+        assert_eq!(r.status, 403, "{}", r.body);
+    }
+
+    #[test]
+    fn linking_your_own_account_needs_a_fresh_sign_in() {
+        let (h, admin) = shared_workspace();
+        h.user(&admin, "zed@acme.test", "Zed", "member");
+        let stale = sign_in_session_aged(&h, &sign_in(&h, "zed@acme.test", "password123"), 20);
+        let r = h.call("POST", "/api/v1/me/sso", Some(json!({ "provider": "google" })), &stale);
+        assert_eq!(r.status, 403, "a stolen session can't add a lasting way in: {}", r.body);
+        let fresh = sign_in(&h, "zed@acme.test", "password123");
+        assert_eq!(h.call("POST", "/api/v1/me/sso", Some(json!({ "provider": "google" })), &fresh).status, 200);
     }
 
     /// A Google sign-in of the person with session `auth` made `minutes` ago.

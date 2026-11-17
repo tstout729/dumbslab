@@ -57,6 +57,13 @@ name = "REQUEST_LIMITER"
 namespace_id = "20261030"
 simple = { limit = 1200, period = 60 }
 
+# Starting a sign-in with Google, Microsoft or a workspace's single sign-on, per client network
+# per minute: each one asks the provider and records the sign-in in the workspace.
+[[ratelimits]]
+name = "SSO_START_LIMITER"
+namespace_id = "20261116"
+simple = { limit = 20, period = 60 }
+
 [vars]
 MULTI_TENANT = "true"
 ROOT_DOMAIN = "dumbslab.com"
@@ -136,6 +143,11 @@ class_name = "Directory"
 name = "REQUEST_LIMITER"
 namespace_id = "20261030"
 simple = { limit = 1200, period = 60 }
+
+[[env.dev.ratelimits]]
+name = "SSO_START_LIMITER"
+namespace_id = "20261116"
+simple = { limit = 20, period = 60 }
 
 [env.dev.vars]
 MULTI_TENANT = "true"

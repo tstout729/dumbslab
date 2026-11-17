@@ -6,13 +6,16 @@ People can sign in with your organization's identity provider instead of a passw
 
 Without any setup, the sign-in page offers **Continue with Google** and **Continue with Microsoft**, on hosted DumbSlab and on any server that has DumbSlab's (or its own) Google and Microsoft sign-in apps (below). Anyone can use them, with a personal Google account or a work one:
 
-- **Signing up.** On a new workspace's setup page, the first admin can create their account with Google or Microsoft instead of a password. Their name and email come from the provider, which must have confirmed the address. They have no password until they set one in Settings › Profile, within 15 minutes of signing in (after that, sign out and in again first, so a stolen session can't add one).
+- **Signing up.** On a new workspace's setup page, the first admin can create their account with Google or Microsoft instead of a password. Their name and email come from the provider, which must have confirmed the address. They have no password until they set one in Settings › Profile, within 15 minutes of signing in (after that, sign out and in again first, so a stolen session can't add one). The sign-up link's token stays in that browser; it's never put back in a URL.
 - **Signing in.** It finds only people already in the workspace. The first time, it matches you by email only when the provider is the authority on that address: Google for Gmail addresses and for a Google Workspace domain's, Microsoft for a domain its directory verified (`xms_edov`). For any other address on a Google account, Google confirmed it once, but it may have changed hands since, so link that account first: sign in with your password, then **Link your Google account** in Settings › Profile. After the first time, the link finds you whatever the account's address.
 - **Nobody joins this way.** An admin adds people (Settings › People) with their email address; they then sign in with Google or Microsoft, or with the password the admin set.
 - Microsoft accounts must be work or school accounts. Personal Microsoft accounts (Outlook.com, Hotmail) aren't served by DumbSlab's Microsoft app.
+- Linking an account, like setting a first password, works only within 15 minutes of signing in: a link is a lasting way in, so a stolen session can't add one.
 - Your last way to sign in can't be unlinked: set a password first.
 
-Once a workspace sets up its own single sign-on (below), those buttons go: everyone signs in through the organization's provider, under its rules.
+Once a workspace configures its own single sign-on (below), those buttons go for good, even while it's turned off or not working: everyone signs in through the organization's provider, under its rules (including its own MFA and app assignment). People that provider signs in without a password can't make one; admins can, as their way in should the provider fail.
+
+On hosted DumbSlab, starting a sign-in is limited to 20 a minute from one network, and sign-ins don't count against a workspace's write allowance.
 
 Hosted DumbSlab signs everyone in through one redirect URI, `https://dumbslab.com/sso/callback`. A self-hosted server uses its own `/sso/callback` with the apps it's given (`DUMBSLAB_SSO_GOOGLE_CLIENT_ID` and `DUMBSLAB_SSO_GOOGLE_CLIENT_SECRET`, `DUMBSLAB_SSO_MICROSOFT_CLIENT_ID` and `DUMBSLAB_SSO_MICROSOFT_CLIENT_SECRET`); without them, the buttons don't show.
 
