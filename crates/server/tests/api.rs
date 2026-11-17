@@ -1539,7 +1539,7 @@ fn sign_in_limits_cover_every_email() {
     // A failure counts against the email, the client's address and the whole workspace.
     assert_eq!(login(&h, "first@acme.test", "203.0.113.7", "https://kb.test").status, 401);
     assert_eq!(count(&h, "SELECT COUNT(*) FROM login_attempts"), 3, "only the email is throttled");
-    // An address with a control character is nobody's: it's refused without a lookup or a count.
+    // An address with a NUL is nobody's: it's refused without a lookup or a count.
     assert_eq!(login(&h, "ada@acme.test\0x", "203.0.113.7", "https://kb.test").status, 401);
     assert_eq!(count(&h, "SELECT COUNT(*) FROM login_attempts"), 3);
     assert_eq!(count(&h, "SELECT failures FROM login_attempts WHERE key = 'workspace'"), 1);

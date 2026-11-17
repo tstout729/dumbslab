@@ -462,9 +462,10 @@ fn login(db: &dyn Db, cfg: &HostConfig, req: &Request) -> Outcome {
     if input.email.len() > 254 || input.password.len() > 256 {
         return failed(&ApiError::bad_request("email or password is too long"));
     }
-    // No address has control characters. Refused here because the database compares emails only up
-    // to a NUL, so spellings that differ after one would reach one account under many limits.
-    if input.email.trim().chars().any(char::is_control) {
+    // The database compares emails only up to a NUL, so spellings that differ after one would
+    // reach one account under many limits. No address has one (new accounts can't; see
+    // `is_valid_email`), so it's refused before any lookup.
+    if input.email.contains('\0') {
         return failed(&ApiError::unauthorized("email or password is incorrect"));
     }
     let keys = auth::password_keys(&input.email, req.client_ip.as_deref());
