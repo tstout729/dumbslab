@@ -2,18 +2,24 @@
 //! address moves, usage reports and the free plan's capacity, Stripe customers, and the
 //! operator's list. Only the front Worker and workspace objects call it.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 
 use chrono::Utc;
 use dumbslab_core::backup::{self, Kind, Lock};
-use dumbslab_core::tenancy::{self, Limits};
+use dumbslab_core::tenancy::{self, Limits, Load};
 use dumbslab_core::{ApiError, ApiResult};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use worker::*;
 
 use crate::billing::free_budget;
-use crate::sql::{DoDb, api_error_response, json_response, read_body, transaction, var_i64};
+use crate::reporting::{self, Destination};
+use crate::sql::{DoDb, api_error_response, json_response, read_body, transaction, var, var_i64};
+
+/// How long a measured [`Load`] answers usage reports. Measuring reads every workspace's usage
+/// row, so measuring on every report would cost more with each workspace that signs up.
+const LOAD_TTL_SECS: i64 = 60;
 
 #[durable_object]
 pub struct Directory {
@@ -22,6 +28,10 @@ pub struct Directory {
     migrated: Cell<bool>,
     /// Whether it's frozen for a copy or being restored (see `backup::lock`), once read.
     lock: Cell<Option<Lock>>,
+    /// The last [`Load`] measured and when (Unix seconds).
+    load: Cell<Option<(i64, Load)>>,
+    /// The warning level each limit was last at, so the operator hears once per level crossed.
+    warned: RefCell<HashMap<&'static str, u8>>,
 }
 
 #[derive(Deserialize)]
@@ -109,6 +119,37 @@ impl Directory {
         }
     }
 
+    /// The last measured load while it's under a minute old.
+    fn recent_load(&self, now: i64) -> Option<Load> {
+        self.load.get().filter(|(at, _)| now - at < LOAD_TTL_SECS).map(|(_, load)| load)
+    }
+
+    /// Keeps a fresh measurement and tells the operator (through Sentry) about each limit that
+    /// reached a higher warning level than it was at. A limit that falls back can warn again.
+    fn measured(&self, now: i64, load: Load, limits: &Limits) {
+        self.load.set(Some((now, load)));
+        let found = tenancy::warnings(&load, limits);
+        let new: Vec<_> = {
+            let mut warned = self.warned.borrow_mut();
+            let new = found.iter().filter(|w| warned.get(w.limit).is_none_or(|&level| w.percent > level)).cloned().collect();
+            *warned = found.iter().map(|w| (w.limit, w.percent)).collect();
+            new
+        };
+        if new.is_empty() {
+            return;
+        }
+        for w in &new {
+            console_warn!("{}", w.message());
+        }
+        let Some(destination) = var(&self.env, "SENTRY_DSN").and_then(|dsn| Destination::parse(&dsn)) else { return };
+        self.state.wait_until(async move {
+            for w in new {
+                // Never log transport errors: they can contain the DSN.
+                let _ = reporting::send_warning(&destination, &w).await;
+            }
+        });
+    }
+
     /// Runs one directory change in a transaction; errors roll back.
     fn run<T: 'static>(&self, f: impl FnOnce(&dyn dumbslab_core::Db) -> ApiResult<T> + 'static) -> Result<ApiResult<T>> {
         let storage = self.state.storage();
@@ -141,7 +182,7 @@ fn parse<T: for<'de> Deserialize<'de>>(body: &[u8]) -> ApiResult<T> {
 
 impl DurableObject for Directory {
     fn new(state: State, env: Env) -> Self {
-        Self { state, env, migrated: Cell::new(false), lock: Cell::new(None) }
+        Self { state, env, migrated: Cell::new(false), lock: Cell::new(None), load: Cell::new(None), warned: RefCell::new(HashMap::new()) }
     }
 
     async fn fetch(&self, mut req: Request) -> Result<Response> {
@@ -235,28 +276,45 @@ impl DurableObject for Directory {
                 })?
             }
             (Method::Get, "/list") => {
-                let budget = limits.free;
-                self.run(move |db| {
-                    let used = tenancy::free_usage(db, Utc::now())?;
-                    let free = json!({
-                        "writes_24h": used.writes_24h,
-                        "writes_per_day": budget.writes_per_day,
-                        "storage_bytes": used.storage_bytes,
-                        "storage_budget_bytes": budget.storage_bytes,
-                    });
-                    tenancy::list(db).map(|items| json!({ "items": items, "free_plan": free }))
-                })?
+                let now = Utc::now();
+                self.run(move |db| Ok((tenancy::load(db, now)?, tenancy::list(db)?)))?.map(|(load, items)| {
+                    self.measured(now.timestamp(), load, &limits);
+                    let (writes_per_day, storage_budget_bytes) = limits.free.allowed(load.free.paying_pro);
+                    json!({
+                        "items": items,
+                        "free_plan": {
+                            "writes_24h": load.free.writes_24h,
+                            "writes_per_day": writes_per_day,
+                            "storage_bytes": load.free.storage_bytes,
+                            "storage_budget_bytes": storage_budget_bytes,
+                            "paying_pro": load.free.paying_pro,
+                        },
+                        "workspaces": { "count": load.workspaces, "max": limits.max_workspaces },
+                        "signups_24h": { "count": load.signups_24h, "max": limits.per_day },
+                        "warnings": tenancy::warnings(&load, &limits),
+                    })
+                })
             }
             // A workspace's usage report. The answer tells it whether the free plan is at capacity.
+            // It answers from a load measured in the last minute, or measures one.
             (Method::Post, "/usage") => {
                 let input: ApiResult<UsageInput> = parse(&body);
-                self.run(move |db| {
+                let now = Utc::now();
+                let recent = self.recent_load(now.timestamp());
+                let reported = self.run(move |db| {
                     let input = input?;
-                    let now = Utc::now();
                     tenancy::report_usage(db, &input.home, &input.plan, input.writes_24h, input.storage_bytes, now)?;
-                    let capacity = tenancy::free_capacity(db, now, limits.free)?;
-                    serde_json::to_value(capacity).map_err(|e| ApiError::internal(e.to_string()))
-                })?
+                    match recent {
+                        Some(load) => Ok((load, false)),
+                        None => Ok((tenancy::load(db, now)?, true)),
+                    }
+                })?;
+                reported.and_then(|(load, fresh)| {
+                    if fresh {
+                        self.measured(now.timestamp(), load, &limits);
+                    }
+                    serde_json::to_value(tenancy::capacity_of(&load.free, limits.free)).map_err(|e| ApiError::internal(e.to_string()))
+                })
             }
             // A workspace connected (or stopped using) an installation of DumbSlab's GitHub App.
             (Method::Post, "/github/link") => {

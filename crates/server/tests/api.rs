@@ -941,7 +941,8 @@ fn signed_signup_links_set_up_hosted_workspaces() {
 }
 
 /// A free-plan budget no test reaches.
-const ROOMY: dumbslab_core::tenancy::FreeBudget = dumbslab_core::tenancy::FreeBudget { writes_per_day: u64::MAX, storage_bytes: u64::MAX };
+const ROOMY: dumbslab_core::tenancy::FreeBudget =
+    dumbslab_core::tenancy::FreeBudget { writes_per_day: u64::MAX, storage_bytes: u64::MAX, writes_per_pro: 0, storage_per_pro: 0 };
 
 #[test]
 fn the_operator_resets_a_locked_out_password() {
@@ -2572,11 +2573,57 @@ fn pro_is_not_for_sale_without_stripe() {
 }
 
 #[test]
+fn free_budget_grows_with_pro_and_limits_warn() {
+    use chrono::{Duration, Utc};
+    use dumbslab_core::tenancy::{self, FreeBudget, FreeUsage, Limits, Load};
+    let h = H::new();
+    let budget = FreeBudget { writes_per_day: 1_000, storage_bytes: 10_000, writes_per_pro: 500, storage_per_pro: 5_000 };
+    let limits = Limits { per_ip_per_day: 50, per_day: 4, max_workspaces: 10, free: budget };
+    let t0 = Utc::now();
+    db_run(&h, tenancy::directory_migrate);
+    for slug in ["acme", "beta"] {
+        db_run(&h, |db| tenancy::reserve(db, slug, "Name", slug, t0, limits).map(|_| ()));
+        db_run(&h, |db| tenancy::activate(db, slug, t0));
+    }
+    db_run(&h, |db| tenancy::report_usage(db, "acme", "free", 1_200, 12_000, t0));
+    let load = db_run(&h, |db| tenancy::load(db, t0));
+    let free = FreeUsage { writes_24h: 1_200, storage_bytes: 12_000, paying_pro: 0 };
+    assert_eq!(load, Load { free, workspaces: 2, signups_24h: 2 });
+    let full = tenancy::capacity_of(&load.free, budget);
+    assert!(full.writes_paused && full.growth_paused);
+    let levels = |load: &Load, limits: &Limits| tenancy::warnings(load, limits).iter().map(|w| (w.limit, w.percent)).collect::<Vec<_>>();
+    assert_eq!(levels(&load, &limits), [("free_writes", 100), ("free_storage", 100), ("signups", 50)]);
+    assert!(tenancy::warnings(&load, &limits).iter().all(|w| !w.message().is_empty()));
+
+    // Each workspace with an active Pro subscription adds its share, once however many it has.
+    for (customer, subscription) in [("cus_1", "sub_1"), ("cus_2", "sub_2")] {
+        db_run(&h, |db| tenancy::link_customer(db, customer, "beta", t0));
+        db_run(&h, |db| tenancy::record_subscription(db, customer, subscription, "active", t0));
+    }
+    let load = db_run(&h, |db| tenancy::load(db, t0));
+    assert_eq!(load.free.paying_pro, 1);
+    assert_eq!(budget.allowed(1), (1_500, 15_000));
+    assert_eq!(tenancy::capacity_of(&load.free, budget), Default::default());
+    assert_eq!(levels(&load, &limits), [("free_writes", 75), ("free_storage", 75), ("signups", 50)]);
+    for (customer, subscription) in [("cus_1", "sub_1"), ("cus_2", "sub_2")] {
+        db_run(&h, |db| tenancy::record_subscription(db, customer, subscription, "canceled", t0));
+    }
+    assert_eq!(db_run(&h, |db| tenancy::load(db, t0)).free.paying_pro, 0);
+
+    // A day on, the sign-ups stop counting toward the day's and the workspaces still count.
+    let later = db_run(&h, |db| tenancy::load(db, t0 + Duration::hours(25)));
+    assert_eq!((later.workspaces, later.signups_24h), (2, 0));
+    // A limit set to 0 isn't checked.
+    let off = Limits { per_day: 0, max_workspaces: 0, ..limits };
+    assert!(levels(&Load { workspaces: 9, signups_24h: 9, ..Default::default() }, &off).is_empty());
+}
+
+#[test]
 fn directory_budgets_the_free_plan() {
     use chrono::{Duration, Utc};
     use dumbslab_core::tenancy::{self, FreeBudget, Limits};
     let h = H::new();
-    let budget = FreeBudget { writes_per_day: 1_000, storage_bytes: 10_000 };
+    let budget = FreeBudget { writes_per_day: 1_000, storage_bytes: 10_000, writes_per_pro: 0, storage_per_pro: 0 };
     let limits = Limits { per_ip_per_day: 50, per_day: 50, max_workspaces: 50, free: budget };
     let t0 = Utc::now();
     db_run(&h, tenancy::directory_migrate);

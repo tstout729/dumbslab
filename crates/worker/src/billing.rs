@@ -34,11 +34,13 @@ pub fn plans(env: &Env) -> Plans {
     }
 }
 
-/// What all free workspaces together may use.
+/// What all free workspaces together may use, plus what each paying Pro workspace adds.
 pub fn free_budget(env: &Env) -> FreeBudget {
     FreeBudget {
         writes_per_day: positive(env, "FREE_TOTAL_WRITES_PER_DAY", 1_000_000),
         storage_bytes: positive(env, "FREE_TOTAL_STORAGE_MB", 4096) * MB,
+        writes_per_pro: var_i64(env, "FREE_WRITES_PER_PRO_PER_DAY", 0).max(0) as u64,
+        storage_per_pro: var_i64(env, "FREE_STORAGE_MB_PER_PRO", 0).max(0) as u64 * MB,
     }
 }
 

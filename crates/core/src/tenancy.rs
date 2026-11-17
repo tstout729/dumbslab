@@ -321,11 +321,26 @@ pub struct Limits {
 }
 
 /// The free plan's share of the hosting bill: rows all free workspaces may write in 24 hours and
-/// what they may store, together. Keep both inside what the hosting plan includes.
+/// what they may store, together. Each paying Pro workspace adds its share on top, so the free
+/// plan grows with the revenue that pays for it.
 #[derive(Debug, Clone, Copy)]
 pub struct FreeBudget {
     pub writes_per_day: u64,
     pub storage_bytes: u64,
+    /// What each workspace with an active Pro subscription adds to `writes_per_day`.
+    pub writes_per_pro: u64,
+    /// What each workspace with an active Pro subscription adds to `storage_bytes`.
+    pub storage_per_pro: u64,
+}
+
+impl FreeBudget {
+    /// Rows a day and bytes all free workspaces may use while `paying_pro` workspaces pay for Pro.
+    pub fn allowed(&self, paying_pro: u64) -> (u64, u64) {
+        (
+            self.writes_per_day.saturating_add(self.writes_per_pro.saturating_mul(paying_pro)),
+            self.storage_bytes.saturating_add(self.storage_per_pro.saturating_mul(paying_pro)),
+        )
+    }
 }
 
 /// Reserves an address for a new workspace. Returns the reservation's expiry.
@@ -798,23 +813,107 @@ pub fn report_usage(db: &dyn Db, home: &str, plan: &str, writes_24h: u64, storag
 
 /// What all free workspaces used, by their latest reports: rows written in 24 hours (reports
 /// older than a day don't count) and storage.
-#[derive(Debug, Clone, Copy, Serialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct FreeUsage {
     pub writes_24h: u64,
     pub storage_bytes: u64,
+    /// Workspaces with an active Pro subscription; each adds its share to the free plan's budget.
+    pub paying_pro: u64,
 }
 
+/// Adds up every free workspace's latest report, so it reads the whole usage table: the
+/// directory measures it at most once a minute (see [`load`]), not on every report.
 pub fn free_usage(db: &dyn Db, now: DateTime<Utc>) -> ApiResult<FreeUsage> {
     let day_ago = ts(now - Duration::days(1));
     let writes =
         db.scalar_i64("SELECT COALESCE(SUM(writes_24h), 0) FROM usage WHERE plan = 'free' AND reported_at > ?", &params![day_ago])?;
     let storage = db.scalar_i64("SELECT COALESCE(SUM(storage_bytes), 0) FROM usage WHERE plan = 'free'", &[])?;
-    Ok(FreeUsage { writes_24h: writes.max(0) as u64, storage_bytes: storage.max(0) as u64 })
+    let paying_pro = db.scalar_i64("SELECT COUNT(DISTINCT home) FROM billing WHERE detached = 0 AND status = 'active'", &[])?;
+    Ok(FreeUsage { writes_24h: writes.max(0) as u64, storage_bytes: storage.max(0) as u64, paying_pro: paying_pro.max(0) as u64 })
 }
 
 pub fn free_capacity(db: &dyn Db, now: DateTime<Utc>, budget: FreeBudget) -> ApiResult<Capacity> {
-    let used = free_usage(db, now)?;
-    Ok(Capacity { writes_paused: used.writes_24h >= budget.writes_per_day, growth_paused: used.storage_bytes >= budget.storage_bytes })
+    Ok(capacity_of(&free_usage(db, now)?, budget))
+}
+
+/// Whether the free plan is at capacity, given what it uses.
+pub fn capacity_of(used: &FreeUsage, budget: FreeBudget) -> Capacity {
+    let (writes, storage) = budget.allowed(used.paying_pro);
+    Capacity { writes_paused: used.writes_24h >= writes, growth_paused: used.storage_bytes >= storage }
+}
+
+/// What the hosted service uses of its limits, measured at once.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct Load {
+    pub free: FreeUsage,
+    /// Workspaces counted against `MAX_WORKSPACES`: every one but lapsed reservations.
+    pub workspaces: u64,
+    /// Workspaces created in the last 24 hours, counted against `SIGNUPS_PER_DAY`.
+    pub signups_24h: u64,
+}
+
+pub fn load(db: &dyn Db, now: DateTime<Utc>) -> ApiResult<Load> {
+    let now_s = ts(now);
+    let workspaces =
+        db.scalar_i64("SELECT COUNT(*) FROM workspaces WHERE status != 'reserved' OR reserved_until > ?", &params![now_s.clone()])?;
+    let signups = db.scalar_i64(
+        "SELECT COUNT(*) FROM workspaces WHERE created_at > ? AND (status != 'reserved' OR reserved_until > ?)",
+        &params![ts(now - Duration::days(1)), now_s],
+    )?;
+    Ok(Load { free: free_usage(db, now)?, workspaces: workspaces.max(0) as u64, signups_24h: signups.max(0) as u64 })
+}
+
+/// The shares of a limit that warn the operator. At 100 the limit is reached.
+pub const WARN_AT: [u8; 4] = [50, 75, 90, 100];
+
+/// A hosted limit that has reached one of [`WARN_AT`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Warning {
+    /// `free_writes`, `free_storage`, `workspaces` or `signups`.
+    pub limit: &'static str,
+    /// The highest of [`WARN_AT`] reached.
+    pub percent: u8,
+    pub used: u64,
+    pub allowed: u64,
+}
+
+impl Warning {
+    /// What it means, in a sentence. It never names a workspace or a person.
+    pub fn message(&self) -> String {
+        let p = self.percent;
+        match (self.limit, p >= 100) {
+            ("free_writes", false) => format!("Free plan: rows written in 24 hours are at {p}% of the shared cap"),
+            ("free_writes", true) => "Free plan: the shared write cap is reached, so free workspaces can't save changes".into(),
+            ("free_storage", false) => format!("Free plan: storage is at {p}% of the shared cap"),
+            ("free_storage", true) => {
+                "Free plan: the shared storage cap is reached, so free workspaces can't grow and sign-ups pause".into()
+            }
+            ("workspaces", false) => format!("Workspaces are at {p}% of MAX_WORKSPACES"),
+            ("workspaces", true) => "MAX_WORKSPACES is reached, so sign-ups pause".into(),
+            ("signups", false) => format!("Sign-ups in 24 hours are at {p}% of SIGNUPS_PER_DAY"),
+            _ => "SIGNUPS_PER_DAY is reached, so sign-ups pause until tomorrow".into(),
+        }
+    }
+}
+
+/// Each limit that has reached one of [`WARN_AT`], at the highest share it has reached. A limit
+/// set to 0 isn't checked.
+pub fn warnings(load: &Load, limits: &Limits) -> Vec<Warning> {
+    let (writes, storage) = limits.free.allowed(load.free.paying_pro);
+    [
+        ("free_writes", load.free.writes_24h, writes),
+        ("free_storage", load.free.storage_bytes, storage),
+        ("workspaces", load.workspaces, limits.max_workspaces.max(0) as u64),
+        ("signups", load.signups_24h, limits.per_day.max(0) as u64),
+    ]
+    .into_iter()
+    .filter(|&(_, _, allowed)| allowed > 0)
+    .filter_map(|(limit, used, allowed)| {
+        let reached = |p: u8| u128::from(used) * 100 >= u128::from(allowed) * u128::from(p);
+        let percent = WARN_AT.into_iter().rev().find(|&p| reached(p))?;
+        Some(Warning { limit, percent, used, allowed })
+    })
+    .collect()
 }
 
 /// Checkout finished: `customer` pays for the workspace whose first address is `home`. A

@@ -70,7 +70,7 @@ ROOT_DOMAIN = "dumbslab.com"
 # Sign-up limits that keep a free deployment free. dumbslab.com's are sized for launch traffic.
 SIGNUPS_PER_IP_PER_DAY = "5"
 SIGNUPS_PER_DAY = "2000"
-MAX_WORKSPACES = "5000"
+MAX_WORKSPACES = "20000"
 # Plans. Every feature is on both; they differ in storage and in database rows written per 24
 # hours. Past either, changes stop; reading and signing in keep working.
 FREE_STORAGE_MB = "50"
@@ -79,9 +79,13 @@ PRO_STORAGE_MB = "5120"
 PRO_WRITES_PER_DAY = "200000"
 # What all free workspaces together may use; sign-ups and free writes pause past them. Workers
 # Paid includes 50 million rows written a month and 5 GB stored. dumbslab.com allows more: at
-# both caps for a whole month, about 90 million rows and 20 GB, roughly $45 past what's included.
+# both caps for a whole month, about 90 million rows and 100 GB, roughly $60 past what's included.
 FREE_TOTAL_WRITES_PER_DAY = "3000000"
-FREE_TOTAL_STORAGE_MB = "20480"
+FREE_TOTAL_STORAGE_MB = "102400"
+# Each workspace with an active Pro subscription adds this to both totals, so the free plan grows
+# with what pays for it: at most about $1.70 a month of a Pro subscription's $8.
+FREE_WRITES_PER_PRO_PER_DAY = "50000"
+FREE_STORAGE_MB_PER_PRO = "1024"
 # Connected apps (docs/connected-apps.md): the CONNECTOR_KEY secret turns them on; `<APP>_CLIENT_ID`
 # here and the `<APP>_CLIENT_SECRET` secret let people sign in to that app, e.g. GITHUB_CLIENT_ID.
 # ATLASSIAN_CLIENT_ID covers Jira and Confluence. How to register each: docs/hosting/connected-apps.md.
@@ -163,6 +167,8 @@ PRO_STORAGE_MB = "5120"
 PRO_WRITES_PER_DAY = "200000"
 FREE_TOTAL_WRITES_PER_DAY = "1000000"
 FREE_TOTAL_STORAGE_MB = "4096"
+FREE_WRITES_PER_PRO_PER_DAY = "50000"
+FREE_STORAGE_MB_PER_PRO = "1024"
 # Put a sandbox's STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET (from `stripe listen`) and
 # STRIPE_PRICE_ID in crates/worker/.dev.vars to try Pro locally.
 PRO_PRICE_LABEL = "$8 a month"
