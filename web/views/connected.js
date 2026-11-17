@@ -2,7 +2,7 @@
 // and previews of links to them in posts. Everyone connects their own accounts.
 
 import { api, enc } from '/api.js';
-import { h, icon, button, busy, toast, toastError, confirmDialog, field, input, emptyState, timeEl, openPopover } from '/ui.js';
+import { h, icon, button, busy, toast, toastError, confirmDialog, field, input, emptyState, timeEl, openPopover, BLOCK_RECORDING } from '/ui.js';
 
 let listing = null;
 /** Link previews by URL. They depend on the person's connections, so they go when those change. */
@@ -66,7 +66,8 @@ export const KIND_LABEL = {
  * many results the apps found once they've answered (0 when nothing was searched or it failed).
  */
 export function connectedResults(q, { onSettled = () => {} } = {}) {
-  const section = h('section', { class: 'connected-results', 'aria-label': 'Results from your connected apps' });
+  // Someone's own data in other apps (their Drive's file names): an empty box in recordings.
+  const section = h('section', { class: ['connected-results', BLOCK_RECORDING], 'aria-label': 'Results from your connected apps' });
   (async () => {
     let list;
     try {
@@ -143,7 +144,7 @@ function previewCard(p, appName) {
     p.author ? ['Created by', p.author] : null,
     ...(p.details || []).map((d) => [d.label, d.value]),
   ].filter(Boolean);
-  return h('div', { class: 'link-preview' },
+  return h('div', { class: ['link-preview', BLOCK_RECORDING] },
     h('p', { class: 'link-preview-ref muted small' }, [appName, p.reference].filter(Boolean).join(' · ')),
     h('p', { class: 'link-preview-title' }, external(p.url, p.title || p.reference)),
     rows.length ? h('dl', { class: 'link-preview-facts' }, rows.map(([k, v]) => [h('dt', null, k), h('dd', null, v)])) : null,
@@ -278,6 +279,8 @@ function appCard(app, rerender) {
     body.append(actions, form);
   } else if (app.sign_in) {
     body.append(actions);
+  } else if (app.awaiting_review) {
+    body.append(h('p', { class: 'muted small' }, app.awaiting_review));
   } else {
     body.append(h('p', { class: 'muted small' }, `Signing in with ${app.name} isn’t set up on this server yet.`));
   }

@@ -17,12 +17,13 @@ use crate::sql::var;
 /// `CONNECTOR_KEY` (secret) encrypts people's credentials; `<APP>_CLIENT_ID` and the secret
 /// `<APP>_CLIENT_SECRET` (e.g. `GITHUB_CLIENT_ID`, `GOOGLE_DRIVE_CLIENT_SECRET`) let people sign in
 /// to that app, and `ATLASSIAN_CLIENT_ID` with `ATLASSIAN_CLIENT_SECRET` to Jira and Confluence
-/// (see [`connect::oauth_apps`]). Hosted workspaces send sign-ins back through the root domain,
-/// which forwards them.
+/// (see [`connect::oauth_apps`]). `<APP>_TEST_WORKSPACES` keeps signing in with an app to those
+/// workspaces while its provider reviews DumbSlab's access (see [`connect::test_workspaces`]).
+/// Hosted workspaces send sign-ins back through the root domain, which forwards them.
 pub fn connectors(env: &Env, origin: &str, hosted: bool) -> Connectors {
     let apps = connect::oauth_apps(|name| var(env, name));
     let callback_url = if hosted { root_callback(env, origin, "/connect/callback") } else { None };
-    Connectors { key: var(env, "CONNECTOR_KEY"), apps, callback_url }
+    Connectors { key: var(env, "CONNECTOR_KEY"), apps, callback_url, test_workspaces: connect::test_workspaces(|name| var(env, name)) }
 }
 
 /// DumbSlab's GitHub App for docs sync: `GITHUB_APP_ID`, `GITHUB_APP_SLUG` and

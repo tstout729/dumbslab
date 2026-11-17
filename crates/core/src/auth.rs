@@ -398,7 +398,8 @@ pub fn clear_failures(db: &dyn Db, key: &str) -> ApiResult<()> {
 
 /// The operator's way back in for someone locked out of a hosted workspace, such as its only
 /// admin after forgetting the password: sets a temporary password, returned once, signs them out
-/// everywhere and clears their failed sign-ins. Bots and deactivated people are refused.
+/// everywhere, deletes their connected apps' credentials and clears their failed sign-ins. Bots
+/// and deactivated people are refused.
 pub fn operator_reset_password(db: &dyn Db, email: &str, now: DateTime<Utc>) -> ApiResult<String> {
     let email = email.trim();
     let row = db
@@ -413,7 +414,10 @@ pub fn operator_reset_password(db: &dyn Db, email: &str, now: DateTime<Utc>) -> 
         "UPDATE users SET password_hash = ?, updated_at = ? WHERE id = ?",
         &params![hash_password(&password)?, ts(now), id.clone()],
     )?;
-    db.execute("DELETE FROM sessions WHERE user_id = ?", &params![id])?;
+    db.execute("DELETE FROM sessions WHERE user_id = ?", &params![id.clone()])?;
+    // The operator sees the new password, so the person's connected apps go: see
+    // `connect::forget_person`.
+    crate::connect::forget_person(db, &id)?;
     clear_failures(db, &password_keys(email, None)[0].0)?;
     Ok(password)
 }

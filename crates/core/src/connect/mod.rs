@@ -69,6 +69,11 @@ pub struct Connectors {
     /// Where apps send people back after they sign in. Defaults to this server's
     /// `/connect/callback`; hosted DumbSlab uses the root domain's, which forwards to the workspace.
     pub callback_url: Option<String>,
+    /// Apps whose provider is still reviewing this server's OAuth app, by provider id, with the
+    /// only hosted workspaces (by address) where people may sign in with them meanwhile. Google,
+    /// for one, asks that a public app keep scopes it hasn't verified away from production
+    /// traffic. Connections made earlier keep working everywhere. See [`test_workspaces`].
+    pub test_workspaces: BTreeMap<String, Vec<String>>,
 }
 
 impl std::fmt::Debug for Connectors {
@@ -77,6 +82,7 @@ impl std::fmt::Debug for Connectors {
             .field("key", &self.key.as_ref().map(|_| "…"))
             .field("apps", &self.apps)
             .field("callback_url", &self.callback_url)
+            .field("test_workspaces", &self.test_workspaces)
             .finish()
     }
 }
@@ -718,6 +724,31 @@ pub fn remove(db: &dyn Db, user_id: &str, provider: &str) -> ApiResult<bool> {
     Ok(db.execute("DELETE FROM connections WHERE user_id = ? AND provider = ?", &params![user_id, provider])? > 0)
 }
 
+/// Deletes everything a person connected, and their sign-ins under way: when they're deactivated,
+/// or when someone else sets their password (an admin, or the operator for someone locked out),
+/// since whoever knows that password could otherwise use the person's own accounts elsewhere.
+/// They connect again themselves.
+pub fn forget_person(db: &dyn Db, user_id: &str) -> ApiResult<()> {
+    for table in ["connections", "connect_requests", "connect_attempts"] {
+        db.execute(&format!("DELETE FROM {table} WHERE user_id = ?"), &params![user_id])?;
+    }
+    Ok(())
+}
+
+/// Connected apps are the person's own: only they may list, use or change them. Their sessions,
+/// their own tokens and the AI tools they approved qualify; a token someone else made for them
+/// (an admin's, say for a bot) doesn't, nor does one whose maker isn't known.
+pub fn require_own_credential(db: &dyn Db, actor: &crate::auth::Actor) -> ApiResult<()> {
+    let Some(token_id) = &actor.token_id else { return Ok(()) };
+    let maker = db.one("SELECT created_by FROM api_tokens WHERE id = ?", &params![token_id.clone()])?.and_then(|r| r.opt_str("created_by"));
+    if maker.as_deref() == Some(actor.user_id.as_str()) {
+        return Ok(());
+    }
+    Err(ApiError::forbidden(
+        "connected apps work only with your own sign-in or a token you made yourself; this token was made for you by someone else",
+    ))
+}
+
 // ---------------------------------------------------------------------------
 // Signing in with an app (OAuth)
 
@@ -767,6 +798,45 @@ pub fn oauth_apps(var: impl Fn(&str) -> Option<String>) -> BTreeMap<String, OAut
         apps.insert(people.to_string(), app);
     }
     apps
+}
+
+/// The apps a host's settings limit to test workspaces, read with `var` by name:
+/// `<APP>_TEST_WORKSPACES`, workspace addresses separated by commas or spaces, e.g.
+/// `GOOGLE_DRIVE_TEST_WORKSPACES = "qa, review"`. Unset or empty leaves the app open to every
+/// workspace. Only hosted workspaces are limited (the Cloudflare host reads these): a self-hosted
+/// server is a single workspace, and its OAuth app is its own.
+pub fn test_workspaces(var: impl Fn(&str) -> Option<String>) -> BTreeMap<String, Vec<String>> {
+    let mut out = BTreeMap::new();
+    for c in providers::ALL {
+        let id = c.info().id;
+        let list: Vec<String> = var(&format!("{}_TEST_WORKSPACES", env_name(id)))
+            .unwrap_or_default()
+            .split([',', ' ', '\n', '\t'])
+            .map(|a| a.trim().to_ascii_lowercase())
+            .filter(|a| !a.is_empty())
+            .collect();
+        if !list.is_empty() {
+            out.insert(id.to_string(), list);
+        }
+    }
+    out
+}
+
+/// Whether signing in with `provider` waits here for the provider's review of this server's
+/// OAuth app: the host limits it to test workspaces (see [`Connectors::test_workspaces`]) and
+/// this hosted workspace isn't one, under its current address or its first.
+pub fn awaiting_review(cfg: &HostConfig, provider: &str) -> bool {
+    let Some(allowed) = cfg.connectors.test_workspaces.get(provider) else { return false };
+    let Some(address) = &cfg.workspace else { return false };
+    let home = cfg.hosting.as_ref().map(|h| h.home.as_str());
+    !allowed.iter().any(|a| a == address || Some(a.as_str()) == home)
+}
+
+/// What a person sees about an app that waits for its provider's review here.
+pub fn review_notice(app: &str) -> String {
+    format!(
+        "DumbSlab's access to {app} is still being reviewed, so only a few test workspaces can connect {app} for now. Connections made earlier keep working."
+    )
 }
 
 /// The sign-in page and the token endpoint for a connection to `connector` whose credential (so
@@ -859,6 +929,9 @@ pub fn start_sign_in(
             info.name
         )));
     };
+    if awaiting_review(cfg, info.id) {
+        return Err(ApiError::new(403, "awaiting_review", review_notice(info.name)));
+    }
     // The credential so far: for apps on each customer's site, which site.
     let mut cred = Credential::default();
     let site = site.map(str::trim).filter(|s| !s.is_empty());
@@ -2031,7 +2104,7 @@ mod tests {
         assert_ne!(seal("k1", "u1", "github", &cred).unwrap(), sealed, "a fresh nonce each time");
         assert!(format!("{cred:?}").find("ghp_secret").is_none(), "never printed");
         let app = OAuthApp { client_id: "id".into(), client_secret: "client-secret".into() };
-        let host = Connectors { key: Some("connector-key".into()), apps: [("github".into(), app)].into(), callback_url: None };
+        let host = Connectors { key: Some("connector-key".into()), apps: [("github".into(), app)].into(), ..Default::default() };
         let tokens = TokenSet { access_token: "at".into(), refresh_token: Some("rt".into()), ..Default::default() };
         let printed = format!("{host:?} {tokens:?}");
         for secret in ["client-secret", "connector-key", "\"at\"", "\"rt\""] {

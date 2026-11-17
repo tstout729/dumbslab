@@ -21,7 +21,7 @@ pub fn ops() -> Vec<Op> {
     vec![
         op("connections", "list_connections", "GET", "/connections", Access::Read, list_connections)
             .title("Connected apps")
-            .desc("The apps you can connect (GitHub, Google Drive…) and which you have. For each: whether this server lets you sign in to it (`sign_in`), what to fill in first for apps on your company's own address (`sign_in_field`, e.g. Zendesk's subdomain), and the fields for connecting with a personal token instead (`token_fields`). After a sign-in that didn't work, `sign_in_error` says why for a few minutes. Everyone connects their own accounts; nobody else can use them.")
+            .desc("The apps you can connect (GitHub, Google Drive…) and which you have. For each: whether this server lets you sign in to it (`sign_in`; `awaiting_review` says why not when the app's provider is still reviewing this server's access), what to fill in first for apps on your company's own address (`sign_in_field`, e.g. Zendesk's subdomain), and the fields for connecting with a personal token instead (`token_fields`). After a sign-in that didn't work, `sign_in_error` says why for a few minutes. Everyone connects their own accounts; nobody else can use them.")
             .build(),
         op("connections", "connect_app", "POST", "/connections", Access::Write, connect_app)
             .title("Connect an app")
@@ -56,6 +56,10 @@ pub struct AppInfo {
     pub preview: bool,
     /// You can connect by signing in to the app: this server registered an OAuth app with it.
     pub sign_in: bool,
+    /// Signing in with this app isn't open here yet: the app's provider is still reviewing this
+    /// server's access, and until it approves, only a few test workspaces can connect it.
+    /// `sign_in` is then false. Says so in a sentence for the person; None otherwise.
+    pub awaiting_review: Option<String>,
     /// What to fill in before signing in, for apps on each company's own address (Zendesk's
     /// subdomain). Send it to connect_app as `site`. None for other apps.
     pub sign_in_field: Option<Field>,
@@ -80,6 +84,7 @@ pub struct ConnectionList {
 }
 
 fn list_connections(ctx: &mut Ctx, _: NoInput) -> ApiResult<ConnectionList> {
+    connect::require_own_credential(ctx.db, &ctx.actor)?;
     let enabled = connect::enabled(ctx.cfg);
     let mine = if enabled { connect::connections(ctx.db, ctx.cfg, &ctx.actor.user_id)? } else { vec![] };
     let mut failures = if enabled { connect::sign_in_failures(ctx.db, &ctx.actor.user_id, Utc::now())? } else { BTreeMap::new() };
@@ -87,7 +92,9 @@ fn list_connections(ctx: &mut Ctx, _: NoInput) -> ApiResult<ConnectionList> {
         .iter()
         .map(|c| {
             let info = c.info();
-            let sign_in = info.oauth.is_some() && connect::oauth_app(ctx.cfg, info.id).is_some();
+            let registered = info.oauth.is_some() && connect::oauth_app(ctx.cfg, info.id).is_some();
+            let waiting = registered && connect::awaiting_review(ctx.cfg, info.id);
+            let sign_in = registered && !waiting;
             AppInfo {
                 id: info.id.into(),
                 name: info.name.into(),
@@ -95,6 +102,7 @@ fn list_connections(ctx: &mut Ctx, _: NoInput) -> ApiResult<ConnectionList> {
                 search: info.search,
                 preview: info.preview,
                 sign_in,
+                awaiting_review: waiting.then(|| connect::review_notice(info.name)),
                 sign_in_field: info.oauth.and_then(|o| o.site).filter(|_| sign_in),
                 token_fields: info.token_fields.to_vec(),
                 token_help: Some(info.token_help.to_string()).filter(|h| !h.is_empty()),
@@ -135,6 +143,7 @@ pub struct ConnectStart {
 }
 
 fn connect_app(ctx: &mut Ctx, input: ConnectInput) -> ApiResult<Deferred<ConnectStart>> {
+    connect::require_own_credential(ctx.db, &ctx.actor)?;
     let connector = app(&input.app)?;
     let info = connector.info();
     if !connect::enabled(ctx.cfg) {
@@ -184,6 +193,7 @@ pub struct AppInput {
 }
 
 fn disconnect_app(ctx: &mut Ctx, input: AppInput) -> ApiResult<Done> {
+    connect::require_own_credential(ctx.db, &ctx.actor)?;
     let connector = app(&input.app)?;
     if !connect::remove(ctx.db, &ctx.actor.user_id, connector.info().id)? {
         return Err(ApiError::not_found(format!("your {} connection", connector.info().name)));
@@ -202,6 +212,7 @@ pub struct SearchConnectedInput {
 }
 
 fn search_connected(ctx: &mut Ctx, input: SearchConnectedInput) -> ApiResult<Deferred<ConnectedResults>> {
+    connect::require_own_credential(ctx.db, &ctx.actor)?;
     let q = input.q.trim();
     if q.is_empty() {
         return Ok(Deferred::Ready(ConnectedResults::default()));
@@ -231,6 +242,7 @@ pub struct PreviewInput {
 }
 
 fn preview_link(ctx: &mut Ctx, input: PreviewInput) -> ApiResult<Deferred<LinkPreview>> {
+    connect::require_own_credential(ctx.db, &ctx.actor)?;
     let url = input.url.trim();
     if !(url.starts_with("https://") || url.starts_with("http://")) || url.len() > 2000 {
         return Err(ApiError::bad_request("`url` must be an http(s) link"));

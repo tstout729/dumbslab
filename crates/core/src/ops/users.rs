@@ -5,6 +5,7 @@ use serde_json::json;
 
 use super::{DONE, Done, NoInput, clean, required};
 use crate::auth::{self, Role, Scopes, Via};
+use crate::connect;
 use crate::db::{DbExt, Row, SqlValue};
 use crate::error::{ApiError, ApiResult};
 use crate::events::{Event, emit};
@@ -31,7 +32,7 @@ pub fn ops() -> Vec<Op> {
             .build(),
         op("users", "update_user", "PATCH", "/users/{user}", Access::Write, update_user)
             .title("Update a profile")
-            .desc("Update your own name, handle, bio or avatar. Admins can also change roles, deactivate accounts and set passwords.")
+            .desc("Update your own name, handle, bio or avatar. Admins can also change roles, deactivate accounts and set passwords. Deactivating signs the person out and deletes their connected apps' credentials.")
             .build(),
         op("users", "change_password", "POST", "/me/password", Access::Write, change_password)
             .title("Change your password")
@@ -291,9 +292,11 @@ pub struct UpdateUserInput {
     pub avatar_url: Option<String>,
     /// Admins only.
     pub role: Option<Role>,
-    /// Admins only. Deactivated people can't sign in and their tokens stop working.
+    /// Admins only. Deactivated people can't sign in and their tokens stop working, and the
+    /// credentials of the apps they connected are deleted.
     pub deactivated: Option<bool>,
-    /// Admins only: set a new password for this person.
+    /// Admins only: set a new password for this person. Signs them out, and for someone else,
+    /// deletes the credentials of the apps they connected.
     pub new_password: Option<String>,
 }
 
@@ -359,6 +362,9 @@ fn update_user(ctx: &mut Ctx, input: UpdateUserInput) -> ApiResult<User> {
             sets.push("deactivated_at = ?");
             p.push(ctx.now_s().into());
             ctx.db.execute("DELETE FROM sessions WHERE user_id = ?", &params![id.clone()])?;
+            // A deactivated account can't use its connected apps, so their credentials go now
+            // rather than waiting for the workspace to be deleted. Reactivated, they connect again.
+            connect::forget_person(ctx.db, &id)?;
         } else {
             sets.push("deactivated_at = NULL");
         }
@@ -367,6 +373,11 @@ fn update_user(ctx: &mut Ctx, input: UpdateUserInput) -> ApiResult<User> {
         sets.push("password_hash = ?");
         p.push(auth::hash_password(&pw)?.into());
         ctx.db.execute("DELETE FROM sessions WHERE user_id = ?", &params![id.clone()])?;
+        // Whoever set it can sign in as this person, so their connected apps (their own Google
+        // Drive, GitHub…) go too. They connect again themselves.
+        if !is_self {
+            connect::forget_person(ctx.db, &id)?;
+        }
     }
     if !sets.is_empty() {
         sets.push("updated_at = ?");
@@ -536,7 +547,8 @@ pub struct CreateTokenInput {
     pub scopes: Option<Vec<String>>,
     /// Days until it expires. Default: never.
     pub expires_in_days: Option<u32>,
-    /// Admins only: mint the token for another account (usually a bot).
+    /// Admins only: mint the token for another account (usually a bot). Such a token can't
+    /// reach that account's connected apps: those are the person's own.
     pub user: Option<String>,
 }
 
@@ -560,9 +572,12 @@ pub fn mint_token(
     let (kind, prefix) = if app.is_some() { ("oauth", "ds_oat_") } else { ("personal", "ds_pat_") };
     let secret = new_secret(prefix);
     let id = new_id();
+    // A connected app's token is approved by the person themselves; a personal token may be made
+    // by an admin for someone else, such as a bot (see `connect::require_own_credential`).
+    let created_by = if app.is_some() { user_id.to_string() } else { ctx.actor.user_id.clone() };
     ctx.db.execute(
-        "INSERT INTO api_tokens (id, user_id, name, token_hash, prefix, scopes, kind, client_id, resource, created_at, expires_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO api_tokens (id, user_id, name, token_hash, prefix, scopes, kind, client_id, resource, created_at, expires_at, created_by)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         &params![
             id.clone(),
             user_id,
@@ -574,7 +589,8 @@ pub fn mint_token(
             app.map(|(client, _)| client),
             app.map(|(_, resource)| resource),
             ctx.now_s(),
-            expires_at
+            expires_at,
+            created_by
         ],
     )?;
     Ok((id, secret))
